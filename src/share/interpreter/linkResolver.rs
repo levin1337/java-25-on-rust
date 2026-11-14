@@ -202,12 +202,44 @@ impl LinkResolver {
             }
         }
 
-        // 2. If receiver overrides it directly, resolve virtual call
+        // 2. Private/default methods declared on the named interface itself
+        // (e.g. LambdaMetafactory impl handles with REF_invokeInterface kind
+        // targeting private interface methods). Walk the receiver's interface
+        // hierarchy looking for the interface that declares the method.
+        {
+            let mut pending: Vec<Rc<InstanceKlass<'a>>> = receiver_klass.interfaces.clone();
+            let mut visited = HashSet::new();
+            while let Some(iface) = pending.pop() {
+                if !visited.insert(Rc::as_ptr(&iface) as usize) {
+                    continue;
+                }
+                pending.extend(iface.interfaces.iter().cloned());
+                let declares = iface.class.name == interface_name
+                    || iface
+                        .class
+                        .methods
+                        .iter()
+                        .any(|m| m.name == name && m.descriptor == descriptor);
+                if !declares {
+                    continue;
+                }
+                if let Some(method) = iface.class.methods.iter().find(|m| {
+                    m.name == name
+                        && m.descriptor == descriptor
+                        && m.accessFlags & 8 == 0
+                        && m.code_attribute().is_some()
+                }) {
+                    return Ok((Rc::clone(&iface), Code::parse(method)?));
+                }
+            }
+        }
+
+        // 3. If receiver overrides it directly, resolve virtual call
         if let Ok(res) = Self::resolve_virtual_call(receiver_klass, name, descriptor) {
             return Ok(res);
         }
 
-        // 3. Check public method on java/lang/Object
+        // 4. Check public method on java/lang/Object
         let mut curr = Some(receiver_klass);
         while let Some(k) = curr {
             if k.class.name == b"java/lang/Object" {

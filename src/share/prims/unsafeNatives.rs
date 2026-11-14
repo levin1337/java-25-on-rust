@@ -14,6 +14,14 @@ use crate::share::{
 };
 use std::io::{self, Error};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicI64, Ordering};
+
+/// Sentinel offset returned by `Thread.getNextThreadIdOffset`. Unsafe accesses
+/// with a null object and this offset operate on a VM-side thread-id counter,
+/// mirroring HotSpot's static-field-offset fast path for `Thread.threadSeqNumber`.
+pub(crate) const THREAD_TID_SENTINEL_OFFSET: i64 = i64::MAX;
+
+static THREAD_TID_COUNTER: AtomicI64 = AtomicI64::new(0);
 
 type NativeResult<'a> = Option<Option<Value<'a>>>;
 
@@ -646,6 +654,11 @@ fn read_raw<'a>(
 ) -> io::Result<Raw> {
     let object = object_arg(arguments, object_index)?;
     let offset = offset_arg(arguments, object_index + 1)?;
+    if matches!(object, Value::Null) && offset == THREAD_TID_SENTINEL_OFFSET {
+        return Ok(Raw {
+            value: THREAD_TID_COUNTER.load(Ordering::Relaxed) as u64,
+        });
+    }
     let raw = match object {
         Value::Null => read_offheap_raw(offset, size)?,
         Value::ClassMirror(class) => {
@@ -691,6 +704,11 @@ fn write_raw<'a>(
 ) -> io::Result<()> {
     let object = object_arg(arguments, object_index)?;
     let offset = offset_arg(arguments, object_index + 1)?;
+    if matches!(object, Value::Null) && offset == THREAD_TID_SENTINEL_OFFSET {
+        let raw = value_to_raw(value, size)?;
+        THREAD_TID_COUNTER.store(raw as i64, Ordering::Relaxed);
+        return Ok(());
+    }
     let value_raw = value_to_raw(value, size)?;
     match object {
         Value::Null => write_offheap_raw(offset, size, value_raw),

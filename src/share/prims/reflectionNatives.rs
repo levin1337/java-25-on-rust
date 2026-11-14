@@ -876,7 +876,7 @@ fn class_constant_index<'a>(klass: &InstanceKlass<'a>) -> Option<u16> {
                 klass.class.constants.get(usize::from(*name_index))
             && *name == klass.class.name
         {
-            return u16::try_from(index + 1).ok();
+            return u16::try_from(index).ok();
         }
     }
     None
@@ -934,8 +934,18 @@ pub(crate) fn class_modifiers(loader: &ClassLoader<'_>, class: &[u8]) -> io::Res
         return Ok(0x0411);
     }
     let klass = loader.load(class)?;
-    let flags = u32::from(klass.class.accessFlags) | u32::from(inner_class_access_flags(&klass));
-    Ok(i32::try_from(flags & 0x7FFF).unwrap_or(0))
+    let inner = inner_class_access_flags(&klass);
+    let flags = u32::from(klass.class.accessFlags) | u32::from(inner);
+    if std::env::var_os("JVM25_TRACE").is_some() {
+        eprintln!(
+            "[modifiers] {} access={:#x} inner={:#x} -> {:#x}",
+            String::from_utf8_lossy(class),
+            klass.class.accessFlags,
+            inner,
+            flags & 0x761F
+        );
+    }
+    Ok(i32::try_from(flags & 0x761F).unwrap_or(0))
 }
 
 /// Member classes declared by `klass` (InnerClasses entries whose outer
@@ -2096,13 +2106,7 @@ pub(crate) fn class_invoke<'a>(
                 class_array(loader, &names)?
             }
         }
-        (b"getModifiers", b"()I") => {
-            if is_primitive || is_array {
-                Value::Int(0x0411)
-            } else {
-                Value::Int(i32::from(klass.as_ref().unwrap().class.accessFlags & 0x761F))
-            }
-        }
+        (b"getModifiers", b"()I") => Value::Int(class_modifiers(loader, class)?),
         (b"isInstance", b"(Ljava/lang/Object;)Z") => {
             let arg = arguments.get(1).copied().unwrap_or(Value::Null);
             let result = !matches!(arg, Value::Null)

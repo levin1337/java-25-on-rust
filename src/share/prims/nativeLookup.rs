@@ -258,6 +258,23 @@ pub fn invokeInstance<'a>(
         }
         (b"java/lang/Runtime", b"maxMemory", b"()J") => Some(Value::Long(Jvm::max_memory() as i64)),
         (b"java/lang/Runtime", b"gc", b"()V") => None,
+        (b"java/lang/ClassLoader", b"findBootstrapClass", b"(Ljava/lang/String;)Ljava/lang/Class;") => {
+            let name_value = arguments.get(1).copied().unwrap_or(Value::Null);
+            let text = super::stringNatives::string(loader, name_value)?
+                .map(|cow| cow.into_owned());
+            match text {
+                Some(text) if !text.starts_with('[') => {
+                    let internal = text.replace('.', "/");
+                    match loader.load(internal.as_bytes()) {
+                        Ok(_) => Some(Value::ClassMirror(
+                            loader.storage.alloc_str(&internal).as_bytes(),
+                        )),
+                        Err(_) => Some(Value::Null),
+                    }
+                }
+                _ => Some(Value::Null),
+            }
+        }
         (b"java/lang/Object", b"hashCode", b"()I") => {
             let receiver = *arguments
                 .first()
@@ -296,13 +313,19 @@ pub fn invokeInstance<'a>(
                     Value::PrimitiveArray(loader.alloc_type_array(array))
                 }
                 Value::ObjectArray(handle) => {
-                    let array = {
+                    let (component, elements) = {
                         let arrays = loader.obj_arrays.borrow();
-                        arrays
+                        let array = arrays
                             .get(handle)
-                            .ok_or_else(|| io::Error::other("Invalid array reference"))?
-                            .clone()
+                            .ok_or_else(|| io::Error::other("Invalid array reference"))?;
+                        (array.component, array.elements.clone())
                     };
+                    let mut array =
+                        crate::share::oops::objArrayOop::ObjArrayOop::withComponent(
+                            elements.len() as i32,
+                            component,
+                        )?;
+                    array.elements = elements;
                     Value::ObjectArray(loader.alloc_obj_array(array))
                 }
                 Value::String(_) | Value::HostString(_) | Value::ClassMirror(_) => receiver,
@@ -380,6 +403,14 @@ pub fn invokeInstance<'a>(
             }
         }
         _ => {
+            if std::env::var_os("JVM25_TRACE").is_some() {
+                eprintln!(
+                    "[nativeInstance] {}.{}{}",
+                    String::from_utf8_lossy(owner),
+                    String::from_utf8_lossy(name),
+                    String::from_utf8_lossy(descriptor)
+                );
+            }
             return match super::jniInvocation::invoke_dll_native(
                 loader, owner, name, descriptor, false, arguments,
             )? {
@@ -606,7 +637,9 @@ pub fn invokeStatic<'a>(
         (b"jdk/internal/misc/Signal", b"findSignal0", b"(Ljava/lang/String;)I") => {
             Some(Some(Value::Int(-1)))
         }
-        (b"java/lang/Thread", b"getNextThreadIdOffset", b"()J") => Some(Some(Value::Long(0))),
+        (b"java/lang/Thread", b"getNextThreadIdOffset", b"()J") => Some(Some(Value::Long(
+            crate::share::prims::unsafeNatives::THREAD_TID_SENTINEL_OFFSET,
+        ))),
         (b"jdk/internal/misc/Unsafe", b"getUnsafe", b"()Ljdk/internal/misc/Unsafe;") => {
             match loader.load(b"jdk/internal/misc/Unsafe") {
                 Ok(klass) => match crate::share::oops::instanceOop::InstanceOop::new(klass) {

@@ -497,22 +497,28 @@ fn generate_class<'a>(
     sam_return: &Type,
     bsm_args: &[BootstrapArg],
 ) -> io::Result<Rc<InstanceKlass<'a>>> {
-    // altMetafactory flags: FLAG_MARKERS = 1, FLAG_SERIALIZABLE = 2,
-    // FLAG_BRIDGES = 4. Marker interfaces come first, Serializable last —
-    // matching LambdaMetafactory's generated interface list.
+    // altMetafactory flags (java.lang.invoke.LambdaMetafactory):
+    // FLAG_SERIALIZABLE = 1, FLAG_MARKERS = 2, FLAG_BRIDGES = 4.
+    // With FLAG_MARKERS the next arg is a marker-interface count followed by
+    // that many Class args; FLAG_BRIDGES likewise carries MethodType bridge
+    // signatures (not needed for our direct class generation).
     let mut interfaces: Vec<&'a [u8]> = vec![loader.storage.alloc_str(sam_interface).as_bytes()];
     let flags = match bsm_args.get(3) {
         Some(BootstrapArg::Int(flags)) => *flags,
         _ => 0,
     };
-    if flags & 1 != 0 {
-        for arg in bsm_args.iter().skip(4) {
+    if flags & 2 != 0 {
+        let marker_count = match bsm_args.get(4) {
+            Some(BootstrapArg::Int(count)) => (*count).max(0) as usize,
+            _ => 0,
+        };
+        for arg in bsm_args.iter().skip(5).take(marker_count) {
             if let BootstrapArg::Klass(name) = arg {
                 interfaces.push(loader.storage.alloc_str(name).as_bytes());
             }
         }
     }
-    if flags & 2 != 0 {
+    if flags & 1 != 0 && !interfaces.contains(&b"java/io/Serializable".as_slice()) {
         interfaces.push(b"java/io/Serializable");
     }
 

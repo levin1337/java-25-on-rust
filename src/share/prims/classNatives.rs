@@ -175,12 +175,7 @@ pub(crate) fn invoke<'a>(
             )?));
         }
         (b"getModifiers", b"()I") => {
-            let flags = if class.starts_with(b":") || class.starts_with(b"[") {
-                0x0411
-            } else {
-                i32::from(loader.load(class)?.class.accessFlags & 0x761F)
-            };
-            Value::Int(flags)
+            Value::Int(crate::share::prims::reflectionNatives::class_modifiers(loader, class)?)
         }
         (b"getSimpleName", b"()Ljava/lang/String;") => {
             if class.starts_with(b"[") {

@@ -8,6 +8,7 @@
 use super::jni::NativeMethodFn;
 use std::collections::HashMap;
 use std::io;
+use std::rc::Rc;
 use std::sync::{Mutex, OnceLock};
 
 #[allow(dead_code)]
@@ -266,12 +267,81 @@ pub fn invokeInstance<'a>(
             };
             Some(Value::Int(hash))
         }
+        (b"java/lang/Object", b"clone", b"()Ljava/lang/Object;") => {
+            let receiver = *arguments
+                .first()
+                .ok_or_else(|| io::Error::other("Missing receiver"))?;
+            Some(match receiver {
+                Value::Object(handle) => {
+                    let (klass, fields) = {
+                        let objects = loader.borrow_objects();
+                        let object = objects
+                            .get(handle)
+                            .ok_or_else(|| io::Error::other("Invalid object reference"))?;
+                        (Rc::clone(&object.klass), object.fields.clone())
+                    };
+                    let mut cloned =
+                        crate::share::oops::instanceOop::InstanceOop::new(klass)?;
+                    cloned.fields = fields;
+                    Value::Object(loader.alloc_object(cloned))
+                }
+                Value::PrimitiveArray(handle) => {
+                    let array = {
+                        let arrays = loader.arrays.borrow();
+                        arrays
+                            .get(handle)
+                            .ok_or_else(|| io::Error::other("Invalid array reference"))?
+                            .clone()
+                    };
+                    Value::PrimitiveArray(loader.alloc_type_array(array))
+                }
+                Value::ObjectArray(handle) => {
+                    let array = {
+                        let arrays = loader.obj_arrays.borrow();
+                        arrays
+                            .get(handle)
+                            .ok_or_else(|| io::Error::other("Invalid array reference"))?
+                            .clone()
+                    };
+                    Value::ObjectArray(loader.alloc_obj_array(array))
+                }
+                Value::String(_) | Value::HostString(_) | Value::ClassMirror(_) => receiver,
+                Value::Null => {
+                    return Err(io::Error::other("NullPointerException"));
+                }
+                _ => {
+                    return Err(io::Error::other(
+                        "java/lang/CloneNotSupportedException",
+                    ));
+                }
+            })
+        }
         (b"java/lang/Throwable", b"fillInStackTrace", b"(I)Ljava/lang/Throwable;") => {
             Some(arguments.first().copied().unwrap_or(Value::Null))
         }
         (b"java/lang/Object", b"notify", b"()V")
         | (b"java/lang/Object", b"notifyAll", b"()V")
         | (b"java/lang/Object", b"wait0", b"(J)V") => None,
+        _ if owner.starts_with(b"java/lang/ref/")
+            && name == b"refersTo0"
+            && descriptor == b"(Ljava/lang/Object;)Z" => {
+            let receiver = arguments.first().copied().unwrap_or(Value::Null);
+            let target = arguments.get(1).copied().unwrap_or(Value::Null);
+            let referent = match receiver {
+                Value::Object(handle) => {
+                    let objects = loader.borrow_objects();
+                    objects.get(handle).and_then(|object| {
+                        let slot = object
+                            .klass
+                            .instanceField(b"referent", b"Ljava/lang/Object;")
+                            .ok()?;
+                        object.fields.get(slot).copied()
+                    })
+                }
+                _ => None,
+            };
+            Some(Value::Int(i32::from(referent == Some(target))))
+        }
         (b"java/lang/Runtime", b"load0", b"(Ljava/lang/String;)V") => {
             // System.load(String): arguments = [receiver, filename]
             let Some(filename) = arguments
@@ -551,6 +621,9 @@ pub fn invokeStatic<'a>(
         | (b"java/lang/System", b"setErr0", b"(Ljava/io/PrintStream;)V") => Some(None),
         (b"java/lang/System", b"mapLibraryName", b"(Ljava/lang/String;)Ljava/lang/String;") => {
             arguments.first().copied().map(Some)
+        }
+        (b"jdk/internal/loader/NativeLibraries", b"findBuiltinLib", b"(Ljava/lang/String;)Ljava/lang/String;") => {
+            Some(Some(Value::Null))
         }
         (b"jdk/internal/loader/BootLoader", b"setBootLoaderUnnamedModule0", b"(Ljava/lang/Module;)V") => {
             Some(None)

@@ -178,7 +178,7 @@ pub(crate) fn invoke<'a>(
             let flags = if class.starts_with(b":") || class.starts_with(b"[") {
                 0x0411
             } else {
-                i32::from(loader.load(class)?.class.accessFlags & 0x7611)
+                i32::from(loader.load(class)?.class.accessFlags & 0x761F)
             };
             Value::Int(flags)
         }

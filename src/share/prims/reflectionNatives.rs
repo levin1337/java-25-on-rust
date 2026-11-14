@@ -238,12 +238,13 @@ fn new_throwable<'a>(
         }
         Ok(())
     })();
-    if let Some(position) = loader
-        .gc_extra_roots
-        .borrow()
-        .iter()
-        .rposition(|value| matches!(value, Value::Object(root) if *root == handle))
-    {
+    let root_position = {
+        let roots = loader.gc_extra_roots.borrow();
+        roots
+            .iter()
+            .rposition(|value| matches!(value, Value::Object(root) if *root == handle))
+    };
+    if let Some(position) = root_position {
         loader.gc_extra_roots.borrow_mut().remove(position);
     }
     result?;
@@ -436,8 +437,8 @@ fn unbox<'a>(loader: &ClassLoader<'a>, value: Value<'a>) -> io::Result<(u8, Valu
             .ok_or_else(|| invalid("Invalid object"))?;
         (Rc::clone(&object.klass), object.klass.class.name)
     };
-    let dotted = dotted_name(name);
-    let Some(tag) = Reflection::unbox_target_descriptor(&dotted) else {
+    let internal = String::from_utf8_lossy(name);
+    let Some(tag) = Reflection::unbox_target_descriptor(internal.as_ref()) else {
         return Err(iae(loader, "Argument is not a wrapper object"));
     };
     let tag = tag.as_bytes()[0];
@@ -512,7 +513,7 @@ fn box_value<'a>(
 /// reference assignability checks.
 fn adapt_arguments<'a>(
     loader: &ClassLoader<'a>,
-    parameters: &[&'a [u8]],
+    parameters: &[&[u8]],
     arguments: &[Value<'a>],
 ) -> io::Result<Vec<Value<'a>>> {
     if parameters.len() != arguments.len() {
@@ -711,7 +712,13 @@ fn invoke0_inner<'a>(loader: &ClassLoader<'a>, arguments: &[Value<'a>]) -> io::R
     };
     let info = executable_info(loader, *method, b"java/lang/reflect/Method")?;
     let args = object_args(loader, *raw_args)?;
-    let adapted = adapt_arguments(loader, &info.parameters, &args)?;
+    let descriptors: Vec<Vec<u8>> = info
+        .parameters
+        .iter()
+        .map(|parameter| mirror_descriptor(parameter))
+        .collect();
+    let param_refs: Vec<&[u8]> = descriptors.iter().map(Vec::as_slice).collect();
+    let adapted = adapt_arguments(loader, &param_refs, &args)?;
     if matches!(receiver, Value::Null) && (info.modifiers as u16 & ACC_STATIC) == 0 {
         return Err(npe(loader));
     }
@@ -749,7 +756,12 @@ pub(crate) fn constructor_new_instance0<'a>(
     }
 
     let args = object_args(loader, *raw_args)?;
-    let adapted = adapt_arguments(loader, &parameters, &args)?;
+    let descriptors: Vec<Vec<u8>> = parameters
+        .iter()
+        .map(|parameter| mirror_descriptor(parameter))
+        .collect();
+    let param_refs: Vec<&[u8]> = descriptors.iter().map(Vec::as_slice).collect();
+    let adapted = adapt_arguments(loader, &param_refs, &args)?;
 
     let mut descriptor = Vec::new();
     descriptor.push(b'(');
@@ -794,12 +806,13 @@ pub(crate) fn constructor_new_instance0<'a>(
         Ok(())
     })();
 
-    if let Some(position) = loader
-        .gc_extra_roots
-        .borrow()
-        .iter()
-        .rposition(|value| matches!(value, Value::Object(root) if *root == object_handle))
-    {
+    let root_position = {
+        let roots = loader.gc_extra_roots.borrow();
+        roots
+            .iter()
+            .rposition(|value| matches!(value, Value::Object(root) if *root == object_handle))
+    };
+    if let Some(position) = root_position {
         loader.gc_extra_roots.borrow_mut().remove(position);
     }
 
@@ -881,6 +894,48 @@ fn utf8_at<'a>(klass: &InstanceKlass<'a>, index: u16) -> Option<&'a [u8]> {
         Constant::Utf8(bytes) => Some(bytes),
         _ => None,
     }
+}
+
+/// Access flags from the InnerClasses self-entry (carries `static` for
+/// member classes, which is not part of the class-file access_flags).
+fn inner_class_access_flags<'a>(klass: &InstanceKlass<'a>) -> u16 {
+    let Some(this_index) = class_constant_index(klass) else {
+        return 0;
+    };
+    let Some(attribute) = klass
+        .class
+        .attributes
+        .iter()
+        .find(|attribute| attribute.name == b"InnerClasses")
+    else {
+        return 0;
+    };
+    let bytes = attribute.bytes;
+    if bytes.len() < 2 {
+        return 0;
+    }
+    let count = u16::from_be_bytes([bytes[0], bytes[1]]) as usize;
+    for entry in 0..count {
+        let base = 2 + entry * 8;
+        let Some(slice) = bytes.get(base..base + 8) else {
+            break;
+        };
+        if u16::from_be_bytes([slice[0], slice[1]]) == this_index {
+            return u16::from_be_bytes([slice[6], slice[7]]);
+        }
+    }
+    0
+}
+
+/// `Class.getModifiers()` value: class access flags merged with the
+/// InnerClasses entry flags (JVM_RECOGNIZED_CLASS_MODIFIERS).
+pub(crate) fn class_modifiers(loader: &ClassLoader<'_>, class: &[u8]) -> io::Result<i32> {
+    if class.starts_with(b":") || class.starts_with(b"[") {
+        return Ok(0x0411);
+    }
+    let klass = loader.load(class)?;
+    let flags = u32::from(klass.class.accessFlags) | u32::from(inner_class_access_flags(&klass));
+    Ok(i32::try_from(flags & 0x7FFF).unwrap_or(0))
 }
 
 /// Member classes declared by `klass` (InnerClasses entries whose outer
@@ -1404,6 +1459,7 @@ fn class_java_method<'a>(
     class: &'a [u8],
     name: &[u8],
     descriptor: &[u8],
+    arguments: &[Value<'a>],
 ) -> io::Result<Option<Value<'a>>> {
     let is_array = class.starts_with(b"[");
     let is_primitive = class.starts_with(b":");
@@ -1576,9 +1632,250 @@ fn class_java_method<'a>(
         | (b"getEnumConstantsShared", b"()[Ljava/lang/Object;") => {
             enum_constants(loader, class).ok()
         }
+        (b"getMethod", b"(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;") => {
+            let name = member_name(loader, arguments, 1)?;
+            let parameters = parameter_classes(loader, arguments, 2)?;
+            match find_public_method(loader, class, &name, &parameters)? {
+                Some((method_klass, index)) => {
+                    let member = method_klass.class.methods[index].clone();
+                    Some(Value::Object(new_method_object(
+                        loader,
+                        &method_klass,
+                        &member,
+                        index as i32,
+                    )?))
+                }
+                None => {
+                    return Err(no_such_method(loader, class, &name, &parameters));
+                }
+            }
+        }
+        (b"getDeclaredMethod", b"(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;") => {
+            let name = member_name(loader, arguments, 1)?;
+            let parameters = parameter_classes(loader, arguments, 2)?;
+            if is_array || is_primitive {
+                return Err(no_such_method(loader, class, &name, &parameters));
+            }
+            let method_klass = loader.load(class)?;
+            match find_declared_method(&method_klass, &name, &parameters, false) {
+                Some(index) => {
+                    let member = method_klass.class.methods[index].clone();
+                    Some(Value::Object(new_method_object(
+                        loader,
+                        &method_klass,
+                        &member,
+                        index as i32,
+                    )?))
+                }
+                None => return Err(no_such_method(loader, class, &name, &parameters)),
+            }
+        }
+        (b"getMethods", b"()[Ljava/lang/reflect/Method;") => {
+            let methods = public_methods(loader, class)?;
+            let mut handles = Vec::with_capacity(methods.len());
+            for (method_klass, index) in methods {
+                let member = method_klass.class.methods[index].clone();
+                handles.push(new_method_object(loader, &method_klass, &member, index as i32)?);
+            }
+            Some(member_array(loader, b"java/lang/reflect/Method", handles)?)
+        }
+        (b"getDeclaredMethods", b"()[Ljava/lang/reflect/Method;") => {
+            if is_array || is_primitive {
+                Some(member_array(loader, b"java/lang/reflect/Method", Vec::new())?)
+            } else {
+                let method_klass = loader.load(class)?;
+                Some(declared_methods(loader, &method_klass, false)?)
+            }
+        }
+        (b"getField", b"(Ljava/lang/String;)Ljava/lang/reflect/Field;") => {
+            let name = member_name(loader, arguments, 1)?;
+            match find_public_field(loader, class, &name)? {
+                Some((field_klass, index)) => {
+                    let member = field_klass.class.fields[index].clone();
+                    Some(Value::Object(new_field_object(loader, &field_klass, &member)?))
+                }
+                None => {
+                    return Err(throw_java(
+                        loader,
+                        b"java/lang/NoSuchFieldException",
+                        Some(&String::from_utf8_lossy(&name)),
+                    ));
+                }
+            }
+        }
+        (b"getDeclaredField", b"(Ljava/lang/String;)Ljava/lang/reflect/Field;") => {
+            let name = member_name(loader, arguments, 1)?;
+            if is_array || is_primitive {
+                return Err(throw_java(
+                    loader,
+                    b"java/lang/NoSuchFieldException",
+                    Some(&String::from_utf8_lossy(&name)),
+                ));
+            }
+            let field_klass = loader.load(class)?;
+            match find_declared_field(&field_klass, &name, false) {
+                Some(index) => {
+                    let member = field_klass.class.fields[index].clone();
+                    Some(Value::Object(new_field_object(loader, &field_klass, &member)?))
+                }
+                None => {
+                    return Err(throw_java(
+                        loader,
+                        b"java/lang/NoSuchFieldException",
+                        Some(&String::from_utf8_lossy(&name)),
+                    ));
+                }
+            }
+        }
+        (b"getFields", b"()[Ljava/lang/reflect/Field;") => {
+            let fields = public_fields(loader, class)?;
+            let mut handles = Vec::with_capacity(fields.len());
+            for (field_klass, index) in fields {
+                let member = field_klass.class.fields[index].clone();
+                handles.push(new_field_object(loader, &field_klass, &member)?);
+            }
+            Some(member_array(loader, b"java/lang/reflect/Field", handles)?)
+        }
+        (b"getDeclaredFields", b"()[Ljava/lang/reflect/Field;") => {
+            if is_array || is_primitive {
+                Some(member_array(loader, b"java/lang/reflect/Field", Vec::new())?)
+            } else {
+                let field_klass = loader.load(class)?;
+                Some(declared_fields(loader, &field_klass, false)?)
+            }
+        }
+        (b"getConstructor", b"([Ljava/lang/Class;)Ljava/lang/reflect/Constructor;") => {
+            let parameters = parameter_classes(loader, arguments, 1)?;
+            if is_array || is_primitive {
+                return Err(no_such_method(loader, class, b"<init>", &parameters));
+            }
+            let ctor_klass = loader.load(class)?;
+            match find_constructor(loader, &ctor_klass, &parameters, true) {
+                Some(index) => {
+                    let member = ctor_klass.class.methods[index].clone();
+                    Some(Value::Object(new_constructor_object(
+                        loader,
+                        &ctor_klass,
+                        &member,
+                        index as i32,
+                    )?))
+                }
+                None => return Err(no_such_method(loader, class, b"<init>", &parameters)),
+            }
+        }
+        (b"getDeclaredConstructor", b"([Ljava/lang/Class;)Ljava/lang/reflect/Constructor;") => {
+            let parameters = parameter_classes(loader, arguments, 1)?;
+            if is_array || is_primitive {
+                return Err(no_such_method(loader, class, b"<init>", &parameters));
+            }
+            let ctor_klass = loader.load(class)?;
+            match find_constructor(loader, &ctor_klass, &parameters, false) {
+                Some(index) => {
+                    let member = ctor_klass.class.methods[index].clone();
+                    Some(Value::Object(new_constructor_object(
+                        loader,
+                        &ctor_klass,
+                        &member,
+                        index as i32,
+                    )?))
+                }
+                None => return Err(no_such_method(loader, class, b"<init>", &parameters)),
+            }
+        }
+        (b"getConstructors", b"()[Ljava/lang/reflect/Constructor;") => {
+            if is_array || is_primitive {
+                Some(member_array(loader, b"java/lang/reflect/Constructor", Vec::new())?)
+            } else {
+                let ctor_klass = loader.load(class)?;
+                Some(constructors_array(loader, &ctor_klass, true)?)
+            }
+        }
+        (b"getDeclaredConstructors", b"()[Ljava/lang/reflect/Constructor;") => {
+            if is_array || is_primitive {
+                Some(member_array(loader, b"java/lang/reflect/Constructor", Vec::new())?)
+            } else {
+                let ctor_klass = loader.load(class)?;
+                Some(constructors_array(loader, &ctor_klass, false)?)
+            }
+        }
+        (b"asSubclass", b"(Ljava/lang/Class;)Ljava/lang/Class;") => {
+            let target = match arguments.get(1).copied().unwrap_or(Value::Null) {
+                Value::ClassMirror(target) => target,
+                Value::Null => return Err(npe(loader)),
+                _ => return Err(iae(loader, "Argument is not a Class")),
+            };
+            let assignable = if class == target {
+                true
+            } else if is_primitive || target.starts_with(b":") {
+                false
+            } else if target.starts_with(b"[") {
+                loader.classAssignable(class, target).unwrap_or(false)
+            } else {
+                let source_klass = loader.load(class)?;
+                crate::share::classfile::systemDictionary::SystemDictionary::is_subclass_of(
+                    &source_klass, target,
+                ) || crate::share::classfile::systemDictionary::SystemDictionary::implements_interface(
+                    &source_klass, target,
+                )
+            };
+            if !assignable {
+                return Err(throw_java(
+                    loader,
+                    b"java/lang/ClassCastException",
+                    Some(&format!(
+                        "Cannot cast {} to {}",
+                        class_display_name(class),
+                        class_display_name(target)
+                    )),
+                ));
+            }
+            Some(Value::ClassMirror(class))
+        }
+        (b"cast", b"(Ljava/lang/Object;)Ljava/lang/Object;") => {
+            let object = arguments.get(1).copied().unwrap_or(Value::Null);
+            let instance = !matches!(object, Value::Null)
+                && loader.referenceAssignable(object, class).unwrap_or(false);
+            if !instance {
+                return Err(throw_java(
+                    loader,
+                    b"java/lang/ClassCastException",
+                    Some(&format!(
+                        "Cannot cast {} to {}",
+                        match object {
+                            Value::Null => "null".to_owned(),
+                            _ => "object".to_owned(),
+                        },
+                        class_display_name(class)
+                    )),
+                ));
+            }
+            Some(object)
+        }
         _ => None,
     };
     Ok(result)
+}
+
+fn no_such_method<'a>(
+    loader: &ClassLoader<'a>,
+    class: &[u8],
+    name: &[u8],
+    parameters: &[Vec<u8>],
+) -> Error {
+    let mut signature = String::new();
+    signature.push_str(&class_display_name(class));
+    signature.push('.');
+    signature.push_str(&String::from_utf8_lossy(name));
+    signature.push('(');
+    for parameter in parameters {
+        signature.push_str(&class_display_name(parameter));
+    }
+    signature.push(')');
+    throw_java(
+        loader,
+        b"java/lang/NoSuchMethodException",
+        Some(&signature),
+    )
 }
 
 fn canonical_name_of(loader: &ClassLoader<'_>, class: &[u8]) -> Option<String> {
@@ -1756,7 +2053,7 @@ pub(crate) fn class_invoke<'a>(
         Some(loader.load(class)?)
     };
 
-    if let Some(value) = class_java_method(loader, class, name, descriptor)? {
+    if let Some(value) = class_java_method(loader, class, name, descriptor, arguments)? {
         return Ok(Some(value));
     }
 
@@ -1803,7 +2100,7 @@ pub(crate) fn class_invoke<'a>(
             if is_primitive || is_array {
                 Value::Int(0x0411)
             } else {
-                Value::Int(i32::from(klass.as_ref().unwrap().class.accessFlags & 0x7611))
+                Value::Int(i32::from(klass.as_ref().unwrap().class.accessFlags & 0x761F))
             }
         }
         (b"isInstance", b"(Ljava/lang/Object;)Z") => {
@@ -1889,7 +2186,8 @@ pub(crate) fn class_invoke<'a>(
             }
         }
         (b"getRawAnnotations", b"()[B") | (b"getRawTypeAnnotations", b"()[B") => Value::Null,
-        (b"getConstantPool", b"()Ljava/lang/constant/ConstantPool;") => Value::Null,
+        (b"getConstantPool", b"()Ljava/lang/constant/ConstantPool;")
+        | (b"getConstantPool", b"()Ljdk/internal/reflect/ConstantPool;") => Value::Null,
         (b"getRecordComponents0", b"()[Ljava/lang/reflect/RecordComponent;") => Value::Null,
         (b"getNestHost0", b"()Ljava/lang/Class;") => Value::ClassMirror(class),
         (b"getNestMembers0", b"()[Ljava/lang/Class;") => class_array(loader, &[class])?,

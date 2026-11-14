@@ -7,6 +7,7 @@ pub mod bytecodeStream;
 pub mod bytecodeTracer;
 pub mod bytecodes;
 pub mod invocationCounter;
+pub mod lambdaMetafactory;
 pub mod linkResolver;
 pub(crate) mod numeric;
 pub mod oopMapCache;

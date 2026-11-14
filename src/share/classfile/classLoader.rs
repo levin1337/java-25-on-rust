@@ -140,6 +140,7 @@ pub struct ClassLoader<'a> {
     unnamed_module_object: RefCell<Option<usize>>,
     current_thread_object: RefCell<Option<usize>>,
     pub(crate) call_stack: RefCell<Vec<&'a [u8]>>,
+    pub(crate) lambda_cache: RefCell<HashMap<(Vec<u8>, u16), Rc<InstanceKlass<'a>>>>,
     loader_type: ClassLoaderType,
 }
 
@@ -372,6 +373,7 @@ impl<'a> ClassLoader<'a> {
             unnamed_module_object: RefCell::new(None),
             current_thread_object: RefCell::new(None),
             call_stack: RefCell::new(Vec::new()),
+            lambda_cache: RefCell::new(HashMap::new()),
             loader_type: ClassLoaderType::AppLoader,
         })
     }
@@ -418,6 +420,7 @@ impl<'a> ClassLoader<'a> {
             unnamed_module_object: RefCell::new(None),
             current_thread_object: RefCell::new(None),
             call_stack: RefCell::new(Vec::new()),
+            lambda_cache: RefCell::new(HashMap::new()),
             loader_type: ClassLoaderType::AppLoader,
         })
     }
@@ -795,7 +798,34 @@ impl<'a> ClassLoader<'a> {
         if class.name != name {
             return Err(super::linkageError::LinkageError::no_class_def_found(name).io());
         }
+        self.defineParsed(class)
+    }
 
+    /// Defines a class from raw classfile bytes (used for runtime-generated
+    /// classes such as invokedynamic lambda proxies). The bytes are copied
+    /// into the loader's bump storage so the parsed `ClassFile` borrows stay
+    /// valid for `'a`.
+    pub fn define_class_bytes(&self, name: &[u8], bytes: &[u8]) -> io::Result<Rc<InstanceKlass<'a>>> {
+        let bytes = self.storage.alloc_slice_copy(bytes);
+        let class = ClassFile::parse(bytes, false).map_err(|error| {
+            super::linkageError::LinkageError::new(
+                super::linkageError::LinkageErrorKind::ClassFormat,
+                error.to_string(),
+            )
+            .io()
+        })?;
+        if class.name != name {
+            return Err(super::linkageError::LinkageError::no_class_def_found(name).io());
+        }
+        self.defineParsed(class)
+    }
+
+    /// Links an already-parsed ClassFile: resolves the superclass and interfaces,
+    /// builds the InstanceKlass and registers it. Used both for classes loaded
+    /// from classpath/image sources and for synthetic classes generated at
+    /// runtime (e.g. invokedynamic lambda classes).
+    fn defineParsed(&self, class: ClassFile<'a>) -> io::Result<Rc<InstanceKlass<'a>>> {
+        let class_name = class.name;
         let no_class_def = |dep: &[u8], error: io::Error| {
             if super::linkageError::linkage_kind(&error).is_some() {
                 return error;
@@ -804,7 +834,7 @@ impl<'a> ClassLoader<'a> {
                 super::linkageError::LinkageErrorKind::NoClassDefFound,
                 format!(
                     "{}/{} (wrong name: {})",
-                    String::from_utf8_lossy(name),
+                    String::from_utf8_lossy(class_name),
                     String::from_utf8_lossy(dep),
                     String::from_utf8_lossy(dep)
                 ),
@@ -837,7 +867,7 @@ impl<'a> ClassLoader<'a> {
             return Err(
                 super::linkageError::LinkageError::incompatible_class_change(format!(
                     "class {} has interface {} as super class",
-                    String::from_utf8_lossy(name),
+                    String::from_utf8_lossy(class_name),
                     String::from_utf8_lossy(super_klass.class.name)
                 ))
                 .io(),
@@ -848,7 +878,7 @@ impl<'a> ClassLoader<'a> {
                 return Err(
                     super::linkageError::LinkageError::incompatible_class_change(format!(
                         "class {} implements non-interface {}",
-                        String::from_utf8_lossy(name),
+                        String::from_utf8_lossy(class_name),
                         String::from_utf8_lossy(iface.class.name)
                     ))
                     .io(),
@@ -861,6 +891,38 @@ impl<'a> ClassLoader<'a> {
             .borrow_mut()
             .insert(klass.class.name, Rc::clone(&klass));
         Ok(klass)
+    }
+
+    /// Defines a synthetic class from an already-parsed ClassFile structure.
+    /// All byte slices inside `class` must be allocated in this loader's
+    /// storage (or be 'static) so that they live for 'a.
+    pub fn define_class(&self, class: ClassFile<'a>) -> io::Result<Rc<InstanceKlass<'a>>> {
+        self.defineParsed(class)
+    }
+
+    /// Returns the cached synthetic lambda class for an invokedynamic call
+    /// site, or `None`.
+    pub(crate) fn lambda_class(
+        &self,
+        caller: &[u8],
+        bsm_index: u16,
+    ) -> Option<Rc<InstanceKlass<'a>>> {
+        self.lambda_cache
+            .borrow()
+            .get(&(caller.to_vec(), bsm_index))
+            .map(Rc::clone)
+    }
+
+    /// Caches a generated lambda class for an invokedynamic call site.
+    pub(crate) fn cache_lambda_class(
+        &self,
+        caller: &[u8],
+        bsm_index: u16,
+        klass: Rc<InstanceKlass<'a>>,
+    ) {
+        self.lambda_cache
+            .borrow_mut()
+            .insert((caller.to_vec(), bsm_index), klass);
     }
 
     pub fn systemClassLoaderObject(&self) -> io::Result<usize> {

@@ -294,7 +294,15 @@ impl<'a> Frame<'a> {
     fn load(&mut self, index: u16, kind: u8) -> io::Result<Value<'a>> {
         let value = *self.local(index)?;
         if !value.matchesLocal(kind) {
-            return Err(Error::other("Invalid local type"));
+            return Err(Error::other(format!(
+                "Invalid local type at pc {} in {}.{}{} (local {} kind {})",
+                self.pc,
+                String::from_utf8_lossy(self.owner),
+                String::from_utf8_lossy(self.code.name),
+                String::from_utf8_lossy(self.code.descriptor),
+                index,
+                kind
+            )));
         }
         Ok(value)
     }
@@ -302,7 +310,15 @@ impl<'a> Frame<'a> {
     fn storeOperand(&mut self, index: u16, kind: u8) -> io::Result<()> {
         let value = self.pop()?;
         if !value.matchesLocal(kind) {
-            return Err(Error::other("Invalid local type"));
+            return Err(Error::other(format!(
+                "Invalid local store type at pc {} in {}.{}{} (local {} kind {}) value={value:?}",
+                self.pc,
+                String::from_utf8_lossy(self.owner),
+                String::from_utf8_lossy(self.code.name),
+                String::from_utf8_lossy(self.code.descriptor),
+                index,
+                kind
+            )));
         }
         self.store(index, value)
     }
@@ -435,7 +451,18 @@ fn describeValue<'a>(
     output: &mut impl Write,
     depth: usize,
 ) -> io::Result<String> {
+    describeValueKind(loader, value, false, output, depth)
+}
+
+fn describeValueKind<'a>(
+    loader: &ClassLoader<'a>,
+    value: Value<'a>,
+    as_boolean: bool,
+    output: &mut impl Write,
+    depth: usize,
+) -> io::Result<String> {
     match value {
+        Value::Int(value) if as_boolean => Ok(if value != 0 { "true" } else { "false" }.to_owned()),
         Value::Int(value) => Ok(value.to_string()),
         Value::Long(value) => Ok(value.to_string()),
         Value::Float(value) => Ok(javaFloat(value)),
@@ -711,6 +738,11 @@ fn executeFrame<'a>(
                     }
                 }
                 None => {
+                    if std::env::var_os("JVM25_TRACE").is_some() {
+                        let mut frames = Vec::new();
+                        for_each_active_frame(&mut |f| frames.push(f.site()));
+                        eprintln!("[fatal] {error} stack={frames:?}");
+                    }
                     release_frame_monitors(loader, &frame);
                     return Err(error);
                 }
@@ -1635,7 +1667,17 @@ fn step<'a>(
             let [owner, name, descriptor] =
                 klass.memberRef(u16::from_be_bytes(frame.read()?), true)?;
             let value = (opcode == 0xb5).then(|| frame.pop()).transpose()?;
-            let receiver = frame.pop()?;
+            let mut receiver = frame.pop()?;
+            // Lightweight string values have no field storage; materialize them
+            // into real java.lang.String objects on field access.
+            if matches!(receiver, Value::String(_) | Value::HostString(_))
+                && let Some(materialized) =
+                    crate::share::prims::stringNatives::materialize(
+                        loader, receiver, output, depth + 1,
+                    )?
+            {
+                receiver = materialized;
+            }
             if matches!(receiver, Value::Null) {
                 if std::env::var_os("JVM25_TRACE").is_some() {
                     eprintln!(
@@ -1876,7 +1918,19 @@ fn step<'a>(
                 .stack
                 .len()
                 .checked_sub(count + receiverSlots)
-                .ok_or_else(|| Error::other("Missing method arguments"))?;
+                .ok_or_else(|| {
+                Error::other(format!(
+                    "Missing method arguments at pc {} in {}.{}{} ({}.{}) stack={} need={}",
+                    pc,
+                    String::from_utf8_lossy(frame.owner),
+                    String::from_utf8_lossy(frame.code.name),
+                    String::from_utf8_lossy(frame.code.descriptor),
+                    String::from_utf8_lossy(owner),
+                    String::from_utf8_lossy(name),
+                    frame.stack.len(),
+                    count + receiverSlots,
+                ))
+            })?;
             let mut slots = receiverSlots;
             for (kind, &val) in signature::method(descriptor)?
                 .0
@@ -2262,13 +2316,22 @@ fn step<'a>(
                             return Ok(Step::Continue);
                         }
                         _ => {
-                            let result = crate::share::prims::classNatives::invoke(
+                            let mut result = crate::share::prims::classNatives::invoke(
                                 loader,
                                 name,
                                 descriptor,
                                 &frame.stack[start..],
                             )
                             .map_err(|error| linkageExc(loader, output, depth, error))?;
+                            if result.is_none() {
+                                result = crate::share::prims::reflectionNatives::class_invoke(
+                                    loader,
+                                    name,
+                                    descriptor,
+                                    &frame.stack[start..],
+                                )
+                                .map_err(|error| linkageExc(loader, output, depth, error))?;
+                            }
                             match result {
                                 Some(value) => {
                                     frame.stack.truncate(start);
@@ -2444,9 +2507,35 @@ fn step<'a>(
                     }
                 });
 
+                let mut boolean_params = Vec::new();
+                {
+                    let mut rest = descriptor.strip_prefix(b"(").unwrap_or(descriptor);
+                    while !rest.is_empty() && rest[0] != b')' {
+                        let dims = rest.iter().take_while(|byte| **byte == b'[').count();
+                        let tag = rest.get(dims).copied().unwrap_or(0);
+                        boolean_params.push(tag == b'Z');
+                        let len = if tag == b'L' {
+                            dims + 1
+                                + rest[dims + 1..]
+                                    .iter()
+                                    .position(|byte| *byte == b';')
+                                    .map(|pos| pos + 1)
+                                    .unwrap_or(rest.len().saturating_sub(dims + 1))
+                        } else {
+                            dims + 1
+                        };
+                        rest = rest.get(len..).unwrap_or(&[]);
+                    }
+                }
                 let mut dynamic_args = Vec::with_capacity(frame.stack.len() - start);
-                for value in &frame.stack[start..] {
-                    dynamic_args.push(describeValue(loader, *value, output, depth + 1)?);
+                for (arg_index, value) in frame.stack[start..].iter().enumerate() {
+                    dynamic_args.push(describeValueKind(
+                        loader,
+                        *value,
+                        boolean_params.get(arg_index).copied().unwrap_or(false),
+                        output,
+                        depth + 1,
+                    )?);
                 }
 
                 if let Some(recipe_str) = recipe {
@@ -2481,15 +2570,31 @@ fn step<'a>(
                 let allocated_str = loader.storage.alloc_str(&formatted);
                 Value::HostString(allocated_str)
             } else {
+                let captured = frame.stack[start..].to_vec();
                 frame.stack.truncate(start);
                 frame.stackSlots -= slots;
-                return Err(jex(
+                match super::lambdaMetafactory::invoke(
                     loader,
-                    output,
-                    depth,
-                    b"java/lang/BootstrapMethodError",
-                    Some("invokedynamic bootstrap method is not supported"),
-                ));
+                    klass,
+                    &bs_info,
+                    name,
+                    descriptor,
+                    &captured,
+                )? {
+                    Some(value) => {
+                        frame.push(value)?;
+                        return Ok(Step::Continue);
+                    }
+                    None => {
+                        return Err(jex(
+                            loader,
+                            output,
+                            depth,
+                            b"java/lang/BootstrapMethodError",
+                            Some("invokedynamic bootstrap method is not supported"),
+                        ));
+                    }
+                }
             }
         }
         0xbb => {

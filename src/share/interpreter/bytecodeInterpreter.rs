@@ -458,12 +458,29 @@ fn describeValue<'a>(
                 Ok((target, code)) => {
                     let flags =
                         methodAccessFlags(&target, b"toString", b"()Ljava/lang/String;", false);
-                    match execute(loader, &target, code, &[value], output, depth + 1, flags)? {
-                        Some(result) => describeValue(loader, result, output, depth + 1),
-                        None => Ok("null".to_owned()),
+                    match execute(loader, &target, code, &[value], output, depth + 1, flags) {
+                        Ok(Some(result)) => describeValue(loader, result, output, depth + 1),
+                        Ok(None) => Ok("null".to_owned()),
+                        Err(error) => {
+                            if std::env::var_os("JVM25_TRACE").is_some() {
+                                eprintln!(
+                                    "[describeValue] toString failed for {}: {error}",
+                                    dotted(klass.class.name)
+                                );
+                            }
+                            Ok(format!("Object@{handle:x}"))
+                        }
                     }
                 }
-                Err(_) => Ok(format!("Object@{handle:x}")),
+                Err(error) => {
+                    if std::env::var_os("JVM25_TRACE").is_some() {
+                        eprintln!(
+                            "[describeValue] resolve toString failed for {}: {error}",
+                            dotted(klass.class.name)
+                        );
+                    }
+                    Ok(format!("Object@{handle:x}"))
+                }
             }
         }
         _ => Ok(String::new()),
@@ -1818,10 +1835,13 @@ fn step<'a>(
                                 }
                             }
                             None => {
+                                let text = describeValue(
+                                    loader, value, output, depth + 1,
+                                )?;
                                 if is_println {
-                                    writeln!(output, "Object@{handle:x}")?;
+                                    writeln!(output, "{text}")?;
                                 } else {
-                                    write!(output, "Object@{handle:x}")?;
+                                    write!(output, "{text}")?;
                                 }
                             }
                         }

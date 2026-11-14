@@ -556,7 +556,24 @@ pub fn invokeStatic<'a>(
             Some(None)
         }
         (b"jdk/internal/misc/VM", b"initialize", b"()V")
-        | (b"jdk/internal/misc/VM", b"saveAndRemoveProperties", b"()V") => Some(None),
+        | (b"jdk/internal/misc/VM", b"saveAndRemoveProperties", b"()V")
+        | (b"jdk/internal/misc/VM", b"initializeOSEnvironment", b"()V") => Some(None),
+        (b"jdk/internal/misc/VM", b"saveProperties", b"(Ljava/util/Map;)V") => {
+            if let Ok(vm) = loader.load(b"jdk/internal/misc/VM")
+                && let Ok(cell) = vm.staticField(b"savedProps", b"Ljava/util/Map;")
+            {
+                cell.set(arguments.first().copied().unwrap_or(Value::Null));
+            }
+            Some(None)
+        }
+        (b"jdk/internal/misc/VM", b"initLevel", b"(I)V") => {
+            if let Ok(vm) = loader.load(b"jdk/internal/misc/VM")
+                && let Ok(cell) = vm.staticField(b"initLevel", b"I")
+            {
+                cell.set(arguments.first().copied().unwrap_or(Value::Int(0)));
+            }
+            Some(None)
+        }
         (b"jdk/internal/misc/VM", b"isBooted", b"()Z") => Some(Some(Value::Int(1))),
         (b"jdk/internal/misc/VM", b"getNanoTimeAdjustment", b"(J)J") => Some(Some(Value::Long(0))),
         (b"jdk/internal/misc/VM", b"latestUserDefinedLoader", b"()Ljava/lang/ClassLoader;") => {

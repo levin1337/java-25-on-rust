@@ -162,6 +162,18 @@ pub(crate) fn invoke<'a>(
                 Value::Object(loader.systemClassLoaderObject()?)
             }
         }
+        (b"getInterfaces", b"()[Ljava/lang/Class;") => {
+            if class.starts_with(b"[") || class.starts_with(b":") {
+                return Ok(Some(crate::share::prims::reflectionNatives::class_array(
+                    loader, &[],
+                )?));
+            }
+            let klass = loader.load(class)?;
+            let names: Vec<&'a [u8]> = klass.interfaces.iter().map(|i| i.class.name).collect();
+            return Ok(Some(crate::share::prims::reflectionNatives::class_array(
+                loader, &names,
+            )?));
+        }
         (b"getModifiers", b"()I") => {
             let flags = if class.starts_with(b":") || class.starts_with(b"[") {
                 0x0411

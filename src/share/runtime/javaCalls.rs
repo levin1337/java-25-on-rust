@@ -276,9 +276,7 @@ pub fn mainClass<'a>(
     arguments: &'a [String],
     output: &mut impl Write,
 ) -> io::Result<()> {
-    if loader.bootImage.is_some()
-        && let Ok(system) = loader.load(b"java/lang/System")
-    {
+    if let Ok(system) = loader.load(b"java/lang/System") {
         let args = JavaCallArguments::new();
         let _ = JavaCalls::call_static(loader, &system, b"initPhase1", b"()V", &args, output);
         let mut args = JavaCallArguments::new();

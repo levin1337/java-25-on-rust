@@ -150,11 +150,7 @@ fn current_frame_site() -> String {
             .take(6)
             .map(|ptr| unsafe {
                 let frame = &**ptr;
-                format!(
-                    "{}@{}",
-                    String::from_utf8_lossy(frame.owner),
-                    frame.pc
-                )
+                format!("{}@{}", String::from_utf8_lossy(frame.owner), frame.pc)
             })
             .collect::<Vec<_>>()
             .join(" <- ")
@@ -183,6 +179,8 @@ impl Drop for FrameRegistration {
 pub(crate) struct Frame<'a> {
     code: Code<'a>,
     pc: usize,
+    instructionPc: usize,
+    threadId: u64,
     pub(crate) locals: Vec<Value<'a>>,
     pub(crate) stack: Vec<Value<'a>>,
     stackSlots: usize,
@@ -197,6 +195,22 @@ impl<'a> Frame<'a> {
 
     pub(crate) fn stack(&self) -> &[Value<'a>] {
         &self.stack
+    }
+
+    pub(crate) fn stackWalkInfo(&self) -> crate::share::prims::stackwalk::StackFrameInfo {
+        use crate::share::oops::symbol::Symbol;
+        crate::share::prims::stackwalk::StackFrameInfo::new(
+            Symbol::new(self.owner),
+            Symbol::new(self.code.name),
+            Symbol::new(self.code.descriptor),
+            self.instructionPc as i32,
+            -1,
+            false,
+        )
+    }
+
+    pub(crate) fn threadId(&self) -> u64 {
+        self.threadId
     }
 
     pub(crate) fn site(&self) -> String {
@@ -225,18 +239,15 @@ impl<'a> Frame<'a> {
     }
 
     fn pop(&mut self) -> io::Result<Value<'a>> {
-        let value = self
-            .stack
-            .pop()
-            .ok_or_else(|| {
-                Error::other(format!(
-                    "Operand stack underflow at pc {} in {}.{}{}",
-                    self.pc,
-                    String::from_utf8_lossy(self.owner),
-                    String::from_utf8_lossy(self.code.name),
-                    String::from_utf8_lossy(self.code.descriptor)
-                ))
-            })?;
+        let value = self.stack.pop().ok_or_else(|| {
+            Error::other(format!(
+                "Operand stack underflow at pc {} in {}.{}{}",
+                self.pc,
+                String::from_utf8_lossy(self.owner),
+                String::from_utf8_lossy(self.code.name),
+                String::from_utf8_lossy(self.code.descriptor)
+            ))
+        })?;
         self.stackSlots -= value.slots();
         Ok(value)
     }
@@ -581,7 +592,16 @@ pub fn execute<'a>(
     depth: usize,
     access_flags: u16,
 ) -> io::Result<Option<Value<'a>>> {
-    execute_labeled(loader, klass, code, arguments, output, depth, access_flags, None)
+    execute_labeled(
+        loader,
+        klass,
+        code,
+        arguments,
+        output,
+        depth,
+        access_flags,
+        None,
+    )
 }
 
 pub fn execute_labeled<'a>(
@@ -642,7 +662,10 @@ pub fn execute_labeled<'a>(
                 .iter()
                 .map(|name| String::from_utf8_lossy(name).into_owned())
                 .collect();
-            eprintln!("[uncaught] {} stack={stack:?}", throwableDescription(loader, handle));
+            eprintln!(
+                "[uncaught] {} stack={stack:?}",
+                throwableDescription(loader, handle)
+            );
         }
         return Err(Error::other(throwableDescription(loader, handle)));
     }
@@ -705,6 +728,8 @@ fn executeFrame<'a>(
         stackSlots: 0,
         code,
         pc: 0,
+        instructionPc: 0,
+        threadId: crate::share::runtime::threading::current_tid(loader),
         locals,
         owner,
         monitors: Vec::new(),
@@ -721,6 +746,7 @@ fn executeFrame<'a>(
             let _ = crate::share::memory::heap::collect(loader);
         }
         let insn_pc = frame.pc;
+        frame.instructionPc = insn_pc;
         match step(loader, klass, &mut frame, output, depth) {
             Ok(Step::Push(value)) => {
                 if let Err(error) = frame.push(value) {
@@ -771,7 +797,7 @@ fn dotted(name: &[u8]) -> String {
 /// `<init>(String)` constructor when available, and returns the
 /// object-arena handle. The object is kept alive through
 /// `gc_extra_roots` while the constructor executes.
-fn throwableObject<'a>(
+pub(crate) fn throwableObject<'a>(
     loader: &ClassLoader<'a>,
     output: &mut dyn Write,
     depth: usize,
@@ -1016,10 +1042,12 @@ fn monitorEnter<'a>(
     // Contended monitors block cooperatively: keep trying while driving
     // other queued Java threads until the lock is acquired.
     loop {
-        let acquired = loader.synchronizer.borrow_mut().try_enter_thread(
-            key as usize,
-            crate::share::runtime::threading::current_tid(loader),
-        );
+        let acquired = {
+            loader.synchronizer.borrow_mut().try_enter_thread(
+                key as usize,
+                crate::share::runtime::threading::current_tid(loader),
+            )
+        };
         if acquired {
             break;
         }
@@ -1048,13 +1076,16 @@ fn monitorExit<'a>(
     let Some(key) = monitorKey(value) else {
         return Err(Error::other("Expected reference for monitor"));
     };
-    loader
-        .synchronizer
-        .borrow_mut()
-        .exit_thread(
-            key as usize,
-            crate::share::runtime::threading::current_tid(loader),
-        )
+    let exit_result = {
+        loader
+            .synchronizer
+            .borrow_mut()
+            .exit_thread(
+                key as usize,
+                crate::share::runtime::threading::current_tid(loader),
+            )
+    };
+    exit_result
         .map_err(|message| {
             jex(
                 loader,
@@ -1190,7 +1221,15 @@ fn step<'a>(
                     output,
                     depth,
                     b"java/lang/ArrayIndexOutOfBoundsException",
-                    Some(&format!("{} (index {} len {:?} pc {} in {}.{})", error, index, array_len, pc, String::from_utf8_lossy(klass.class.name), String::from_utf8_lossy(frame.code.name))),
+                    Some(&format!(
+                        "{} (index {} len {:?} pc {} in {}.{})",
+                        error,
+                        index,
+                        array_len,
+                        pc,
+                        String::from_utf8_lossy(klass.class.name),
+                        String::from_utf8_lossy(frame.code.name)
+                    )),
                 )
             })? {
                 Element::Int(value) => Value::Int(value),
@@ -1711,10 +1750,20 @@ fn step<'a>(
             // Lightweight string values have no field storage; materialize them
             // into real java.lang.String objects on field access.
             if matches!(receiver, Value::String(_) | Value::HostString(_))
+                && let Some(materialized) = crate::share::prims::stringNatives::materialize(
+                    loader,
+                    receiver,
+                    output,
+                    depth + 1,
+                )?
+            {
+                receiver = materialized;
+            }
+            // Class literals have no field storage; materialize them into
+            // cached java.lang.Class objects so getfield/putfield work.
+            if matches!(receiver, Value::ClassMirror(_))
                 && let Some(materialized) =
-                    crate::share::prims::stringNatives::materialize(
-                        loader, receiver, output, depth + 1,
-                    )?
+                    crate::share::prims::classNatives::materialize_class(loader, receiver)?
             {
                 receiver = materialized;
             }
@@ -1944,9 +1993,7 @@ fn step<'a>(
                                 }
                             }
                             None => {
-                                let text = describeValue(
-                                    loader, value, output, depth + 1,
-                                )?;
+                                let text = describeValue(loader, value, output, depth + 1)?;
                                 if is_println {
                                     writeln!(output, "{text}")?;
                                 } else {
@@ -1986,18 +2033,18 @@ fn step<'a>(
                 .len()
                 .checked_sub(count + receiverSlots)
                 .ok_or_else(|| {
-                Error::other(format!(
-                    "Missing method arguments at pc {} in {}.{}{} ({}.{}) stack={} need={}",
-                    pc,
-                    String::from_utf8_lossy(frame.owner),
-                    String::from_utf8_lossy(frame.code.name),
-                    String::from_utf8_lossy(frame.code.descriptor),
-                    String::from_utf8_lossy(owner),
-                    String::from_utf8_lossy(name),
-                    frame.stack.len(),
-                    count + receiverSlots,
-                ))
-            })?;
+                    Error::other(format!(
+                        "Missing method arguments at pc {} in {}.{}{} ({}.{}) stack={} need={}",
+                        pc,
+                        String::from_utf8_lossy(frame.owner),
+                        String::from_utf8_lossy(frame.code.name),
+                        String::from_utf8_lossy(frame.code.descriptor),
+                        String::from_utf8_lossy(owner),
+                        String::from_utf8_lossy(name),
+                        frame.stack.len(),
+                        count + receiverSlots,
+                    ))
+                })?;
             let mut slots = receiverSlots;
             for (kind, &val) in signature::method(descriptor)?
                 .0
@@ -2156,29 +2203,75 @@ fn step<'a>(
                     let path = crate::share::prims::stringNatives::string(loader, value)?
                         .ok_or_else(|| Error::other("Expected library name"))?;
                     let libraries = crate::share::prims::nativeLibraries::NativeLibraries::global();
-                    if name == b"load" {
-                        libraries.load(std::path::Path::new(path.as_ref()))?;
+                    let (java_home, java_library_path) = {
+                        let properties = loader.systemProperties.borrow();
+                        (
+                            properties.get("java.home").copied().map(str::to_owned),
+                            properties
+                                .get("java.library.path")
+                                .copied()
+                                .map(str::to_owned),
+                        )
+                    };
+                    let mapped_name = if cfg!(windows) {
+                        if path.ends_with(".dll") {
+                            path.to_string()
+                        } else {
+                            format!("{path}.dll")
+                        }
+                    } else if cfg!(target_os = "macos") {
+                        if path.starts_with("lib") && path.ends_with(".dylib") {
+                            path.to_string()
+                        } else {
+                            format!("lib{path}.dylib")
+                        }
+                    } else if path.starts_with("lib") && path.ends_with(".so") {
+                        path.to_string()
                     } else {
-                        let mut search_path = String::from(".");
-                        {
-                            let properties = loader.systemProperties.borrow();
-                            if let Some(value) = properties.get("java.library.path") {
-                                search_path.push_str(*value);
-                            }
-                            if let Some(home) = properties.get("java.home") {
-                                for sub in ["bin", "lib"] {
-                                    if !search_path.is_empty() {
-                                        search_path.push(';');
-                                    }
-                                    search_path.push_str(
-                                        &std::path::Path::new(*home)
-                                            .join(sub)
-                                            .to_string_lossy(),
-                                    );
-                                }
+                        format!("lib{path}.so")
+                    };
+                    if name == b"load" {
+                        let library_path = std::path::Path::new(path.as_ref());
+                        let canonical = library_path
+                            .canonicalize()
+                            .unwrap_or_else(|_| library_path.to_path_buf());
+                        let builtin = java_home.as_deref().is_some_and(|home| {
+                            let home = std::path::Path::new(home);
+                            ["lib", "bin"]
+                                .iter()
+                                .any(|sub| canonical.starts_with(home.join(sub)))
+                        });
+                        if !builtin {
+                            libraries.load(library_path)?;
+                        }
+                        return Ok(Step::Continue);
+                    }
+                    let builtin = java_home.as_deref().is_some_and(|home| {
+                        ["lib", "bin"].iter().any(|sub| {
+                            std::path::Path::new(home)
+                                .join(sub)
+                                .join(&mapped_name)
+                                .is_file()
+                        })
+                    });
+                    if builtin {
+                        return Ok(Step::Continue);
+                    }
+                    let mut found = None;
+                    if let Some(library_path) = java_library_path.as_deref() {
+                        for dir in std::env::split_paths(library_path) {
+                            let candidate = dir.join(&mapped_name);
+                            if candidate.is_file() {
+                                found = Some(candidate);
+                                break;
                             }
                         }
-                        libraries.loadLibraryWithPaths(path.as_ref(), Some(&search_path))?;
+                    }
+                    match found {
+                        Some(candidate) => libraries.load(&candidate)?,
+                        None => {
+                            return Err(Error::other(format!("Native library not found: {path}")));
+                        }
                     }
                     return Ok(Step::Continue);
                 }
@@ -2426,10 +2519,25 @@ fn step<'a>(
                                     return Ok(Step::Continue);
                                 }
                                 None => {
-                                    return Err(methodError(Error::other(format!(
-                                        "Expected instance method receiver at {pc} in {}: ClassMirror",
-                                        String::from_utf8_lossy(klass.class.name)
-                                    ))));
+                                    // Materialize the class literal into a real
+                                    // `java.lang.Class` object and continue with
+                                    // ordinary virtual dispatch on it.
+                                    match crate::share::prims::classNatives::materialize_class(
+                                        loader,
+                                        Value::ClassMirror(class_name),
+                                    )
+                                    .map_err(|error| linkageExc(loader, output, depth, error))?
+                                    {
+                                        Some(object) => {
+                                            frame.stack[start] = object;
+                                        }
+                                        None => {
+                                            return Err(methodError(Error::other(format!(
+                                                "Expected instance method receiver at {pc} in {}: ClassMirror",
+                                                String::from_utf8_lossy(klass.class.name)
+                                            ))));
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -2682,24 +2790,14 @@ fn step<'a>(
                 let captured = frame.stack[start..].to_vec();
                 frame.stack.truncate(start);
                 frame.stackSlots -= slots;
-                if let Some(value) = super::objectMethods::invoke(
-                    loader,
-                    klass,
-                    &bs_info,
-                    &captured,
-                    output,
-                    depth,
-                )? {
+                if let Some(value) =
+                    super::objectMethods::invoke(loader, klass, &bs_info, &captured, output, depth)?
+                {
                     frame.push(value)?;
                     return Ok(Step::Continue);
                 }
                 match super::lambdaMetafactory::invoke(
-                    loader,
-                    klass,
-                    &bs_info,
-                    name,
-                    descriptor,
-                    &captured,
+                    loader, klass, &bs_info, name, descriptor, &captured,
                 )? {
                     Some(value) => {
                         frame.push(value)?;

@@ -71,10 +71,9 @@ fn inspect() -> Result<(), Box<dyn Error>> {
             .to_str()
             .filter(|name| !name.is_empty() && !name.starts_with('-'))
             .ok_or_else(|| io::Error::other("Invalid main class"))?;
-        (
-            ClassLoader::open_classpath(classpath, &storage)?,
-            name.replace('.', "/"),
-        )
+        let mut loader = ClassLoader::open_classpath(classpath, &storage)?;
+        loader.setSystemProperty("java.class.path", classpath)?;
+        (loader, name.replace('.', "/"))
     };
     if let Some(modules) = modules {
         // Derive java.home from the modules image location
@@ -129,6 +128,7 @@ fn main() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
+            eprintln!("[exit-err] len={} {:?}", error.len(), error);
             eprintln!("{error}");
             ExitCode::FAILURE
         }

@@ -123,9 +123,26 @@ pub fn invokeInstance<'a>(
     use super::jvm::Jvm;
     use crate::share::interpreter::bytecodeInterpreter::Value;
 
+    if std::env::var_os("JVM25_TRACE_NATIVE").is_some() {
+        eprintln!(
+            "[invokeInstance] {}.{}{}",
+            String::from_utf8_lossy(owner),
+            String::from_utf8_lossy(name),
+            String::from_utf8_lossy(descriptor)
+        );
+    }
+
     if owner == b"jdk/internal/misc/Unsafe" {
         return super::unsafeNatives::invoke(loader, name, descriptor, arguments, output, depth).map_err(
             |error| {
+                // Preserve real Java throwables (e.g. ThreadDeath) and
+                // scheduler control errors (ThreadSuspended); only annotate
+                // plain errors.
+                if crate::share::interpreter::bytecodeInterpreter::throwable_of(&error).is_some()
+                    || crate::share::runtime::threading::is_suspended(&error)
+                {
+                    return error;
+                }
                 io::Error::other(format!(
                     "Unsafe.{}{}: {}",
                     String::from_utf8_lossy(name),
@@ -144,6 +161,14 @@ pub fn invokeInstance<'a>(
             arguments,
         )? {
             return Ok(Some(Some(value)));
+        }
+    }
+
+    if super::vmManagementNatives::is_owner(owner) {
+        if let Some(result) =
+            super::vmManagementNatives::invoke(loader, name, descriptor, arguments)?
+        {
+            return Ok(Some(result));
         }
     }
 
@@ -382,6 +407,10 @@ pub fn invokeInstance<'a>(
             })
         }
         (b"java/lang/Throwable", b"fillInStackTrace", b"(I)Ljava/lang/Throwable;") => {
+            fill_in_stack_trace(
+                loader,
+                arguments.first().copied().unwrap_or(Value::Null),
+            )?;
             Some(arguments.first().copied().unwrap_or(Value::Null))
         }
         (b"java/lang/Object", b"wait0", b"(J)V") => {
@@ -680,6 +709,137 @@ fn set_instance_field<'a>(
     Ok(())
 }
 
+/// Implements `Throwable.fillInStackTrace(int)`: snapshots the current Java
+/// call stack (innermost first, skipping `java.lang.Throwable` frames) into a
+/// `StackTraceElement[]` stored in the throwable's `stackTrace` field.
+fn fill_in_stack_trace<'a>(
+    loader: &crate::share::classfile::classLoader::ClassLoader<'a>,
+    receiver: crate::share::interpreter::bytecodeInterpreter::Value<'a>,
+) -> io::Result<()> {
+    use crate::share::interpreter::bytecodeInterpreter::Value;
+    use crate::share::oops::objArrayOop::ObjArrayOop;
+
+    let Value::Object(handle) = receiver else {
+        return Err(io::Error::other("Invalid Throwable receiver"));
+    };
+    let frames = super::stackwalk::StackWalk::currentFrames(loader);
+    if std::env::var_os("JVM25_TRACE_NATIVE").is_some() {
+        eprintln!("[fillInStackTrace] frames={}", frames.len());
+    }
+    let component = loader
+        .storage
+        .alloc_slice_copy(b"java/lang/StackTraceElement");
+    let mut array = ObjArrayOop::withComponent(frames.len() as i32, component)?;
+    let mut count = 0usize;
+    for frame in frames.iter() {
+        if frame.class_name.as_str() == "java/lang/Throwable" {
+            continue;
+        }
+        let class_name = frame.class_name.as_str().replace('/', ".");
+        let method_name = frame.method_name.as_str().to_owned();
+        let element = match raw_instance(loader, b"java/lang/StackTraceElement") {
+            Ok(handle) => handle,
+            Err(error) => {
+                if std::env::var_os("JVM25_TRACE_NATIVE").is_some() {
+                    eprintln!("[fillInStackTrace] raw_instance failed: {error}");
+                }
+                break;
+            }
+        };
+        set_instance_field(
+            loader,
+            element,
+            b"declaringClass",
+            b"Ljava/lang/String;",
+            Value::HostString(loader.storage.alloc_str(&class_name)),
+        )?;
+        set_instance_field(
+            loader,
+            element,
+            b"methodName",
+            b"Ljava/lang/String;",
+            Value::HostString(loader.storage.alloc_str(&method_name)),
+        )?;
+        set_instance_field(
+            loader,
+            element,
+            b"fileName",
+            b"Ljava/lang/String;",
+            Value::Null,
+        )?;
+        set_instance_field(
+            loader,
+            element,
+            b"lineNumber",
+            b"I",
+            Value::Int(frame.line_number.max(-1)),
+        )?;
+        // `computeFormat` resolves the declaring class lazily through this
+        // field; seed it with a class mirror so `getClassLoader0`/`getModule`
+        // work without a materialized `java.lang.Class` instance.
+        let internal = loader.storage.alloc_str(frame.class_name.as_str());
+        set_instance_field(
+            loader,
+            element,
+            b"declaringClassObject",
+            b"Ljava/lang/Class;",
+            Value::ClassMirror(internal.as_bytes()),
+        )?;
+        array.elements[count] = Value::Object(element);
+        count += 1;
+    }
+    array.elements.truncate(count);
+    // HotSpot protocol: the native stores the raw backtrace object plus a
+    // depth; the Java wrapper marks `stackTrace` as UNASSIGNED_STACK and
+    // `getOurStackTrace` materializes elements lazily through
+    // `StackTraceElement.of(backtrace, depth)` -> `initStackTraceElements`.
+    // We store a ready `StackTraceElement[]` as the backtrace payload.
+    let array_handle = loader.alloc_obj_array(array);
+    set_instance_field(
+        loader,
+        handle,
+        b"backtrace",
+        b"Ljava/lang/Object;",
+        Value::ObjectArray(array_handle),
+    )?;
+    set_instance_field(loader, handle, b"depth", b"I", Value::Int(count as i32))
+}
+
+/// Implements `StackTraceElement.initStackTraceElements(elements, backtrace,
+/// depth)`: copies the pre-materialized `StackTraceElement` objects stored as
+/// the throwable's `backtrace` payload into the freshly allocated target
+/// array produced by `StackTraceElement.of`.
+fn init_stack_trace_elements<'a>(
+    loader: &crate::share::classfile::classLoader::ClassLoader<'a>,
+    arguments: &[crate::share::interpreter::bytecodeInterpreter::Value<'a>],
+) -> io::Result<()> {
+    use crate::share::interpreter::bytecodeInterpreter::Value;
+
+    let (Some(&Value::ObjectArray(target)), Some(&Value::ObjectArray(source)), Some(&Value::Int(depth))) = (
+        arguments.first(),
+        arguments.get(1),
+        arguments.get(2),
+    ) else {
+        return Ok(());
+    };
+    let count = depth.max(0) as usize;
+    let source_elements = {
+        let sources = loader.obj_arrays.borrow();
+        let Some(source_array) = sources.get(source) else {
+            return Ok(());
+        };
+        source_array.elements.clone()
+    };
+    let mut targets = loader.obj_arrays.borrow_mut();
+    let Some(target_array) = targets.get_mut(target) else {
+        return Ok(());
+    };
+    for index in 0..count.min(source_elements.len()).min(target_array.elements.len()) {
+        target_array.elements[index] = source_elements[index];
+    }
+    Ok(())
+}
+
 /// Creates a minimal `AccessControlContext` with an empty protection-domain
 /// array, used for the no-security-manager bootstrap path.
 fn access_control_context<'a>(
@@ -882,10 +1042,30 @@ pub fn invokeStatic<'a>(
         return Ok(Some(result));
     }
 
+    if super::vmManagementNatives::is_owner(owner) {
+        if let Some(result) =
+            super::vmManagementNatives::invoke_static(loader, name, descriptor, arguments)?
+        {
+            return Ok(Some(result));
+        }
+    }
+
     if let Some(result) =
         super::netNatives::invoke_static(loader, owner, name, descriptor, arguments)?
     {
         return Ok(Some(result));
+    }
+
+    if owner == b"jdk/internal/jimage/NativeImageBuffer" {
+        if let Some(result) = super::jimageNatives::invoke_static(
+            loader,
+            name,
+            descriptor,
+            arguments,
+            output,
+        )? {
+            return Ok(Some(result));
+        }
     }
 
     let result = match (owner, name, descriptor) {
@@ -904,10 +1084,52 @@ pub fn invokeStatic<'a>(
             block.push('\0');
             Some(Some(Value::HostString(loader.storage.alloc_str(&block))))
         }
+        (b"java/lang/StackStreamFactory", b"checkStackWalkModes", b"()Z") => {
+            use super::stackwalk::{
+                JVM_STACKWALK_FILL_CLASS_REFS_ONLY, JVM_STACKWALK_FILL_LIVE_STACK_FRAMES,
+                JVM_STACKWALK_GET_CALLER_CLASS, JVM_STACKWALK_SHOW_HIDDEN_FRAMES,
+            };
+            let klass = loader.load(owner)?;
+            let modes: [(&[u8], i32); 5] = [
+                (b"DEFAULT_MODE", 0),
+                (b"FILL_CLASS_REFS_ONLY", JVM_STACKWALK_FILL_CLASS_REFS_ONLY),
+                (b"GET_CALLER_CLASS", JVM_STACKWALK_GET_CALLER_CLASS),
+                (b"SHOW_HIDDEN_FRAMES", JVM_STACKWALK_SHOW_HIDDEN_FRAMES),
+                (b"FILL_LIVE_STACK_FRAMES", JVM_STACKWALK_FILL_LIVE_STACK_FRAMES),
+            ];
+            let mut compatible = true;
+            for (field, expected) in modes {
+                compatible &= klass.staticField(field, b"I")?.get() == Value::Int(expected);
+            }
+            Some(Some(Value::Int(i32::from(compatible))))
+        }
         (b"java/lang/StringUTF16", b"isBigEndian", b"()Z") => {
             Some(Some(Value::Int(i32::from(cfg!(target_endian = "big")))))
         }
         (_, b"registerNatives", b"()V") | (_, b"initIDs", b"()V") => Some(None),
+        (
+            b"java/lang/StackTraceElement",
+            b"initStackTraceElements",
+            b"([Ljava/lang/StackTraceElement;Ljava/lang/Object;I)V",
+        ) => {
+            init_stack_trace_elements(loader, arguments)?;
+            Some(None)
+        }
+        (b"java/io/ObjectStreamClass", b"initNative", b"()V") => Some(None),
+        (b"java/io/ObjectStreamClass", b"hasStaticInitializer", b"(Ljava/lang/Class;)Z") => {
+            let has = match arguments.first().copied().unwrap_or(Value::Null) {
+                Value::ClassMirror(name) => loader.load(name).map(|klass| {
+                    klass.class.methods.iter().any(|method| {
+                        method.name == b"<clinit>" && method.descriptor == b"()V"
+                    })
+                }),
+                _ => Ok(false),
+            };
+            match has {
+                Ok(flag) => Some(Some(Value::Int(i32::from(flag)))),
+                Err(error) => return Err(error),
+            }
+        }
         (b"java/io/FileDescriptor", b"getHandle", b"(I)J")
         | (b"java/io/FileDescriptor", b"getLong", b"(I)J") => Some(Some(Value::Long(0))),
         (b"java/io/FileDescriptor", b"getInt", b"(I)I")
@@ -1253,6 +1475,18 @@ pub fn invokeStatic<'a>(
                 _ => Some(Some(Value::Null)),
             }
         }
+        (b"java/lang/ClassLoader", b"defineClass0", b"(Ljava/lang/ClassLoader;Ljava/lang/Class;Ljava/lang/String;[BIILjava/security/ProtectionDomain;ZILjava/lang/Object;)Ljava/lang/Class;")
+        | (b"java/lang/ClassLoader", b"defineClass1", b"(Ljava/lang/ClassLoader;Ljava/lang/String;[BIILjava/security/ProtectionDomain;Ljava/lang/String;)Ljava/lang/Class;") => {
+            let result = if name == b"defineClass0" {
+                super::defineClassNatives::define_class0(loader, arguments)
+            } else {
+                super::defineClassNatives::define_class1(loader, arguments)
+            };
+            match result {
+                Ok(value) => value.map(Some),
+                Err(error) => return Err(error),
+            }
+        }
         (b"java/lang/System", b"currentTimeMillis", b"()J") => {
             Some(Some(Value::Long(Jvm::current_time_millis())))
         }
@@ -1498,6 +1732,45 @@ pub fn invokeStatic<'a>(
                 _ => return Ok(Some(Some(Value::Null))),
             }
         }
+        (b"jdk/internal/reflect/Reflection", b"areNestMates", b"(Ljava/lang/Class;Ljava/lang/Class;)Z") => {
+            let mirror_name = |value: &Value<'a>| -> Option<&'a [u8]> {
+                match value {
+                    Value::ClassMirror(name) => Some(*name),
+                    Value::Object(handle) => loader
+                        .class_object_names
+                        .borrow()
+                        .get(handle)
+                        .copied(),
+                    _ => None,
+                }
+            };
+            let host_of = |value: &Value<'a>| -> Option<Vec<u8>> {
+                let name = mirror_name(value)?;
+                let name = name
+                    .strip_prefix(b"[")
+                    .and_then(|rest| rest.strip_prefix(b"L"))
+                    .and_then(|rest| rest.strip_suffix(b";"))
+                    .unwrap_or(name);
+                if name.starts_with(b":") {
+                    return None;
+                }
+                loader
+                    .load(name)
+                    .ok()
+                    .map(|klass| {
+                        klass
+                            .class
+                            .nest_host()
+                            .map(|host| host.to_vec())
+                            .unwrap_or_else(|| klass.class.name.to_vec())
+                    })
+            };
+            let first = arguments.first().and_then(host_of);
+            let second = arguments.get(1).and_then(host_of);
+            Some(Some(Value::Int(i32::from(
+                first.is_some() && first == second,
+            ))))
+        }
         (b"jdk/internal/reflect/Reflection", b"getCallerClass", b"(I)Ljava/lang/Class;") => {
             let stack = loader.call_stack.borrow();
             let depth = arguments
@@ -1513,6 +1786,9 @@ pub fn invokeStatic<'a>(
                 .and_then(|i| stack.get(i))
                 .copied();
             Some(Some(caller.map(Value::ClassMirror).unwrap_or(Value::Null)))
+        }
+        (b"jdk/internal/jimage/NativeImageBuffer", b"getNativeMap", b"(Ljava/lang/String;)Ljava/nio/ByteBuffer;") => {
+            Some(Some(jimage_native_map(loader, arguments, output)?))
         }
         _ if owner == b"java/util/zip/Inflater"
             || owner == b"java/util/zip/Deflater"
@@ -1601,6 +1877,44 @@ pub fn invokeStatic<'a>(
     Ok(result)
 }
 
+
+/// `jdk.internal.jimage.NativeImageBuffer.getNativeMap`: memory-maps the
+/// runtime image for the `jrt:` filesystem. We satisfy it with a heap
+/// `ByteBuffer` wrapping the file contents (equivalent for read-only use).
+fn jimage_native_map<'a>(
+    loader: &crate::share::classfile::classLoader::ClassLoader<'a>,
+    arguments: &[crate::share::interpreter::bytecodeInterpreter::Value<'a>],
+    output: &mut dyn std::io::Write,
+) -> io::Result<crate::share::interpreter::bytecodeInterpreter::Value<'a>> {
+    use crate::share::oops::typeArrayOop::TypeArrayOop;
+    use crate::share::runtime::javaCalls::{JavaCallArguments, JavaCalls};
+    use crate::share::interpreter::bytecodeInterpreter::Value;
+    let path = match arguments.first().copied() {
+        Some(value) => match super::stringNatives::string(loader, value)? {
+            Some(path) => path.into_owned(),
+            None => return Ok(Value::Null),
+        },
+        None => return Ok(Value::Null),
+    };
+    let bytes = match std::fs::read(path.as_str()) {
+        Ok(bytes) => bytes,
+        Err(_) => return Ok(Value::Null),
+    };
+    let array = TypeArrayOop::Byte(bytes.into_iter().map(|byte| byte as i8).collect());
+    let handle = loader.alloc_type_array(array);
+    let klass = loader.load(b"java/nio/ByteBuffer")?;
+    let mut args = JavaCallArguments::new();
+    args.push_oop(Value::PrimitiveArray(handle));
+    let buffer = JavaCalls::call_static(
+        loader,
+        &klass,
+        b"wrap",
+        b"([B)Ljava/nio/ByteBuffer;",
+        &args,
+        output,
+    )?;
+    Ok(buffer.unwrap_or(Value::Null))
+}
 
 /// Fills `bytes` with operating-system entropy.
 #[cfg(windows)]

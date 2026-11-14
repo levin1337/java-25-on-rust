@@ -88,6 +88,20 @@ impl StackFrameInfo {
 pub struct StackWalk;
 
 impl StackWalk {
+    pub fn currentFrames(
+        loader: &crate::share::classfile::classLoader::ClassLoader<'_>,
+    ) -> Vec<StackFrameInfo> {
+        let mut frames = Vec::new();
+        let currentThread = crate::share::runtime::threading::current_tid(loader);
+        crate::share::interpreter::bytecodeInterpreter::for_each_active_frame(&mut |frame| {
+            if frame.threadId() == currentThread {
+                frames.push(frame.stackWalkInfo());
+            }
+        });
+        frames.reverse();
+        frames
+    }
+
     /// Filters and collects stack frames according to the requested StackWalker options
     pub fn filter_frames(
         frames: &[StackFrameInfo],
@@ -95,6 +109,9 @@ impl StackWalk {
         skip_count: usize,
         max_batch_size: usize,
     ) -> Vec<StackFrameInfo> {
+        if max_batch_size == 0 {
+            return Vec::new();
+        }
         let mut result = Vec::new();
         let mut skipped = 0;
 
@@ -136,6 +153,37 @@ impl StackWalk {
                 return Some(frame.class_name.clone());
             }
         }
-        frames.get(1).map(|f| f.class_name.clone())
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn emptyBatchDoesNotReturnFrame() {
+        let frame = StackFrameInfo::new(
+            Symbol::new(b"example/Main"),
+            Symbol::new(b"main"),
+            Symbol::new(b"()V"),
+            3,
+            -1,
+            false,
+        );
+        assert!(StackWalk::filter_frames(&[frame], &StackWalkOptions::default(), 0, 0).is_empty());
+    }
+
+    #[test]
+    fn missingWalkerHasNoCaller() {
+        let frame = StackFrameInfo::new(
+            Symbol::new(b"example/Main"),
+            Symbol::new(b"main"),
+            Symbol::new(b"()V"),
+            3,
+            -1,
+            false,
+        );
+        assert_eq!(StackWalk::get_caller_class(&[frame]), None);
     }
 }

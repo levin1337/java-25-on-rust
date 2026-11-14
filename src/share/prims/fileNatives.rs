@@ -554,6 +554,13 @@ pub(crate) fn invoke<'a>(
                 buf.truncate(n);
                 *pos += n as u64;
                 Ok(n)
+            })
+            .map_err(|error| {
+                let path = nioFileNatives::entry_path(handle)
+                    .unwrap_or_else(|| "?".to_string());
+                io::Error::other(format!(
+                    "readBytes {path} handle={handle} off={offset} len={len}: {error}"
+                ))
             })?;
             for (index, &byte) in buf.iter().enumerate() {
                 bytes[offset as usize + index] = byte as i8;

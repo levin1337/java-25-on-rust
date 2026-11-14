@@ -1729,9 +1729,33 @@ fn class_java_method<'a>(
         (b"desiredAssertionStatus", b"()Z") => Some(Value::Int(0)),
         (b"getModule", b"()Ljava/lang/Module;") => class_module_object(loader, class),
         (b"getPackage", b"()Ljava/lang/Package;") => Some(Value::Null),
-        (b"getNestHost", b"()Ljava/lang/Class;") => Some(Value::ClassMirror(class)),
+        (b"getNestHost", b"()Ljava/lang/Class;") => {
+            let host = if !is_array
+                && !is_primitive
+                && let Ok(klass) = loader.load(class)
+                && let Some(host) = klass.class.nest_host()
+            {
+                host
+            } else {
+                class
+            };
+            Some(Value::ClassMirror(host))
+        }
         (b"getNestMembers", b"()[Ljava/lang/Class;") => {
-            class_array(loader, &[class]).ok()
+            if !is_array && !is_primitive && let Ok(klass) = loader.load(class) {
+                let mut names: Vec<&[u8]> = Vec::new();
+                for index in klass.class.nest_members() {
+                    if let Some(name) = class_name_at(&klass, index) {
+                        names.push(name);
+                    }
+                }
+                if !names.iter().any(|name| *name == klass.class.name) {
+                    names.push(klass.class.name);
+                }
+                class_array(loader, &names).ok()
+            } else {
+                class_array(loader, &[class]).ok()
+            }
         }
         (b"getPermittedSubclasses", b"()[Ljava/lang/Class;") => {
             class_array(loader, &[]).ok()
@@ -2173,6 +2197,26 @@ pub(crate) fn class_invoke<'a>(
     arguments: &[Value<'a>],
 ) -> io::Result<Option<Value<'a>>> {
     let receiver = arguments.first().copied().unwrap_or(Value::Null);
+    // Accept materialized `java.lang.Class` objects as well as `ClassMirror`
+    // literals by recovering the internal class name.
+    let receiver = match receiver {
+        Value::Object(handle) => {
+            let is_class_object = {
+                let objects = loader.borrow_objects();
+                objects.get(handle).is_some_and(|object| {
+                    object.klass.class.name == b"java/lang/Class"
+                })
+            };
+            if is_class_object
+                && let Some(name) = loader.class_object_names.borrow().get(&handle)
+            {
+                Value::ClassMirror(*name)
+            } else {
+                receiver
+            }
+        }
+        _ => receiver,
+    };
     let Value::ClassMirror(class) = receiver else {
         return Err(invalid("Expected java.lang.Class receiver"));
     };
@@ -2277,7 +2321,8 @@ pub(crate) fn class_invoke<'a>(
         (b"getSigners", b"()[Ljava/lang/Object;") => class_array(loader, &[])?,
         (b"setSigners", b"([Ljava/lang/Object;)V") => return Ok(Some(Value::Null)),
         (b"getEnclosingMethod0", b"()[Ljava/lang/Object;") => Value::Null,
-        (b"getDeclaringClass0", b"()Ljava/lang/Class;") => {
+        (b"getDeclaringClass0", b"()Ljava/lang/Class;")
+        | (b"getDeclaringClass", b"()Ljava/lang/Class;") => {
             if is_array || is_primitive {
                 Value::Null
             } else {
@@ -2321,8 +2366,36 @@ pub(crate) fn class_invoke<'a>(
         (b"getConstantPool", b"()Ljava/lang/constant/ConstantPool;")
         | (b"getConstantPool", b"()Ljdk/internal/reflect/ConstantPool;") => Value::Null,
         (b"getRecordComponents0", b"()[Ljava/lang/reflect/RecordComponent;") => Value::Null,
-        (b"getNestHost0", b"()Ljava/lang/Class;") => Value::ClassMirror(class),
-        (b"getNestMembers0", b"()[Ljava/lang/Class;") => class_array(loader, &[class])?,
+        (b"getNestHost0", b"()Ljava/lang/Class;") => {
+            if is_array || is_primitive {
+                Value::Null
+            } else {
+                match klass
+                    .as_ref()
+                    .and_then(|klass| klass.class.nest_host())
+                {
+                    Some(host) => Value::ClassMirror(host),
+                    None => Value::ClassMirror(class),
+                }
+            }
+        }
+        (b"getNestMembers0", b"()[Ljava/lang/Class;") => {
+            if is_array || is_primitive {
+                class_array(loader, &[])?
+            } else {
+                let klass = klass.as_ref().unwrap();
+                let mut names: Vec<&[u8]> = Vec::new();
+                for index in klass.class.nest_members() {
+                    if let Some(name) = class_name_at(klass, index) {
+                        names.push(name);
+                    }
+                }
+                if !names.iter().any(|name| *name == klass.class.name) {
+                    names.push(klass.class.name);
+                }
+                class_array(loader, &names)?
+            }
+        }
         (b"getPermittedSubclasses0", b"()[Ljava/lang/Class;") => Value::Null,
         (b"getClassFileVersion0", b"()I") => Value::Int(i32::from(
             klass.as_ref().map_or(0, |klass| klass.class.majorVersion),

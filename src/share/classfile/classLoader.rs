@@ -139,7 +139,7 @@ pub struct ClassLoader<'a> {
     class_loader_object: RefCell<Option<usize>>,
     unnamed_module_object: RefCell<Option<usize>>,
     module_objects: RefCell<HashMap<String, usize>>,
-    pub(crate) current_thread_object: RefCell<Option<usize>>,
+    current_thread_object: RefCell<Option<usize>>,
     pub(crate) call_stack: RefCell<Vec<&'a [u8]>>,
     pub(crate) lambda_cache: RefCell<HashMap<(Vec<u8>, u16), Rc<InstanceKlass<'a>>>>,
     /// Cooperative Java thread registry (see runtime::threading).
@@ -152,6 +152,13 @@ pub struct ClassLoader<'a> {
     pub(crate) next_java_tid: Cell<u64>,
     /// Nested scheduler depth guard.
     pub(crate) schedule_depth: Cell<u32>,
+    /// Consecutive suspend-and-reschedule activations; bounds scheduler
+    /// churn when only suspended workers remain runnable.
+    pub(crate) suspend_streak: Cell<u32>,
+    /// Materialized `java.lang.Class` objects keyed by internal class name.
+    pub(crate) class_objects: RefCell<HashMap<Vec<u8>, usize>>,
+    /// Reverse lookup: materialized Class object handle -> internal name.
+    pub(crate) class_object_names: RefCell<HashMap<usize, &'a [u8]>>,
     loader_type: ClassLoaderType,
 }
 
@@ -412,6 +419,9 @@ impl<'a> ClassLoader<'a> {
             current_java_thread: RefCell::new(None),
             next_java_tid: Cell::new(2),
             schedule_depth: Cell::new(0),
+            suspend_streak: Cell::new(0),
+            class_objects: RefCell::new(HashMap::new()),
+            class_object_names: RefCell::new(HashMap::new()),
             loader_type: ClassLoaderType::AppLoader,
         })
     }
@@ -490,6 +500,9 @@ impl<'a> ClassLoader<'a> {
             current_java_thread: RefCell::new(None),
             next_java_tid: Cell::new(2),
             schedule_depth: Cell::new(0),
+            suspend_streak: Cell::new(0),
+            class_objects: RefCell::new(HashMap::new()),
+            class_object_names: RefCell::new(HashMap::new()),
             loader_type: ClassLoaderType::AppLoader,
         })
     }

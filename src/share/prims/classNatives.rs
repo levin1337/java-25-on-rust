@@ -1,6 +1,7 @@
 use crate::share::{
     classfile::{classFileParser::decodeString, classLoader::ClassLoader},
     interpreter::bytecodeInterpreter::Value,
+    oops::instanceOop::InstanceOop,
 };
 use std::io;
 
@@ -106,8 +107,26 @@ pub(crate) fn invoke<'a>(
     let Some((receiver, arguments)) = arguments.split_first() else {
         return Ok(None);
     };
-    let Value::ClassMirror(class) = receiver else {
-        return Ok(None);
+    // Accept both `ClassMirror` literals and materialized `java.lang.Class`
+    // objects (produced by `materialize_class` for field/method access).
+    let class = match *receiver {
+        Value::ClassMirror(class) => class,
+        Value::Object(handle) => {
+            let is_class_object = {
+                let objects = loader.borrow_objects();
+                objects.get(handle).is_some_and(|object| {
+                    object.klass.class.name == b"java/lang/Class"
+                })
+            };
+            if !is_class_object {
+                return Ok(None);
+            }
+            match loader.class_object_names.borrow().get(&handle) {
+                Some(name) => *name,
+                None => return Ok(None),
+            }
+        }
+        _ => return Ok(None),
     };
     if name == b"getResource" && descriptor == b"(Ljava/lang/String;)Ljava/net/URL;" {
         let resource = arguments.first().copied().ok_or_else(|| io::Error::other("Missing resource name"))?;
@@ -120,7 +139,7 @@ pub(crate) fn invoke<'a>(
             Value::Null => return Err(io::Error::other("NullPointerException")),
             _ => return Ok(Some(Value::Int(0))),
         };
-        let assignable = if *target == source {
+        let assignable = if target == source {
             true
         } else if target.starts_with(b":") || source.starts_with(b":") {
             false
@@ -203,7 +222,7 @@ pub(crate) fn invoke<'a>(
             if class.starts_with(b":") {
                 return Ok(Some(Value::HostString("java.lang")));
             }
-            let mut name = *class;
+            let mut name = class;
             if name.starts_with(b"[") {
                 name = &name[1..];
                 if name.starts_with(b"L") {
@@ -296,7 +315,7 @@ pub(crate) fn invoke<'a>(
             // equal to) S — the same relation as `S.isAssignableFrom(thisClass)`.
             let ok = match arg {
                 Value::ClassMirror(other) => {
-                    if *class == other {
+                    if class == other {
                         true
                     } else if class.starts_with(b":") || other.starts_with(b":") {
                         false
@@ -334,9 +353,62 @@ pub(crate) fn invoke<'a>(
                     String::from_utf8_lossy(class)
                 )));
             }
-            return Ok(Some(Value::ClassMirror(*class)));
+            return Ok(Some(Value::ClassMirror(class)));
         }
         _ => return Ok(None),
     };
     Ok(Some(value))
+}
+
+/// Materializes a `Value::ClassMirror` into a real `java.lang.Class`
+/// instance so instance fields (`classValueMap`, `annotationData`, ...)
+/// have storage. Results are cached per class name so field writes
+/// persist across accesses.
+pub(crate) fn materialize_class<'a>(
+    loader: &ClassLoader<'a>,
+    value: Value<'a>,
+) -> io::Result<Option<Value<'a>>> {
+    let Value::ClassMirror(name) = value else {
+        return Ok(None);
+    };
+    let key = name.to_vec();
+    if let Some(&handle) = loader.class_objects.borrow().get(&key) {
+        return Ok(Some(Value::Object(handle)));
+    }
+    let klass = loader.load(b"java/lang/Class")?;
+    let _ = crate::share::interpreter::bytecodeInterpreter::initialize(
+        loader,
+        &klass,
+        &mut io::sink(),
+        0,
+    );
+    let object = InstanceOop::new(klass.clone())?;
+    let handle = loader.alloc_object(object);
+    {
+        let mut objects = loader.borrow_objects_mut();
+        if let Some(object) = objects.get_mut(handle) {
+            // Best-effort `name` field (JDK keeps the binary name there on
+            // some versions); harmless when absent.
+            if let Ok(slot) = klass.instanceField(b"name", b"Ljava/lang/String;")
+                && slot < object.fields.len()
+            {
+                let dotted = if name.starts_with(b"[") {
+                    // Array classes: "[Ljava/lang/String;" -> "[Ljava.lang.String;"
+                    let text = String::from_utf8_lossy(name).replace('/', ".");
+                    loader.storage.alloc_str(&text)
+                } else {
+                    let text = String::from_utf8_lossy(name).replace('/', ".");
+                    loader.storage.alloc_str(&text)
+                };
+                object.fields[slot] = Value::HostString(dotted);
+            }
+        }
+    }
+    loader
+        .gc_extra_roots
+        .borrow_mut()
+        .push(Value::Object(handle));
+    loader.class_object_names.borrow_mut().insert(handle, name);
+    loader.class_objects.borrow_mut().insert(key, handle);
+    Ok(Some(Value::Object(handle)))
 }

@@ -12,11 +12,34 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 pub struct Os;
 
 static VM_START_INSTANT: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+static VM_START_WALL_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 static OS_THREAD_COUNTER: AtomicU64 = AtomicU64::new(1000);
 
 impl Os {
     pub fn init() {
         let _ = VM_START_INSTANT.get_or_init(Instant::now);
+        let _ = VM_START_WALL_MS.get_or_init(|| {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0)
+        });
+    }
+
+    /// Wall-clock time (epoch millis) when the VM started.
+    pub fn vm_startup_time_ms() -> i64 {
+        let start = VM_START_WALL_MS.get_or_init(|| {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0)
+        });
+                *start as i64
+    }
+
+    /// Milliseconds elapsed since VM start.
+    pub fn vm_uptime_ms() -> i64 {
+        VM_START_INSTANT.get_or_init(Instant::now).elapsed().as_millis() as i64
     }
 
     pub fn vm_start_time_ms() -> i64 {

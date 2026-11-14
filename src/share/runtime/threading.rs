@@ -170,6 +170,28 @@ pub fn finish(loader: &ClassLoader<'_>, handle: usize) {
 }
 
 /// Reads `Thread$FieldHolder.daemon` for a thread object handle.
+/// JDK infrastructure daemon threads that must not run: they loop forever
+/// waiting for GC/finalization work that this VM performs synchronously.
+/// User and pool daemon threads (e.g. `ForkJoinWorkerThread`) DO run.
+fn is_infra_thread(loader: &ClassLoader<'_>, handle: usize) -> bool {
+    const INFRA: &[&[u8]] = &[
+        b"java/lang/ref/Reference$ReferenceHandler",
+        b"java/lang/ref/Finalizer$FinalizerThread",
+        b"jdk/internal/ref/CleanerImpl$CleanerThread",
+        b"jdk/internal/ref/CleanerFactory$CleanerThread",
+        b"jdk/internal/misc/Signal$SignalDispatcher",
+        b"java/lang/ProcessImpl$ProcessReaper",
+        b"java/lang/management/NotificationThread",
+        b"jdk/internal/misc/InnocuousThread",
+        b"jdk/internal/misc/InnocuousForkJoinWorkerThread",
+    ];
+    let objects = loader.borrow_objects();
+    let Some(object) = objects.get(handle) else {
+        return false;
+    };
+    INFRA.contains(&object.klass.class.name)
+}
+
 fn is_daemon(loader: &ClassLoader<'_>, handle: usize) -> bool {
     let holder = {
         let objects = loader.borrow_objects();
@@ -201,13 +223,16 @@ fn is_daemon(loader: &ClassLoader<'_>, handle: usize) -> bool {
 /// was executed. Called from interpreter safepoints and blocking natives.
 pub fn run_next<'a>(
     loader: &ClassLoader<'a>,
-    output: &mut (impl Write + ?Sized),
+    output: &mut dyn Write,
     depth: usize,
 ) -> io::Result<bool> {
     loop {
         let Some(handle) = loader.thread_ready.borrow_mut().pop_front() else {
             return Ok(false);
         };
+        if handle == MAIN_THREAD_KEY {
+            continue;
+        }
         let runnable = {
             let mut threads = loader.java_threads.borrow_mut();
             match threads.get_mut(&handle) {
@@ -221,15 +246,14 @@ pub fn run_next<'a>(
         if !runnable {
             continue;
         }
-        // Daemon threads (ReferenceHandler, Finalizer, cleaners, ...) are
-        // infrastructure: they run endless wait loops that would park the
-        // cooperative scheduler forever. Their work (reference processing,
-        // finalization) is handled synchronously by our stop-the-world GC,
-        // so we retire them instead of running them.
-        if std::env::var_os("JVM25_TRACE").is_some() {
-            eprintln!("[schedule] pop handle={handle} daemon={}", is_daemon(loader, handle));
-        }
-        if is_daemon(loader, handle) {
+        // JDK infrastructure daemons (ReferenceHandler, Finalizer, cleaners,
+        // signal dispatcher, process reaper) loop forever on work our
+        // stop-the-world GC performs synchronously, so retire them. Other
+        // daemon threads — notably ForkJoinPool workers — run normally.
+        if is_infra_thread(loader, handle) {
+            if std::env::var_os("JVM25_TRACE").is_some() {
+                eprintln!("[schedule] retire infra thread handle={handle}");
+            }
             finish(loader, handle);
             continue;
         }
@@ -242,7 +266,7 @@ pub fn run_next<'a>(
 /// scheduler recursion bounded.
 pub fn schedule<'a>(
     loader: &ClassLoader<'a>,
-    output: &mut (impl Write + ?Sized),
+    output: &mut dyn Write,
     depth: usize,
 ) -> io::Result<()> {
     if loader.schedule_depth.get() >= MAX_SCHEDULE_DEPTH {
@@ -260,7 +284,7 @@ pub fn schedule<'a>(
 fn run_thread<'a>(
     loader: &ClassLoader<'a>,
     handle: usize,
-    output: &mut (impl Write + ?Sized),
+    output: &mut dyn Write,
     depth: usize,
 ) -> io::Result<()> {
     let klass = {
@@ -272,6 +296,12 @@ fn run_thread<'a>(
         return Ok(());
     };
 
+    if std::env::var_os("JVM25_TRACE").is_some() {
+        eprintln!(
+            "[sched] run_thread handle={handle} klass={}",
+            String::from_utf8_lossy(&klass.class.name)
+        );
+    }
     let previous = *loader.current_java_thread.borrow();
     *loader.current_java_thread.borrow_mut() = Some(handle);
     loader.schedule_depth.set(loader.schedule_depth.get() + 1);
@@ -292,8 +322,28 @@ fn run_thread<'a>(
     *loader.current_java_thread.borrow_mut() = previous;
 
     match result {
-        Ok(_) => finish(loader, handle),
+        Ok(_) => {
+            loader.suspend_streak.set(0);
+            finish(loader, handle);
+        }
+        Err(error) if is_suspended(&error) => {
+            // Worker-loop thread parked with nothing runnable: abandon this
+            // activation (no Java finally) and re-queue `run()` so the
+            // worker re-scans its queue on the next activation.
+            loader.suspend_streak.set(loader.suspend_streak.get() + 1);
+            {
+                let mut threads = loader.java_threads.borrow_mut();
+                if let Some(info) = threads.get_mut(&handle) {
+                    info.state = ThreadState::Ready;
+                    info.waiting_on = None;
+                    info.notified = false;
+                    info.wait_deadline = None;
+                }
+            }
+            loader.thread_ready.borrow_mut().push_back(handle);
+        }
         Err(error) => {
+            loader.suspend_streak.set(0);
             finish(loader, handle);
             if std::env::var_os("JVM25_TRACE").is_some() {
                 eprintln!("[thread] java.lang.Thread.run died: {error}");
@@ -305,33 +355,138 @@ fn run_thread<'a>(
 
 /// Drives the scheduler until `current` is notified, its deadline expires,
 /// or no runnable threads remain. Used by `Object.wait` and `Thread.sleep`.
+/// Outcome of `drive_until`: woken by notify/unpark, deadline expiry, or
+/// scheduler starvation (nothing runnable).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DriveResult {
+    Woke,
+    Timeout,
+    Empty,
+}
+
 fn drive_until<'a>(
     loader: &ClassLoader<'a>,
-    output: &mut (impl Write + ?Sized),
+    output: &mut dyn Write,
     depth: usize,
     current: usize,
     deadline: Option<Instant>,
-) -> io::Result<()> {
+) -> io::Result<DriveResult> {
     loop {
-        let done = {
+        let status = {
             let threads = loader.java_threads.borrow();
             match threads.get(&current) {
-                Some(info) => info.notified || deadline.is_some_and(|d| Instant::now() >= d),
-                None => true,
+                Some(info) => {
+                    if info.notified {
+                        Some(DriveResult::Woke)
+                    } else if deadline.is_some_and(|d| Instant::now() >= d) {
+                        Some(DriveResult::Timeout)
+                    } else {
+                        None
+                    }
+                }
+                None => Some(DriveResult::Woke),
             }
         };
-        if done {
-            return Ok(());
+        if let Some(result) = status {
+            // `notify`/`unpark` also push the woken thread onto the ready
+            // queue, but this thread resumes directly through the flag —
+            // drop the stale entry so `run_next` cannot re-enter `run()`.
+            loader
+                .thread_ready
+                .borrow_mut()
+                .retain(|entry| *entry != current);
+            return Ok(result);
+        }
+        // Bound scheduler recursion: each nested run_thread adds a full
+        // interpreter activation to the Rust stack.
+        if loader.schedule_depth.get() >= MAX_SCHEDULE_DEPTH
+            || loader.suspend_streak.get() >= 8
+        {
+            return Ok(DriveResult::Empty);
         }
         if !run_next(loader, output, depth)? {
             // No runnable threads: nothing can notify us until the outer
-            // driver resumes, so return with a spurious wakeup — explicitly
-            // permitted by the Java memory model. Callers re-check their
-            // condition (e.g. `while (isAlive()) wait()`), which either
-            // re-waits or proceeds.
-            return Ok(());
+            // driver resumes.
+            return Ok(DriveResult::Empty);
         }
     }
+}
+
+/// Throws `java.lang.ThreadDeath` to suspend a nested Java thread whose
+/// blocking call found no runnable threads. `ThreadGroup.uncaughtException`
+/// ignores `ThreadDeath`, so the thread exits quietly after running its
+/// `finally` blocks; executors replace it on demand.
+fn suspend<'a>(
+    loader: &ClassLoader<'a>,
+    output: &mut dyn Write,
+    depth: usize,
+) -> io::Error {
+    if is_resumable_worker(loader) {
+        return io::Error::other(ThreadSuspended);
+    }
+    match crate::share::interpreter::bytecodeInterpreter::throwableObject(
+        loader,
+        output,
+        depth,
+        b"java/lang/ThreadDeath",
+        Some("thread suspended: no runnable threads"),
+    ) {
+        Ok(handle) => io::Error::other(
+            crate::share::interpreter::bytecodeInterpreter::JavaThrowable(handle),
+        ),
+        Err(_) => io::Error::other("java.lang.ThreadDeath"),
+    }
+}
+
+/// Returns `true` when `current` is a nested Java thread (not the primordial
+/// driver), i.e. it was started via `Thread.start` and is running inside
+/// another thread's scheduler activation.
+fn is_nested(loader: &ClassLoader<'_>) -> bool {
+    loader.current_java_thread.borrow().is_some()
+}
+
+/// Marker error for suspend-and-reschedule: the thread's `run()` activation
+/// is abandoned mid-block WITHOUT running Java `finally` blocks, and the
+/// thread is re-queued so `run()` starts over. Only safe for worker-loop
+/// threads whose `run()` is a re-entrant work loop.
+#[derive(Debug)]
+pub struct ThreadSuspended;
+
+impl std::fmt::Display for ThreadSuspended {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("thread suspended")
+    }
+}
+
+impl std::error::Error for ThreadSuspended {}
+
+pub fn is_suspended(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<ThreadSuspended>())
+        .is_some()
+}
+
+/// Classes whose `run()` is a re-entrant worker loop and can be safely
+/// restarted after a mid-block suspend.
+fn is_resumable_worker(loader: &ClassLoader<'_>) -> bool {
+    let Some(handle) = current_thread_handle(loader) else {
+        return false;
+    };
+    let objects = loader.borrow_objects();
+    let Some(object) = objects.get(handle) else {
+        return false;
+    };
+    let name = object.klass.class.name;
+    name == b"java/util/concurrent/ThreadPoolExecutor$Worker"
+        || name == b"java/util/concurrent/ForkJoinWorkerThread"
+        || name.starts_with(b"java/util/concurrent/ForkJoinPool$")
+        || (name.starts_with(b"java/util/concurrent/")
+            && [b"Worker".as_slice(), b"Thread".as_slice()]
+                .iter()
+                .any(|needle| {
+                    name.windows(needle.len()).any(|window| window == *needle)
+                }))
 }
 
 /// `Object.wait0(millis)`: releases `monitor`, blocks the current Java
@@ -340,19 +495,20 @@ pub fn wait_object<'a>(
     loader: &ClassLoader<'a>,
     monitor_key: usize,
     timeout_millis: i64,
-    output: &mut (impl Write + ?Sized),
+    output: &mut dyn Write,
     depth: usize,
 ) -> io::Result<()> {
     let tid = current_tid(loader);
     let current = current_thread_handle(loader);
-
-    let recursions = loader
-        .synchronizer
-        .borrow_mut()
-        .wait_thread(monitor_key, tid)
-        .map_err(|message| {
-            io::Error::other(format!("java.lang.IllegalMonitorStateException: {message}"))
-        })?;
+    let recursions = {
+        loader
+            .synchronizer
+            .borrow_mut()
+            .wait_thread(monitor_key, tid)
+    }
+    .map_err(|message| {
+        io::Error::other(format!("java.lang.IllegalMonitorStateException: {message}"))
+    })?;
 
     let drive_key = current.unwrap_or(MAIN_THREAD_KEY);
     {
@@ -378,14 +534,19 @@ pub fn wait_object<'a>(
     };
     // The monitor was already released by `wait_thread`; drive the
     // scheduler until this thread is notified or its deadline expires.
-    drive_until(loader, output, depth, drive_key, deadline)?;
+    // When the ready queue runs dry `drive_until` reports `false`; per the
+    // JMM `wait` may wake spuriously, so we simply continue — the monitor
+    // is re-acquired below and `wait` returns normally.
+    let _ = drive_until(loader, output, depth, drive_key, deadline)?;
 
     // Remove ourselves from the monitor wait set (covers timeouts where
     // no notify consumed the entry) and clear waiting state.
-    loader
-        .synchronizer
-        .borrow_mut()
-        .remove_waiter(monitor_key, tid);
+    {
+        loader
+            .synchronizer
+            .borrow_mut()
+            .remove_waiter(monitor_key, tid);
+    }
     {
         let mut threads = loader.java_threads.borrow_mut();
         if let Some(info) = threads.get_mut(&drive_key) {
@@ -438,7 +599,11 @@ pub fn notify_object(loader: &ClassLoader<'_>, monitor_key: usize, all: bool) ->
         {
             info.notified = true;
             info.state = ThreadState::Ready;
-            ready.push_back(*handle);
+            // The primordial driver is not a runnable object; its `notified`
+            // flag is consumed by `drive_until` directly.
+            if *handle != MAIN_THREAD_KEY {
+                ready.push_back(*handle);
+            }
             if !all {
                 break;
             }
@@ -453,7 +618,7 @@ pub fn notify_object(loader: &ClassLoader<'_>, monitor_key: usize, all: bool) ->
 pub fn sleep_nanos<'a>(
     loader: &ClassLoader<'a>,
     nanos: i64,
-    output: &mut (impl Write + ?Sized),
+    output: &mut dyn Write,
     depth: usize,
 ) -> io::Result<()> {
     if nanos <= 0 {
@@ -488,7 +653,7 @@ pub fn park<'a>(
     loader: &ClassLoader<'a>,
     is_absolute: bool,
     time: i64,
-    output: &mut (impl Write + ?Sized),
+    output: &mut dyn Write,
     depth: usize,
 ) -> io::Result<()> {
     let deadline = if time <= 0 {
@@ -521,7 +686,7 @@ pub fn park<'a>(
         info.wait_deadline = deadline;
     }
 
-    drive_until(loader, output, depth, drive_key, deadline)?;
+    let woke = drive_until(loader, output, depth, drive_key, deadline)?;
 
     {
         let mut threads = loader.java_threads.borrow_mut();
@@ -531,6 +696,9 @@ pub fn park<'a>(
             info.notified = false;
             info.wait_deadline = None;
         }
+    }
+    if !woke && is_nested(loader) {
+        return Err(suspend(loader, output, depth));
     }
     Ok(())
 }
@@ -547,9 +715,9 @@ pub fn unpark(loader: &ClassLoader<'_>, value: Value<'_>) -> io::Result<()> {
         let threads = loader.java_threads.borrow();
         if threads.contains_key(&handle) {
             handle
-        } else if *loader.current_thread_object.borrow() == Some(handle)
-            && loader.current_java_thread.borrow().is_none()
-        {
+        } else if *loader.current_thread_object_handle().borrow() == Some(handle) {
+            // The cached current-thread object belongs to the primordial
+            // thread, which parks under MAIN_THREAD_KEY.
             MAIN_THREAD_KEY
         } else {
             handle
@@ -573,7 +741,7 @@ pub fn unpark(loader: &ClassLoader<'_>, value: Value<'_>) -> io::Result<()> {
             requeue = true;
         }
     }
-    if requeue {
+    if requeue && key != MAIN_THREAD_KEY {
         loader.thread_ready.borrow_mut().push_back(key);
     }
     Ok(())
@@ -582,7 +750,7 @@ pub fn unpark(loader: &ClassLoader<'_>, value: Value<'_>) -> io::Result<()> {
 /// `Thread.yield0`: runs one queued thread if any.
 pub fn yield_thread<'a>(
     loader: &ClassLoader<'a>,
-    output: &mut (impl Write + ?Sized),
+    output: &mut dyn Write,
     depth: usize,
 ) -> io::Result<()> {
     run_next(loader, output, depth)?;

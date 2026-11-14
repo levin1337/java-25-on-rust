@@ -145,6 +145,11 @@ pub(crate) fn free_handle(handle: u64) -> Option<Entry> {
     table().lock().unwrap().entries.remove(&handle)
 }
 
+/// Path recorded for a registered handle (diagnostics).
+pub(crate) fn entry_path(handle: u64) -> Option<String> {
+    table().lock().unwrap().entries.get(&handle).map(|e| e.path.clone())
+}
+
 pub(crate) fn with_entry<R>(handle: u64, f: impl FnOnce(&mut Entry) -> io::Result<R>) -> io::Result<R> {
     let mut table = table().lock().unwrap();
     let entry = table

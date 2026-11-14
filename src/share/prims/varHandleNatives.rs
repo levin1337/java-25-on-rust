@@ -197,6 +197,15 @@ pub(crate) fn polymorphic<'a>(
     if !receiver_klass_name.starts_with(b"java/lang/invoke/VarHandle") {
         return Ok(None);
     }
+    if std::env::var_os("JVM25_TRACE").is_some() {
+        eprintln!(
+            "[varhandle] {}.{}{} args={}",
+            String::from_utf8_lossy(receiver_klass_name),
+            String::from_utf8_lossy(name),
+            String::from_utf8_lossy(descriptor),
+            arguments.len()
+        );
+    }
     let Some((size, is_float, is_double)) = view_kind(receiver_klass_name) else {
         return Ok(None);
     };

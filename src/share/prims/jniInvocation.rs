@@ -4121,6 +4121,14 @@ pub fn invoke_dll_native(
         };
     }
 
+    if std::env::var_os("JVM25_TRACE_DLL").is_some() {
+        eprintln!(
+            "[dll-native] {}.{}{} static={is_static}",
+            String::from_utf8_lossy(owner),
+            String::from_utf8_lossy(name),
+            String::from_utf8_lossy(descriptor),
+        );
+    }
     let trampoline: unsafe extern "system" fn(*const CallContext) -> u64 =
         unsafe { std::mem::transmute(code.trampoline) };
     let raw = unsafe { trampoline(&ctx) };

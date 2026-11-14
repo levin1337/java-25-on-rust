@@ -138,6 +138,7 @@ pub struct ClassLoader<'a> {
     pub(crate) synchronizer: RefCell<Synchronizer>,
     class_loader_object: RefCell<Option<usize>>,
     unnamed_module_object: RefCell<Option<usize>>,
+    module_objects: RefCell<HashMap<String, usize>>,
     current_thread_object: RefCell<Option<usize>>,
     pub(crate) call_stack: RefCell<Vec<&'a [u8]>>,
     pub(crate) lambda_cache: RefCell<HashMap<(Vec<u8>, u16), Rc<InstanceKlass<'a>>>>,
@@ -203,6 +204,27 @@ impl<'a> ClassLoader<'a> {
 
     pub(crate) fn unnamed_module_object_handle(&self) -> &RefCell<Option<usize>> {
         &self.unnamed_module_object
+    }
+
+    /// Registers a `java.lang.Module` object created by `Module.<init>` /
+    /// `defineModule0` so `Class.getModule` can resolve it by module name.
+    pub(crate) fn register_module_object(&self, name: &str, handle: usize) {
+        self.module_objects
+            .borrow_mut()
+            .insert(name.to_owned(), handle);
+    }
+
+    pub(crate) fn module_object(&self, name: &str) -> Option<usize> {
+        self.module_objects.borrow().get(name).copied()
+    }
+
+    /// Module name providing the given internal class name, when the class
+    /// comes from a named JDK module in the boot image. Returns `None` for
+    /// classpath classes (unnamed module) and unknown classes.
+    pub(crate) fn class_module_name(&self, class: &[u8]) -> Option<String> {
+        let name = super::classFileParser::decodeString(class).ok()?;
+        let image = self.bootImage.as_ref()?;
+        image.borrow().class_module(&name).map(str::to_owned)
     }
 
     pub(crate) fn current_thread_object_handle(&self) -> &RefCell<Option<usize>> {
@@ -371,6 +393,7 @@ impl<'a> ClassLoader<'a> {
             synchronizer: RefCell::new(Synchronizer::new()),
             class_loader_object: RefCell::new(None),
             unnamed_module_object: RefCell::new(None),
+            module_objects: RefCell::new(HashMap::new()),
             current_thread_object: RefCell::new(None),
             call_stack: RefCell::new(Vec::new()),
             lambda_cache: RefCell::new(HashMap::new()),
@@ -418,6 +441,7 @@ impl<'a> ClassLoader<'a> {
             synchronizer: RefCell::new(Synchronizer::new()),
             class_loader_object: RefCell::new(None),
             unnamed_module_object: RefCell::new(None),
+            module_objects: RefCell::new(HashMap::new()),
             current_thread_object: RefCell::new(None),
             call_stack: RefCell::new(Vec::new()),
             lambda_cache: RefCell::new(HashMap::new()),
@@ -708,6 +732,16 @@ impl<'a> ClassLoader<'a> {
             }
         }
         Ok(None)
+    }
+
+    /// Returns true when the class is provided by the boot image (JDK
+    /// modules), i.e. loaded by the bootstrap loader.
+    pub fn is_boot_class(&self, name: &[u8]) -> io::Result<bool> {
+        let name = super::classFileParser::decodeString(name)?;
+        Ok(self
+            .bootImage
+            .as_ref()
+            .is_some_and(|image| image.borrow().hasClass(&name)))
     }
 
     pub fn hasClass(&self, name: &[u8]) -> io::Result<bool> {

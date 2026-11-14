@@ -211,6 +211,36 @@ pub(crate) fn invoke<'a>(
                 loader, arguments, 1, expected, value,
             )?))
         }
+        (b"getAndAddInt", b"(Ljava/lang/Object;JI)I") => {
+            let delta = int_arg(arguments, 3)?;
+            Some(Value::Int(
+                get_and_add(loader, arguments, 1, 4, delta as u32 as u64, false)? as u32 as i32,
+            ))
+        }
+        (b"getAndAddLong", b"(Ljava/lang/Object;JJ)J") => {
+            let delta = long_arg(arguments, 3)?;
+            Some(Value::Long(
+                get_and_add(loader, arguments, 1, 8, delta as u64, true)? as i64,
+            ))
+        }
+        (b"getAndSetInt", b"(Ljava/lang/Object;JI)I") => {
+            let value = int_arg(arguments, 3)?;
+            let old = read_raw(loader, arguments, 1, 4)?.int()?;
+            write_raw(loader, arguments, 1, 4, Value::Int(value))?;
+            Some(Value::Int(old))
+        }
+        (b"getAndSetLong", b"(Ljava/lang/Object;JJ)J") => {
+            let value = long_arg(arguments, 3)?;
+            let old = read_raw(loader, arguments, 1, 8)?.long()?;
+            write_raw(loader, arguments, 1, 8, Value::Long(value))?;
+            Some(Value::Long(old))
+        }
+        (b"getAndSetReference", b"(Ljava/lang/Object;JLjava/lang/Object;)Ljava/lang/Object;") => {
+            let new = arguments.get(3).copied().unwrap_or(Value::Null);
+            let old = read_reference(loader, arguments, 1)?;
+            write_reference(loader, arguments, 1, new)?;
+            Some(old)
+        }
         (b"allocateMemory0", b"(J)J") => {
             let size = usize::try_from(long_arg(arguments, 1)?)
                 .map_err(|_| Error::other("NegativeArraySizeException"))?;
@@ -654,6 +684,9 @@ fn read_raw<'a>(
 ) -> io::Result<Raw> {
     let object = object_arg(arguments, object_index)?;
     let offset = offset_arg(arguments, object_index + 1)?;
+    if std::env::var_os("JVM25_TRACE").is_some() && matches!(object, Value::Null) {
+        eprintln!("[unsafe-null] offset={offset} args={arguments:?}");
+    }
     if matches!(object, Value::Null) && offset == THREAD_TID_SENTINEL_OFFSET {
         return Ok(Raw {
             value: THREAD_TID_COUNTER.load(Ordering::Relaxed) as u64,
@@ -991,6 +1024,30 @@ fn compare_exchange_long<'a>(
     }
     write_raw(loader, arguments, object_index, 8, Value::Long(value))?;
     Ok(true)
+}
+
+fn get_and_add<'a>(
+    loader: &ClassLoader<'a>,
+    arguments: &[Value<'a>],
+    object_index: usize,
+    size: usize,
+    delta: u64,
+    wide: bool,
+) -> io::Result<u64> {
+    let mask = if size == 8 {
+        u64::MAX
+    } else {
+        (1u64 << (size * 8)) - 1
+    };
+    let old = read_raw(loader, arguments, object_index, size)?.value & mask;
+    let new = old.wrapping_add(delta) & mask;
+    let value = if wide {
+        Value::Long(new as i64)
+    } else {
+        Value::Int(new as u32 as i32)
+    };
+    write_raw(loader, arguments, object_index, size, value)?;
+    Ok(old)
 }
 
 fn compare_exchange_long_value<'a>(

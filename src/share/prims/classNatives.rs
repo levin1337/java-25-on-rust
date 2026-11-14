@@ -153,7 +153,7 @@ pub(crate) fn invoke<'a>(
             if class.starts_with(b"[") || class.starts_with(b":") {
                 Value::Null
             } else if loader.bootImage.is_some() {
-                if loader.hasClass(class)? {
+                if loader.is_boot_class(class)? {
                     Value::Null
                 } else {
                     Value::Object(loader.systemClassLoaderObject()?)

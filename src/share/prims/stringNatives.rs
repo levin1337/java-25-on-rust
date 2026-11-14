@@ -38,9 +38,11 @@ pub(crate) fn string<'a>(
             let text = match coder {
                 0 => bytes.iter().map(|&byte| char::from(byte as u8)).collect(),
                 1 if bytes.len() % 2 == 0 => {
+                    // StringUTF16 stores chars in platform byte order; on
+                    // little-endian hosts (x86, AArch64) that is LE.
                     let units = bytes
                         .chunks_exact(2)
-                        .map(|pair| u16::from_be_bytes([pair[0] as u8, pair[1] as u8]));
+                        .map(|pair| u16::from_le_bytes([pair[0] as u8, pair[1] as u8]));
                     char::decode_utf16(units)
                         .collect::<Result<String, _>>()
                         .map_err(Error::other)?
@@ -94,8 +96,8 @@ pub(crate) fn materialize<'a>(
     } else {
         let mut bytes = Vec::with_capacity(text.encode_utf16().count() * 2);
         for unit in text.encode_utf16() {
-            bytes.push((unit >> 8) as u8);
             bytes.push(unit as u8);
+            bytes.push((unit >> 8) as u8);
         }
         bytes
     };

@@ -828,6 +828,90 @@ pub(crate) fn constructor_new_instance0<'a>(
     }
 }
 
+/// `Class.newInstance()`: allocates the class and invokes its no-arg
+/// constructor. Used by JDK internals (e.g. charset providers).
+fn class_new_instance<'a>(
+    loader: &ClassLoader<'a>,
+    class: &[u8],
+) -> io::Result<Option<Value<'a>>> {
+    if class.starts_with(b":") || class.starts_with(b"[") {
+        return Err(throw_java(
+            loader,
+            b"java/lang/InstantiationException",
+            None,
+        ));
+    }
+    let target_klass = loader.load(class)?;
+    if (target_klass.class.accessFlags & (ACC_ABSTRACT | ACC_INTERFACE)) != 0 {
+        return Err(throw_java(
+            loader,
+            b"java/lang/InstantiationException",
+            Some(&dotted_name(class)),
+        ));
+    }
+    let member = target_klass
+        .class
+        .methods
+        .iter()
+        .find(|method| {
+            method.name == b"<init>"
+                && method.descriptor == b"()V"
+                && method.accessFlags & ACC_STATIC == 0
+        })
+        .cloned();
+    let Some(member) = member else {
+        return Err(throw_java(
+            loader,
+            b"java/lang/InstantiationException",
+            Some(&dotted_name(class)),
+        ));
+    };
+
+    bytecodeInterpreter::initialize(loader, &target_klass, &mut io::sink(), 0)?;
+
+    let object = InstanceOop::new(target_klass.clone())?;
+    let object_handle = loader.alloc_object(object);
+    loader
+        .gc_extra_roots
+        .borrow_mut()
+        .push(Value::Object(object_handle));
+
+    let result = (|| -> io::Result<()> {
+        let code = crate::share::oops::method::Code::parse(&member)?;
+        bytecodeInterpreter::execute(
+            loader,
+            &target_klass,
+            code,
+            &[Value::Object(object_handle)],
+            &mut io::sink(),
+            0,
+            member.accessFlags,
+        )?;
+        Ok(())
+    })();
+
+    let root_position = {
+        let roots = loader.gc_extra_roots.borrow();
+        roots
+            .iter()
+            .rposition(|value| matches!(value, Value::Object(root) if *root == object_handle))
+    };
+    if let Some(position) = root_position {
+        loader.gc_extra_roots.borrow_mut().remove(position);
+    }
+
+    match result {
+        Ok(()) => Ok(Some(Value::Object(object_handle))),
+        Err(error) => {
+            if let Some(target) = bytecodeInterpreter::throwable_of(&error) {
+                Err(invocation_target(loader, target))
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
 /// InnerClasses attribute lookup: returns (outer class name, inner simple
 /// name) for the class represented by `klass`.
 fn inner_class_info<'a>(
@@ -925,6 +1009,37 @@ fn inner_class_access_flags<'a>(klass: &InstanceKlass<'a>) -> u16 {
         }
     }
     0
+}
+
+/// `Class.getModule()`: resolves the `java.lang.Module` object for the
+/// module that defined the class. Array classes defer to their element type;
+/// primitives resolve to `java.base`. Falls back to the unnamed module when
+/// no named module object has been registered yet.
+fn class_module_object<'a>(
+    loader: &ClassLoader<'a>,
+    class: &[u8],
+) -> Option<Value<'a>> {
+    let mut name = class;
+    while let Some(rest) = name.strip_prefix(b"[") {
+        name = rest;
+    }
+    if name.starts_with(b"L") && name.ends_with(b";") && name.len() >= 2 {
+        name = &name[1..name.len() - 1];
+    }
+    let module_name = if name.starts_with(b":") {
+        Some("java.base".to_owned())
+    } else {
+        loader.class_module_name(name)
+    };
+    if let Some(module_name) = module_name
+        && let Some(handle) = loader.module_object(&module_name)
+    {
+        return Some(Value::Object(handle));
+    }
+    loader
+        .unnamedModuleObject()
+        .ok()
+        .map(Value::Object)
 }
 
 /// `Class.getModifiers()` value: class access flags merged with the
@@ -1275,7 +1390,7 @@ fn public_methods<'a>(
     let mut result: Vec<(Rc<InstanceKlass<'a>>, usize)> = Vec::new();
     let mut seen: std::collections::HashSet<(Vec<u8>, Vec<u8>)> =
         std::collections::HashSet::new();
-    let mut push = |klass: &Rc<InstanceKlass<'a>>,
+    let push = |klass: &Rc<InstanceKlass<'a>>,
                     result: &mut Vec<(Rc<InstanceKlass<'a>>, usize)>,
                     seen: &mut std::collections::HashSet<(Vec<u8>, Vec<u8>)>| {
         for (index, member) in klass.class.methods.iter().enumerate() {
@@ -1385,7 +1500,7 @@ fn public_fields<'a>(
     };
     let mut result: Vec<(Rc<InstanceKlass<'a>>, usize)> = Vec::new();
     let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
-    let mut push = |klass: &Rc<InstanceKlass<'a>>,
+    let push = |klass: &Rc<InstanceKlass<'a>>,
                     result: &mut Vec<(Rc<InstanceKlass<'a>>, usize)>,
                     seen: &mut std::collections::HashSet<Vec<u8>>| {
         for (index, field) in klass.class.fields.iter().enumerate() {
@@ -1431,7 +1546,7 @@ fn declared_fields<'a>(
 }
 
 fn find_constructor<'a>(
-    loader: &ClassLoader<'a>,
+    _loader: &ClassLoader<'a>,
     klass: &Rc<InstanceKlass<'a>>,
     parameters: &[Vec<u8>],
     public_only: bool,
@@ -1608,13 +1723,7 @@ fn class_java_method<'a>(
         ))),
         (b"isUnnamedClass", b"()Z") => Some(Value::Int(0)),
         (b"desiredAssertionStatus", b"()Z") => Some(Value::Int(0)),
-        (b"getModule", b"()Ljava/lang/Module;") => match loader.unnamedModuleObject() {
-            Ok(handle) => Some(Value::Object(handle)),
-            Err(error) => {
-                eprintln!("[getModule] unnamedModuleObject failed: {error}");
-                None
-            }
-        },
+        (b"getModule", b"()Ljava/lang/Module;") => class_module_object(loader, class),
         (b"getPackage", b"()Ljava/lang/Package;") => Some(Value::Null),
         (b"getNestHost", b"()Ljava/lang/Class;") => Some(Value::ClassMirror(class)),
         (b"getNestMembers", b"()[Ljava/lang/Class;") => {
@@ -1697,6 +1806,13 @@ fn class_java_method<'a>(
                 Some(declared_methods(loader, &method_klass, false)?)
             }
         }
+        // Internal helper used by Class.getMethods(); returning an empty
+        // list is sufficient for bootstrap paths that only probe members.
+        (b"getDeclaredPublicMethods", b"(Ljava/lang/String;[Ljava/lang/Class;)Ljava/util/List;") => {
+            let klass = loader.load(b"java/util/Collections$EmptyList")?;
+            let object = InstanceOop::new(klass)?;
+            Some(Value::Object(loader.alloc_object(object)))
+        }
         (b"getField", b"(Ljava/lang/String;)Ljava/lang/reflect/Field;") => {
             let name = member_name(loader, arguments, 1)?;
             match find_public_field(loader, class, &name)? {
@@ -1754,6 +1870,7 @@ fn class_java_method<'a>(
                 Some(declared_fields(loader, &field_klass, false)?)
             }
         }
+        (b"newInstance", b"()Ljava/lang/Object;") => class_new_instance(loader, class)?,
         (b"getConstructor", b"([Ljava/lang/Class;)Ljava/lang/reflect/Constructor;") => {
             let parameters = parameter_classes(loader, arguments, 1)?;
             if is_array || is_primitive {

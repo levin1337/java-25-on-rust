@@ -1,12 +1,17 @@
 //! Native methods of `java.io.WinNTFileSystem` (and the shared
 //! `java.io.FileSystem` contract) backed by the host filesystem.
 
+use super::nioFileNatives::{self, io_error};
 use crate::share::{
     classfile::classLoader::ClassLoader,
     interpreter::bytecodeInterpreter::Value,
+    oops::typeArrayOop::TypeArrayOop,
     prims::stringNatives,
 };
-use std::{io, path::Path};
+use std::{
+    io::{self, Read, Seek, SeekFrom, Write},
+    path::Path,
+};
 
 const BA_EXISTS: i32 = 0x01;
 const BA_REGULAR: i32 = 0x02;
@@ -77,6 +82,107 @@ fn boolean_attributes(path: &Path) -> i32 {
         }
     }
     attrs
+}
+
+/// Returns the object index of the `java.io.FileDescriptor` referenced
+/// by `value`. `value` may be a `FileDescriptor` itself or a stream
+/// object (`FileInputStream`, `FileOutputStream`, `RandomAccessFile`)
+/// carrying an `fd` field.
+fn descriptor_object<'a>(loader: &ClassLoader<'a>, value: Value<'a>) -> io::Result<Option<usize>> {
+    let Value::Object(handle) = value else {
+        return Ok(None);
+    };
+    let objects = loader.borrow_objects();
+    let object = objects
+        .get(handle)
+        .ok_or_else(|| invalid("Invalid object"))?;
+    // A FileDescriptor carries a `handle` field directly.
+    if object
+        .klass
+        .instanceField(b"handle", b"J")
+        .is_ok()
+    {
+        return Ok(Some(handle));
+    }
+    match object
+        .klass
+        .instanceField(b"fd", b"Ljava/io/FileDescriptor;")
+    {
+        Ok(slot) => match object.fields.get(slot).copied().unwrap_or(Value::Null) {
+            Value::Object(fd) => Ok(Some(fd)),
+            _ => Ok(None),
+        },
+        Err(_) => Ok(None),
+    }
+}
+
+/// Reads the opaque stream handle stored in a `FileDescriptor.handle`
+/// field. Returns 0 for standard streams / unset descriptors.
+fn stream_handle<'a>(loader: &ClassLoader<'a>, value: Value<'a>) -> io::Result<u64> {
+    let Some(fd) = descriptor_object(loader, value)? else {
+        return Ok(0);
+    };
+    let objects = loader.borrow_objects();
+    let object = objects
+        .get(fd)
+        .ok_or_else(|| invalid("Invalid FileDescriptor"))?;
+    let slot = object
+        .klass
+        .instanceField(b"handle", b"J")
+        .map_err(|_| invalid("FileDescriptor has no handle field"))?;
+    match object.fields.get(slot).copied().unwrap_or(Value::Null) {
+        Value::Long(handle) if handle > 0 => Ok(handle as u64),
+        _ => Ok(0),
+    }
+}
+
+/// The `fd` field of a stream object (`FileInputStream` etc.).
+fn stream_fd_object<'a>(loader: &ClassLoader<'a>, value: Value<'a>) -> io::Result<usize> {
+    let Value::Object(handle) = value else {
+        return Err(invalid("Expected stream object"));
+    };
+    let objects = loader.borrow_objects();
+    let object = objects
+        .get(handle)
+        .ok_or_else(|| invalid("Invalid stream object"))?;
+    let slot = object
+        .klass
+        .instanceField(b"fd", b"Ljava/io/FileDescriptor;")
+        .map_err(|_| invalid("Stream has no fd field"))?;
+    match object.fields.get(slot).copied().unwrap_or(Value::Null) {
+        Value::Object(fd) => Ok(fd),
+        _ => Err(invalid("Stream fd is not a FileDescriptor")),
+    }
+}
+
+fn set_fd_fields<'a>(loader: &ClassLoader<'a>, fd: usize, handle: i64) -> io::Result<()> {
+    let mut objects = loader.borrow_objects_mut();
+    let object = objects
+        .get_mut(fd)
+        .ok_or_else(|| invalid("Invalid FileDescriptor"))?;
+    let hslot = object
+        .klass
+        .instanceField(b"handle", b"J")
+        .map_err(|_| invalid("FileDescriptor has no handle field"))?;
+    object.fields[hslot] = Value::Long(handle);
+    if let Ok(fslot) = object.klass.instanceField(b"fd", b"I") {
+        object.fields[fslot] = Value::Int(-1);
+    }
+    Ok(())
+}
+
+fn byte_array_handle<'a>(loader: &ClassLoader<'a>, value: Value<'a>) -> io::Result<usize> {
+    match value {
+        Value::PrimitiveArray(handle) => Ok(handle),
+        _ => Err(invalid("Expected byte array")),
+    }
+}
+
+fn int_pair(arguments: &[Value<'_>], first: usize) -> io::Result<(i32, i32)> {
+    match (arguments.get(first).copied(), arguments.get(first + 1).copied()) {
+        (Some(Value::Int(a)), Some(Value::Int(b))) => Ok((a, b)),
+        _ => Err(invalid("Invalid int arguments")),
+    }
 }
 
 /// Instance native methods: `arguments[0]` is the FileSystem receiver.
@@ -324,8 +430,272 @@ pub(crate) fn invoke<'a>(
             let _ = arg(1);
             Value::Int(255)
         }
-        (b"sync0", b"()V") => return Ok(Some(Value::Null)),
-        (b"close0", b"()V") => return Ok(Some(Value::Null)),
+        (b"sync0", b"()V") => {
+            let handle = stream_handle(loader, arg(0))?;
+            if handle != 0 {
+                let _ = nioFileNatives::with_file(handle, |file, _| {
+                    file.sync_all().map_err(io_error)
+                });
+            }
+            return Ok(Some(Value::Null));
+        }
+        (b"close0", b"()V") => {
+            let handle = stream_handle(loader, arg(0))?;
+            if handle != 0 {
+                nioFileNatives::remove_handle(handle);
+            }
+            return Ok(Some(Value::Null));
+        }
+        // java.io.FileInputStream / FileOutputStream / RandomAccessFile
+        (b"open0", b"(Ljava/lang/String;)V") => {
+            let Some(text) = stringNatives::string(loader, arg(1))? else {
+                return Err(invalid("Expected path string"));
+            };
+            let path = java_path(text.as_ref());
+            let handle = nioFileNatives::open_file(&path, true, false, false, false)
+                .map_err(|error| {
+                    io::Error::other(format!(
+                        "java.io.FileNotFoundException: {}",
+                        error
+                    ))
+                })?;
+            let fd = stream_fd_object(loader, arg(0))?;
+            set_fd_fields(loader, fd, handle as i64)?;
+            return Ok(Some(Value::Null));
+        }
+        (b"open0", b"(Ljava/lang/String;Z)V") => {
+            let Some(text) = stringNatives::string(loader, arg(1))? else {
+                return Err(invalid("Expected path string"));
+            };
+            let append = match arg(2) {
+                Value::Int(flag) => flag != 0,
+                _ => return Err(invalid("Invalid append flag")),
+            };
+            let path = java_path(text.as_ref());
+            let handle = nioFileNatives::open_file(&path, false, true, append, !append)
+                .map_err(|error| {
+                    io::Error::other(format!(
+                        "java.io.FileNotFoundException: {}",
+                        error
+                    ))
+                })?;
+            let fd = stream_fd_object(loader, arg(0))?;
+            set_fd_fields(loader, fd, handle as i64)?;
+            return Ok(Some(Value::Null));
+        }
+        (b"open0", b"(Ljava/lang/String;I)V") => {
+            let Some(text) = stringNatives::string(loader, arg(1))? else {
+                return Err(invalid("Expected path string"));
+            };
+            let mode = match arg(2) {
+                Value::Int(mode) => mode,
+                _ => return Err(invalid("Invalid open mode")),
+            };
+            let access = mode & 3;
+            let (read, write) = match access {
+                0 => (true, false),
+                1 => (false, true),
+                _ => (true, true),
+            };
+            let append = mode & 0x8 != 0;
+            let path = java_path(text.as_ref());
+            let handle = nioFileNatives::open_file(&path, read, write, append, false)
+                .map_err(|error| {
+                    io::Error::other(format!(
+                        "java.io.FileNotFoundException: {}",
+                        error
+                    ))
+                })?;
+            let fd = stream_fd_object(loader, arg(0))?;
+            set_fd_fields(loader, fd, handle as i64)?;
+            return Ok(Some(Value::Null));
+        }
+        (b"read0", b"()I") => {
+            let handle = stream_handle(loader, arg(0))?;
+            if handle == 0 {
+                return Err(invalid("Stream is not open"));
+            }
+            let mut byte = [0u8; 1];
+            let count = nioFileNatives::with_file(handle, |file, pos| {
+                file.seek(SeekFrom::Start(*pos))?;
+                let n = file.read(&mut byte)?;
+                *pos += n as u64;
+                Ok(n)
+            })?;
+            return Ok(Some(Value::Int(if count == 0 {
+                -1
+            } else {
+                i32::from(byte[0])
+            })));
+        }
+        (b"readBytes", b"([BII)I") | (b"readBytes0", b"([BII)I") => {
+            let array_handle = byte_array_handle(loader, arg(1))?;
+            let (offset, len) = int_pair(arguments, 2)?;
+            let handle = stream_handle(loader, arg(0))?;
+            if handle == 0 {
+                return Err(invalid("Stream is not open"));
+            }
+            let mut arrays = loader.arrays.borrow_mut();
+            let array = arrays
+                .get_mut(array_handle)
+                .ok_or_else(|| invalid("Invalid array"))?;
+            let TypeArrayOop::Byte(bytes) = array else {
+                return Err(invalid("Expected byte array"));
+            };
+            if offset < 0 || len < 0 || offset as usize + len as usize > bytes.len() {
+                return Err(io::Error::other(
+                    "java.lang.IndexOutOfBoundsException",
+                ));
+            }
+            let mut buf = vec![0u8; len as usize];
+            let count = nioFileNatives::with_file(handle, |file, pos| {
+                file.seek(SeekFrom::Start(*pos))?;
+                let n = file.read(&mut buf)?;
+                buf.truncate(n);
+                *pos += n as u64;
+                Ok(n)
+            })?;
+            for (index, &byte) in buf.iter().enumerate() {
+                bytes[offset as usize + index] = byte as i8;
+            }
+            return Ok(Some(Value::Int(if count == 0 { -1 } else { count as i32 })));
+        }
+        (b"length0", b"()J") => {
+            let handle = stream_handle(loader, arg(0))?;
+            if handle == 0 {
+                return Err(invalid("Stream is not open"));
+            }
+            return Ok(Some(Value::Long(nioFileNatives::file_len(handle)? as i64)));
+        }
+        (b"position0", b"()J") | (b"getFilePointer", b"()J") => {
+            let handle = stream_handle(loader, arg(0))?;
+            if handle == 0 {
+                return Err(invalid("Stream is not open"));
+            }
+            let pos = nioFileNatives::with_file(handle, |_, pos| Ok(*pos))?;
+            return Ok(Some(Value::Long(pos as i64)));
+        }
+        (b"skip0", b"(J)J") => {
+            let handle = stream_handle(loader, arg(0))?;
+            if handle == 0 {
+                return Err(invalid("Stream is not open"));
+            }
+            let delta = match arg(1) {
+                Value::Long(delta) => delta,
+                _ => return Err(invalid("Invalid skip distance")),
+            };
+            let pos = nioFileNatives::with_file(handle, |file, pos| {
+                let target = (*pos as i64 + delta).max(0) as u64;
+                file.seek(SeekFrom::Start(target))?;
+                let skipped = target - *pos;
+                *pos = target;
+                Ok(skipped as i64)
+            })?;
+            return Ok(Some(Value::Long(pos)));
+        }
+        (b"seek0", b"(J)V") => {
+            let handle = stream_handle(loader, arg(0))?;
+            if handle == 0 {
+                return Err(invalid("Stream is not open"));
+            }
+            let target = match arg(1) {
+                Value::Long(target) => target,
+                _ => return Err(invalid("Invalid seek position")),
+            };
+            nioFileNatives::with_file(handle, |file, pos| {
+                file.seek(SeekFrom::Start(target as u64))?;
+                *pos = target as u64;
+                Ok(())
+            })?;
+            return Ok(Some(Value::Null));
+        }
+        (b"setLength0", b"(J)V") => {
+            let handle = stream_handle(loader, arg(0))?;
+            if handle == 0 {
+                return Err(invalid("Stream is not open"));
+            }
+            let length = match arg(1) {
+                Value::Long(length) => length,
+                _ => return Err(invalid("Invalid length")),
+            };
+            if length < 0 {
+                return Err(io::Error::other("java.io.IOException: Negative length"));
+            }
+            nioFileNatives::with_file(handle, |file, _| {
+                file.set_len(length as u64).map_err(io_error)
+            })?;
+            return Ok(Some(Value::Null));
+        }
+        (b"available0", b"()I") => {
+            let handle = stream_handle(loader, arg(0))?;
+            if handle == 0 {
+                return Err(invalid("Stream is not open"));
+            }
+            let available = nioFileNatives::with_file(handle, |file, pos| {
+                let len = file.metadata().map_err(io_error)?.len();
+                Ok(len.saturating_sub(*pos).min(i32::MAX as u64) as i32)
+            })?;
+            return Ok(Some(Value::Int(available)));
+        }
+        (b"write", b"(IZ)V") | (b"write0", b"(I)V") => {
+            let handle = stream_handle(loader, arg(0))?;
+            if handle == 0 {
+                return Err(invalid("Stream is not open"));
+            }
+            let byte = match arg(1) {
+                Value::Int(byte) => byte as u8,
+                _ => return Err(invalid("Invalid byte")),
+            };
+            let append = name == b"write"
+                && matches!(arguments.get(2).copied(), Some(Value::Int(flag)) if flag != 0);
+            nioFileNatives::with_file(handle, |file, pos| {
+                if append {
+                    let len = file.metadata().map_err(io_error)?.len();
+                    file.seek(SeekFrom::Start(len))?;
+                }
+                file.write_all(&[byte]).map_err(io_error)?;
+                *pos = file.stream_position().map_err(io_error)?;
+                Ok(())
+            })?;
+            return Ok(Some(Value::Null));
+        }
+        (b"writeBytes", b"([BIIZ)V") | (b"writeBytes0", b"([BII)V") => {
+            let array_handle = byte_array_handle(loader, arg(1))?;
+            let has_append = descriptor.ends_with(b"IZ)V");
+            let (offset, len) = int_pair(arguments, 2)?;
+            let append = has_append
+                && matches!(arguments.get(4).copied(), Some(Value::Int(flag)) if flag != 0);
+            let handle = stream_handle(loader, arg(0))?;
+            if handle == 0 {
+                return Err(invalid("Stream is not open"));
+            }
+            let mut arrays = loader.arrays.borrow_mut();
+            let array = arrays
+                .get_mut(array_handle)
+                .ok_or_else(|| invalid("Invalid array"))?;
+            let TypeArrayOop::Byte(bytes) = array else {
+                return Err(invalid("Expected byte array"));
+            };
+            if offset < 0 || len < 0 || offset as usize + len as usize > bytes.len() {
+                return Err(io::Error::other(
+                    "java.lang.IndexOutOfBoundsException",
+                ));
+            }
+            let buf: Vec<u8> = bytes[offset as usize..offset as usize + len as usize]
+                .iter()
+                .map(|&b| b as u8)
+                .collect();
+            nioFileNatives::with_file(handle, |file, pos| {
+                if append {
+                    let end = file.metadata().map_err(io_error)?.len();
+                    file.seek(SeekFrom::Start(end))?;
+                }
+                file.write_all(&buf).map_err(io_error)?;
+                *pos = file.stream_position().map_err(io_error)?;
+                Ok(())
+            })?;
+            return Ok(Some(Value::Null));
+        }
         (b"getDriveDirectory", b"(I)Ljava/lang/String;") => {
             let drive = match arg(1) {
                 Value::Int(drive) => drive,

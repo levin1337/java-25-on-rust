@@ -9,6 +9,7 @@ pub mod bytecodes;
 pub mod invocationCounter;
 pub mod lambdaMetafactory;
 pub mod linkResolver;
+pub mod objectMethods;
 pub(crate) mod numeric;
 pub mod oopMapCache;
 pub mod templateTable;

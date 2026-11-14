@@ -145,6 +145,34 @@ pub fn invokeInstance<'a>(
         }
     }
 
+    // TEST-ONLY wiring for urlNatives (to be placed by orchestrator).
+    if let Some(result) =
+        super::urlNatives::invoke_instance(loader, owner, name, descriptor, arguments)?
+    {
+        return Ok(Some(result));
+    }
+
+    if owner == b"java/lang/ClassLoader"
+        && (name == b"findLoadedClass0" || name == b"findBootstrapClass")
+        && descriptor == b"(Ljava/lang/String;)Ljava/lang/Class;"
+    {
+        let binary = arguments
+            .get(1)
+            .copied()
+            .and_then(|value| super::stringNatives::string(loader, value).ok().flatten());
+        let Some(binary) = binary else {
+            return Ok(Some(Some(Value::Null)));
+        };
+        // Binary name -> internal name ("java.lang.String" -> "java/lang/String",
+        // "[Ljava.lang.String;" -> "[Ljava/lang/String;").
+        let internal = binary.replace('.', "/");
+        let internal = loader.storage.alloc_str(&internal);
+        return match loader.load(internal.as_bytes()) {
+            Ok(_) => Ok(Some(Some(Value::ClassMirror(internal.as_bytes())))),
+            Err(_) => Ok(Some(Some(Value::Null))),
+        };
+    }
+
     if owner == b"java/lang/ClassLoader"
         && name == b"getResources"
         && descriptor == b"(Ljava/lang/String;)Ljava/util/Enumeration;"
@@ -345,6 +373,35 @@ pub fn invokeInstance<'a>(
         (b"java/lang/Object", b"notify", b"()V")
         | (b"java/lang/Object", b"notifyAll", b"()V")
         | (b"java/lang/Object", b"wait0", b"(J)V") => None,
+        (b"java/lang/NullPointerException", b"getExtendedNPEMessage", b"()Ljava/lang/String;") => {
+            Some(Value::Null)
+        }
+        (b"java/lang/Thread", b"setPriority0", b"(I)V")
+        | (b"java/lang/Thread", b"setNativeName", b"(Ljava/lang/String;)V")
+        | (b"java/lang/Thread", b"setCurrentThread", b"(Ljava/lang/Thread;)V") => None,
+        (b"java/lang/Thread", b"start0", b"()V") => None,
+        (b"java/lang/Thread", b"interrupt0", b"()V") => {
+            let receiver = arguments.first().copied().unwrap_or(Value::Null);
+            if let Value::Object(handle) = receiver {
+                let _ = set_instance_field(
+                    loader,
+                    handle,
+                    b"interrupted",
+                    b"Z",
+                    Value::Int(1),
+                );
+            }
+            None
+        }
+        (b"java/lang/Thread", b"getStackTrace0", b"()[Ljava/lang/StackTraceElement;") => {
+            let component = loader
+                .storage
+                .alloc_slice_copy(b"java/lang/StackTraceElement");
+            let array =
+                crate::share::oops::objArrayOop::ObjArrayOop::withComponent(0, component)?;
+            Some(Value::ObjectArray(loader.alloc_obj_array(array)))
+        }
+        _ if owner.starts_with(b"java/lang/Thread") && descriptor.ends_with(b")V") => None,
         _ if owner.starts_with(b"java/lang/ref/")
             && name == b"refersTo0"
             && descriptor == b"(Ljava/lang/Object;)Z" => {
@@ -364,6 +421,19 @@ pub fn invokeInstance<'a>(
                 _ => None,
             };
             Some(Value::Int(i32::from(referent == Some(target))))
+        }
+        (b"java/lang/ref/Reference", b"clear0", b"()V") => {
+            let receiver = arguments.first().copied().unwrap_or(Value::Null);
+            if let Value::Object(handle) = receiver {
+                let _ = set_instance_field(
+                    loader,
+                    handle,
+                    b"referent",
+                    b"Ljava/lang/Object;",
+                    Value::Null,
+                );
+            }
+            None
         }
         (b"java/lang/Runtime", b"load0", b"(Ljava/lang/String;)V") => {
             // System.load(String): arguments = [receiver, filename]
@@ -388,9 +458,27 @@ pub fn invokeInstance<'a>(
             super::nativeLibraries::NativeLibraries::global().load_library(name.as_ref())?;
             None
         }
-        _ if (owner == b"java/io/WinNTFileSystem" || owner == b"java/io/UnixFileSystem" || owner == b"java/io/FileDescriptor") => {
+        _ if ((owner == b"java/io/WinNTFileSystem"
+                || owner == b"java/io/UnixFileSystem"
+                || owner == b"java/io/FileDescriptor"
+                || owner == b"java/io/FileInputStream"
+                || owner == b"java/io/FileOutputStream"
+                || owner == b"java/io/RandomAccessFile")) => {
             match super::fileNatives::invoke(loader, name, descriptor, arguments)? {
                 Some(_value) if descriptor.ends_with(b")V") => None,
+                Some(value) => Some(value),
+                None => {
+                    return match super::jniInvocation::invoke_dll_native(
+                        loader, owner, name, descriptor, false, arguments,
+                    )? {
+                        Some(result) => Ok(Some(result)),
+                        None => Ok(None),
+                    };
+                }
+            }
+        }
+        _ if owner == b"java/util/zip/Inflater" || owner == b"java/util/zip/Deflater" => {
+            match super::zipNatives::instance(loader, owner, name, descriptor, arguments)? {
                 Some(value) => Some(value),
                 None => {
                     return match super::jniInvocation::invoke_dll_native(
@@ -461,6 +549,30 @@ fn set_instance_field<'a>(
     }
     let _ = Value::Null;
     Ok(())
+}
+
+/// Creates a minimal `AccessControlContext` with an empty protection-domain
+/// array, used for the no-security-manager bootstrap path.
+fn access_control_context<'a>(
+    loader: &crate::share::classfile::classLoader::ClassLoader<'a>,
+) -> io::Result<crate::share::interpreter::bytecodeInterpreter::Value<'a>> {
+    use crate::share::interpreter::bytecodeInterpreter::Value;
+    use crate::share::oops::objArrayOop::ObjArrayOop;
+
+    let component = loader
+        .storage
+        .alloc_slice_copy(b"java/security/ProtectionDomain");
+    let domains = ObjArrayOop::withComponent(0, component)?;
+    let context_array = loader.alloc_obj_array(domains);
+    let handle = raw_instance(loader, b"java/security/AccessControlContext")?;
+    set_instance_field(
+        loader,
+        handle,
+        b"context",
+        b"[Ljava/security/ProtectionDomain;",
+        Value::ObjectArray(context_array),
+    )?;
+    Ok(Value::Object(handle))
 }
 
 /// Returns the current thread object. The lazily-created synthetic instance is
@@ -640,6 +752,18 @@ pub fn invokeStatic<'a>(
         (b"java/lang/Thread", b"getNextThreadIdOffset", b"()J") => Some(Some(Value::Long(
             crate::share::prims::unsafeNatives::THREAD_TID_SENTINEL_OFFSET,
         ))),
+        (b"java/lang/Thread", b"findScopedValueBindings", b"()Ljava/lang/Object;")
+        | (b"java/security/AccessController", b"ensureMaterializedForStackWalk", b"(Ljava/lang/Object;)V")
+        | (b"java/lang/Thread", b"ensureMaterializedForStackWalk", b"(Ljava/lang/Object;)V") => {
+            Some(if name == b"findScopedValueBindings" { Some(Value::Null) } else { None })
+        }
+        (b"java/lang/Thread", b"scopedValueCache", b"()[Ljava/lang/Object;") => {
+            let component = loader.storage.alloc_slice_copy(b"java/lang/Object");
+            let array =
+                crate::share::oops::objArrayOop::ObjArrayOop::withComponent(0, component)?;
+            Some(Some(Value::ObjectArray(loader.alloc_obj_array(array))))
+        }
+        (b"java/lang/Thread", b"setScopedValueCache", b"([Ljava/lang/Object;)V") => Some(None),
         (b"jdk/internal/misc/Unsafe", b"getUnsafe", b"()Ljdk/internal/misc/Unsafe;") => {
             match loader.load(b"jdk/internal/misc/Unsafe") {
                 Ok(klass) => match crate::share::oops::instanceOop::InstanceOop::new(klass) {
@@ -651,7 +775,19 @@ pub fn invokeStatic<'a>(
         }
         (b"java/lang/System", b"setIn0", b"(Ljava/io/InputStream;)V")
         | (b"java/lang/System", b"setOut0", b"(Ljava/io/PrintStream;)V")
-        | (b"java/lang/System", b"setErr0", b"(Ljava/io/PrintStream;)V") => Some(None),
+        | (b"java/lang/System", b"setErr0", b"(Ljava/io/PrintStream;)V") => {
+            let field = match name {
+                b"setIn0" => (b"in".as_slice(), b"Ljava/io/InputStream;".as_slice()),
+                b"setOut0" => (b"out".as_slice(), b"Ljava/io/PrintStream;".as_slice()),
+                _ => (b"err".as_slice(), b"Ljava/io/PrintStream;".as_slice()),
+            };
+            if let Ok(system) = loader.load(b"java/lang/System")
+                && let Ok(cell) = system.staticField(field.0, field.1)
+            {
+                cell.set(arguments.first().copied().unwrap_or(Value::Null));
+            }
+            Some(None)
+        }
         (b"java/lang/System", b"mapLibraryName", b"(Ljava/lang/String;)Ljava/lang/String;") => {
             arguments.first().copied().map(Some)
         }
@@ -661,6 +797,50 @@ pub fn invokeStatic<'a>(
         (b"jdk/internal/loader/BootLoader", b"setBootLoaderUnnamedModule0", b"(Ljava/lang/Module;)V") => {
             Some(None)
         }
+        // java.lang.Module VM-graph updates. Java-side state (reads,
+        // exportedPackages/openPackages, ReflectionData) is maintained by
+        // java.lang.Module itself, so these are no-ops for the interpreter.
+        (b"java/lang/Module", b"defineModule0", b"(Ljava/lang/Module;ZLjava/lang/String;Ljava/lang/String;[Ljava/lang/Object;)V") => {
+            // JVM_DefineModule: record the module object so Class.getModule
+            // can resolve it. Java-side state is maintained by java.lang.Module.
+            let module = arguments.first().copied().unwrap_or(Value::Null);
+            if let Value::Object(handle) = module {
+                let name_value = {
+                    let objects = loader.borrow_objects();
+                    objects.get(handle).and_then(|object| {
+                        let slot = object
+                            .klass
+                            .instanceField(b"name", b"Ljava/lang/String;")
+                            .ok()?;
+                        object.fields.get(slot).copied()
+                    })
+                };
+                if let Some(name_value) = name_value
+                    && let Ok(Some(name)) = super::stringNatives::string(loader, name_value)
+                {
+                    loader.register_module_object(&name, handle);
+                }
+            }
+            Some(None)
+        }
+        (b"java/lang/Module", b"defineModule0", _)
+        | (b"java/lang/Module", b"addReads0", _)
+        | (b"java/lang/Module", b"addExports0", _)
+        | (b"java/lang/Module", b"addExportsToAll0", _)
+        | (b"java/lang/Module", b"addExportsToAllUnnamed0", _) => Some(None),
+        (b"java/lang/ref/Finalizer", b"isFinalizationEnabled", b"()Z") => {
+            Some(Some(Value::Int(1)))
+        }
+        (b"java/lang/ref/Finalizer", b"reportComplete", b"(Ljava/lang/Object;)V") => {
+            Some(None)
+        }
+        (b"java/lang/ref/Reference", b"getAndClearReferencePendingList", b"()Ljava/lang/ref/Reference;") => {
+            Some(Some(Value::Null))
+        }
+        (b"java/lang/ref/Reference", b"hasReferencePendingList", b"()Z") => {
+            Some(Some(Value::Int(0)))
+        }
+        (b"java/lang/ref/Reference", b"waitForReferencePendingList", b"()V") => Some(None),
         (b"jdk/internal/misc/VM", b"initialize", b"()V")
         | (b"jdk/internal/misc/VM", b"saveAndRemoveProperties", b"()V")
         | (b"jdk/internal/misc/VM", b"initializeOSEnvironment", b"()V") => Some(None),
@@ -680,6 +860,7 @@ pub fn invokeStatic<'a>(
             }
             Some(None)
         }
+        (b"java/util/concurrent/atomic/AtomicLong", b"VMSupportsCS8", b"()Z") => Some(Some(Value::Int(1))),
         (b"jdk/internal/misc/VM", b"isBooted", b"()Z") => Some(Some(Value::Int(1))),
         (b"jdk/internal/misc/VM", b"getNanoTimeAdjustment", b"(J)J") => Some(Some(Value::Long(0))),
         (b"jdk/internal/misc/VM", b"latestUserDefinedLoader", b"()Ljava/lang/ClassLoader;") => {
@@ -687,6 +868,36 @@ pub fn invokeStatic<'a>(
         }
         (b"java/lang/ClassLoader", b"registerAsParallelCapable", b"()Z") => {
             Some(Some(Value::Int(1)))
+        }
+        (b"java/security/AccessController", b"getStackAccessControlContext", b"()Ljava/security/AccessControlContext;")
+        | (b"java/security/AccessController", b"getInheritedAccessControlContext", b"()Ljava/security/AccessControlContext;") => {
+            match access_control_context(loader) {
+                Ok(value) => Some(Some(value)),
+                Err(error) => return Err(error),
+            }
+        }
+        (b"java/security/AccessController", b"getProtectionDomain", b"(Ljava/lang/Class;)Ljava/security/ProtectionDomain;") => {
+            match raw_instance(loader, b"java/security/ProtectionDomain") {
+                Ok(handle) => Some(Some(Value::Object(handle))),
+                Err(error) => return Err(error),
+            }
+        }
+        (b"java/lang/ClassLoader", b"findBootstrapClass", b"(Ljava/lang/String;)Ljava/lang/Class;") => {
+            let name_value = arguments.first().copied().unwrap_or(Value::Null);
+            let text = super::stringNatives::string(loader, name_value)?
+                .map(|cow| cow.into_owned());
+            match text {
+                Some(text) if !text.starts_with('[') => {
+                    let internal = text.replace('.', "/");
+                    match loader.load(internal.as_bytes()) {
+                        Ok(_) => Some(Some(Value::ClassMirror(
+                            loader.storage.alloc_str(&internal).as_bytes(),
+                        ))),
+                        Err(_) => Some(Some(Value::Null)),
+                    }
+                }
+                _ => Some(Some(Value::Null)),
+            }
         }
         (b"java/lang/System", b"currentTimeMillis", b"()J") => {
             Some(Some(Value::Long(Jvm::current_time_millis())))
@@ -768,11 +979,29 @@ pub fn invokeStatic<'a>(
         (b"jdk/internal/misc/CDS", b"getRandomSeedForDumping", b"()J") => {
             Some(Some(Value::Long(Jvm::nano_time())))
         }
-        (
-            b"jdk/internal/util/SystemProps$Raw",
-            b"platformProperties" | b"vmProperties",
-            b"()[Ljava/lang/String;",
-        ) => {
+        (b"jdk/internal/misc/CDS", b"getCDSConfigStatus", b"()I") => {
+            Some(Some(Value::Int(0)))
+        }
+        (b"jdk/internal/util/SystemProps$Raw", b"platformProperties", b"()[Ljava/lang/String;") => {
+            // Positional array indexed by SystemProps.Raw NDX constants.
+            let slots = super::systemProperties::platform_property_slots(loader);
+            let component = loader.storage.alloc_slice_copy(b"java/lang/String");
+            let mut array = crate::share::oops::objArrayOop::ObjArrayOop::withComponent(
+                slots.len() as i32,
+                component,
+            )?;
+            let mut leaked = Vec::with_capacity(slots.len());
+            for (index, slot) in slots.iter().enumerate() {
+                if let Some(value) = slot {
+                    let value: &'static str = Box::leak(value.clone().into_boxed_str());
+                    leaked.push(value);
+                    array.elements[index] =
+                        Value::HostString(loader.storage.alloc_str(value));
+                }
+            }
+            Some(Some(Value::ObjectArray(loader.alloc_obj_array(array))))
+        }
+        (b"jdk/internal/util/SystemProps$Raw", b"vmProperties", b"()[Ljava/lang/String;") => {
             let mut pairs: Vec<(String, String)> =
                 super::systemProperties::platform_properties(loader);
             {
@@ -904,7 +1133,43 @@ pub fn invokeStatic<'a>(
                 .copied();
             Some(Some(caller.map(Value::ClassMirror).unwrap_or(Value::Null)))
         }
-        _ if (owner == b"java/io/WinNTFileSystem" || owner == b"java/io/UnixFileSystem" || owner == b"java/io/FileDescriptor") => {
+        _ if owner == b"java/util/zip/Inflater"
+            || owner == b"java/util/zip/Deflater"
+            || owner == b"java/util/zip/CRC32" =>
+        {
+            match super::zipNatives::statik(loader, owner, name, descriptor, arguments)? {
+                Some(_value) if descriptor.ends_with(b")V") => Some(None),
+                Some(value) => Some(Some(value)),
+                None => return Ok(None),
+            }
+        }
+        _ if owner == b"sun/nio/fs/WindowsNativeDispatcher" => {
+            match super::nioFileNatives::dispatcher(loader, name, descriptor, arguments)? {
+                Some(_value) if descriptor.ends_with(b")V") => Some(None),
+                Some(value) => Some(Some(value)),
+                None => return Ok(None),
+            }
+        }
+        _ if owner == b"sun/nio/ch/FileDispatcherImpl" || owner == b"sun/nio/ch/WindowsFileDispatcherImpl" => {
+            match super::nioFileNatives::dispatcher_impl(loader, name, descriptor, arguments)? {
+                Some(_value) if descriptor.ends_with(b")V") => Some(None),
+                Some(value) => Some(Some(value)),
+                None => return Ok(None),
+            }
+        }
+        _ if owner == b"sun/nio/ch/IOUtil" => {
+            match super::nioFileNatives::io_util(loader, name, descriptor, arguments)? {
+                Some(_value) if descriptor.ends_with(b")V") => Some(None),
+                Some(value) => Some(Some(value)),
+                None => return Ok(None),
+            }
+        }
+        _ if ((owner == b"java/io/WinNTFileSystem"
+                || owner == b"java/io/UnixFileSystem"
+                || owner == b"java/io/FileDescriptor"
+                || owner == b"java/io/FileInputStream"
+                || owner == b"java/io/FileOutputStream"
+                || owner == b"java/io/RandomAccessFile")) => {
             match super::fileNatives::invoke_static(loader, name, descriptor, arguments)? {
                 Some(_value) if descriptor.ends_with(b")V") => Some(None),
                 Some(value) => Some(Some(value)),

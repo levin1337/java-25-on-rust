@@ -140,6 +140,7 @@ pub(crate) fn for_each_active_frame(f: &mut impl FnMut(&Frame<'static>)) {
     });
 }
 
+#[allow(dead_code)]
 fn current_frame_site() -> String {
     ACTIVE_FRAMES.with(|frames| {
         let frames = frames.borrow();
@@ -445,7 +446,7 @@ fn javaDouble(value: f64) -> String {
 
 /// Renders a stack value the way `String.valueOf` would during string
 /// concatenation: strings as text, objects via their `toString()`.
-fn describeValue<'a>(
+pub(crate) fn describeValue<'a>(
     loader: &ClassLoader<'a>,
     value: Value<'a>,
     output: &mut impl Write,
@@ -938,6 +939,26 @@ fn linkageExc<'a>(
     jex(loader, output, depth, class_name, Some(&error.to_string()))
 }
 
+fn is_print_stream(loader: &ClassLoader<'_>, value: Value<'_>) -> bool {
+    match value {
+        Value::Output => true,
+        Value::Object(handle) => {
+            let objects = loader.borrow_objects();
+            objects.get(handle).is_some_and(|object| {
+                let mut current = Some(object.klass.as_ref());
+                while let Some(klass) = current {
+                    if klass.class.name == b"java/io/PrintStream" {
+                        return true;
+                    }
+                    current = klass.super_klass.as_deref();
+                }
+                false
+            })
+        }
+        _ => false,
+    }
+}
+
 fn monitorKey(value: Value<'_>) -> Option<u64> {
     const OBJ_ARRAY: u64 = 1 << 62;
     const PRIM_ARRAY: u64 = 2 << 62;
@@ -1144,13 +1165,17 @@ fn step<'a>(
                     .ok_or_else(|| Error::other("Invalid array reference"))
                     .and_then(|array| array.load(opcode - 0x2e, index))
             };
+            let array_len = {
+                let arrays = loader.arrays.borrow();
+                arrays.get(handle).map(|array| array.len())
+            };
             match load_result.map_err(|error| {
                 jex(
                     loader,
                     output,
                     depth,
                     b"java/lang/ArrayIndexOutOfBoundsException",
-                    Some(&error.to_string()),
+                    Some(&format!("{} (index {} len {:?} pc {} in {}.{})", error, index, array_len, pc, String::from_utf8_lossy(klass.class.name), String::from_utf8_lossy(frame.code.name))),
                 )
             })? {
                 Element::Int(value) => Value::Int(value),
@@ -1778,6 +1803,12 @@ fn step<'a>(
             if opcode == 0xb6
                 && owner == b"java/io/PrintStream"
                 && (name == b"println" || name == b"print")
+                && frame
+                    .stack
+                    .len()
+                    .checked_sub(1 + usize::from(descriptor != b"()V"))
+                    .and_then(|index| frame.stack.get(index))
+                    .is_some_and(|value| is_print_stream(loader, *value))
             {
                 let is_println = name == b"println";
                 let value = if descriptor == b"()V" {
@@ -1785,7 +1816,28 @@ fn step<'a>(
                 } else {
                     frame.pop()?
                 };
-                if !matches!(frame.pop()?, Value::Output) {
+                let receiver = frame.pop()?;
+                let is_output = match receiver {
+                    Value::Output => true,
+                    Value::Object(handle) => {
+                        let objects = loader.borrow_objects();
+                        objects.get(handle).is_some_and(|object| {
+                            let mut current = Some(object.klass.as_ref());
+                            while let Some(klass) = current {
+                                if klass.class.name == b"java/io/PrintStream" {
+                                    return true;
+                                }
+                                current = klass.super_klass.as_deref();
+                            }
+                            false
+                        })
+                    }
+                    _ => false,
+                };
+                if !is_output {
+                    if std::env::var_os("JVM25_TRACE").is_some() {
+                        eprintln!("[print-receiver] {receiver:?}");
+                    }
                     return Err(Error::other("Invalid print receiver"));
                 }
                 match (descriptor, value) {
@@ -2573,6 +2625,17 @@ fn step<'a>(
                 let captured = frame.stack[start..].to_vec();
                 frame.stack.truncate(start);
                 frame.stackSlots -= slots;
+                if let Some(value) = super::objectMethods::invoke(
+                    loader,
+                    klass,
+                    &bs_info,
+                    &captured,
+                    output,
+                    depth,
+                )? {
+                    frame.push(value)?;
+                    return Ok(Step::Continue);
+                }
                 match super::lambdaMetafactory::invoke(
                     loader,
                     klass,

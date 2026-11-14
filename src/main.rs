@@ -77,6 +77,16 @@ fn inspect() -> Result<(), Box<dyn Error>> {
         )
     };
     if let Some(modules) = modules {
+        // Derive java.home from the modules image location
+        // (<java.home>/lib/modules) so JDK code that resolves files
+        // relative to the runtime (conf/security/java.security, lib,
+        // ...) sees a consistent layout.
+        if let Some(java_home) = Path::new(&modules)
+            .parent()
+            .and_then(|lib| lib.parent())
+        {
+            loader.setSystemProperty("java.home", &java_home.to_string_lossy())?;
+        }
         loader = loader.withBootImage(Path::new(&modules))?;
     }
     for (key, value) in properties {

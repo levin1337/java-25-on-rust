@@ -1,0 +1,14 @@
+[package]
+name = "jvm25-rust"
+version = "0.1.0"
+edition = "2024"
+
+[lints.rust]
+non_snake_case = "allow"
+non_camel_case_types = "allow"
+non_upper_case_globals = "allow"
+
+[dependencies]
+bumpalo = "3.20.3"
+libloading = "0.9.1"
+zip = { version = "9.5.1", default-features = false, features = ["deflate-flate2-zlib-rs"] }

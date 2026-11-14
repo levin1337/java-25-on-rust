@@ -61,7 +61,7 @@ pub(crate) fn string<'a>(
 pub(crate) fn materialize<'a>(
     loader: &ClassLoader<'a>,
     value: Value<'a>,
-    output: &mut impl Write,
+    output: &mut dyn Write,
     depth: usize,
 ) -> io::Result<Option<Value<'a>>> {
     if matches!(

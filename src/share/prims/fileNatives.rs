@@ -171,7 +171,7 @@ fn set_fd_fields<'a>(loader: &ClassLoader<'a>, fd: usize, handle: i64) -> io::Re
     Ok(())
 }
 
-fn byte_array_handle<'a>(loader: &ClassLoader<'a>, value: Value<'a>) -> io::Result<usize> {
+fn byte_array_handle<'a>(_loader: &ClassLoader<'a>, value: Value<'a>) -> io::Result<usize> {
     match value {
         Value::PrimitiveArray(handle) => Ok(handle),
         _ => Err(invalid("Expected byte array")),

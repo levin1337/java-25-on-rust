@@ -109,6 +109,10 @@ pub(crate) fn invoke<'a>(
     let Value::ClassMirror(class) = receiver else {
         return Ok(None);
     };
+    if name == b"getResource" && descriptor == b"(Ljava/lang/String;)Ljava/net/URL;" {
+        let resource = arguments.first().copied().ok_or_else(|| io::Error::other("Missing resource name"))?;
+        return crate::share::prims::urlNatives::classResource(loader, class, resource).map(Some);
+    }
     if name == b"isAssignableFrom" && descriptor == b"(Ljava/lang/Class;)Z" {
         let target = class;
         let source = match arguments.first().copied().unwrap_or(Value::Null) {

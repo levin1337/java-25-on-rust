@@ -44,7 +44,7 @@ fn record_field<'a>(
 }
 
 fn field_value<'a>(
-    loader: &ClassLoader<'a>,
+    _loader: &ClassLoader<'a>,
     object: &crate::share::oops::instanceOop::InstanceOop<'a>,
     record: &InstanceKlass<'a>,
     name: &[u8],
@@ -116,7 +116,7 @@ pub fn invoke<'a>(
     klass: &InstanceKlass<'a>,
     bs_info: &BootstrapInfo,
     captured: &[Value<'a>],
-    output: &mut impl Write,
+    output: &mut dyn Write,
     depth: usize,
 ) -> io::Result<Option<Value<'a>>> {
     if !is_object_methods_bootstrap(klass, bs_info)? {

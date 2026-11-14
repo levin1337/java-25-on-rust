@@ -30,6 +30,8 @@ pub(crate) fn invoke<'a>(
     name: &[u8],
     descriptor: &[u8],
     arguments: &[Value<'a>],
+    output: &mut dyn std::io::Write,
+    depth: usize,
 ) -> io::Result<NativeResult<'a>> {
     if name == b"registerNatives" {
         return Ok(Some(None));
@@ -335,9 +337,23 @@ pub(crate) fn invoke<'a>(
             Some(allocate_instance(loader, class_arg(arguments, 1)?)?)
         }
         (b"getUncompressedObject", b"(J)Ljava/lang/Object;") => Some(Value::Null),
-        (b"unpark", b"(Ljava/lang/Object;)V")
-        | (b"park", b"(ZJ)V")
-        | (b"fullFence", b"()V")
+        (b"unpark", b"(Ljava/lang/Object;)V") => {
+            crate::share::runtime::threading::unpark(
+                loader,
+                arguments.get(1).copied().unwrap_or(Value::Null),
+            )?;
+            None
+        }
+        (b"park", b"(ZJ)V") => {
+            let is_absolute = matches!(arguments.get(1), Some(Value::Int(v)) if *v != 0);
+            let time = match arguments.get(2) {
+                Some(Value::Long(v)) => *v,
+                _ => 0,
+            };
+            crate::share::runtime::threading::park(loader, is_absolute, time, output, depth)?;
+            None
+        }
+        (b"fullFence", b"()V")
         | (b"writeback0", b"(J)V")
         | (b"writebackPreSync0", b"()V")
         | (b"writebackPostSync0", b"()V") => None,

@@ -116,13 +116,15 @@ pub fn invokeInstance<'a>(
     name: &[u8],
     descriptor: &[u8],
     arguments: &[crate::share::interpreter::bytecodeInterpreter::Value<'a>],
+    output: &mut dyn std::io::Write,
+    depth: usize,
 ) -> io::Result<Option<Option<crate::share::interpreter::bytecodeInterpreter::Value<'a>>>> {
     let _rg = crate::share::recprobe::Guard::enter("invokeInstance");
     use super::jvm::Jvm;
     use crate::share::interpreter::bytecodeInterpreter::Value;
 
     if owner == b"jdk/internal/misc/Unsafe" {
-        return super::unsafeNatives::invoke(loader, name, descriptor, arguments).map_err(
+        return super::unsafeNatives::invoke(loader, name, descriptor, arguments, output, depth).map_err(
             |error| {
                 io::Error::other(format!(
                     "Unsafe.{}{}: {}",
@@ -143,6 +145,18 @@ pub fn invokeInstance<'a>(
         )? {
             return Ok(Some(Some(value)));
         }
+    }
+
+    if let Some(result) =
+        super::varHandleNatives::invoke(loader, name, descriptor, arguments)?
+    {
+        return Ok(Some(result));
+    }
+
+    if let Some(result) =
+        super::methodHandleNatives::invoke_instance(loader, owner, name, descriptor, arguments)?
+    {
+        return Ok(Some(result));
     }
 
     // TEST-ONLY wiring for urlNatives (to be placed by orchestrator).
@@ -370,16 +384,83 @@ pub fn invokeInstance<'a>(
         (b"java/lang/Throwable", b"fillInStackTrace", b"(I)Ljava/lang/Throwable;") => {
             Some(arguments.first().copied().unwrap_or(Value::Null))
         }
+        (b"java/lang/Object", b"wait0", b"(J)V") => {
+            let receiver = arguments.first().copied().unwrap_or(Value::Null);
+            let Some(key) =
+                crate::share::interpreter::bytecodeInterpreter::monitorKey(receiver)
+            else {
+                return Err(io::Error::other("Expected reference for wait"));
+            };
+            let timeout = match arguments.get(1) {
+                Some(Value::Long(millis)) => *millis,
+                _ => 0,
+            };
+            crate::share::runtime::threading::wait_object(
+                loader,
+                key as usize,
+                timeout,
+                output,
+                depth,
+            )?;
+            None
+        }
         (b"java/lang/Object", b"notify", b"()V")
-        | (b"java/lang/Object", b"notifyAll", b"()V")
-        | (b"java/lang/Object", b"wait0", b"(J)V") => None,
+        | (b"java/lang/Object", b"notifyAll", b"()V") => {
+            let receiver = arguments.first().copied().unwrap_or(Value::Null);
+            let Some(key) =
+                crate::share::interpreter::bytecodeInterpreter::monitorKey(receiver)
+            else {
+                return Err(io::Error::other("Expected reference for notify"));
+            };
+            crate::share::runtime::threading::notify_object(
+                loader,
+                key as usize,
+                name == b"notifyAll",
+            )?;
+            None
+        }
         (b"java/lang/NullPointerException", b"getExtendedNPEMessage", b"()Ljava/lang/String;") => {
             Some(Value::Null)
         }
         (b"java/lang/Thread", b"setPriority0", b"(I)V")
         | (b"java/lang/Thread", b"setNativeName", b"(Ljava/lang/String;)V")
         | (b"java/lang/Thread", b"setCurrentThread", b"(Ljava/lang/Thread;)V") => None,
-        (b"java/lang/Thread", b"start0", b"()V") => None,
+        (b"java/lang/Thread", b"start0", b"()V") => {
+            let receiver = arguments.first().copied().unwrap_or(Value::Null);
+            if std::env::var_os("JVM25_TRACE").is_some() {
+                eprintln!("[start0] receiver={receiver:?}");
+            }
+            if let Value::Object(handle) = receiver {
+                let tid = crate::share::runtime::threading::register(loader, handle)?;
+                set_instance_field(
+                    loader,
+                    handle,
+                    b"eetop",
+                    b"J",
+                    Value::Long(i64::from(tid.min(i64::MAX as u64) as i64)),
+                )?;
+                let holder = {
+                    let objects = loader.borrow_objects();
+                    objects.get(handle).and_then(|object| {
+                        let slot = object
+                            .klass
+                            .instanceField(b"holder", b"Ljava/lang/Thread$FieldHolder;")
+                            .ok()?;
+                        object.fields.get(slot).copied()
+                    })
+                };
+                if let Some(Value::Object(holder_handle)) = holder {
+                    set_instance_field(
+                        loader,
+                        holder_handle,
+                        b"threadStatus",
+                        b"I",
+                        Value::Int(1),
+                    )?;
+                }
+            }
+            None
+        }
         (b"java/lang/Thread", b"interrupt0", b"()V") => {
             let receiver = arguments.first().copied().unwrap_or(Value::Null);
             if let Value::Object(handle) = receiver {
@@ -401,7 +482,6 @@ pub fn invokeInstance<'a>(
                 crate::share::oops::objArrayOop::ObjArrayOop::withComponent(0, component)?;
             Some(Value::ObjectArray(loader.alloc_obj_array(array)))
         }
-        _ if owner.starts_with(b"java/lang/Thread") && descriptor.ends_with(b")V") => None,
         _ if owner.starts_with(b"java/lang/ref/")
             && name == b"refersTo0"
             && descriptor == b"(Ljava/lang/Object;)Z" => {
@@ -455,7 +535,56 @@ pub fn invokeInstance<'a>(
             else {
                 return Err(io::Error::other("Invalid library name"));
             };
-            super::nativeLibraries::NativeLibraries::global().load_library(name.as_ref())?;
+            let java_home = loader
+                .systemProperties
+                .borrow()
+                .get("java.home")
+                .cloned();
+            let file_name = if cfg!(windows) {
+                format!("{name}.dll")
+            } else if cfg!(target_os = "macos") {
+                format!("lib{name}.dylib")
+            } else {
+                format!("lib{name}.so")
+            };
+            let builtin = java_home.as_deref().is_some_and(|home| {
+                ["lib", "bin"].iter().any(|sub| {
+                    std::path::Path::new(home)
+                        .join(sub)
+                        .join(&file_name)
+                        .is_file()
+                })
+            });
+            if std::env::var_os("JVM25_TRACE_NATIVE").is_some() {
+                eprintln!("[loadLibrary0] name={name} file={file_name} home={java_home:?} builtin={builtin}");
+            }
+            if !builtin {
+                // JDK's default java.library.path starts with the current
+                // directory; honour an explicit property first.
+                let mut search_path = String::from(".");
+                {
+                    let props = loader.systemProperties.borrow();
+                    if let Some(value) = props.get("java.library.path") {
+                        search_path.push_str(*value);
+                    }
+                    if let Some(home) = props.get("java.home") {
+                        for sub in ["bin", "lib"] {
+                            if !search_path.is_empty() {
+                                search_path.push(';');
+                            }
+                            search_path.push_str(
+                                &std::path::Path::new(*home)
+                                    .join(sub)
+                                    .to_string_lossy(),
+                            );
+                        }
+                    }
+                }
+                super::nativeLibraries::NativeLibraries::global().loadLibraryWithPaths(
+                    name.as_ref(),
+                    Some(&search_path),
+                )?;
+            }
             None
         }
         _ if ((owner == b"java/io/WinNTFileSystem"
@@ -583,6 +712,9 @@ fn current_thread<'a>(
 ) -> io::Result<crate::share::interpreter::bytecodeInterpreter::Value<'a>> {
     use crate::share::interpreter::bytecodeInterpreter::Value;
 
+    if let Some(handle) = crate::share::runtime::threading::current_thread_handle(loader) {
+        return Ok(Value::Object(handle));
+    }
     let handle = loader.currentThreadObject()?;
     let uninitialized = {
         let objects = loader.borrow_objects();
@@ -721,11 +853,22 @@ pub fn invokeStatic<'a>(
     name: &[u8],
     descriptor: &[u8],
     arguments: &[crate::share::interpreter::bytecodeInterpreter::Value<'a>],
+    output: &mut dyn std::io::Write,
+    depth: usize,
 ) -> io::Result<Option<Option<crate::share::interpreter::bytecodeInterpreter::Value<'a>>>> {
     let _rg = crate::share::recprobe::Guard::enter("invokeStatic");
     use super::jvm::Jvm;
     use super::jvmNatives::JvmNatives;
     use crate::share::interpreter::bytecodeInterpreter::Value;
+
+    if std::env::var_os("JVM25_TRACE_NATIVE").is_some() {
+        eprintln!(
+            "[invokeStatic] {}.{}{}",
+            String::from_utf8_lossy(owner),
+            String::from_utf8_lossy(name),
+            String::from_utf8_lossy(descriptor)
+        );
+    }
 
     if let Some(result) =
         super::reflectionNatives::invoke_static(loader, owner, name, descriptor, arguments)?
@@ -733,7 +876,34 @@ pub fn invokeStatic<'a>(
         return Ok(Some(result));
     }
 
+    if let Some(result) =
+        super::methodHandleNatives::invoke_static(loader, owner, name, descriptor, arguments)?
+    {
+        return Ok(Some(result));
+    }
+
+    if let Some(result) =
+        super::netNatives::invoke_static(loader, owner, name, descriptor, arguments)?
+    {
+        return Ok(Some(result));
+    }
+
     let result = match (owner, name, descriptor) {
+        (b"java/lang/ProcessEnvironment", b"environmentBlock", b"()Ljava/lang/String;") if cfg!(windows) => {
+            let mut variables: Vec<_> = std::env::vars_os()
+                .map(|(key, value)| {
+                    let mut entry = key.to_string_lossy().into_owned();
+                    entry.push('=');
+                    entry.push_str(&value.to_string_lossy());
+                    entry
+                })
+                .collect();
+            variables.sort_by_key(|entry| entry.to_uppercase());
+            let mut block = variables.join("\0");
+            block.push('\0');
+            block.push('\0');
+            Some(Some(Value::HostString(loader.storage.alloc_str(&block))))
+        }
         (b"java/lang/StringUTF16", b"isBigEndian", b"()Z") => {
             Some(Some(Value::Int(i32::from(cfg!(target_endian = "big")))))
         }
@@ -747,7 +917,64 @@ pub fn invokeStatic<'a>(
         | (b"java/io/FileDescriptor", b"setLong", b"(IJ)V")
         | (b"java/io/FileDescriptor", b"setHandle", b"(IJ)V") => Some(None),
         (b"jdk/internal/misc/Signal", b"findSignal0", b"(Ljava/lang/String;)I") => {
-            Some(Some(Value::Int(-1)))
+            // Standard signal numbers (Linux/POSIX numbering, same table
+            // HotSpot uses on Windows for the Signal API).
+            let name = arguments
+                .first()
+                .and_then(|value| super::stringNatives::string(loader, *value).ok().flatten());
+            let number = name.as_deref().and_then(|name| match name {
+                "HUP" => Some(1),
+                "INT" => Some(2),
+                "QUIT" => Some(3),
+                "ILL" => Some(4),
+                "TRAP" => Some(5),
+                "ABRT" | "IOT" => Some(6),
+                "BUS" => Some(7),
+                "FPE" => Some(8),
+                "KILL" => Some(9),
+                "USR1" => Some(10),
+                "SEGV" => Some(11),
+                "USR2" => Some(12),
+                "PIPE" => Some(13),
+                "ALRM" => Some(14),
+                "TERM" => Some(15),
+                "STKFLT" => Some(16),
+                "CHLD" => Some(17),
+                "CONT" => Some(18),
+                "STOP" => Some(19),
+                "TSTP" => Some(20),
+                "TTIN" => Some(21),
+                "TTOU" => Some(22),
+                "URG" => Some(23),
+                "XCPU" => Some(24),
+                "XFSZ" => Some(25),
+                "VTALRM" => Some(26),
+                "PROF" => Some(27),
+                "WINCH" => Some(28),
+                "IO" => Some(29),
+                "PWR" => Some(30),
+                "SYS" => Some(31),
+                _ => None,
+            });
+            Some(Some(Value::Int(number.unwrap_or(-1))))
+        }
+        (b"jdk/internal/misc/Signal", b"handle0", b"(IJ)J") => {
+            Some(Some(Value::Long(0)))
+        }
+        (b"jdk/internal/misc/Signal", b"raise0", b"(I)V") => Some(None),
+        (b"java/util/TimeZone", b"getSystemTimeZoneID", b"(Ljava/lang/String;)Ljava/lang/String;") => {
+            let user_tz = arguments
+                .first()
+                .and_then(|value| super::stringNatives::string(loader, *value).ok().flatten())
+                .map(|text| text.into_owned())
+                .filter(|text| !text.is_empty());
+            let tz = user_tz
+                .or_else(|| std::env::var("TZ").ok().filter(|v| !v.is_empty()))
+                .unwrap_or_else(|| "GMT".to_string());
+            Some(Some(Value::HostString(loader.storage.alloc_str(&tz))))
+        }
+        (b"java/util/TimeZone", b"getSystemGMTOffsetID", b"()Ljava/lang/String;") => {
+            Some(Some(Value::HostString(loader.storage.alloc_str("GMT"))))
         }
         (b"java/lang/Thread", b"getNextThreadIdOffset", b"()J") => Some(Some(Value::Long(
             crate::share::prims::unsafeNatives::THREAD_TID_SENTINEL_OFFSET,
@@ -789,10 +1016,137 @@ pub fn invokeStatic<'a>(
             Some(None)
         }
         (b"java/lang/System", b"mapLibraryName", b"(Ljava/lang/String;)Ljava/lang/String;") => {
-            arguments.first().copied().map(Some)
+            let mapped = arguments
+                .first()
+                .and_then(|value| super::stringNatives::string(loader, *value).ok().flatten())
+                .map(|name| {
+                    let name = name.as_ref();
+                    if cfg!(windows) {
+                        if name.ends_with(".dll") {
+                            name.to_string()
+                        } else {
+                            format!("{name}.dll")
+                        }
+                    } else if cfg!(target_os = "macos") {
+                        if name.starts_with("lib") && name.ends_with(".dylib") {
+                            name.to_string()
+                        } else {
+                            format!("lib{name}.dylib")
+                        }
+                    } else if name.starts_with("lib") && name.ends_with(".so") {
+                        name.to_string()
+                    } else {
+                        format!("lib{name}.so")
+                    }
+                });
+            if std::env::var_os("JVM25_TRACE_NATIVE").is_some() {
+                eprintln!("[mapLibraryName] -> {mapped:?}");
+            }
+            match mapped {
+                Some(text) => Some(Some(Value::HostString(loader.storage.alloc_str(&text)))),
+                None => Some(Some(Value::Null)),
+            }
         }
         (b"jdk/internal/loader/NativeLibraries", b"findBuiltinLib", b"(Ljava/lang/String;)Ljava/lang/String;") => {
-            Some(Some(Value::Null))
+            let found = arguments
+                .first()
+                .and_then(|value| super::stringNatives::string(loader, *value).ok().flatten())
+                .and_then(|file| {
+                    let home = loader
+                        .systemProperties
+                        .borrow()
+                        .get("java.home")
+                        .copied()?;
+                    for sub in ["lib", "bin"] {
+                        let path = std::path::Path::new(home).join(sub).join(file.as_ref());
+                        if path.is_file() {
+                            return Some(path.to_string_lossy().into_owned());
+                        }
+                    }
+                    None
+                });
+            if std::env::var_os("JVM25_TRACE_NATIVE").is_some() {
+                eprintln!("[findBuiltinLib] -> {found:?}");
+            }
+            match found {
+                Some(path) => Some(Some(Value::HostString(loader.storage.alloc_str(&path)))),
+                None => Some(Some(Value::Null)),
+            }
+        }
+        (b"jdk/internal/loader/NativeLibraries", b"load", b"(Ljdk/internal/loader/NativeLibraries$NativeLibraryImpl;Ljava/lang/String;ZZ)Z") => {
+            let impl_value = arguments.first().copied().unwrap_or(Value::Null);
+            let path_value = arguments.get(1).copied().unwrap_or(Value::Null);
+            let is_builtin = matches!(arguments.get(2), Some(Value::Int(i)) if *i != 0);
+            let throw_on_fail = matches!(arguments.get(3), Some(Value::Int(i)) if *i != 0);
+            let path = super::stringNatives::string(loader, path_value)?
+                .map(|cow| cow.into_owned())
+                .unwrap_or_default();
+            if std::env::var_os("JVM25_TRACE_NATIVE").is_some() {
+                eprintln!("[NativeLibraries.load] path={path} builtin={is_builtin} throw={throw_on_fail}");
+            }
+            let Value::Object(impl_handle) = impl_value else {
+                return Err(io::Error::other("Invalid NativeLibraryImpl"));
+            };
+            let (handle, ok) = if is_builtin {
+                (-1i64, true)
+            } else {
+                match super::nativeLibraries::NativeLibraries::global()
+                    .load_handle(std::path::Path::new(&path))
+                {
+                    Ok(value) => (value as i64, true),
+                    Err(error) => {
+                        if throw_on_fail {
+                            return Err(error);
+                        }
+                        (0, false)
+                    }
+                }
+            };
+            if ok {
+                set_instance_field(
+                    loader,
+                    impl_handle,
+                    b"handle",
+                    b"J",
+                    Value::Long(handle),
+                )?;
+                set_instance_field(
+                    loader,
+                    impl_handle,
+                    b"jniVersion",
+                    b"I",
+                    Value::Int(0x0001_0008),
+                )?;
+            }
+            Some(Some(Value::Int(i32::from(ok))))
+        }
+        (b"jdk/internal/loader/NativeLibraries", b"unload", b"(Ljava/lang/String;ZJ)V") => {
+            let is_builtin = matches!(arguments.get(1), Some(Value::Int(i)) if *i != 0);
+            let handle = match arguments.get(2) {
+                Some(Value::Long(value)) => *value as usize,
+                _ => 0,
+            };
+            if !is_builtin && handle != usize::MAX {
+                let _ = super::nativeLibraries::NativeLibraries::global().unload_handle(handle);
+            }
+            Some(None)
+        }
+        (b"jdk/internal/loader/NativeLibrary", b"findEntry0", b"(JLjava/lang/String;)J") => {
+            let handle = match arguments.first() {
+                Some(Value::Long(value)) => *value as usize,
+                _ => 0,
+            };
+            let symbol = arguments
+                .get(1)
+                .and_then(|value| super::stringNatives::string(loader, *value).ok().flatten());
+            let address = if handle == usize::MAX {
+                None
+            } else {
+                symbol.and_then(|name| {
+                    super::nativeLibraries::NativeLibraries::global().find_entry(name.as_ref())
+                })
+            };
+            Some(Some(Value::Long(address.unwrap_or(0) as i64)))
         }
         (b"jdk/internal/loader/BootLoader", b"setBootLoaderUnnamedModule0", b"(Ljava/lang/Module;)V") => {
             Some(None)
@@ -910,9 +1264,21 @@ pub fn invokeStatic<'a>(
                 Err(error) => return Err(error),
             }
         }
-        (b"java/lang/Thread", b"yield0", b"()V")
-        | (b"java/lang/Thread", b"sleep0", b"(J)V")
-        | (b"java/lang/Thread", b"clearInterruptEvent", b"()V") => Some(None),
+        (b"java/lang/Thread", b"yield0", b"()V") => {
+            crate::share::runtime::threading::yield_thread(loader, output, depth)?;
+            Some(None)
+        }
+        (b"java/lang/Thread", b"sleep0", b"(J)V") => {
+            // sleep0 takes nanoseconds (Thread.sleep converts millis via
+            // TimeUnit.MILLISECONDS.toNanos before calling it).
+            let nanos = match arguments.first() {
+                Some(Value::Long(nanos)) => *nanos,
+                _ => 0,
+            };
+            crate::share::runtime::threading::sleep_nanos(loader, nanos, output, depth)?;
+            Some(None)
+        }
+        (b"java/lang/Thread", b"clearInterruptEvent", b"()V") => Some(None),
         (b"java/lang/Thread", b"holdsLock", b"(Ljava/lang/Object;)Z") => {
             Some(Some(Value::Int(i32::from(matches!(
                 arguments.first(),
@@ -982,6 +1348,21 @@ pub fn invokeStatic<'a>(
         (b"jdk/internal/misc/CDS", b"getCDSConfigStatus", b"()I") => {
             Some(Some(Value::Int(0)))
         }
+        (b"jdk/internal/misc/CDS", b"isDumpingClassList0", b"()Z") => {
+            Some(Some(Value::Int(0)))
+        }
+        (b"jdk/internal/misc/CDS", b"isDumpingArchive0", b"()Z") => {
+            Some(Some(Value::Int(0)))
+        }
+        (b"jdk/internal/misc/CDS", b"isSharingEnabled0", b"()Z") => {
+            // No CDS archive: behave as if sharing is unavailable.
+            Some(Some(Value::Int(0)))
+        }
+        (b"jdk/internal/misc/CDS", b"logLambdaFormInvoker", b"(Ljava/lang/String;)V") => Some(None),
+        (b"jdk/internal/misc/CDS", b"initializeFromArchive", b"(Ljava/lang/Class;)V") => Some(None),
+        (b"jdk/internal/misc/CDS", b"defineArchivedModules", b"(Ljava/lang/ClassLoader;Ljava/lang/ClassLoader;)V") => Some(None),
+        (b"jdk/internal/misc/CDS", b"dumpClassList", b"(Ljava/lang/String;)V") => Some(None),
+        (b"jdk/internal/misc/CDS", b"dumpDynamicArchive", b"(Ljava/lang/String;)V") => Some(None),
         (b"jdk/internal/util/SystemProps$Raw", b"platformProperties", b"()[Ljava/lang/String;") => {
             // Positional array indexed by SystemProps.Raw NDX constants.
             let slots = super::systemProperties::platform_property_slots(loader);
@@ -1164,6 +1545,26 @@ pub fn invokeStatic<'a>(
                 None => return Ok(None),
             }
         }
+        (b"sun/security/provider/NativeSeedGenerator", b"nativeGenerateSeed", b"([B)Z") => {
+            let filled = match arguments.first().copied() {
+                Some(Value::PrimitiveArray(handle)) => {
+                    let mut arrays = loader.arrays.borrow_mut();
+                    match arrays.get_mut(handle) {
+                        Some(crate::share::oops::typeArrayOop::TypeArrayOop::Byte(bytes)) => {
+                            let mut buf = vec![0u8; bytes.len()];
+                            let ok = os_random(&mut buf);
+                            for (slot, &byte) in bytes.iter_mut().zip(buf.iter()) {
+                                *slot = byte as i8;
+                            }
+                            ok
+                        }
+                        _ => false,
+                    }
+                }
+                _ => false,
+            };
+            Some(Some(Value::Int(i32::from(filled))))
+        }
         _ if ((owner == b"java/io/WinNTFileSystem"
                 || owner == b"java/io/UnixFileSystem"
                 || owner == b"java/io/FileDescriptor"
@@ -1200,3 +1601,62 @@ pub fn invokeStatic<'a>(
     Ok(result)
 }
 
+
+/// Fills `bytes` with operating-system entropy.
+#[cfg(windows)]
+fn os_random(bytes: &mut [u8]) -> bool {
+    #[link(name = "bcrypt")]
+    unsafe extern "system" {
+        fn BCryptGenRandom(
+            algorithm: *mut core::ffi::c_void,
+            buffer: *mut u8,
+            length: u32,
+            flags: u32,
+        ) -> i32;
+    }
+    const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 0x0000_0002;
+    if bytes.is_empty() {
+        return true;
+    }
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        let chunk = (bytes.len() - offset).min(u32::MAX as usize) as u32;
+        let status = unsafe {
+            BCryptGenRandom(
+                core::ptr::null_mut(),
+                bytes[offset..].as_mut_ptr(),
+                chunk,
+                BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+            )
+        };
+        if status != 0 {
+            return false;
+        }
+        offset += chunk as usize;
+    }
+    true
+}
+
+/// Fills `bytes` with a splitmix64 generator seeded from the OS clock
+/// and process state (non-Windows fallback).
+#[cfg(not(windows))]
+fn os_random(bytes: &mut [u8]) -> bool {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x9E37_79B9_7F4A_7C15)
+        ^ ((std::process::id() as u64) << 32);
+    let mut state = seed | 1;
+    let mut buffer = [0u8; 8];
+    for chunk in bytes.chunks_mut(8) {
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        buffer[..8].copy_from_slice(&z.to_le_bytes());
+        chunk.copy_from_slice(&buffer[..chunk.len()]);
+    }
+    true
+}

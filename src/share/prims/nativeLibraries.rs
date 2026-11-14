@@ -4,7 +4,10 @@ use std::{
     collections::HashMap,
     io::{self, Error},
     path::{Path, PathBuf},
-    sync::{Mutex, OnceLock},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Mutex, OnceLock,
+    },
 };
 
 pub type NativeFunction = fn(args: &[Value<'_>]) -> Option<Value<'static>>;
@@ -13,6 +16,7 @@ pub type NativeFunction = fn(args: &[Value<'_>]) -> Option<Value<'static>>;
 /// and records JNI lifecycle callbacks.
 pub struct LoadedLibrary {
     pub path: PathBuf,
+    pub handle: usize,
     library: Library,
     #[allow(dead_code)]
     on_load: Option<
@@ -54,6 +58,7 @@ pub struct NativeLibraries {
     loadedLibraries: Mutex<Vec<LoadedLibrary>>,
     searchPaths: Mutex<Vec<PathBuf>>,
     customSymbols: Mutex<HashMap<String, NativeFunction>>,
+    next_handle: AtomicUsize,
 }
 
 static nativeLibraries: OnceLock<NativeLibraries> = OnceLock::new();
@@ -68,6 +73,7 @@ impl NativeLibraries {
                 PathBuf::from("lib"),
             ]),
             customSymbols: Mutex::new(HashMap::new()),
+            next_handle: AtomicUsize::new(1),
         }
     }
 
@@ -110,7 +116,7 @@ impl NativeLibraries {
         for dir in paths {
             let path = dir.join(&filename);
             if path.is_file() {
-                return self.loadPath(&path);
+                return self.loadPath(&path).map(|_| ());
             }
         }
         Err(Error::new(
@@ -126,10 +132,22 @@ impl NativeLibraries {
                 "Native library path must be absolute",
             ));
         }
+        self.loadPath(path).map(|_| ())
+    }
+
+    /// Loads an absolute library path and returns the VM handle used by the
+    /// JDK `NativeLibrary` API (`handle`/`findEntry0`/`unload`).
+    pub fn load_handle(&self, path: &Path) -> io::Result<usize> {
+        if !path.is_absolute() {
+            return Err(Error::new(
+                io::ErrorKind::InvalidInput,
+                "Native library path must be absolute",
+            ));
+        }
         self.loadPath(path)
     }
 
-    fn loadPath(&self, path: &Path) -> io::Result<()> {
+    fn loadPath(&self, path: &Path) -> io::Result<usize> {
         let loadPath = if path.is_absolute() {
             path.to_path_buf()
         } else {
@@ -138,8 +156,8 @@ impl NativeLibraries {
         let path = loadPath.canonicalize()?;
         {
             let libraries = self.loadedLibraries.lock().unwrap();
-            if libraries.iter().any(|loaded| loaded.path == path) {
-                return Ok(());
+            if let Some(loaded) = libraries.iter().find(|loaded| loaded.path == path) {
+                return Ok(loaded.handle);
             }
         }
         let library = unsafe { Library::new(&loadPath) }.map_err(Error::other)?;
@@ -165,27 +183,33 @@ impl NativeLibraries {
         };
 
         // JNI_OnLoad runs on the loading thread with a valid JavaVM*.
+        // JVM25_SKIP_JNI_ONLOAD is a diagnostic escape hatch for JDK built-ins
+        // whose JNI_OnLoad expects HotSpot internals we do not reproduce.
         if let Some(on_load) = on_load {
-            let vm = crate::share::prims::jniInvocation::JavaVm::global();
-            let _env = unsafe { &*vm }.ensure_attached();
-            let result = unsafe { on_load(vm, std::ptr::null_mut()) };
-            // JNI_VERSION_1_2 (0x00010002) is the minimum accepted by HotSpot.
-            if result < 0x00010002 {
-                return Err(Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("JNI_OnLoad returned unsupported version {result:#x}"),
-                ));
+            if std::env::var_os("JVM25_SKIP_JNI_ONLOAD").is_none() {
+                let vm = crate::share::prims::jniInvocation::JavaVm::global();
+                let _env = unsafe { &*vm }.ensure_attached();
+                let result = unsafe { on_load(vm, std::ptr::null_mut()) };
+                // JNI_VERSION_1_2 (0x00010002) is the minimum accepted by HotSpot.
+                if result < 0x00010002 {
+                    return Err(Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("JNI_OnLoad returned unsupported version {result:#x}"),
+                    ));
+                }
             }
         }
 
+        let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
         let loaded = LoadedLibrary {
             path,
+            handle,
             library,
             on_load,
             on_unload,
         };
         self.loadedLibraries.lock().unwrap().push(loaded);
-        Ok(())
+        Ok(handle)
     }
 
     /// Unloads a library by canonical path, invoking JNI_OnUnload first.
@@ -203,6 +227,34 @@ impl NativeLibraries {
         }
         drop(loaded);
         Ok(())
+    }
+
+    /// Unloads a library by the handle returned from [`Self::load_handle`].
+    pub fn unload_handle(&self, handle: usize) -> io::Result<()> {
+        let mut libraries = self.loadedLibraries.lock().unwrap();
+        let position = libraries
+            .iter()
+            .position(|loaded| loaded.handle == handle)
+            .ok_or_else(|| Error::new(io::ErrorKind::NotFound, "Library not loaded"))?;
+        let loaded = libraries.swap_remove(position);
+        if let Some(on_unload) = loaded.on_unload {
+            let vm = crate::share::prims::jniInvocation::JavaVm::global();
+            unsafe { on_unload(vm, std::ptr::null_mut()) };
+        }
+        drop(loaded);
+        Ok(())
+    }
+
+    /// Resolves an exported symbol address for `NativeLibrary.findEntry0`.
+    /// Scans loaded libraries in load order, matching JNI `find` semantics.
+    pub fn find_entry(&self, symbol: &str) -> Option<usize> {
+        if symbol.as_bytes().contains(&0) {
+            return None;
+        }
+        let libraries = self.loadedLibraries.lock().unwrap();
+        libraries
+            .iter()
+            .find_map(|loaded| loaded.symbol(symbol).map(|sym| sym as usize))
     }
 
     pub fn hasSymbol(&self, symbol: &str) -> io::Result<bool> {

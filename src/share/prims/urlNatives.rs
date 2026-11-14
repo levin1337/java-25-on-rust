@@ -32,6 +32,75 @@ use std::{
 /// `url_connection.java`).
 const URL_CONNECTION_CLASS: &[u8] = b"jvm25/url/UrlConnection";
 
+const URL_CONNECTION_CLASS_BYTES: &[u8] = &[
+    202, 254, 186, 190, 0, 0, 0, 65, 0, 41, 10, 0, 2, 0, 3, 7,
+    0, 4, 12, 0, 5, 0, 6, 1, 0, 22, 106, 97, 118, 97, 47, 110,
+    101, 116, 47, 85, 82, 76, 67, 111, 110, 110, 101, 99, 116, 105, 111, 110,
+    1, 0, 6, 60, 105, 110, 105, 116, 62, 1, 0, 17, 40, 76, 106, 97,
+    118, 97, 47, 110, 101, 116, 47, 85, 82, 76, 59, 41, 86, 10, 0, 8,
+    0, 9, 7, 0, 10, 12, 0, 11, 0, 12, 1, 0, 23, 106, 118, 109,
+    50, 53, 47, 117, 114, 108, 47, 85, 114, 108, 67, 111, 110, 110, 101, 99,
+    116, 105, 111, 110, 1, 0, 5, 111, 112, 101, 110, 48, 1, 0, 23, 40,
+    41, 76, 106, 97, 118, 97, 47, 105, 111, 47, 73, 110, 112, 117, 116, 83,
+    116, 114, 101, 97, 109, 59, 10, 0, 8, 0, 14, 12, 0, 15, 0, 16,
+    1, 0, 7, 108, 101, 110, 103, 116, 104, 48, 1, 0, 3, 40, 41, 74,
+    5, 0, 0, 0, 0, 127, 255, 255, 255, 1, 0, 4, 67, 111, 100, 101,
+    1, 0, 15, 76, 105, 110, 101, 78, 117, 109, 98, 101, 114, 84, 97, 98,
+    108, 101, 1, 0, 7, 99, 111, 110, 110, 101, 99, 116, 1, 0, 3, 40,
+    41, 86, 1, 0, 14, 103, 101, 116, 73, 110, 112, 117, 116, 83, 116, 114,
+    101, 97, 109, 1, 0, 10, 69, 120, 99, 101, 112, 116, 105, 111, 110, 115,
+    7, 0, 26, 1, 0, 19, 106, 97, 118, 97, 47, 105, 111, 47, 73, 79,
+    69, 120, 99, 101, 112, 116, 105, 111, 110, 1, 0, 16, 103, 101, 116, 67,
+    111, 110, 116, 101, 110, 116, 76, 101, 110, 103, 116, 104, 1, 0, 3, 40,
+    41, 73, 1, 0, 13, 83, 116, 97, 99, 107, 77, 97, 112, 84, 97, 98,
+    108, 101, 1, 0, 20, 103, 101, 116, 67, 111, 110, 116, 101, 110, 116, 76,
+    101, 110, 103, 116, 104, 76, 111, 110, 103, 1, 0, 14, 103, 101, 116, 67,
+    111, 110, 116, 101, 110, 116, 84, 121, 112, 101, 1, 0, 20, 40, 41, 76,
+    106, 97, 118, 97, 47, 108, 97, 110, 103, 47, 83, 116, 114, 105, 110, 103,
+    59, 1, 0, 14, 103, 101, 116, 72, 101, 97, 100, 101, 114, 70, 105, 101,
+    108, 100, 1, 0, 38, 40, 76, 106, 97, 118, 97, 47, 108, 97, 110, 103,
+    47, 83, 116, 114, 105, 110, 103, 59, 41, 76, 106, 97, 118, 97, 47, 108,
+    97, 110, 103, 47, 83, 116, 114, 105, 110, 103, 59, 1, 0, 15, 103, 101,
+    116, 72, 101, 97, 100, 101, 114, 70, 105, 101, 108, 100, 115, 1, 0, 17,
+    40, 41, 76, 106, 97, 118, 97, 47, 117, 116, 105, 108, 47, 77, 97, 112,
+    59, 1, 0, 9, 83, 105, 103, 110, 97, 116, 117, 114, 101, 1, 0, 73,
+    40, 41, 76, 106, 97, 118, 97, 47, 117, 116, 105, 108, 47, 77, 97, 112,
+    60, 76, 106, 97, 118, 97, 47, 108, 97, 110, 103, 47, 83, 116, 114, 105,
+    110, 103, 59, 76, 106, 97, 118, 97, 47, 117, 116, 105, 108, 47, 76, 105,
+    115, 116, 60, 76, 106, 97, 118, 97, 47, 108, 97, 110, 103, 47, 83, 116,
+    114, 105, 110, 103, 59, 62, 59, 62, 59, 1, 0, 10, 83, 111, 117, 114,
+    99, 101, 70, 105, 108, 101, 1, 0, 18, 85, 114, 108, 67, 111, 110, 110,
+    101, 99, 116, 105, 111, 110, 46, 106, 97, 118, 97, 0, 49, 0, 8, 0,
+    2, 0, 0, 0, 0, 0, 10, 0, 1, 0, 5, 0, 6, 0, 1, 0,
+    19, 0, 0, 0, 34, 0, 2, 0, 2, 0, 0, 0, 6, 42, 43, 183,
+    0, 1, 177, 0, 0, 0, 1, 0, 20, 0, 0, 0, 10, 0, 2, 0,
+    0, 0, 16, 0, 5, 0, 17, 0, 1, 0, 21, 0, 22, 0, 1, 0,
+    19, 0, 0, 0, 25, 0, 0, 0, 1, 0, 0, 0, 1, 177, 0, 0,
+    0, 1, 0, 20, 0, 0, 0, 6, 0, 1, 0, 0, 0, 21, 0, 1,
+    0, 23, 0, 12, 0, 2, 0, 19, 0, 0, 0, 29, 0, 1, 0, 1,
+    0, 0, 0, 5, 42, 182, 0, 7, 176, 0, 0, 0, 1, 0, 20, 0,
+    0, 0, 6, 0, 1, 0, 0, 0, 25, 0, 24, 0, 0, 0, 4, 0,
+    1, 0, 25, 1, 2, 0, 11, 0, 12, 0, 1, 0, 24, 0, 0, 0,
+    4, 0, 1, 0, 25, 1, 2, 0, 15, 0, 16, 0, 0, 0, 1, 0,
+    27, 0, 28, 0, 1, 0, 19, 0, 0, 0, 73, 0, 4, 0, 3, 0,
+    0, 0, 24, 42, 182, 0, 13, 64, 31, 9, 148, 155, 0, 11, 31, 20,
+    0, 17, 148, 158, 0, 5, 2, 172, 31, 136, 172, 0, 0, 0, 2, 0,
+    20, 0, 0, 0, 18, 0, 4, 0, 0, 0, 34, 0, 5, 0, 35, 0,
+    19, 0, 36, 0, 21, 0, 38, 0, 29, 0, 0, 0, 7, 0, 2, 252,
+    0, 19, 4, 1, 0, 1, 0, 30, 0, 16, 0, 1, 0, 19, 0, 0,
+    0, 29, 0, 2, 0, 1, 0, 0, 0, 5, 42, 182, 0, 13, 173, 0,
+    0, 0, 1, 0, 20, 0, 0, 0, 6, 0, 1, 0, 0, 0, 43, 0,
+    1, 0, 31, 0, 32, 0, 1, 0, 19, 0, 0, 0, 26, 0, 1, 0,
+    1, 0, 0, 0, 2, 1, 176, 0, 0, 0, 1, 0, 20, 0, 0, 0,
+    6, 0, 1, 0, 0, 0, 48, 0, 1, 0, 33, 0, 34, 0, 1, 0,
+    19, 0, 0, 0, 26, 0, 1, 0, 2, 0, 0, 0, 2, 1, 176, 0,
+    0, 0, 1, 0, 20, 0, 0, 0, 6, 0, 1, 0, 0, 0, 53, 0,
+    1, 0, 35, 0, 36, 0, 2, 0, 19, 0, 0, 0, 26, 0, 1, 0,
+    1, 0, 0, 0, 2, 1, 176, 0, 0, 0, 1, 0, 20, 0, 0, 0,
+    6, 0, 1, 0, 0, 0, 58, 0, 37, 0, 0, 0, 2, 0, 38, 0,
+    1, 0, 39, 0, 0, 0, 2, 0, 40,
+];
+
 fn invalid(message: &'static str) -> io::Error {
     io::Error::other(message)
 }
@@ -114,34 +183,6 @@ fn object_field<'a>(
         .ok_or_else(|| invalid("Invalid field slot"))
 }
 
-/// Writes an instance field of an object value.
-fn set_object_field<'a>(
-    loader: &ClassLoader<'a>,
-    object: Value<'a>,
-    name: &[u8],
-    descriptor: &[u8],
-    value: Value<'a>,
-) -> io::Result<()> {
-    let Value::Object(handle) = object else {
-        return Err(invalid("Expected object receiver"));
-    };
-    let slot = {
-        let objects = loader.borrow_objects();
-        let target = objects
-            .get(handle)
-            .ok_or_else(|| invalid("Invalid object reference"))?;
-        target.klass.instanceField(name, descriptor)?
-    };
-    let mut objects = loader.borrow_objects_mut();
-    let target = objects
-        .get_mut(handle)
-        .ok_or_else(|| invalid("Invalid object reference"))?;
-    if slot < target.fields.len() {
-        target.fields[slot] = value;
-    }
-    Ok(())
-}
-
 /// Reads a String-typed instance field as owned text.
 fn string_field<'a>(
     loader: &ClassLoader<'a>,
@@ -183,7 +224,7 @@ fn connection_class<'a>(
     if let Ok(klass) = loader.load(URL_CONNECTION_CLASS) {
         return Ok(klass);
     }
-    loader.define_class_bytes(URL_CONNECTION_CLASS, include_bytes!("url_connection.class"))?;
+    loader.define_class_bytes(URL_CONNECTION_CLASS, URL_CONNECTION_CLASS_BYTES)?;
     loader.load(URL_CONNECTION_CLASS)
 }
 
@@ -457,6 +498,35 @@ fn resource_specs<'a>(loader: &ClassLoader<'a>, name: &str) -> io::Result<Vec<St
     Ok(specs)
 }
 
+pub(crate) fn classResource<'a>(
+    loader: &ClassLoader<'a>,
+    class: &[u8],
+    value: Value<'a>,
+) -> io::Result<Value<'a>> {
+    if matches!(value, Value::Null) {
+        return Err(invalid("NullPointerException"));
+    }
+    let name = stringNatives::string(loader, value)?.ok_or_else(|| invalid("Expected resource name"))?;
+    let name = if let Some(absolute) = name.strip_prefix('/') {
+        absolute.to_owned()
+    } else {
+        let mut component = class;
+        while let Some(rest) = component.strip_prefix(b"[") { component = rest; }
+        if let Some(rest) = component.strip_prefix(b"L").and_then(|value| value.strip_suffix(b";")) {
+            component = rest;
+        }
+        let prefix = component.iter().rposition(|byte| *byte == b'/')
+            .map(|end| &component[..end + 1]).unwrap_or_default();
+        format!("{}{}", crate::classfile::decodeString(prefix)?, name)
+    };
+    let Some(spec) = resource_specs(loader, &name)?.into_iter().next() else {
+        return Ok(Value::Null);
+    };
+    let klass = loader.load(b"java/net/URL")?;
+    bytecodeInterpreter::initialize(loader, &klass, &mut sink(), 0)?;
+    Ok(Value::Object(make_url(loader, &klass, &spec)?))
+}
+
 /// Constructs a real `java.net.URL` for `spec` through `URL.<init>(String)`.
 fn make_url<'a>(
     loader: &ClassLoader<'a>,
@@ -615,13 +685,4 @@ pub(crate) fn invoke_instance<'a>(
     }
 }
 
-/// Static-method interception (currently unused; kept for symmetric wiring).
-pub(crate) fn invoke_static<'a>(
-    _loader: &ClassLoader<'a>,
-    _owner: &[u8],
-    _name: &[u8],
-    _descriptor: &[u8],
-    _arguments: &[Value<'a>],
-) -> io::Result<Option<Option<Value<'a>>>> {
-    Ok(None)
-}
+

@@ -94,7 +94,7 @@ impl JavaCalls {
         name: &[u8],
         descriptor: &[u8],
         args: &JavaCallArguments<'a>,
-        output: &mut impl Write,
+        output: &mut dyn Write,
     ) -> io::Result<Option<Value<'a>>> {
         let code = klass.staticCode(name, descriptor, false)?;
         bytecodeInterpreter::initialize(loader, klass, output, 0)?;
@@ -108,7 +108,7 @@ impl JavaCalls {
         name: &[u8],
         descriptor: &[u8],
         args: &JavaCallArguments<'a>,
-        output: &mut impl Write,
+        output: &mut dyn Write,
     ) -> io::Result<Option<Value<'a>>> {
         let code = klass.methodCode(name, descriptor, false, false)?;
         bytecodeInterpreter::initialize(loader, klass, output, 0)?;
@@ -122,7 +122,7 @@ impl JavaCalls {
         name: &[u8],
         descriptor: &[u8],
         args: &JavaCallArguments<'a>,
-        output: &mut impl Write,
+        output: &mut dyn Write,
     ) -> io::Result<Option<Value<'a>>> {
         let method_name = String::from_utf8_lossy(name);
         let method_sig = String::from_utf8_lossy(descriptor);
@@ -162,7 +162,7 @@ impl JavaCalls {
 /// Bootstraps the minimal JDK runtime state that HotSpot normally establishes
 /// in `System.initPhase1/2/3`: `VM.initLevel`, `VM.savedProps`, `System.props`
 /// and `System.lineSeparator`. Skipped silently when no JDK image is present.
-fn bootstrap<'a>(loader: &ClassLoader<'a>, output: &mut impl Write) -> io::Result<()> {
+fn bootstrap<'a>(loader: &ClassLoader<'a>, output: &mut dyn Write) -> io::Result<()> {
     // Merge platform properties (java.home, os.name, ...) underneath any
     // user-supplied -D entries so System.getProperty/props see the full set.
     {
@@ -274,9 +274,15 @@ pub fn mainClass<'a>(
     loader: &ClassLoader<'a>,
     name: &str,
     arguments: &'a [String],
-    output: &mut impl Write,
+    output: &mut dyn Write,
 ) -> io::Result<()> {
     if let Ok(system) = loader.load(b"java/lang/System") {
+        // HotSpot eagerly initializes java.lang.ref.Reference during VM
+        // startup; its <clinit> registers JavaLangRefAccess in SharedSecrets,
+        // which System.initPhase1 needs for startThreads().
+        if let Ok(reference) = loader.load(b"java/lang/ref/Reference") {
+            let _ = bytecodeInterpreter::initialize(loader, &reference, output, 0);
+        }
         let args = JavaCallArguments::new();
         let _ = JavaCalls::call_static(loader, &system, b"initPhase1", b"()V", &args, output);
         let mut args = JavaCallArguments::new();

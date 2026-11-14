@@ -449,7 +449,7 @@ fn javaDouble(value: f64) -> String {
 pub(crate) fn describeValue<'a>(
     loader: &ClassLoader<'a>,
     value: Value<'a>,
-    output: &mut impl Write,
+    output: &mut dyn Write,
     depth: usize,
 ) -> io::Result<String> {
     describeValueKind(loader, value, false, output, depth)
@@ -459,7 +459,7 @@ fn describeValueKind<'a>(
     loader: &ClassLoader<'a>,
     value: Value<'a>,
     as_boolean: bool,
-    output: &mut impl Write,
+    output: &mut dyn Write,
     depth: usize,
 ) -> io::Result<String> {
     match value {
@@ -518,7 +518,7 @@ fn describeValueKind<'a>(
 pub(crate) fn initialize<'a>(
     loader: &ClassLoader<'a>,
     klass: &InstanceKlass<'a>,
-    output: &mut impl Write,
+    output: &mut dyn Write,
     depth: usize,
 ) -> io::Result<()> {
     let _rg = crate::share::recprobe::Guard::enter("initialize");
@@ -577,7 +577,7 @@ pub fn execute<'a>(
     klass: &InstanceKlass<'a>,
     code: Code<'a>,
     arguments: &[Value<'a>],
-    output: &mut impl Write,
+    output: &mut dyn Write,
     depth: usize,
     access_flags: u16,
 ) -> io::Result<Option<Value<'a>>> {
@@ -589,7 +589,7 @@ pub fn execute_labeled<'a>(
     klass: &InstanceKlass<'a>,
     code: Code<'a>,
     arguments: &[Value<'a>],
-    output: &mut impl Write,
+    output: &mut dyn Write,
     depth: usize,
     access_flags: u16,
     method: Option<(&'a [u8], &'a [u8])>,
@@ -678,7 +678,7 @@ fn executeFrame<'a>(
     klass: &InstanceKlass<'a>,
     code: Code<'a>,
     arguments: &[Value<'a>],
-    output: &mut impl Write,
+    output: &mut dyn Write,
     depth: usize,
     owner: &'a [u8],
 ) -> io::Result<Option<Value<'a>>> {
@@ -710,7 +710,12 @@ fn executeFrame<'a>(
         monitors: Vec::new(),
     };
     let _registration = FrameRegistration::new(&frame);
+    let mut safepoint_tick = 0u32;
     loop {
+        safepoint_tick = safepoint_tick.wrapping_add(1);
+        if safepoint_tick & 0x3ff == 0 {
+            crate::share::runtime::threading::schedule(loader, output, depth)?;
+        }
         if loader.gc_due() {
             loader.reset_allocations();
             let _ = crate::share::memory::heap::collect(loader);
@@ -768,7 +773,7 @@ fn dotted(name: &[u8]) -> String {
 /// `gc_extra_roots` while the constructor executes.
 fn throwableObject<'a>(
     loader: &ClassLoader<'a>,
-    output: &mut impl Write,
+    output: &mut dyn Write,
     depth: usize,
     class_name: &[u8],
     message: Option<&str>,
@@ -854,7 +859,7 @@ fn throwableObject<'a>(
 /// loaded or instantiated (e.g. minimal bootstrap environments).
 fn jex<'a>(
     loader: &ClassLoader<'a>,
-    output: &mut impl Write,
+    output: &mut dyn Write,
     depth: usize,
     class_name: &[u8],
     message: Option<&str>,
@@ -881,7 +886,7 @@ fn jex<'a>(
 /// error, preserving fatal VM errors otherwise.
 fn linkageExc<'a>(
     loader: &ClassLoader<'a>,
-    output: &mut impl Write,
+    output: &mut dyn Write,
     depth: usize,
     error: Error,
 ) -> Error {
@@ -959,7 +964,7 @@ fn is_print_stream(loader: &ClassLoader<'_>, value: Value<'_>) -> bool {
     }
 }
 
-fn monitorKey(value: Value<'_>) -> Option<u64> {
+pub(crate) fn monitorKey(value: Value<'_>) -> Option<u64> {
     const OBJ_ARRAY: u64 = 1 << 62;
     const PRIM_ARRAY: u64 = 2 << 62;
     const OTHER: u64 = 3 << 62;
@@ -992,7 +997,7 @@ fn monitorKey(value: Value<'_>) -> Option<u64> {
 
 fn monitorEnter<'a>(
     loader: &ClassLoader<'a>,
-    output: &mut impl Write,
+    output: &mut dyn Write,
     depth: usize,
     value: Value<'a>,
 ) -> io::Result<u64> {
@@ -1008,16 +1013,26 @@ fn monitorEnter<'a>(
     let Some(key) = monitorKey(value) else {
         return Err(Error::other("Expected reference for monitor"));
     };
-    loader.synchronizer.borrow_mut().enter_thread(
-        key as usize,
-        crate::share::runtime::synchronizer::Synchronizer::DEFAULT_THREAD_ID,
-    );
+    // Contended monitors block cooperatively: keep trying while driving
+    // other queued Java threads until the lock is acquired.
+    loop {
+        let acquired = loader.synchronizer.borrow_mut().try_enter_thread(
+            key as usize,
+            crate::share::runtime::threading::current_tid(loader),
+        );
+        if acquired {
+            break;
+        }
+        if !crate::share::runtime::threading::run_next(loader, output, depth)? {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
     Ok(key)
 }
 
 fn monitorExit<'a>(
     loader: &ClassLoader<'a>,
-    output: &mut impl Write,
+    output: &mut dyn Write,
     depth: usize,
     value: Value<'a>,
 ) -> io::Result<()> {
@@ -1038,7 +1053,7 @@ fn monitorExit<'a>(
         .borrow_mut()
         .exit_thread(
             key as usize,
-            crate::share::runtime::synchronizer::Synchronizer::DEFAULT_THREAD_ID,
+            crate::share::runtime::threading::current_tid(loader),
         )
         .map_err(|message| {
             jex(
@@ -1060,7 +1075,7 @@ fn release_frame_monitors(loader: &ClassLoader<'_>, frame: &Frame<'_>) {
     for &key in &frame.monitors {
         let _ = synchronizer.exit_thread(
             key as usize,
-            crate::share::runtime::synchronizer::Synchronizer::DEFAULT_THREAD_ID,
+            crate::share::runtime::threading::current_tid(loader),
         );
     }
 }
@@ -1089,7 +1104,7 @@ fn step<'a>(
     loader: &ClassLoader<'a>,
     klass: &InstanceKlass<'a>,
     frame: &mut Frame<'a>,
-    output: &mut impl Write,
+    output: &mut dyn Write,
     depth: usize,
 ) -> io::Result<Step<'a>> {
     let pc = frame.pc;
@@ -2120,6 +2135,8 @@ fn step<'a>(
                     name,
                     descriptor,
                     &frame.stack[start..],
+                    output,
+                    depth,
                 )?
             {
                 frame.stack.truncate(start);
@@ -2142,11 +2159,26 @@ fn step<'a>(
                     if name == b"load" {
                         libraries.load(std::path::Path::new(path.as_ref()))?;
                     } else {
-                        let properties = loader.systemProperties.borrow();
-                        libraries.loadLibraryWithPaths(
-                            path.as_ref(),
-                            properties.get("java.library.path").copied(),
-                        )?;
+                        let mut search_path = String::from(".");
+                        {
+                            let properties = loader.systemProperties.borrow();
+                            if let Some(value) = properties.get("java.library.path") {
+                                search_path.push_str(*value);
+                            }
+                            if let Some(home) = properties.get("java.home") {
+                                for sub in ["bin", "lib"] {
+                                    if !search_path.is_empty() {
+                                        search_path.push(';');
+                                    }
+                                    search_path.push_str(
+                                        &std::path::Path::new(*home)
+                                            .join(sub)
+                                            .to_string_lossy(),
+                                    );
+                                }
+                            }
+                        }
+                        libraries.loadLibraryWithPaths(path.as_ref(), Some(&search_path))?;
                     }
                     return Ok(Step::Continue);
                 }
@@ -2235,6 +2267,8 @@ fn step<'a>(
                     name,
                     descriptor,
                     &frame.stack[start..],
+                    output,
+                    depth,
                 )? {
                     frame.stack.truncate(start);
                     frame.stackSlots -= slots;
@@ -2421,22 +2455,45 @@ fn step<'a>(
                         None,
                     ));
                 }
-                let Value::Object(handle) = receiver else {
-                    return Err(jex(
+                let object_klass = match receiver {
+                    Value::Object(handle) => {
+                        let objects = loader.borrow_objects();
+                        let object = objects
+                            .get(handle)
+                            .ok_or_else(|| Error::other("Invalid object reference"))?;
+                        std::rc::Rc::clone(&object.klass)
+                    }
+                    // Arrays are objects too: they only expose java.lang.Object
+                    // methods (wait/notify/hashCode/toString/getClass; clone is
+                    // handled by a dedicated fast path above).
+                    Value::PrimitiveArray(_) | Value::ObjectArray(_) => {
+                        loader.load(b"java/lang/Object")?
+                    }
+                    _ => {
+                        return Err(jex(
+                            loader,
+                            output,
+                            depth,
+                            b"java/lang/IncompatibleClassChangeError",
+                            Some("Expected object receiver"),
+                        ));
+                    }
+                };
+                if opcode == 0xb6
+                    && let Some(value) = crate::share::prims::varHandleNatives::polymorphic(
                         loader,
-                        output,
-                        depth,
-                        b"java/lang/IncompatibleClassChangeError",
-                        Some("Expected object receiver"),
-                    ));
-                };
-                let object_klass = {
-                    let objects = loader.borrow_objects();
-                    let object = objects
-                        .get(handle)
-                        .ok_or_else(|| Error::other("Invalid object reference"))?;
-                    std::rc::Rc::clone(&object.klass)
-                };
+                        &object_klass.class.name,
+                        name,
+                        descriptor,
+                        &frame.stack[start..],
+                    )
+                    .map_err(|error| linkageExc(loader, output, depth, error))?
+                {
+                    frame.stack.truncate(start);
+                    frame.stackSlots -= slots;
+                    frame.push(value)?;
+                    return Ok(Step::Continue);
+                }
                 if opcode == 0xb9 && !SystemDictionary::implements_interface(&object_klass, owner) {
                     return Err(jex(
                         loader,

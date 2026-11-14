@@ -652,6 +652,8 @@ fn invoke_resolved_value<'a>(
                 name,
                 descriptor.as_slice(),
                 &native_args,
+                &mut io::sink(),
+                0,
             )? {
                 Some(inner) => inner,
                 None => {
@@ -669,6 +671,8 @@ fn invoke_resolved_value<'a>(
                 name,
                 descriptor.as_slice(),
                 &native_args,
+                &mut io::sink(),
+                0,
             )?
             .unwrap_or(None)
         };
@@ -2257,6 +2261,13 @@ pub(crate) fn class_invoke<'a>(
         )),
         (b"isArray", b"()Z") => Value::Int(i32::from(is_array)),
         (b"isPrimitive", b"()Z") => Value::Int(i32::from(is_primitive)),
+        (b"descriptorString", b"()Ljava/lang/String;") => {
+            let descriptor = mirror_descriptor(class);
+            return Ok(Some(string_value(
+                loader,
+                &String::from_utf8_lossy(&descriptor),
+            )));
+        }
         (b"isHidden", b"()Z") => Value::Int(0),
         (b"isRecord0", b"()Z") => Value::Int(i32::from(
             klass
@@ -2706,12 +2717,22 @@ pub(crate) fn invoke_static<'a>(
             b"jdk/internal/reflect/NativeMethodAccessorImpl",
             b"invoke0",
             b"(Ljava/lang/reflect/Method;Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;",
+        )
+        | (
+            b"jdk/internal/reflect/DirectMethodHandleAccessor$NativeAccessor",
+            b"invoke0",
+            b"(Ljava/lang/reflect/Method;Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;",
         ) => {
             let value = invoke0_inner(loader, arguments)?;
             Ok(Some(Some(value)))
         }
         (
             b"jdk/internal/reflect/NativeConstructorAccessorImpl",
+            b"newInstance0",
+            b"(Ljava/lang/reflect/Constructor;[Ljava/lang/Object;)Ljava/lang/Object;",
+        )
+        | (
+            b"jdk/internal/reflect/DirectConstructorHandleAccessor$NativeAccessor",
             b"newInstance0",
             b"(Ljava/lang/reflect/Constructor;[Ljava/lang/Object;)Ljava/lang/Object;",
         ) => constructor_new_instance0(loader, arguments)

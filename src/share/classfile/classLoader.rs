@@ -16,7 +16,7 @@ use crate::{classfile::ClassFile, share::oops::instanceKlass::InstanceKlass};
 use bumpalo::Bump;
 use std::{
     cell::{Cell, Ref, RefCell},
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fs::{self, File},
     io::{self, Error, Read},
     path::{Path, PathBuf},
@@ -139,9 +139,19 @@ pub struct ClassLoader<'a> {
     class_loader_object: RefCell<Option<usize>>,
     unnamed_module_object: RefCell<Option<usize>>,
     module_objects: RefCell<HashMap<String, usize>>,
-    current_thread_object: RefCell<Option<usize>>,
+    pub(crate) current_thread_object: RefCell<Option<usize>>,
     pub(crate) call_stack: RefCell<Vec<&'a [u8]>>,
     pub(crate) lambda_cache: RefCell<HashMap<(Vec<u8>, u16), Rc<InstanceKlass<'a>>>>,
+    /// Cooperative Java thread registry (see runtime::threading).
+    pub(crate) java_threads: RefCell<HashMap<usize, crate::share::runtime::threading::JavaThreadInfo>>,
+    /// FIFO of thread object handles ready to run.
+    pub(crate) thread_ready: RefCell<VecDeque<usize>>,
+    /// Thread object handle currently executing (`None` = main thread).
+    pub(crate) current_java_thread: RefCell<Option<usize>>,
+    /// Next monitor id assigned to a started Java thread.
+    pub(crate) next_java_tid: Cell<u64>,
+    /// Nested scheduler depth guard.
+    pub(crate) schedule_depth: Cell<u32>,
     loader_type: ClassLoaderType,
 }
 
@@ -397,6 +407,11 @@ impl<'a> ClassLoader<'a> {
             current_thread_object: RefCell::new(None),
             call_stack: RefCell::new(Vec::new()),
             lambda_cache: RefCell::new(HashMap::new()),
+            java_threads: RefCell::new(HashMap::new()),
+            thread_ready: RefCell::new(VecDeque::new()),
+            current_java_thread: RefCell::new(None),
+            next_java_tid: Cell::new(2),
+            schedule_depth: Cell::new(0),
             loader_type: ClassLoaderType::AppLoader,
         })
     }
@@ -409,6 +424,31 @@ impl<'a> ClassLoader<'a> {
             } else {
                 entry.as_path()
             };
+            if p.file_name().is_some_and(|name| name == "*") {
+                if let Some(dir) = p.parent()
+                    && let Ok(entries) = fs::read_dir(dir)
+                {
+                    let mut jars: Vec<PathBuf> = entries
+                        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+                        .filter(|path| {
+                            path.extension()
+                                .is_some_and(|ext| ext.eq_ignore_ascii_case("jar"))
+                        })
+                        .collect();
+                    jars.sort();
+                    for jar in jars {
+                        if let Ok(file) = File::open(&jar)
+                            && let Ok(zip) = ZipArchive::new(file)
+                        {
+                            sources.push(ClassSource::Jar {
+                                archive: zip,
+                                path: jar.clone(),
+                            });
+                        }
+                    }
+                }
+                continue;
+            }
             if p.is_dir() {
                 sources.push(ClassSource::Directory(p.to_path_buf()));
             } else if p.is_file() {
@@ -445,6 +485,11 @@ impl<'a> ClassLoader<'a> {
             current_thread_object: RefCell::new(None),
             call_stack: RefCell::new(Vec::new()),
             lambda_cache: RefCell::new(HashMap::new()),
+            java_threads: RefCell::new(HashMap::new()),
+            thread_ready: RefCell::new(VecDeque::new()),
+            current_java_thread: RefCell::new(None),
+            next_java_tid: Cell::new(2),
+            schedule_depth: Cell::new(0),
             loader_type: ClassLoaderType::AppLoader,
         })
     }

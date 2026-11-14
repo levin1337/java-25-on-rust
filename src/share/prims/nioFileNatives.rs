@@ -110,6 +110,7 @@ pub(crate) struct Entry {
     pub(crate) path: String,
 }
 
+#[allow(dead_code)]
 pub(crate) enum EntryKind {
     File(std::fs::File),
     ReadEnd(std::fs::File),
@@ -117,7 +118,7 @@ pub(crate) enum EntryKind {
     Other,
 }
 
-struct Table {
+pub(crate) struct Table {
     entries: HashMap<u64, Entry>,
     next: u64,
 }
@@ -158,6 +159,203 @@ pub(crate) fn file_of(entry: &mut Entry) -> io::Result<&mut std::fs::File> {
         EntryKind::File(file) => Ok(file),
         _ => Err(invalid("Handle is not a file")),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Directory iteration (FindFirstFile*/FindNextFile*/FindClose)
+// ---------------------------------------------------------------------------
+
+struct DirEntry {
+    name: String,
+    is_dir: bool,
+    size: u64,
+    modified: Option<std::time::SystemTime>,
+    attrs: u32,
+}
+
+struct DirState {
+    entries: Vec<DirEntry>,
+    index: usize,
+}
+
+fn dir_table() -> &'static Mutex<HashMap<u64, DirState>> {
+    static TABLE: OnceLock<Mutex<HashMap<u64, DirState>>> = OnceLock::new();
+    TABLE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn filetime(time: std::time::SystemTime) -> i64 {
+    match time.duration_since(std::time::UNIX_EPOCH) {
+        Ok(duration) => {
+            (duration.as_secs() * 10_000_000 + duration.subsec_nanos() as u64 / 100) as i64
+                + 11_644_473_600_000_000
+        }
+        Err(_) => 0,
+    }
+}
+
+/// Simple `*`/`?` wildcard match on a single path component.
+fn wildcard_match(pattern: &str, name: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let n: Vec<char> = name.chars().collect();
+    let (mut pi, mut ni) = (0usize, 0usize);
+    let (mut star, mut mark) = (usize::MAX, 0usize);
+    while ni < n.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == n[ni]) {
+            pi += 1;
+            ni += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = pi;
+            mark = ni;
+            pi += 1;
+        } else if star != usize::MAX {
+            pi = star + 1;
+            mark += 1;
+            ni = mark;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+/// Splits a Windows search path into (directory, file-name pattern).
+/// A trailing `\*` or bare `*` is treated as "all entries".
+fn split_search_path(path: &str) -> (String, String) {
+    let trimmed = path.trim_end_matches(['\\', '/']);
+    if let Some(index) = trimmed.rfind(['\\', '/']) {
+        let (dir, pat) = trimmed.split_at(index);
+        let pat = &pat[1..];
+        if pat.is_empty() {
+            return (dir.to_string(), "*".to_string());
+        }
+        (dir.to_string(), pat.to_string())
+    } else {
+        (String::new(), "*".to_string())
+    }
+}
+
+/// Reads a directory and returns snapshot entries matching `pattern`.
+fn scan_directory(dir: &str, pattern: &str) -> io::Result<Vec<DirEntry>> {
+    let mut entries = Vec::new();
+    for item in std::fs::read_dir(dir)? {
+        let item = item?;
+        let name = item.file_name().to_string_lossy().into_owned();
+        if name == "." || name == ".." {
+            continue;
+        }
+        if !wildcard_match(pattern, &name) {
+            continue;
+        }
+        let meta = item.metadata()?;
+        let is_dir = meta.is_dir();
+        let attrs = if is_dir { 0x10u32 } else { 0x80 | 0x20 };
+        entries.push(DirEntry {
+            name,
+            is_dir,
+            size: meta.len(),
+            modified: meta.modified().ok(),
+            attrs,
+        });
+    }
+    Ok(entries)
+}
+
+/// Opens a directory search and returns a handle plus the first match.
+fn dir_open(dir_path: &str, pattern: &str) -> io::Result<(u64, Option<DirEntry>)> {
+    let mut entries = scan_directory(dir_path, pattern)?;
+    let first = if entries.is_empty() { None } else { Some(entries.remove(0)) };
+    let mut table = dir_table().lock().unwrap();
+    let mut next = 0x8000_0000u64;
+    while table.contains_key(&next) {
+        next += 0x10;
+    }
+    table.insert(next, DirState { entries, index: 0 });
+    Ok((next, first))
+}
+
+/// Returns the next matching entry for an open search handle.
+fn dir_next(handle: u64) -> io::Result<Option<DirEntry>> {
+    let mut table = dir_table().lock().unwrap();
+    let state = table
+        .get_mut(&handle)
+        .ok_or_else(|| invalid("Invalid directory handle"))?;
+    if state.index >= state.entries.len() {
+        return Ok(None);
+    }
+    let entry = state.entries[state.index].clone_name_only();
+    state.index += 1;
+    Ok(Some(entry))
+}
+
+impl DirEntry {
+    fn clone_name_only(&self) -> DirEntry {
+        DirEntry {
+            name: self.name.clone(),
+            is_dir: self.is_dir,
+            size: self.size,
+            modified: self.modified,
+            attrs: self.attrs,
+        }
+    }
+}
+
+/// Serializes a `WIN32_FIND_DATAW` (592 bytes) into off-heap memory.
+fn write_find_data(address: i64, entry: &DirEntry) -> io::Result<()> {
+    let mut data = vec![0u8; 592];
+    data[0..4].copy_from_slice(&entry.attrs.to_le_bytes());
+    if let Some(modified) = entry.modified {
+        let ft = filetime(modified);
+        data[20..28].copy_from_slice(&ft.to_le_bytes()); // ftLastWriteTime
+    }
+    data[28..32].copy_from_slice(&((entry.size >> 32) as u32).to_le_bytes());
+    data[32..36].copy_from_slice(&(entry.size as u32).to_le_bytes());
+    let name: Vec<u16> = entry.name.encode_utf16().collect();
+    for (index, unit) in name.iter().take(259).enumerate() {
+        let offset = 44 + index * 2;
+        data[offset..offset + 2].copy_from_slice(&unit.to_le_bytes());
+    }
+    write_buffer(address, &data)
+}
+
+/// Sets `handle`/`name`/`attributes` on a `FirstFile`/`FirstStream` object.
+fn set_first_file_fields<'a>(
+    loader: &ClassLoader<'a>,
+    value: Value<'a>,
+    handle: u64,
+    name: &str,
+    attributes: u32,
+) -> io::Result<()> {
+    let Value::Object(object_handle) = value else {
+        return Err(invalid("Expected FirstFile object"));
+    };
+    let updates = {
+        let objects = loader.borrow_objects();
+        let object = objects
+            .get(object_handle)
+            .ok_or_else(|| invalid("Invalid FirstFile object"))?;
+        let klass = &object.klass;
+        vec![
+            (klass.instanceField(b"handle", b"J")?, Value::Long(handle as i64)),
+            (
+                klass.instanceField(b"name", b"Ljava/lang/String;")?,
+                Value::HostString(loader.storage.alloc_str(name)),
+            ),
+            (klass.instanceField(b"attributes", b"I")?, Value::Int(attributes as i32)),
+        ]
+    };
+    let mut objects = loader.borrow_objects_mut();
+    let object = objects
+        .get_mut(object_handle)
+        .ok_or_else(|| invalid("Invalid FirstFile object"))?;
+    for (slot, value) in updates {
+        if slot < object.fields.len() {
+            object.fields[slot] = value;
+        }
+    }
+    Ok(())
 }
 
 /// Reads a NUL-terminated UTF-16LE path from off-heap memory.
@@ -253,6 +451,9 @@ pub(crate) fn dispatcher<'a>(
             let _security = arg(3);
             let disposition = arg(4) as u32;
             let _flags = arg(5) as u32;
+            if std::env::var_os("JVM25_TRACE").is_some() {
+                eprintln!("[CreateFile0] path={:?} desired={:#x} disp={}", path, desired, disposition);
+            }
             let _ = share;
             let mut options = std::fs::OpenOptions::new();
             options.read(desired & 0x8000_0000 != 0 || desired & 0x1 != 0);
@@ -427,6 +628,70 @@ pub(crate) fn dispatcher<'a>(
         (b"GetAce", b"(JI)J") => Value::Long(0),
         (b"LookupPrivilegeValue0", b"(J)J") => Value::Long(0),
         (b"GetLengthSid", b"(J)I") => Value::Int(0),
+        (b"FindFirstFile0", b"(JLsun/nio/fs/WindowsNativeDispatcher$FirstFile;)V") => {
+            let search = read_wide_path(arg(0))?;
+            let (dir, pattern) = split_search_path(&search);
+            let dir = if dir.is_empty() { ".".to_string() } else { dir };
+            let (handle, first) = match dir_open(&dir, &pattern) {
+                Ok(opened) => opened,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    return Err(windows_exception(loader, 2, "The system cannot find the file specified"));
+                }
+                Err(error) => return Err(io_exception(loader, &error.to_string())),
+            };
+            match first {
+                Some(entry) => {
+                    set_first_file_fields(
+                        loader,
+                        arguments.get(1).copied().unwrap_or(Value::Null),
+                        handle,
+                        &entry.name,
+                        entry.attrs,
+                    )?;
+                }
+                None => {
+                    dir_table().lock().unwrap().remove(&handle);
+                    return Err(windows_exception(loader, 2, "The system cannot find the file specified"));
+                }
+            }
+            return Ok(Some(Value::Null));
+        }
+        (b"FindFirstFile1", b"(JJ)J") => {
+            let search = read_wide_path(arg(0))?;
+            let (dir, pattern) = split_search_path(&search);
+            let dir = if dir.is_empty() { ".".to_string() } else { dir };
+            let (handle, first) = match dir_open(&dir, &pattern) {
+                Ok(opened) => opened,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    return Err(windows_exception(loader, 2, "The system cannot find the path specified"));
+                }
+                Err(error) => return Err(io_exception(loader, &error.to_string())),
+            };
+            match first {
+                Some(entry) => {
+                    write_find_data(arg(1), &entry)?;
+                    Value::Long(handle as i64)
+                }
+                None => {
+                    dir_table().lock().unwrap().remove(&handle);
+                    return Err(windows_exception(loader, 2, "The system cannot find the file specified"));
+                }
+            }
+        }
+        (b"FindNextFile0", b"(JJ)Ljava/lang/String;") => {
+            let handle = arg(0) as u64;
+            match dir_next(handle)? {
+                Some(entry) => {
+                    write_find_data(arg(1), &entry)?;
+                    Value::HostString(loader.storage.alloc_str(&entry.name))
+                }
+                None => Value::Null,
+            }
+        }
+        (b"FindClose", b"(J)V") => {
+            dir_table().lock().unwrap().remove(&(arg(0) as u64));
+            return Ok(Some(Value::Null));
+        }
         (b"GetQueuedCompletionStatus0", b"(JJJ)I") => Value::Int(0),
         (b"GetOverlappedResult", b"(JJ)I") => Value::Int(0),
         _ => return Ok(None),

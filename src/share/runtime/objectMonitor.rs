@@ -178,40 +178,48 @@ impl ObjectMonitor {
                 self.recursions = saved_recursions;
                 true
             }
+            // The monitor was handed to us directly by `exit`.
+            Some(owner) if owner == thread_id => {
+                self.recursions = saved_recursions;
+                true
+            }
             Some(_) => {
-                self.entry_list.push_back(thread_id);
-                self.contentions = self.contentions.saturating_add(1);
+                if !self.entry_list.contains(&thread_id) {
+                    self.entry_list.push_back(thread_id);
+                    self.contentions = self.contentions.saturating_add(1);
+                }
                 false
             }
         }
     }
 
-    /// Notifies one waiting thread from wait_set, transferring it to entry_list.
+    /// Removes a thread from both the wait set and the entry list. Used when
+    /// a timed wait expires without a matching notify, or when a thread
+    /// leaves the monitor for any other reason.
+    pub fn remove_waiter(&mut self, thread_id: u64) -> bool {
+        let before = self.wait_set.len() + self.entry_list.len();
+        self.wait_set.retain(|&id| id != thread_id);
+        self.entry_list.retain(|&id| id != thread_id);
+        before != self.wait_set.len() + self.entry_list.len()
+    }
+
+    /// Notifies one waiting thread from wait_set.
     pub fn notify(&mut self, thread_id: u64) -> Result<bool, &'static str> {
         if self.owner != Some(thread_id) {
             return Err("IllegalMonitorStateException");
         }
 
-        if let Some(waiter) = self.wait_set.pop_front() {
-            self.entry_list.push_back(waiter);
-            self.contentions = self.contentions.saturating_add(1);
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+        Ok(self.wait_set.pop_front().is_some())
     }
 
-    /// Notifies all waiting threads from wait_set, transferring all to entry_list.
+    /// Notifies all waiting threads from wait_set.
     pub fn notify_all(&mut self, thread_id: u64) -> Result<usize, &'static str> {
         if self.owner != Some(thread_id) {
             return Err("IllegalMonitorStateException");
         }
 
         let count = self.wait_set.len();
-        while let Some(waiter) = self.wait_set.pop_front() {
-            self.entry_list.push_back(waiter);
-            self.contentions = self.contentions.saturating_add(1);
-        }
+        self.wait_set.clear();
         Ok(count)
     }
 }

@@ -153,19 +153,26 @@ fn set_counters<'a>(
     consumed: usize,
     produced: usize,
 ) -> io::Result<()> {
-    let objects = loader.borrow_objects();
-    let object = objects
-        .get(receiver)
-        .ok_or_else(|| invalid("Invalid receiver"))?;
-    let input_slot = object
-        .klass
-        .instanceField(b"inputConsumed", b"I")
-        .map_err(|_| invalid("Missing inputConsumed"))?;
-    let output_slot = object
-        .klass
-        .instanceField(b"outputConsumed", b"I")
-        .map_err(|_| invalid("Missing outputConsumed"))?;
-    drop(objects);
+    // JDK 21 tracks progress through inputPos/inputLim and the packed return
+    // value; newer JDKs expose inputConsumed/outputConsumed fields instead.
+    let (input_slot, output_slot) = {
+        let objects = loader.borrow_objects();
+        let Some(object) = objects.get(receiver) else {
+            return Err(invalid("Invalid receiver"));
+        };
+        let input_slot = object
+            .klass
+            .instanceField(b"inputConsumed", b"I")
+            .ok();
+        let output_slot = object
+            .klass
+            .instanceField(b"outputConsumed", b"I")
+            .ok();
+        (input_slot, output_slot)
+    };
+    let (Some(input_slot), Some(output_slot)) = (input_slot, output_slot) else {
+        return Ok(());
+    };
     let mut objects = loader.borrow_objects_mut();
     let object = objects
         .get_mut(receiver)
@@ -212,7 +219,7 @@ fn run_inflate<'a>(
                 let before_out = decompress.total_out();
                 let status = decompress
                     .decompress(&input, &mut output, flate2::FlushDecompress::None)
-                    .map_err(|error| invalid("DataFormatException"))?;
+                    .map_err(|_error| invalid("DataFormatException"))?;
                 let consumed = (decompress.total_in() - before_in) as usize;
                 let written = (decompress.total_out() - before_out) as usize;
                 (written.min(output_len), consumed.min(input.len()), matches!(status, flate2::Status::StreamEnd))
@@ -234,6 +241,7 @@ fn run_deflate<'a>(
     loader: &ClassLoader<'a>,
     arguments: &[Value<'a>],
     layout: usize,
+    flush_at: usize,
 ) -> io::Result<u64> {
     let receiver = match arg_value(arguments, 0) {
         Value::Object(handle) => handle,
@@ -248,7 +256,7 @@ fn run_deflate<'a>(
         arg_usize(arguments, layout + 2),
     )?;
     let output_len = arg_usize(arguments, layout + 5);
-    let flush = arg_usize(arguments, layout + 8);
+    let flush = arg_usize(arguments, flush_at);
     let mut output = vec![0u8; output_len];
     let (written, consumed, finished) = {
         let mut table = table().lock().unwrap();
@@ -260,10 +268,12 @@ fn run_deflate<'a>(
             Stream::Deflate(compress) => {
                 let before_in = compress.total_in();
                 let before_out = compress.total_out();
+                // zlib flush constants passed straight through by the JDK.
                 let flush = match flush {
-                    1 => flate2::FlushCompress::Sync,
-                    2 => flate2::FlushCompress::Finish,
+                    1 => flate2::FlushCompress::Partial,
+                    2 => flate2::FlushCompress::Sync,
                     3 => flate2::FlushCompress::Full,
+                    4 => flate2::FlushCompress::Finish,
                     _ => flate2::FlushCompress::None,
                 };
                 let status = compress
@@ -304,14 +314,16 @@ pub(crate) fn instance<'a>(
         return Ok(None);
     }
     let result = match (name, descriptor) {
+        (b"inflateBytesBytes", b"(J[BII[BII)J") => run_inflate(loader, arguments, 2)?,
         (b"inflateBytesBytes", b"(J[BI[BI[BI)J") => run_inflate(loader, arguments, 2)?,
         (b"inflateBytesBuffer", b"(J[BIIJI)J") => run_inflate(loader, arguments, 2)?,
         (b"inflateBufferBytes", b"(JJ[BII[BI)J") => run_inflate(loader, arguments, 3)?,
         (b"inflateBufferBuffer", b"(JJIJI)J") => run_inflate(loader, arguments, 3)?,
-        (b"deflateBytesBytes", b"(J[BI[I[BIIII)J") => run_deflate(loader, arguments, 2)?,
-        (b"deflateBytesBuffer", b"(J[BIIJIIII)J") => run_deflate(loader, arguments, 2)?,
-        (b"deflateBufferBytes", b"(JJ[BII[BIIII)J") => run_deflate(loader, arguments, 3)?,
-        (b"deflateBufferBuffer", b"(JJIJIIII)J") => run_deflate(loader, arguments, 3)?,
+        (b"deflateBytesBytes", b"(J[BII[BIIII)J") => run_deflate(loader, arguments, 2, 8)?,
+        (b"deflateBytesBytes", b"(J[BI[I[BIIII)J") => run_deflate(loader, arguments, 2, 10)?,
+        (b"deflateBytesBuffer", b"(J[BIIJIIII)J") => run_deflate(loader, arguments, 2, 10)?,
+        (b"deflateBufferBytes", b"(JJ[BII[BIIII)J") => run_deflate(loader, arguments, 3, 11)?,
+        (b"deflateBufferBuffer", b"(JJIJIIII)J") => run_deflate(loader, arguments, 3, 11)?,
         _ => return Ok(None),
     };
     Ok(Some(Value::Long(result as i64)))
@@ -333,7 +345,11 @@ pub(crate) fn statik<'a>(
         (b"java/util/zip/Deflater", b"init", b"(IIZ)J") => {
             let level = arg_i64(arguments, 0);
             let nowrap = arg_i64(arguments, 2) != 0;
-            let level = flate2::Compression::new(level.clamp(-1, 9) as u32);
+            let level = if level < 0 {
+                flate2::Compression::default()
+            } else {
+                flate2::Compression::new(level.min(9) as u32)
+            };
             Value::Long(alloc(Stream::Deflate(flate2::Compress::new(level, !nowrap))) as i64)
         }
         (b"java/util/zip/Inflater", b"reset", b"(J)V")

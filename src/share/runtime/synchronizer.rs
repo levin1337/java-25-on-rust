@@ -109,6 +109,15 @@ impl Synchronizer {
         monitor.notify_all(thread_id)
     }
 
+    /// Removes a thread from a monitor's wait/entry queues (timeout or
+    /// cancellation path). Returns true when an entry was removed.
+    pub fn remove_waiter(&mut self, handle: usize, thread_id: u64) -> bool {
+        self.monitors
+            .get_mut(&handle)
+            .map(|monitor| monitor.remove_waiter(thread_id))
+            .unwrap_or(false)
+    }
+
     /// Checks if a thread currently holds the lock for the given object.
     #[inline]
     pub fn current_thread_holds_lock(&self, handle: usize, thread_id: u64) -> bool {

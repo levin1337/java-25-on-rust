@@ -20,6 +20,7 @@ pub mod stackOverflow;
 pub mod synchronizer;
 pub mod thread;
 pub mod threadIdentifier;
+pub mod threading;
 pub mod threadSMR;
 pub mod threads;
 pub mod timer;

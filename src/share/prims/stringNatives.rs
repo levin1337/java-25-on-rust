@@ -1,8 +1,12 @@
-use crate::share::{classfile::classLoader::ClassLoader, oops::typeArrayOop::TypeArrayOop};
-use crate::{classfile::decodeString, share::interpreter::bytecodeInterpreter::Value};
+use crate::classfile::decodeString;
+use crate::share::{
+    classfile::classLoader::ClassLoader,
+    interpreter::bytecodeInterpreter::Value,
+    oops::{instanceOop::InstanceOop, typeArrayOop::TypeArrayOop},
+};
 use std::{
     borrow::Cow,
-    io::{self, Error},
+    io::{self, Error, Write},
 };
 
 pub(crate) fn string<'a>(
@@ -13,7 +17,7 @@ pub(crate) fn string<'a>(
         Value::String(bytes) => decodeString(bytes).map(|value| Some(Cow::Owned(value))),
         Value::HostString(value) => Ok(Some(Cow::Borrowed(value))),
         Value::Object(handle) => {
-            let objects = loader.objects.borrow();
+            let objects = loader.borrow_objects();
             let object = objects
                 .get(handle)
                 .ok_or_else(|| Error::other("Invalid object reference"))?;
@@ -36,7 +40,7 @@ pub(crate) fn string<'a>(
                 1 if bytes.len() % 2 == 0 => {
                     let units = bytes
                         .chunks_exact(2)
-                        .map(|pair| u16::from_ne_bytes([pair[0] as u8, pair[1] as u8]));
+                        .map(|pair| u16::from_be_bytes([pair[0] as u8, pair[1] as u8]));
                     char::decode_utf16(units)
                         .collect::<Result<String, _>>()
                         .map_err(Error::other)?
@@ -47,6 +51,69 @@ pub(crate) fn string<'a>(
         }
         _ => Ok(None),
     }
+}
+
+/// Materializes a lightweight string value (`Value::String` / `Value::HostString`)
+/// into a real `java.lang.String` heap object so that JDK bytecode can access
+/// its fields (`value`, `coder`, `hash`) and invoke its methods.
+pub(crate) fn materialize<'a>(
+    loader: &ClassLoader<'a>,
+    value: Value<'a>,
+    output: &mut impl Write,
+    depth: usize,
+) -> io::Result<Option<Value<'a>>> {
+    if matches!(
+        value,
+        Value::Object(_)
+            | Value::ObjectArray(_)
+            | Value::PrimitiveArray(_)
+            | Value::Arguments(_)
+            | Value::ClassMirror(_)
+            | Value::Null
+            | Value::Empty
+            | Value::Output
+            | Value::ReturnAddress(_)
+            | Value::Int(_)
+            | Value::Long(_)
+            | Value::Float(_)
+            | Value::Double(_)
+    ) {
+        return Ok(None);
+    }
+    let Some(text) = string(loader, value)? else {
+        return Ok(None);
+    };
+    let text = text.into_owned();
+
+    let klass = loader.load(b"java/lang/String")?;
+    crate::share::interpreter::bytecodeInterpreter::initialize(loader, &klass, output, depth + 1)?;
+
+    let latin1 = text.chars().all(|c| u32::from(c) <= 0xff);
+    let bytes: Vec<u8> = if latin1 {
+        text.chars().map(|c| c as u32 as u8).collect()
+    } else {
+        let mut bytes = Vec::with_capacity(text.encode_utf16().count() * 2);
+        for unit in text.encode_utf16() {
+            bytes.push((unit >> 8) as u8);
+            bytes.push(unit as u8);
+        }
+        bytes
+    };
+
+    let array_handle = loader.alloc_type_array(TypeArrayOop::Byte(
+        bytes.into_iter().map(|b| b as i8).collect(),
+    ));
+
+    let mut object = InstanceOop::new(klass)?;
+    let value_index = object.klass.instanceField(b"value", b"[B")?;
+    let coder_index = object.klass.instanceField(b"coder", b"B")?;
+    object.fields[value_index] = Value::PrimitiveArray(array_handle);
+    object.fields[coder_index] = Value::Int(i32::from(!latin1));
+    if let Ok(hash_index) = object.klass.instanceField(b"hash", b"I") {
+        object.fields[hash_index] = Value::Int(0);
+    }
+
+    Ok(Some(Value::Object(loader.alloc_object(object))))
 }
 
 pub(crate) fn invoke<'a>(

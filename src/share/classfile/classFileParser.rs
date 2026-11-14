@@ -203,6 +203,142 @@ pub struct ClassFile<'a> {
 }
 
 impl<'a> ClassFile<'a> {
+    /// Post-parse structural verification mirroring the checks HotSpot's
+    /// classFileParser performs while parsing: legal names, access flag
+    /// combinations, superclass/interface constraints and duplicate members.
+    fn verify_structure(&self) -> Result<(), ClassError> {
+        let is_interface = (self.accessFlags & 0x0200) != 0;
+        let is_object = self.name == b"java/lang/Object";
+
+        if !ClassFileParser::verify_legal_class_name(self.name) {
+            return Err(ClassError::ClassFormatError(format!(
+                "Illegal class name {}",
+                String::from_utf8_lossy(self.name)
+            )));
+        }
+
+        for &iface in &self.interfaces {
+            if !ClassFileParser::verify_legal_class_name(iface) {
+                return Err(ClassError::ClassFormatError(format!(
+                    "Illegal interface name {}",
+                    String::from_utf8_lossy(iface)
+                )));
+            }
+            if iface == self.name {
+                return Err(ClassError::ClassFormatError(
+                    "Interface cannot be implemented by itself".to_string(),
+                ));
+            }
+        }
+
+        if is_interface {
+            if self.accessFlags & 0x0010 != 0 {
+                return Err(ClassError::ClassFormatError(
+                    "Interface cannot be final".to_string(),
+                ));
+            }
+            if self.accessFlags & 0x0400 == 0 {
+                return Err(ClassError::ClassFormatError(
+                    "Interface must be abstract".to_string(),
+                ));
+            }
+            if let Some(super_name) = self.superName
+                && super_name != b"java/lang/Object"
+            {
+                return Err(ClassError::ClassFormatError(
+                    "Interface superclass must be java/lang/Object".to_string(),
+                ));
+            }
+        } else if is_object {
+            if self.superName.is_some() {
+                return Err(ClassError::ClassFormatError(
+                    "java/lang/Object must not have a superclass".to_string(),
+                ));
+            }
+            if !self.interfaces.is_empty() {
+                return Err(ClassError::ClassFormatError(
+                    "java/lang/Object must not implement interfaces".to_string(),
+                ));
+            }
+        } else if self.superName.is_none() {
+            return Err(ClassError::ClassFormatError(
+                "Class must have a superclass".to_string(),
+            ));
+        }
+
+        let mut seen_fields = std::collections::HashSet::with_capacity(self.fields.len());
+        for field in &self.fields {
+            if !ClassFileParser::verify_legal_field_name(field.name)
+                || !ClassFileParser::verify_legal_field_signature(field.descriptor)
+                || decodeString(field.name).is_err()
+                || decodeString(field.descriptor).is_err()
+            {
+                return Err(ClassError::ClassFormatError(format!(
+                    "Illegal field {}{}",
+                    String::from_utf8_lossy(field.name),
+                    String::from_utf8_lossy(field.descriptor)
+                )));
+            }
+            if !seen_fields.insert((field.name, field.descriptor)) {
+                return Err(ClassError::ClassFormatError(format!(
+                    "Duplicate field {}{}",
+                    String::from_utf8_lossy(field.name),
+                    String::from_utf8_lossy(field.descriptor)
+                )));
+            }
+        }
+
+        let mut seen_methods = std::collections::HashSet::with_capacity(self.methods.len());
+        for method in &self.methods {
+            if !ClassFileParser::verify_legal_method_name(method.name, self.majorVersion)
+                || !ClassFileParser::verify_legal_method_signature(method.name, method.descriptor)
+                || decodeString(method.name).is_err()
+                || decodeString(method.descriptor).is_err()
+            {
+                return Err(ClassError::ClassFormatError(format!(
+                    "Illegal method {}{}",
+                    String::from_utf8_lossy(method.name),
+                    String::from_utf8_lossy(method.descriptor)
+                )));
+            }
+            if !seen_methods.insert((method.name, method.descriptor)) {
+                return Err(ClassError::ClassFormatError(format!(
+                    "Duplicate method {}{}",
+                    String::from_utf8_lossy(method.name),
+                    String::from_utf8_lossy(method.descriptor)
+                )));
+            }
+        }
+
+        if is_interface {
+            for method in &self.methods {
+                if method.name == b"<init>" {
+                    return Err(ClassError::ClassFormatError(format!(
+                        "Interface {} cannot declare {}",
+                        String::from_utf8_lossy(self.name),
+                        String::from_utf8_lossy(method.name)
+                    )));
+                }
+                let has_code = method.code_attribute().is_some();
+                let is_static = (method.accessFlags & 0x0008) != 0;
+                let is_private = (method.accessFlags & 0x0002) != 0;
+                let is_abstract = (method.accessFlags & 0x0400) != 0;
+                if is_abstract && has_code {
+                    return Err(ClassError::ClassFormatError(
+                        "Abstract interface method cannot have a Code attribute".to_string(),
+                    ));
+                }
+                if !is_abstract && !is_static && !is_private && !has_code {
+                    return Err(ClassError::ClassFormatError(
+                        "Interface method without Code must be abstract".to_string(),
+                    ));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     pub fn source_file(&self) -> Option<&'a [u8]> {
         let attr = self.attributes.iter().find(|a| a.name == b"SourceFile")?;
         let idx = u16::from_be_bytes([*attr.bytes.first()?, *attr.bytes.get(1)?]);
@@ -410,7 +546,7 @@ impl<'a> ClassFileParser<'a> {
             return Err(ClassError::TrailingBytes);
         }
 
-        Ok(ClassFile {
+        let class = ClassFile {
             majorVersion: self.major_version,
             minorVersion: self.minor_version,
             accessFlags,
@@ -421,34 +557,9 @@ impl<'a> ClassFileParser<'a> {
             fields,
             methods,
             attributes,
-        })
-    }
-
-    pub fn compute_field_layout(fields: &[Member<'a>]) -> FieldLayoutInfo {
-        let mut static_fields = 0;
-        let mut nonstatic_fields = 0;
-        let mut oop_builder = OopMapBlocksBuilder::new(fields.len().max(1));
-
-        for (i, field) in fields.iter().enumerate() {
-            let is_static = (field.accessFlags & 0x0008) != 0;
-            if is_static {
-                static_fields += 1;
-            } else {
-                nonstatic_fields += 1;
-                if field.descriptor.starts_with(b"L") || field.descriptor.starts_with(b"[") {
-                    oop_builder.add(i, 1);
-                }
-            }
-        }
-        oop_builder.compact();
-
-        FieldLayoutInfo {
-            instance_size: nonstatic_fields * 8 + 16,
-            nonstatic_field_size: nonstatic_fields,
-            static_field_size: static_fields,
-            has_nonstatic_fields: nonstatic_fields > 0,
-            oop_maps: oop_builder.nonstatic_oop_maps,
-        }
+        };
+        class.verify_structure()?;
+        Ok(class)
     }
 }
 
@@ -564,6 +675,42 @@ impl<'a> Reader<'a> {
             })
         })
     }
+}
+
+impl<'a> ClassFileParser<'a> {
+    pub fn compute_field_layout(fields: &[Member<'a>]) -> FieldLayoutInfo {
+        let mut static_fields = 0;
+        let mut nonstatic_fields = 0;
+        let mut oop_builder = OopMapBlocksBuilder::new(fields.len().max(1));
+
+        for (i, field) in fields.iter().enumerate() {
+            let is_static = (field.accessFlags & 0x0008) != 0;
+            if is_static {
+                static_fields += 1;
+            } else {
+                nonstatic_fields += 1;
+                if field.descriptor.starts_with(b"L") || field.descriptor.starts_with(b"[") {
+                    oop_builder.add(i, 1);
+                }
+            }
+        }
+        oop_builder.compact();
+
+        FieldLayoutInfo {
+            instance_size: nonstatic_fields * 8 + 16,
+            nonstatic_field_size: nonstatic_fields,
+            static_field_size: static_fields,
+            has_nonstatic_fields: nonstatic_fields > 0,
+            oop_maps: oop_builder.nonstatic_oop_maps,
+        }
+    }
+}
+
+/// Encodes a Rust string as modified UTF-8 (NUL -> C0 80) for jimage
+/// constant-pool reconstruction.
+pub fn encodeModifiedUtf8(text: &str) -> Vec<u8> {
+    let units: Vec<u16> = text.encode_utf16().collect();
+    super::symbolTable::unicode_to_modified_utf8(&units)
 }
 
 pub fn decodeString(mut bytes: &[u8]) -> std::io::Result<String> {

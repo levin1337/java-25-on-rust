@@ -10,7 +10,7 @@
 use crate::share::{
     classfile::classLoader::ClassLoader,
     interpreter::bytecodeInterpreter::{self, Value},
-    oops::instanceKlass::InstanceKlass,
+    oops::{instanceKlass::InstanceKlass, instanceOop::InstanceOop},
 };
 use std::io::{self, Write};
 use std::rc::Rc;
@@ -98,7 +98,7 @@ impl JavaCalls {
     ) -> io::Result<Option<Value<'a>>> {
         let code = klass.staticCode(name, descriptor, false)?;
         bytecodeInterpreter::initialize(loader, klass, output, 0)?;
-        bytecodeInterpreter::execute(loader, klass, code, args.parameters(), output, 0)
+        bytecodeInterpreter::execute(loader, klass, code, args.parameters(), output, 0, 0)
     }
 
     /// Dispatches a special method call (invokespecial: constructors, private methods, super calls)
@@ -112,7 +112,7 @@ impl JavaCalls {
     ) -> io::Result<Option<Value<'a>>> {
         let code = klass.methodCode(name, descriptor, false, false)?;
         bytecodeInterpreter::initialize(loader, klass, output, 0)?;
-        bytecodeInterpreter::execute(loader, klass, code, args.parameters(), output, 0)
+        bytecodeInterpreter::execute(loader, klass, code, args.parameters(), output, 0, 0)
     }
 
     /// Dispatches a virtual method call with vtable dynamic dispatch (invokevirtual)
@@ -134,13 +134,140 @@ impl JavaCalls {
         {
             let code = receiver_klass.methodCode(name, descriptor, false, false)?;
             bytecodeInterpreter::initialize(loader, receiver_klass, output, 0)?;
-            bytecodeInterpreter::execute(loader, receiver_klass, code, args.parameters(), output, 0)
+            bytecodeInterpreter::execute(
+                loader,
+                receiver_klass,
+                code,
+                args.parameters(),
+                output,
+                0,
+                0,
+            )
         } else {
             let code = receiver_klass.methodCode(name, descriptor, false, false)?;
             bytecodeInterpreter::initialize(loader, receiver_klass, output, 0)?;
-            bytecodeInterpreter::execute(loader, receiver_klass, code, args.parameters(), output, 0)
+            bytecodeInterpreter::execute(
+                loader,
+                receiver_klass,
+                code,
+                args.parameters(),
+                output,
+                0,
+                0,
+            )
         }
     }
+}
+
+/// Bootstraps the minimal JDK runtime state that HotSpot normally establishes
+/// in `System.initPhase1/2/3`: `VM.initLevel`, `VM.savedProps`, `System.props`
+/// and `System.lineSeparator`. Skipped silently when no JDK image is present.
+fn bootstrap<'a>(loader: &ClassLoader<'a>, output: &mut impl Write) -> io::Result<()> {
+    // Merge platform properties (java.home, os.name, ...) underneath any
+    // user-supplied -D entries so System.getProperty/props see the full set.
+    {
+        let platform = crate::share::prims::systemProperties::platform_properties(loader);
+        let mut props = loader.systemProperties.borrow_mut();
+        for (key, value) in platform {
+            props
+                .entry(key)
+                .or_insert_with(|| loader.storage.alloc_str(&value));
+        }
+    }
+    let vm = match loader.load(b"jdk/internal/misc/VM") {
+        Ok(klass) => klass,
+        Err(_) => return Ok(()),
+    };
+    bytecodeInterpreter::initialize(loader, &vm, output, 0)?;
+    vm.staticField(b"initLevel", b"I")?.set(Value::Int(4));
+
+    let saved_props = vm.staticField(b"savedProps", b"Ljava/util/Map;")?;
+    if matches!(saved_props.get(), Value::Null) {
+        let map_klass = loader.load(b"java/util/HashMap")?;
+        bytecodeInterpreter::initialize(loader, &map_klass, output, 0)?;
+        let object = InstanceOop::new(map_klass.clone())?;
+        let handle = loader.alloc_object(object);
+        let mut ctor_args = JavaCallArguments::new();
+        ctor_args.push_oop(Value::Object(handle));
+        JavaCalls::call_special(
+            loader,
+            &map_klass,
+            b"<init>",
+            b"()V",
+            &ctor_args,
+            output,
+        )?;
+        let properties: Vec<(String, &'a str)> = loader
+            .systemProperties
+            .borrow()
+            .iter()
+            .map(|(key, value)| (key.clone(), *value))
+            .collect();
+        for (key, value) in properties {
+            let key = loader.storage.alloc_str(&key);
+            let mut args = JavaCallArguments::new();
+            args.push_oop(Value::Object(handle));
+            args.push_oop(Value::HostString(key));
+            args.push_oop(Value::HostString(value));
+            JavaCalls::call_virtual(
+                loader,
+                &map_klass,
+                b"put",
+                b"(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                &args,
+                output,
+            )?;
+        }
+        saved_props.set(Value::Object(handle));
+    }
+
+    let system = loader.load(b"java/lang/System")?;
+    bytecodeInterpreter::initialize(loader, &system, output, 0)?;
+    if let Ok(separator) = system.staticField(b"lineSeparator", b"Ljava/lang/String;") {
+        if matches!(separator.get(), Value::Null) {
+            separator.set(Value::HostString("\n"));
+        }
+    }
+    let props_cell = system.staticField(b"props", b"Ljava/util/Properties;")?;
+    if matches!(props_cell.get(), Value::Null) {
+        let props_klass = loader.load(b"java/util/Properties")?;
+        bytecodeInterpreter::initialize(loader, &props_klass, output, 0)?;
+        let object = InstanceOop::new(props_klass.clone())?;
+        let handle = loader.alloc_object(object);
+        let mut ctor_args = JavaCallArguments::new();
+        ctor_args.push_oop(Value::Object(handle));
+        JavaCalls::call_special(
+            loader,
+            &props_klass,
+            b"<init>",
+            b"()V",
+            &ctor_args,
+            output,
+        )?;
+        let properties: Vec<(String, &'a str)> = loader
+            .systemProperties
+            .borrow()
+            .iter()
+            .map(|(key, value)| (key.clone(), *value))
+            .collect();
+        for (key, value) in properties {
+            let key = loader.storage.alloc_str(&key);
+            let mut args = JavaCallArguments::new();
+            args.push_oop(Value::Object(handle));
+            args.push_oop(Value::HostString(key));
+            args.push_oop(Value::HostString(value));
+            JavaCalls::call_virtual(
+                loader,
+                &props_klass,
+                b"setProperty",
+                b"(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/Object;",
+                &args,
+                output,
+            )?;
+        }
+        props_cell.set(Value::Object(handle));
+    }
+    Ok(())
 }
 
 pub fn mainClass<'a>(
@@ -149,6 +276,18 @@ pub fn mainClass<'a>(
     arguments: &'a [String],
     output: &mut impl Write,
 ) -> io::Result<()> {
+    if loader.bootImage.is_some()
+        && let Ok(system) = loader.load(b"java/lang/System")
+    {
+        let args = JavaCallArguments::new();
+        let _ = JavaCalls::call_static(loader, &system, b"initPhase1", b"()V", &args, output);
+        let mut args = JavaCallArguments::new();
+        args.push_int(0);
+        args.push_int(0);
+        let _ = JavaCalls::call_static(loader, &system, b"initPhase2", b"(ZZ)I", &args, output);
+        let args = JavaCallArguments::new();
+        let _ = JavaCalls::call_static(loader, &system, b"initPhase3", b"()V", &args, output);
+    }
     let mut encoded = Vec::with_capacity(name.len());
     for unit in name.encode_utf16() {
         match unit {
@@ -167,6 +306,9 @@ pub fn mainClass<'a>(
     let mut args = JavaCallArguments::new();
     args.push_oop(Value::Arguments(arguments));
 
+    eprintln!("[dbg] bootstrap...");
+    bootstrap(loader, output)?;
+    eprintln!("[dbg] bootstrap done");
     let res = JavaCalls::call_static(
         loader,
         &klass,

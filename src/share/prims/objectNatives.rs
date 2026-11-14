@@ -24,7 +24,7 @@ pub(crate) fn identity(value: Value<'_>) -> i32 {
 pub(crate) fn hashCode(loader: &ClassLoader<'_>, receiver: Value<'_>) -> io::Result<Option<i32>> {
     match receiver {
         Value::Object(handle) => {
-            let objects = loader.objects.borrow();
+            let objects = loader.borrow_objects();
             let object = objects
                 .get(handle)
                 .ok_or_else(|| Error::other("Invalid hashCode receiver"))?;

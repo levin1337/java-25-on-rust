@@ -398,3 +398,6 @@ ehthumbs.db
 Desktop.ini
 .DS_Store
 $RECYCLE.BIN/
+
+# Local Minecraft classpath for testing
+cp.txt

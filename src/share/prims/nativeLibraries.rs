@@ -9,8 +9,49 @@ use std::{
 
 pub type NativeFunction = fn(args: &[Value<'_>]) -> Option<Value<'static>>;
 
+/// A DLL loaded through System.load/loadLibrary. Keeps the OS handle alive
+/// and records JNI lifecycle callbacks.
+pub struct LoadedLibrary {
+    pub path: PathBuf,
+    library: Library,
+    #[allow(dead_code)]
+    on_load: Option<
+        unsafe extern "system" fn(
+            *mut crate::share::prims::jniInvocation::JavaVm,
+            *mut std::ffi::c_void,
+        ) -> i32,
+    >,
+    #[allow(dead_code)]
+    on_unload: Option<
+        unsafe extern "system" fn(
+            *mut crate::share::prims::jniInvocation::JavaVm,
+            *mut std::ffi::c_void,
+        ),
+    >,
+}
+
+impl LoadedLibrary {
+    /// Returns the address of an exported symbol, if present.
+    pub fn symbol(&self, name: &str) -> Option<*const std::ffi::c_void> {
+        if name.as_bytes().contains(&0) {
+            return None;
+        }
+        // libloading resolves symbols as typed values; fetch as a raw pointer.
+        unsafe {
+            self.library
+                .get::<*const std::ffi::c_void>(name.as_bytes())
+                .ok()
+                .map(|sym| *sym)
+        }
+    }
+
+    pub fn has_symbol(&self, name: &str) -> bool {
+        self.symbol(name).is_some()
+    }
+}
+
 pub struct NativeLibraries {
-    loadedLibraries: Mutex<Vec<(PathBuf, Library)>>,
+    loadedLibraries: Mutex<Vec<LoadedLibrary>>,
     searchPaths: Mutex<Vec<PathBuf>>,
     customSymbols: Mutex<HashMap<String, NativeFunction>>,
 }
@@ -95,18 +136,72 @@ impl NativeLibraries {
             std::env::current_dir()?.join(path)
         };
         let path = loadPath.canonicalize()?;
-        let mut libraries = self.loadedLibraries.lock().unwrap();
-        if libraries.iter().any(|(loadedPath, _)| *loadedPath == path) {
-            return Ok(());
+        {
+            let libraries = self.loadedLibraries.lock().unwrap();
+            if libraries.iter().any(|loaded| loaded.path == path) {
+                return Ok(());
+            }
         }
         let library = unsafe { Library::new(&loadPath) }.map_err(Error::other)?;
-        if unsafe { library.get::<unsafe extern "system" fn()>(b"JNI_OnLoad") }.is_ok() {
-            return Err(Error::new(
-                io::ErrorKind::Unsupported,
-                "JNI_OnLoad requires a compatible JavaVM interface",
-            ));
+
+        // Resolve JNI lifecycle exports before registering the library.
+        let on_load = unsafe {
+            library
+                .get::<unsafe extern "system" fn(
+                    *mut crate::share::prims::jniInvocation::JavaVm,
+                    *mut std::ffi::c_void,
+                ) -> i32>(b"JNI_OnLoad")
+                .ok()
+                .map(|sym| *sym)
+        };
+        let on_unload = unsafe {
+            library
+                .get::<unsafe extern "system" fn(
+                    *mut crate::share::prims::jniInvocation::JavaVm,
+                    *mut std::ffi::c_void,
+                )>(b"JNI_OnUnload")
+                .ok()
+                .map(|sym| *sym)
+        };
+
+        // JNI_OnLoad runs on the loading thread with a valid JavaVM*.
+        if let Some(on_load) = on_load {
+            let vm = crate::share::prims::jniInvocation::JavaVm::global();
+            let _env = unsafe { &*vm }.ensure_attached();
+            let result = unsafe { on_load(vm, std::ptr::null_mut()) };
+            // JNI_VERSION_1_2 (0x00010002) is the minimum accepted by HotSpot.
+            if result < 0x00010002 {
+                return Err(Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("JNI_OnLoad returned unsupported version {result:#x}"),
+                ));
+            }
         }
-        libraries.push((path, library));
+
+        let loaded = LoadedLibrary {
+            path,
+            library,
+            on_load,
+            on_unload,
+        };
+        self.loadedLibraries.lock().unwrap().push(loaded);
+        Ok(())
+    }
+
+    /// Unloads a library by canonical path, invoking JNI_OnUnload first.
+    pub fn unload(&self, path: &Path) -> io::Result<()> {
+        let canonical = path.canonicalize()?;
+        let mut libraries = self.loadedLibraries.lock().unwrap();
+        let position = libraries
+            .iter()
+            .position(|loaded| loaded.path == canonical)
+            .ok_or_else(|| Error::new(io::ErrorKind::NotFound, "Library not loaded"))?;
+        let loaded = libraries.swap_remove(position);
+        if let Some(on_unload) = loaded.on_unload {
+            let vm = crate::share::prims::jniInvocation::JavaVm::global();
+            unsafe { on_unload(vm, std::ptr::null_mut()) };
+        }
+        drop(loaded);
         Ok(())
     }
 
@@ -117,12 +212,32 @@ impl NativeLibraries {
                 "Invalid symbol name",
             ));
         }
-        for (_, library) in self.loadedLibraries.lock().unwrap().iter() {
-            if unsafe { library.get::<unsafe extern "system" fn()>(symbol.as_bytes()) }.is_ok() {
-                return Ok(true);
+        let libraries = self.loadedLibraries.lock().unwrap();
+        Ok(libraries.iter().any(|loaded| loaded.has_symbol(symbol)))
+    }
+
+    /// Resolves a JNI native method to a raw function pointer. Tries the
+    /// short (pure) name first, then the long (signature-mangled) name,
+    /// scanning libraries in load order — matching HotSpot's
+    /// NativeLookup::lookup_entry.
+    pub fn resolve_native_function(
+        &self,
+        class_name: &str,
+        method_name: &str,
+        signature: &str,
+    ) -> Option<*const std::ffi::c_void> {
+        let pure = super::nativeLookup::NativeLookup::pure_jni_name(class_name, method_name);
+        let long =
+            super::nativeLookup::NativeLookup::long_jni_name(class_name, method_name, signature);
+        let libraries = self.loadedLibraries.lock().unwrap();
+        for name in [&pure, &long] {
+            for loaded in libraries.iter() {
+                if let Some(symbol) = loaded.symbol(name) {
+                    return Some(symbol);
+                }
             }
         }
-        Ok(false)
+        None
     }
 
     pub fn resolveJniSymbol(

@@ -113,6 +113,7 @@ impl SystemDictionary {
     }
 
     pub fn implements_interface<'a>(klass: &InstanceKlass<'a>, interface_name: &[u8]) -> bool {
+    let _rg = crate::share::recprobe::Guard::enter("implements_interface");
         for iface in &klass.interfaces {
             if iface.class.name == interface_name {
                 return true;

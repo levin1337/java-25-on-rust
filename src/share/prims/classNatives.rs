@@ -109,11 +109,14 @@ pub(crate) fn invoke<'a>(
     let Value::ClassMirror(class) = receiver else {
         return Ok(None);
     };
-    if let [Value::ClassMirror(target), Value::ClassMirror(source)] = arguments
-        && name == b"isAssignableFrom"
-        && descriptor == b"(Ljava/lang/Class;)Z"
-    {
-        let assignable = if *target == *source {
+    if name == b"isAssignableFrom" && descriptor == b"(Ljava/lang/Class;)Z" {
+        let target = class;
+        let source = match arguments.first().copied().unwrap_or(Value::Null) {
+            Value::ClassMirror(source) => source,
+            Value::Null => return Err(io::Error::other("NullPointerException")),
+            _ => return Ok(Some(Value::Int(0))),
+        };
+        let assignable = if *target == source {
             true
         } else if target.starts_with(b":") || source.starts_with(b":") {
             false
@@ -165,6 +168,161 @@ pub(crate) fn invoke<'a>(
                 i32::from(loader.load(class)?.class.accessFlags & 0x7611)
             };
             Value::Int(flags)
+        }
+        (b"getSimpleName", b"()Ljava/lang/String;") => {
+            if class.starts_with(b"[") {
+                let component = class[1..]
+                    .strip_prefix(b"L")
+                    .and_then(|c| c.strip_suffix(b";"))
+                    .unwrap_or(&class[1..]);
+                let simple = component.rsplit(|b| *b == b'/').next().unwrap_or(component);
+                return Ok(Some(Value::HostString(
+                    loader.storage.alloc_str(&String::from_utf8_lossy(simple)),
+                )));
+            }
+            if let Some(name) = class.strip_prefix(b":").and_then(primitiveName) {
+                return Ok(Some(Value::HostString(name)));
+            }
+            let dotted = decodeString(class)?.replace('/', ".");
+            let simple = dotted.rsplit('.').next().unwrap_or(&dotted);
+            Value::HostString(loader.storage.alloc_str(simple))
+        }
+        (b"getPackageName", b"()Ljava/lang/String;") => {
+            if class.starts_with(b":") {
+                return Ok(Some(Value::HostString("java.lang")));
+            }
+            let mut name = *class;
+            if name.starts_with(b"[") {
+                name = &name[1..];
+                if name.starts_with(b"L") {
+                    name = &name[1..name.len() - 1];
+                } else if let [tag] = name {
+                    name = match *tag {
+                        b'Z' => b":Z",
+                        b'B' => b":B",
+                        b'C' => b":C",
+                        b'S' => b":S",
+                        b'I' => b":I",
+                        b'J' => b":J",
+                        b'F' => b":F",
+                        b'D' => b":D",
+                        _ => b":V",
+                    };
+                }
+            }
+            if name.starts_with(b":") {
+                return Ok(Some(Value::HostString("java.lang")));
+            }
+            let dotted = decodeString(name)?.replace('/', ".");
+            let package = dotted.rsplit_once('.').map(|(p, _)| p).unwrap_or("");
+            Value::HostString(loader.storage.alloc_str(package))
+        }
+        (b"getComponentType", b"()Ljava/lang/Class;") => {
+            if !class.starts_with(b"[") {
+                return Ok(Some(Value::Null));
+            }
+            let component = &class[1..];
+            let name = if component.starts_with(b"L") {
+                &component[1..component.len() - 1]
+            } else if let [tag] = component {
+                match *tag {
+                    b'Z' => b":Z".as_slice(),
+                    b'B' => b":B".as_slice(),
+                    b'C' => b":C".as_slice(),
+                    b'S' => b":S".as_slice(),
+                    b'I' => b":I".as_slice(),
+                    b'J' => b":J".as_slice(),
+                    b'F' => b":F".as_slice(),
+                    b'D' => b":D".as_slice(),
+                    _ => return Ok(Some(Value::Null)),
+                }
+            } else {
+                component
+            };
+            Value::ClassMirror(loader.storage.alloc_slice_copy(name))
+        }
+        (b"getSuperclass", b"()Ljava/lang/Class;") => {
+            if class.starts_with(b"[") || class.starts_with(b":") {
+                return Ok(Some(Value::Null));
+            }
+            let klass = loader.load(class)?;
+            match klass.super_klass() {
+                Some(super_klass) => Value::ClassMirror(super_klass.class.name),
+                None => Value::Null,
+            }
+        }
+        (b"isInstance", b"(Ljava/lang/Object;)Z") => {
+            let arg = arguments.first().copied().unwrap_or(Value::Null);
+            let result = !matches!(arg, Value::Null)
+                && loader.referenceAssignable(arg, class).unwrap_or(false);
+            return Ok(Some(Value::Int(i32::from(result))));
+        }
+        (b"cast", b"(Ljava/lang/Object;)Ljava/lang/Object;") => {
+            let arg = arguments.first().copied().unwrap_or(Value::Null);
+            let ok = matches!(arg, Value::Null)
+                || loader.referenceAssignable(arg, class).unwrap_or(false);
+            if !ok {
+                let stack = loader
+                    .call_stack
+                    .borrow()
+                    .iter()
+                    .rev()
+                    .take(6)
+                    .map(|name| String::from_utf8_lossy(name).into_owned())
+                    .collect::<Vec<_>>()
+                    .join(" <- ");
+                return Err(io::Error::other(format!(
+                    "ClassCastException: cannot cast to {} at {stack}",
+                    String::from_utf8_lossy(class)
+                )));
+            }
+            return Ok(Some(arg));
+        }
+        (b"asSubclass", b"(Ljava/lang/Class;)Ljava/lang/Class;") => {
+            let arg = arguments.first().copied().unwrap_or(Value::Null);
+            // thisClass.asSubclass(S) succeeds iff thisClass is a subclass of (or
+            // equal to) S — the same relation as `S.isAssignableFrom(thisClass)`.
+            let ok = match arg {
+                Value::ClassMirror(other) => {
+                    if *class == other {
+                        true
+                    } else if class.starts_with(b":") || other.starts_with(b":") {
+                        false
+                    } else if class.starts_with(b"[") {
+                        loader.classAssignable(class, other).unwrap_or(false)
+                    } else if other.starts_with(b"[") {
+                        false
+                    } else {
+                        match loader.load(class) {
+                            Ok(source) => {
+                                crate::share::classfile::systemDictionary::SystemDictionary::is_subclass_of(&source, other)
+                                    || crate::share::classfile::systemDictionary::SystemDictionary::implements_interface(&source, other)
+                            }
+                            Err(e) => {
+                                eprintln!("[asSubclass] load {} failed: {e}", String::from_utf8_lossy(class));
+                                false
+                            }
+                        }
+                    }
+                }
+                _ => false,
+            };
+            if !ok {
+                let stack = loader
+                    .call_stack
+                    .borrow()
+                    .iter()
+                    .rev()
+                    .take(6)
+                    .map(|name| String::from_utf8_lossy(name).into_owned())
+                    .collect::<Vec<_>>()
+                    .join(" <- ");
+                return Err(io::Error::other(format!(
+                    "ClassCastException: asSubclass {} from {arg:?} at {stack}",
+                    String::from_utf8_lossy(class)
+                )));
+            }
+            return Ok(Some(Value::ClassMirror(*class)));
         }
         _ => return Ok(None),
     };

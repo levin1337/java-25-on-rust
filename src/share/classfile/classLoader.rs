@@ -11,10 +11,11 @@ use crate::share::interpreter::bytecodeInterpreter::Value;
 use crate::share::oops::instanceOop::InstanceOop;
 use crate::share::oops::objArrayOop::ObjArrayOop;
 use crate::share::oops::typeArrayOop::TypeArrayOop;
+use crate::share::runtime::synchronizer::Synchronizer;
 use crate::{classfile::ClassFile, share::oops::instanceKlass::InstanceKlass};
 use bumpalo::Bump;
 use std::{
-    cell::RefCell,
+    cell::{Cell, Ref, RefCell},
     collections::{HashMap, HashSet},
     fs::{self, File},
     io::{self, Error, Read},
@@ -22,6 +23,37 @@ use std::{
     rc::Rc,
 };
 use zip::ZipArchive;
+
+mod borrow_trace {
+    use std::cell::RefCell;
+    thread_local! {
+        static SITES: RefCell<Vec<&'static std::panic::Location<'static>>> =
+            const { RefCell::new(Vec::new()) };
+    }
+    pub fn note(loc: &'static std::panic::Location<'static>) {
+        SITES.with(|sites| {
+            let mut sites = sites.borrow_mut();
+            if sites.len() >= 512 {
+                sites.remove(0);
+            }
+            sites.push(loc);
+        });
+    }
+    pub fn dump() {
+        SITES.with(|sites| {
+            for loc in sites.borrow().iter().rev().take(40) {
+                eprintln!("[objects-borrow-site] {loc}");
+            }
+        });
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FreeSlot {
+    Object(usize),
+    TypeArray(usize),
+    ObjArray(usize),
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClassLoaderType {
@@ -80,7 +112,10 @@ pub struct ModuleClassPathList {
 }
 
 pub enum ClassSource {
-    Jar { archive: ZipArchive<File>, path: PathBuf },
+    Jar {
+        archive: ZipArchive<File>,
+        path: PathBuf,
+    },
     Directory(PathBuf),
 }
 
@@ -94,9 +129,26 @@ pub struct ClassLoader<'a> {
     pub(crate) arrays: RefCell<Vec<TypeArrayOop>>,
     pub(crate) objects: RefCell<Vec<InstanceOop<'a>>>,
     pub(crate) obj_arrays: RefCell<Vec<ObjArrayOop<'a>>>,
+    pub(crate) objects_live: RefCell<Vec<bool>>,
+    pub(crate) arrays_live: RefCell<Vec<bool>>,
+    pub(crate) obj_arrays_live: RefCell<Vec<bool>>,
+    free_slots: RefCell<Vec<FreeSlot>>,
+    allocations_since_gc: Cell<usize>,
+    pub(crate) gc_extra_roots: RefCell<Vec<Value<'a>>>,
+    pub(crate) synchronizer: RefCell<Synchronizer>,
     class_loader_object: RefCell<Option<usize>>,
+    unnamed_module_object: RefCell<Option<usize>>,
     current_thread_object: RefCell<Option<usize>>,
+    pub(crate) call_stack: RefCell<Vec<&'a [u8]>>,
     loader_type: ClassLoaderType,
+}
+
+/// Extracts the resource name (path inside the module) from a jimage
+/// resource path of the form "/module/rest/of/path".
+fn jimage_resource_name(path: &str) -> Option<String> {
+    let rest = path.strip_prefix('/')?;
+    let (_, name) = rest.split_once('/')?;
+    Some(name.to_owned())
 }
 
 impl<'a> ClassLoader<'a> {
@@ -125,11 +177,42 @@ impl<'a> ClassLoader<'a> {
         0
     }
 
+    pub(crate) fn class_loader_object_handle(&self) -> &RefCell<Option<usize>> {
+        &self.class_loader_object
+    }
+
+    /// Lazily creates the shared unnamed `java.lang.Module` instance used for
+    /// `Class.getModule()` and `ClassLoader.getUnnamedModule()`.
+    pub(crate) fn unnamedModuleObject(&self) -> io::Result<usize> {
+        if let Some(handle) = *self.unnamed_module_object.borrow() {
+            return Ok(handle);
+        }
+        let klass = self.load(b"java/lang/Module")?;
+        let _ = crate::share::interpreter::bytecodeInterpreter::initialize(
+            self,
+            &klass,
+            &mut io::sink(),
+            0,
+        );
+        let object = InstanceOop::new(klass)?;
+        let handle = self.alloc_object(object);
+        *self.unnamed_module_object.borrow_mut() = Some(handle);
+        Ok(handle)
+    }
+
+    pub(crate) fn unnamed_module_object_handle(&self) -> &RefCell<Option<usize>> {
+        &self.unnamed_module_object
+    }
+
+    pub(crate) fn current_thread_object_handle(&self) -> &RefCell<Option<usize>> {
+        &self.current_thread_object
+    }
+
     pub(crate) fn referenceAssignable(&self, value: Value<'a>, target: &[u8]) -> io::Result<bool> {
         Ok(match value {
             Value::Null => true,
             Value::Object(handle) => {
-                let objects = self.objects.borrow();
+                let objects = self.borrow_objects();
                 let object = objects
                     .get(handle)
                     .ok_or_else(|| Error::other("Invalid object reference"))?;
@@ -247,6 +330,18 @@ impl<'a> ClassLoader<'a> {
         )
     }
 
+    /// Default system properties required for correct VM behavior.
+    /// Core reflection is served by the native accessor path; method-handle
+    /// accessors and bytecode inflation are disabled because this VM has no
+    /// bytecode class generation facility.
+    fn default_system_properties() -> HashMap<String, &'static str> {
+        HashMap::from([
+            ("jdk.reflect.useDirectMethodHandle".to_owned(), "false"),
+            ("jdk.reflect.useNativeAccessorOnly".to_owned(), "true"),
+            ("sun.reflect.inflationThreshold".to_owned(), "2147483647"),
+        ])
+    }
+
     pub fn open(path: &Path, storage: &'a Bump) -> io::Result<Self> {
         let source = if path.is_dir() {
             ClassSource::Directory(path.to_path_buf())
@@ -262,12 +357,21 @@ impl<'a> ClassLoader<'a> {
             classes: RefCell::new(HashMap::new()),
             loading: RefCell::new(HashSet::new()),
             bootImage: None,
-            systemProperties: RefCell::new(HashMap::new()),
+            systemProperties: RefCell::new(Self::default_system_properties()),
             arrays: RefCell::new(Vec::new()),
             objects: RefCell::new(Vec::new()),
             obj_arrays: RefCell::new(Vec::new()),
+            objects_live: RefCell::new(Vec::new()),
+            arrays_live: RefCell::new(Vec::new()),
+            obj_arrays_live: RefCell::new(Vec::new()),
+            free_slots: RefCell::new(Vec::new()),
+            allocations_since_gc: Cell::new(0),
+            gc_extra_roots: RefCell::new(Vec::new()),
+            synchronizer: RefCell::new(Synchronizer::new()),
             class_loader_object: RefCell::new(None),
+            unnamed_module_object: RefCell::new(None),
             current_thread_object: RefCell::new(None),
+            call_stack: RefCell::new(Vec::new()),
             loader_type: ClassLoaderType::AppLoader,
         })
     }
@@ -299,14 +403,145 @@ impl<'a> ClassLoader<'a> {
             classes: RefCell::new(HashMap::new()),
             loading: RefCell::new(HashSet::new()),
             bootImage: None,
-            systemProperties: RefCell::new(HashMap::new()),
+            systemProperties: RefCell::new(Self::default_system_properties()),
             arrays: RefCell::new(Vec::new()),
             objects: RefCell::new(Vec::new()),
             obj_arrays: RefCell::new(Vec::new()),
+            objects_live: RefCell::new(Vec::new()),
+            arrays_live: RefCell::new(Vec::new()),
+            obj_arrays_live: RefCell::new(Vec::new()),
+            free_slots: RefCell::new(Vec::new()),
+            allocations_since_gc: Cell::new(0),
+            gc_extra_roots: RefCell::new(Vec::new()),
+            synchronizer: RefCell::new(Synchronizer::new()),
             class_loader_object: RefCell::new(None),
+            unnamed_module_object: RefCell::new(None),
             current_thread_object: RefCell::new(None),
+            call_stack: RefCell::new(Vec::new()),
             loader_type: ClassLoaderType::AppLoader,
         })
+    }
+
+    pub(crate) fn note_allocation(&self) {
+        self.allocations_since_gc
+            .set(self.allocations_since_gc.get() + 1);
+    }
+
+    pub(crate) fn gc_due(&self) -> bool {
+        self.allocations_since_gc.get() >= 2048
+    }
+
+    pub(crate) fn reset_allocations(&self) {
+        self.allocations_since_gc.set(0);
+    }
+
+    #[track_caller]
+    pub(crate) fn borrow_objects(&self) -> Ref<'_, Vec<InstanceOop<'a>>> {
+        borrow_trace::note(std::panic::Location::caller());
+        self.objects.borrow()
+    }
+
+    #[track_caller]
+    pub(crate) fn borrow_objects_mut(&self) -> std::cell::RefMut<'_, Vec<InstanceOop<'a>>> {
+        borrow_trace::note(std::panic::Location::caller());
+        self.objects.borrow_mut()
+    }
+
+    pub(crate) fn alloc_object(&self, object: InstanceOop<'a>) -> usize {
+        self.note_allocation();
+        let mut objects = match self.objects.try_borrow_mut() {
+            Ok(guard) => guard,
+            Err(_) => {
+                borrow_trace::dump();
+                panic!("objects arena already borrowed");
+            }
+        };
+        let mut free = self.free_slots.borrow_mut();
+        if let Some(position) = free
+            .iter()
+            .rposition(|slot| matches!(slot, FreeSlot::Object(_)))
+        {
+            let FreeSlot::Object(index) = free.remove(position) else {
+                unreachable!()
+            };
+            objects[index] = object;
+            drop(objects);
+            drop(free);
+            let mut live = self.objects_live.borrow_mut();
+            live.resize(self.borrow_objects().len(), true);
+            live[index] = true;
+            return index;
+        }
+        drop(free);
+        let handle = objects.len();
+        objects.push(object);
+        drop(objects);
+        let mut live = self.objects_live.borrow_mut();
+        live.resize(handle + 1, true);
+        live[handle] = true;
+        handle
+    }
+
+    pub(crate) fn alloc_type_array(&self, array: TypeArrayOop) -> usize {
+        self.note_allocation();
+        let mut arrays = self.arrays.borrow_mut();
+        let mut free = self.free_slots.borrow_mut();
+        if let Some(position) = free
+            .iter()
+            .rposition(|slot| matches!(slot, FreeSlot::TypeArray(_)))
+        {
+            let FreeSlot::TypeArray(index) = free.remove(position) else {
+                unreachable!()
+            };
+            arrays[index] = array;
+            drop(arrays);
+            drop(free);
+            let mut live = self.arrays_live.borrow_mut();
+            live.resize(self.arrays.borrow().len(), true);
+            live[index] = true;
+            return index;
+        }
+        drop(free);
+        let handle = arrays.len();
+        arrays.push(array);
+        drop(arrays);
+        let mut live = self.arrays_live.borrow_mut();
+        live.resize(handle + 1, true);
+        live[handle] = true;
+        handle
+    }
+
+    pub(crate) fn alloc_obj_array(&self, array: ObjArrayOop<'a>) -> usize {
+        self.note_allocation();
+        let mut arrays = self.obj_arrays.borrow_mut();
+        let mut free = self.free_slots.borrow_mut();
+        if let Some(position) = free
+            .iter()
+            .rposition(|slot| matches!(slot, FreeSlot::ObjArray(_)))
+        {
+            let FreeSlot::ObjArray(index) = free.remove(position) else {
+                unreachable!()
+            };
+            arrays[index] = array;
+            drop(arrays);
+            drop(free);
+            let mut live = self.obj_arrays_live.borrow_mut();
+            live.resize(self.obj_arrays.borrow().len(), true);
+            live[index] = true;
+            return index;
+        }
+        drop(free);
+        let handle = arrays.len();
+        arrays.push(array);
+        drop(arrays);
+        let mut live = self.obj_arrays_live.borrow_mut();
+        live.resize(handle + 1, true);
+        live[handle] = true;
+        handle
+    }
+
+    pub(crate) fn free_slot(&self, slot: FreeSlot) {
+        self.free_slots.borrow_mut().push(slot);
     }
 
     pub fn add_source(&self, source: ClassSource) {
@@ -318,6 +553,11 @@ impl<'a> ClassLoader<'a> {
             Ok(p) => p,
             Err(_) => return false,
         };
+        if let Some(image) = &self.bootImage
+            && image.borrow().hasClass(&rel_path)
+        {
+            return true;
+        }
         let mut sources = self.sources.borrow_mut();
         for source in sources.iter_mut() {
             match source {
@@ -342,14 +582,24 @@ impl<'a> ClassLoader<'a> {
         Ok(self)
     }
 
+    /// Locates all resources (non-class entries) with the given path across
+    /// the boot image and the class path, in loader delegation order.
     pub fn resource_locations(&self, name: &[u8]) -> io::Result<Vec<PathBuf>> {
         let name = super::classFileParser::decodeString(name)?;
         let mut locations = Vec::new();
         if let Some(image) = &self.bootImage {
             let image = image.borrow();
-            for path in image.paths_with_suffix(&name) {
-                locations.push(PathBuf::from(path));
-            }
+            let mut matches: Vec<String> = image
+                .resource_paths()
+                .filter(|path| jimage_resource_name(path).as_deref() == Some(name.as_str()))
+                .map(str::to_owned)
+                .collect();
+            matches.sort_by(|a, b| {
+                let a_base = a.starts_with("/java.base/");
+                let b_base = b.starts_with("/java.base/");
+                b_base.cmp(&a_base).then_with(|| a.cmp(b))
+            });
+            locations.extend(matches.into_iter().map(PathBuf::from));
         }
         let mut sources = self.sources.borrow_mut();
         for source in sources.iter_mut() {
@@ -405,21 +655,75 @@ impl<'a> ClassLoader<'a> {
             }
         }
 
-        Err(Error::other(format!(
-            "ClassNotFoundException: {}",
-            String::from_utf8_lossy(name)
-        )))
+        Err(super::linkageError::LinkageError::class_not_found(name).io())
+    }
+
+    /// Reads a non-class resource (properties files, data files, ...).
+    /// Returns `Ok(None)` when the resource does not exist.
+    pub fn open_resource(&self, name: &[u8]) -> io::Result<Option<Vec<u8>>> {
+        let rel_path = super::classFileParser::decodeString(name)?;
+        if rel_path.is_empty() || rel_path.starts_with('/') || rel_path.contains("..") {
+            return Ok(None);
+        }
+        if let Some(image) = &self.bootImage {
+            let mut image = image.borrow_mut();
+            let mut matches: Vec<String> = image
+                .resource_paths()
+                .filter(|path| jimage_resource_name(path).as_deref() == Some(rel_path.as_str()))
+                .map(str::to_owned)
+                .collect();
+            matches.sort_by(|a, b| {
+                let a_base = a.starts_with("/java.base/");
+                let b_base = b.starts_with("/java.base/");
+                b_base.cmp(&a_base).then_with(|| a.cmp(b))
+            });
+            if let Some(path) = matches.into_iter().next() {
+                return image.read_resource(&path).map(Some);
+            }
+        }
+        let mut sources = self.sources.borrow_mut();
+        for source in sources.iter_mut() {
+            match source {
+                ClassSource::Jar { archive: zip, .. } => {
+                    if let Ok(mut entry) = zip.by_name(&rel_path)
+                        && let Ok(bytes) = {
+                            let mut bytes = Vec::new();
+                            entry.read_to_end(&mut bytes).map(|_| bytes)
+                        }
+                    {
+                        return Ok(Some(bytes));
+                    }
+                }
+                ClassSource::Directory(dir) => {
+                    let file_path = dir.join(&rel_path);
+                    if file_path.is_file()
+                        && let Ok(content) = fs::read(&file_path)
+                    {
+                        return Ok(Some(content));
+                    }
+                }
+            }
+        }
+        Ok(None)
     }
 
     pub fn hasClass(&self, name: &[u8]) -> io::Result<bool> {
         let name = super::classFileParser::decodeString(name)?;
-        if let Some(image) = &self.bootImage {
-            return Ok(image.borrow().hasClass(&name));
+        if let Some(image) = &self.bootImage
+            && image.borrow().hasClass(&name)
+        {
+            return Ok(true);
         }
-        Ok(self.sources.borrow_mut().iter_mut().any(|source| match source {
-            ClassSource::Jar { archive: zip, .. } => zip.by_name(&format!("{name}.class")).is_ok(),
-            ClassSource::Directory(dir) => dir.join(format!("{name}.class")).exists(),
-        }))
+        Ok(self
+            .sources
+            .borrow_mut()
+            .iter_mut()
+            .any(|source| match source {
+                ClassSource::Jar { archive: zip, .. } => {
+                    zip.by_name(&format!("{name}.class")).is_ok()
+                }
+                ClassSource::Directory(dir) => dir.join(format!("{name}.class")).exists(),
+            }))
     }
 
     pub fn load_class(&self, name: &[u8]) -> io::Result<Rc<InstanceKlass<'a>>> {
@@ -427,11 +731,21 @@ impl<'a> ClassLoader<'a> {
     }
 
     pub fn load(&self, name: &[u8]) -> io::Result<Rc<InstanceKlass<'a>>> {
+        if name.starts_with(b"[") || name.starts_with(b":") {
+            return Err(Error::other(format!(
+                "Array or primitive class cannot be loaded by name: {}",
+                String::from_utf8_lossy(name)
+            )));
+        }
         if let Some(klass) = self.classes.borrow().get(name) {
             return Ok(Rc::clone(klass));
         }
         if !self.loading.borrow_mut().insert(name.to_vec()) {
-            return Err(Error::other("ClassCircularityError"));
+            return Err(super::linkageError::LinkageError::new(
+                super::linkageError::LinkageErrorKind::ClassCircularity,
+                format!("{}", String::from_utf8_lossy(name)),
+            )
+            .io());
         }
         let result = self.loadClass(name);
         self.loading.borrow_mut().remove(name);
@@ -439,6 +753,7 @@ impl<'a> ClassLoader<'a> {
     }
 
     fn loadClass(&self, name: &[u8]) -> io::Result<Rc<InstanceKlass<'a>>> {
+    let _rg = crate::share::recprobe::Guard::enter("loadClass");
         if name == b"java/lang/Object" && self.bootImage.is_none() {
             let synthetic_class = ClassFile {
                 majorVersion: 65,
@@ -461,20 +776,84 @@ impl<'a> ClassLoader<'a> {
 
         let bytes = self.open_stream(name)?;
         let bytes = self.storage.alloc_slice_copy(&bytes);
-        let class = ClassFile::parse(bytes, false).map_err(Error::other)?;
+        let class = ClassFile::parse(bytes, false).map_err(|error| {
+            use super::classFileParser::ClassError as E;
+            let kind = match &error {
+                E::InvalidMagic
+                | E::InvalidConstantPool
+                | E::InvalidConstantTag(_)
+                | E::InvalidConstantIndex(_)
+                | E::TrailingBytes
+                | E::ClassFormatError(_) => super::linkageError::LinkageErrorKind::ClassFormat,
+                E::UnsupportedVersion(..) => {
+                    super::linkageError::LinkageErrorKind::UnsupportedClassVersion
+                }
+                _ => super::linkageError::LinkageErrorKind::ClassFormat,
+            };
+            super::linkageError::LinkageError::new(kind, error.to_string()).io()
+        })?;
         if class.name != name {
-            return Err(Error::other("Class name mismatch"));
+            return Err(super::linkageError::LinkageError::no_class_def_found(name).io());
         }
 
+        let no_class_def = |dep: &[u8], error: io::Error| {
+            if super::linkageError::linkage_kind(&error).is_some() {
+                return error;
+            }
+            super::linkageError::LinkageError::new(
+                super::linkageError::LinkageErrorKind::NoClassDefFound,
+                format!(
+                    "{}/{} (wrong name: {})",
+                    String::from_utf8_lossy(name),
+                    String::from_utf8_lossy(dep),
+                    String::from_utf8_lossy(dep)
+                ),
+            )
+            .io()
+        };
+
         let super_klass = if let Some(super_name) = class.superName {
-            Some(self.load(super_name)?)
+            Some(
+                self.load(super_name)
+                    .map_err(|e| no_class_def(super_name, e))?,
+            )
         } else {
             None
         };
 
         let mut interfaces = Vec::with_capacity(class.interfaces.len());
         for iface_name in &class.interfaces {
-            interfaces.push(self.load(iface_name)?);
+            interfaces.push(
+                self.load(iface_name)
+                    .map_err(|e| no_class_def(iface_name, e))?,
+            );
+        }
+
+        let is_interface = (class.accessFlags & 0x0200) != 0;
+        if !is_interface
+            && let Some(super_klass) = &super_klass
+            && super_klass.is_interface()
+        {
+            return Err(
+                super::linkageError::LinkageError::incompatible_class_change(format!(
+                    "class {} has interface {} as super class",
+                    String::from_utf8_lossy(name),
+                    String::from_utf8_lossy(super_klass.class.name)
+                ))
+                .io(),
+            );
+        }
+        for iface in &interfaces {
+            if !iface.is_interface() {
+                return Err(
+                    super::linkageError::LinkageError::incompatible_class_change(format!(
+                        "class {} implements non-interface {}",
+                        String::from_utf8_lossy(name),
+                        String::from_utf8_lossy(iface.class.name)
+                    ))
+                    .io(),
+                );
+            }
         }
 
         let klass = Rc::new(InstanceKlass::new(class, super_klass, interfaces)?);
@@ -488,11 +867,29 @@ impl<'a> ClassLoader<'a> {
         if let Some(handle) = *self.class_loader_object.borrow() {
             return Ok(handle);
         }
-        let klass = self.load(b"java/lang/ClassLoader")?;
-        let object = InstanceOop::new(klass)?;
-        let mut objects = self.objects.borrow_mut();
-        let handle = objects.len();
-        objects.push(object);
+        let klass = if self.bootImage.is_some() {
+            match self.load(b"jdk/internal/loader/ClassLoaders$AppClassLoader") {
+                Ok(k) => k,
+                Err(e) => {
+                    eprintln!("[dbg] AppClassLoader load failed: {e}");
+                    self.load(b"java/lang/ClassLoader")?
+                }
+            }
+        } else {
+            self.load(b"java/lang/ClassLoader")?
+        };
+        let object = InstanceOop::new(klass.clone())?;
+        let handle = self.alloc_object(object);
+        if let Ok(module) = self.unnamedModuleObject()
+            && let Ok(slot) = klass.instanceField(b"unnamedModule", b"Ljava/lang/Module;")
+        {
+            let mut objects = self.borrow_objects_mut();
+            if let Some(object) = objects.get_mut(handle)
+                && slot < object.fields.len()
+            {
+                object.fields[slot] = Value::Object(module);
+            }
+        }
         *self.class_loader_object.borrow_mut() = Some(handle);
         Ok(handle)
     }
@@ -502,11 +899,72 @@ impl<'a> ClassLoader<'a> {
             return Ok(handle);
         }
         let klass = self.load(b"java/lang/Thread")?;
-        let object = InstanceOop::new(klass)?;
-        let mut objects = self.objects.borrow_mut();
-        let handle = objects.len();
-        objects.push(object);
+        let mut object = InstanceOop::new(klass)?;
+        // Thread.threadState() and friends require the private FieldHolder
+        // (and its ThreadGroup) to exist; real threads get them from
+        // Thread.<init>.
+        if let Ok(holder_klass) = self.load(b"java/lang/Thread$FieldHolder") {
+            let mut holder_object = InstanceOop::new(holder_klass)?;
+            if let Ok(group_klass) = self.load(b"java/lang/ThreadGroup") {
+                let mut group_object = InstanceOop::new(group_klass)?;
+                if let Ok(index) =
+                    group_object.klass.instanceField(b"name", b"Ljava/lang/String;")
+                {
+                    group_object.fields[index] = Value::HostString(
+                        self.storage.alloc_str("system"),
+                    );
+                }
+                if let Ok(index) = group_object
+                    .klass
+                    .instanceField(b"maxPriority", b"I")
+                {
+                    group_object.fields[index] = Value::Int(10);
+                }
+                let group_handle = self.alloc_object(group_object);
+                if let Ok(index) = holder_object
+                    .klass
+                    .instanceField(b"group", b"Ljava/lang/ThreadGroup;")
+                {
+                    holder_object.fields[index] = Value::Object(group_handle);
+                }
+            }
+            if let Ok(index) = holder_object
+                .klass
+                .instanceField(b"priority", b"I")
+            {
+                holder_object.fields[index] = Value::Int(5);
+            }
+            if let Ok(index) = holder_object
+                .klass
+                .instanceField(b"threadStatus", b"I")
+            {
+                holder_object.fields[index] = Value::Int(5);
+            }
+            let holder_handle = self.alloc_object(holder_object);
+            if let Ok(index) = object
+                .klass
+                .instanceField(b"holder", b"Ljava/lang/Thread$FieldHolder;")
+            {
+                object.fields[index] = Value::Object(holder_handle);
+            }
+        }
+        if let Ok(index) = object.klass.instanceField(b"name", b"Ljava/lang/String;") {
+            object.fields[index] = Value::HostString(self.storage.alloc_str("main"));
+        }
+        let handle = self.alloc_object(object);
         *self.current_thread_object.borrow_mut() = Some(handle);
+        if std::env::var_os("JVM25_TRACE").is_some() {
+            let objects = self.borrow_objects();
+            if let Some(thread) = objects.get(handle) {
+                eprintln!("[thread] main thread fields={:?}", thread.fields);
+                if let Ok(slot) = thread.klass.instanceField(b"holder", b"Ljava/lang/Thread$FieldHolder;")
+                    && let Some(Value::Object(h)) = thread.fields.get(slot)
+                    && let Some(holder) = objects.get(*h)
+                {
+                    eprintln!("[thread] holder fields={:?}", holder.fields);
+                }
+            }
+        }
         Ok(handle)
     }
 

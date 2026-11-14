@@ -28,6 +28,8 @@ pub struct Code<'a> {
     pub maxLocals: usize,
     pub bytes: &'a [u8],
     pub exception_table: Vec<ExceptionTableEntry>,
+    pub name: &'a [u8],
+    pub descriptor: &'a [u8],
 }
 
 impl<'a> Code<'a> {
@@ -86,6 +88,8 @@ impl<'a> Code<'a> {
             maxLocals: usize::from(u16::from_be_bytes([localsHigh, localsLow])),
             bytes,
             exception_table,
+            name: method.name,
+            descriptor: method.descriptor,
         })
     }
 }

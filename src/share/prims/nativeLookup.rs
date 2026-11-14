@@ -116,11 +116,32 @@ pub fn invokeInstance<'a>(
     descriptor: &[u8],
     arguments: &[crate::share::interpreter::bytecodeInterpreter::Value<'a>],
 ) -> io::Result<Option<Option<crate::share::interpreter::bytecodeInterpreter::Value<'a>>>> {
+    let _rg = crate::share::recprobe::Guard::enter("invokeInstance");
     use super::jvm::Jvm;
     use crate::share::interpreter::bytecodeInterpreter::Value;
 
     if owner == b"jdk/internal/misc/Unsafe" {
-        return super::unsafeNatives::invoke(loader, name, descriptor, arguments);
+        return super::unsafeNatives::invoke(loader, name, descriptor, arguments).map_err(
+            |error| {
+                io::Error::other(format!(
+                    "Unsafe.{}{}: {}",
+                    String::from_utf8_lossy(name),
+                    String::from_utf8_lossy(descriptor),
+                    error
+                ))
+            },
+        );
+    }
+
+    if owner == b"java/lang/Class" {
+        if let Some(value) = super::reflectionNatives::class_invoke(
+            loader,
+            name,
+            descriptor,
+            arguments,
+        )? {
+            return Ok(Some(Some(value)));
+        }
     }
 
     if owner == b"java/lang/ClassLoader"
@@ -139,7 +160,9 @@ pub fn invokeInstance<'a>(
         let mut url_objects = Vec::with_capacity(locations.len());
         for location in locations {
             let mut object = crate::share::oops::instanceOop::InstanceOop::new(url_klass.clone())?;
-            let file = loader.storage.alloc_str(&format!("/{}", location.display()));
+            let file = loader
+                .storage
+                .alloc_str(&format!("/{}", location.display()));
             let protocol = url_klass.instanceField(b"protocol", b"Ljava/lang/String;")?;
             let host = url_klass.instanceField(b"host", b"Ljava/lang/String;")?;
             let port = url_klass.instanceField(b"port", b"I")?;
@@ -157,29 +180,16 @@ pub fn invokeInstance<'a>(
         )?;
         let mut elements = url_objects.into_iter();
         for element in array.elements.iter_mut() {
-            let mut objects = loader.objects.borrow_mut();
-            let handle = objects.len();
-            objects.push(elements.next().unwrap());
-            *element = Value::Object(handle);
+            *element = Value::Object(loader.alloc_object(elements.next().unwrap()));
         }
         let list_klass = loader.load(b"java/util/ArrayList")?;
         let list = crate::share::oops::instanceOop::InstanceOop::new(list_klass.clone())?;
         let data_index = list_klass.instanceField(b"elementData", b"[Ljava/lang/Object;")?;
         let size_index = list_klass.instanceField(b"size", b"I")?;
-        let list_handle = {
-            let mut objects = loader.objects.borrow_mut();
-            let handle = objects.len();
-            objects.push(list);
-            handle
-        };
-        let array_handle = {
-            let mut arrays = loader.obj_arrays.borrow_mut();
-            let handle = arrays.len();
-            arrays.push(array);
-            handle
-        };
+        let list_handle = loader.alloc_object(list);
+        let array_handle = loader.alloc_obj_array(array);
         {
-            let mut objects = loader.objects.borrow_mut();
+            let mut objects = loader.borrow_objects_mut();
             let list = objects
                 .get_mut(list_handle)
                 .ok_or_else(|| io::Error::other("Invalid ArrayList object"))?;
@@ -188,32 +198,41 @@ pub fn invokeInstance<'a>(
         }
         let enum_klass = loader.load(b"java/util/Collections$3")?;
         let mut output = std::io::sink();
-        crate::share::interpreter::bytecodeInterpreter::initialize(loader, &enum_klass, &mut output, 0)?;
-        let mut enumeration = crate::share::oops::instanceOop::InstanceOop::new(enum_klass.clone())?;
+        crate::share::interpreter::bytecodeInterpreter::initialize(
+            loader,
+            &enum_klass,
+            &mut output,
+            0,
+        )?;
+        let mut enumeration =
+            crate::share::oops::instanceOop::InstanceOop::new(enum_klass.clone())?;
         let collection_index = enum_klass.instanceField(b"val$c", b"Ljava/util/Collection;")?;
         enumeration.fields[collection_index] = Value::Object(list_handle);
         let iterator_index = enum_klass.instanceField(b"i", b"Ljava/util/Iterator;")?;
         let list_klass_for_iterator = loader.load(b"java/util/ArrayList")?;
         let iterator_klass = loader.load(b"java/util/ArrayList$Itr")?;
         let mut output = std::io::sink();
-        crate::share::interpreter::bytecodeInterpreter::initialize(loader, &iterator_klass, &mut output, 0)?;
-        let mut iterator = crate::share::oops::instanceOop::InstanceOop::new(iterator_klass.clone())?;
+        crate::share::interpreter::bytecodeInterpreter::initialize(
+            loader,
+            &iterator_klass,
+            &mut output,
+            0,
+        )?;
+        let mut iterator =
+            crate::share::oops::instanceOop::InstanceOop::new(iterator_klass.clone())?;
         let cursor_index = iterator_klass.instanceField(b"cursor", b"I")?;
         let last_ret_index = iterator_klass.instanceField(b"lastRet", b"I")?;
         let expected_mod_count_index = iterator_klass.instanceField(b"expectedModCount", b"I")?;
-        let outer_class_index = iterator_klass.instanceField(b"this$0", b"Ljava/util/ArrayList;")?;
+        let outer_class_index =
+            iterator_klass.instanceField(b"this$0", b"Ljava/util/ArrayList;")?;
         iterator.fields[cursor_index] = Value::Int(0);
         iterator.fields[last_ret_index] = Value::Int(-1);
         iterator.fields[expected_mod_count_index] = Value::Int(0);
         iterator.fields[outer_class_index] = Value::Object(list_handle);
-        let mut objects = loader.objects.borrow_mut();
-        let iterator_handle = objects.len();
-        objects.push(iterator);
-        let handle = objects.len();
-        objects.push(enumeration);
-        drop(objects);
+        let iterator_handle = loader.alloc_object(iterator);
+        let handle = loader.alloc_object(enumeration);
         {
-            let mut objects = loader.objects.borrow_mut();
+            let mut objects = loader.borrow_objects_mut();
             let enumeration = objects
                 .get_mut(handle)
                 .ok_or_else(|| io::Error::other("Invalid Enumeration object"))?;
@@ -253,10 +272,234 @@ pub fn invokeInstance<'a>(
         (b"java/lang/Object", b"notify", b"()V")
         | (b"java/lang/Object", b"notifyAll", b"()V")
         | (b"java/lang/Object", b"wait0", b"(J)V") => None,
-        _ => return Ok(None),
+        (b"java/lang/Runtime", b"load0", b"(Ljava/lang/String;)V") => {
+            // System.load(String): arguments = [receiver, filename]
+            let Some(filename) = arguments
+                .get(1)
+                .and_then(|value| super::stringNatives::string(loader, *value).ok().flatten())
+            else {
+                return Err(io::Error::other("Invalid library path"));
+            };
+            super::nativeLibraries::NativeLibraries::global()
+                .load(std::path::Path::new(filename.as_ref()))?;
+            None
+        }
+        (b"java/lang/Runtime", b"loadLibrary0", b"(Ljava/lang/Class;Ljava/lang/String;)V") => {
+            // System.loadLibrary(String): arguments = [receiver, fromClass, name]
+            let Some(name) = arguments
+                .get(2)
+                .and_then(|value| super::stringNatives::string(loader, *value).ok().flatten())
+            else {
+                return Err(io::Error::other("Invalid library name"));
+            };
+            super::nativeLibraries::NativeLibraries::global().load_library(name.as_ref())?;
+            None
+        }
+        _ if (owner == b"java/io/WinNTFileSystem" || owner == b"java/io/UnixFileSystem" || owner == b"java/io/FileDescriptor") => {
+            match super::fileNatives::invoke(loader, name, descriptor, arguments)? {
+                Some(_value) if descriptor.ends_with(b")V") => None,
+                Some(value) => Some(value),
+                None => {
+                    return match super::jniInvocation::invoke_dll_native(
+                        loader, owner, name, descriptor, false, arguments,
+                    )? {
+                        Some(result) => Ok(Some(result)),
+                        None => Ok(None),
+                    };
+                }
+            }
+        }
+        _ => {
+            return match super::jniInvocation::invoke_dll_native(
+                loader, owner, name, descriptor, false, arguments,
+            )? {
+                Some(result) => Ok(Some(result)),
+                None => Ok(None),
+            };
+        }
     };
 
     Ok(Some(result))
+}
+
+/// Allocates a raw instance of `class_name` without running any constructor.
+fn raw_instance<'a>(
+    loader: &crate::share::classfile::classLoader::ClassLoader<'a>,
+    class_name: &[u8],
+) -> io::Result<usize> {
+    use crate::share::oops::instanceOop::InstanceOop;
+
+    let klass = loader.load(class_name)?;
+    let object = InstanceOop::new(klass)?;
+    Ok(loader.alloc_object(object))
+}
+
+/// Writes an instance field by name/descriptor on an already-allocated object.
+fn set_instance_field<'a>(
+    loader: &crate::share::classfile::classLoader::ClassLoader<'a>,
+    handle: usize,
+    name: &[u8],
+    descriptor: &[u8],
+    value: crate::share::interpreter::bytecodeInterpreter::Value<'a>,
+) -> io::Result<()> {
+    use crate::share::interpreter::bytecodeInterpreter::Value;
+
+    let slot = {
+        let objects = loader.borrow_objects();
+        let object = objects
+            .get(handle)
+            .ok_or_else(|| io::Error::other("Invalid object reference"))?;
+        object.klass.instanceField(name, descriptor)?
+    };
+    let mut objects = loader.borrow_objects_mut();
+    let object = objects
+        .get_mut(handle)
+        .ok_or_else(|| io::Error::other("Invalid object reference"))?;
+    if slot < object.fields.len() {
+        object.fields[slot] = value;
+    }
+    let _ = Value::Null;
+    Ok(())
+}
+
+/// Returns the current thread object. The lazily-created synthetic instance is
+/// initialized directly (FieldHolder + ThreadGroups + fields) because running
+/// `Thread.<init>` would recursively call `Thread.currentThread()`.
+fn current_thread<'a>(
+    loader: &crate::share::classfile::classLoader::ClassLoader<'a>,
+) -> io::Result<crate::share::interpreter::bytecodeInterpreter::Value<'a>> {
+    use crate::share::interpreter::bytecodeInterpreter::Value;
+
+    let handle = loader.currentThreadObject()?;
+    let uninitialized = {
+        let objects = loader.borrow_objects();
+        match objects.get(handle) {
+            Some(object) => match object
+                .klass
+                .instanceField(b"holder", b"Ljava/lang/Thread$FieldHolder;")
+            {
+                Ok(slot) => object
+                    .fields
+                    .get(slot)
+                    .map_or(true, |value| matches!(value, Value::Null)),
+                Err(_) => false,
+            },
+            None => false,
+        }
+    };
+    if uninitialized {
+        // Root "system" thread group (parent = null).
+        let system_group = raw_instance(loader, b"java/lang/ThreadGroup")?;
+        set_instance_field(
+            loader,
+            system_group,
+            b"name",
+            b"Ljava/lang/String;",
+            Value::HostString("system"),
+        )?;
+        set_instance_field(loader, system_group, b"parent", b"Ljava/lang/ThreadGroup;", Value::Null)?;
+        set_instance_field(loader, system_group, b"maxPriority", b"I", Value::Int(10))?;
+        set_instance_field(loader, system_group, b"daemon", b"Z", Value::Int(0))?;
+        set_instance_field(loader, system_group, b"ngroups", b"I", Value::Int(0))?;
+        set_instance_field(loader, system_group, b"groups", b"[Ljava/lang/ThreadGroup;", Value::Null)?;
+        set_instance_field(loader, system_group, b"nweaks", b"I", Value::Int(0))?;
+        set_instance_field(
+            loader,
+            system_group,
+            b"weaks",
+            b"[Ljava/lang/ref/WeakReference;",
+            Value::Null,
+        )?;
+
+        // "main" thread group, child of "system".
+        let main_group = raw_instance(loader, b"java/lang/ThreadGroup")?;
+        set_instance_field(
+            loader,
+            main_group,
+            b"name",
+            b"Ljava/lang/String;",
+            Value::HostString("main"),
+        )?;
+        set_instance_field(
+            loader,
+            main_group,
+            b"parent",
+            b"Ljava/lang/ThreadGroup;",
+            Value::Object(system_group),
+        )?;
+        set_instance_field(loader, main_group, b"maxPriority", b"I", Value::Int(10))?;
+        set_instance_field(loader, main_group, b"daemon", b"Z", Value::Int(0))?;
+        set_instance_field(loader, main_group, b"ngroups", b"I", Value::Int(0))?;
+        set_instance_field(loader, main_group, b"groups", b"[Ljava/lang/ThreadGroup;", Value::Null)?;
+        set_instance_field(loader, main_group, b"nweaks", b"I", Value::Int(0))?;
+        set_instance_field(
+            loader,
+            main_group,
+            b"weaks",
+            b"[Ljava/lang/ref/WeakReference;",
+            Value::Null,
+        )?;
+
+        // Thread$FieldHolder for the main thread: group=main, priority=NORM(5),
+        // daemon=false, threadStatus=RUNNABLE(4), task=null, stackSize=0.
+        let holder = raw_instance(loader, b"java/lang/Thread$FieldHolder")?;
+        set_instance_field(
+            loader,
+            holder,
+            b"group",
+            b"Ljava/lang/ThreadGroup;",
+            Value::Object(main_group),
+        )?;
+        set_instance_field(loader, holder, b"task", b"Ljava/lang/Runnable;", Value::Null)?;
+        set_instance_field(loader, holder, b"stackSize", b"J", Value::Long(0))?;
+        set_instance_field(loader, holder, b"priority", b"I", Value::Int(5))?;
+        set_instance_field(loader, holder, b"daemon", b"Z", Value::Int(0))?;
+        set_instance_field(loader, holder, b"threadStatus", b"I", Value::Int(4))?;
+
+        // interruptLock object.
+        let interrupt_lock = raw_instance(loader, b"java/lang/Object")?;
+
+        // Thread instance fields.
+        set_instance_field(
+            loader,
+            handle,
+            b"holder",
+            b"Ljava/lang/Thread$FieldHolder;",
+            Value::Object(holder),
+        )?;
+        set_instance_field(
+            loader,
+            handle,
+            b"name",
+            b"Ljava/lang/String;",
+            Value::HostString("main"),
+        )?;
+        set_instance_field(loader, handle, b"tid", b"J", Value::Long(1))?;
+        set_instance_field(
+            loader,
+            handle,
+            b"interruptLock",
+            b"Ljava/lang/Object;",
+            Value::Object(interrupt_lock),
+        )?;
+        set_instance_field(
+            loader,
+            handle,
+            b"inheritedAccessControlContext",
+            b"Ljava/security/AccessControlContext;",
+            Value::Null,
+        )?;
+        if let Ok(loader_object) = loader.systemClassLoaderObject() {
+            set_instance_field(
+                loader,
+                handle,
+                b"contextClassLoader",
+                b"Ljava/lang/ClassLoader;",
+                Value::Object(loader_object),
+            )?;
+        }
+    }
+    Ok(Value::Object(handle))
 }
 
 pub fn invokeStatic<'a>(
@@ -265,101 +508,307 @@ pub fn invokeStatic<'a>(
     name: &[u8],
     descriptor: &[u8],
     arguments: &[crate::share::interpreter::bytecodeInterpreter::Value<'a>],
-) -> Option<crate::share::interpreter::bytecodeInterpreter::Value<'a>> {
+) -> io::Result<Option<Option<crate::share::interpreter::bytecodeInterpreter::Value<'a>>>> {
+    let _rg = crate::share::recprobe::Guard::enter("invokeStatic");
     use super::jvm::Jvm;
     use super::jvmNatives::JvmNatives;
     use crate::share::interpreter::bytecodeInterpreter::Value;
 
-    match (owner, name, descriptor) {
+    if let Some(result) =
+        super::reflectionNatives::invoke_static(loader, owner, name, descriptor, arguments)?
+    {
+        return Ok(Some(result));
+    }
+
+    let result = match (owner, name, descriptor) {
         (b"java/lang/StringUTF16", b"isBigEndian", b"()Z") => {
-            Some(Value::Int(i32::from(cfg!(target_endian = "big"))))
+            Some(Some(Value::Int(i32::from(cfg!(target_endian = "big")))))
+        }
+        (_, b"registerNatives", b"()V") | (_, b"initIDs", b"()V") => Some(None),
+        (b"java/io/FileDescriptor", b"getHandle", b"(I)J")
+        | (b"java/io/FileDescriptor", b"getLong", b"(I)J") => Some(Some(Value::Long(0))),
+        (b"java/io/FileDescriptor", b"getInt", b"(I)I")
+        | (b"java/io/FileDescriptor", b"getBoolean", b"(I)Z")
+        | (b"java/io/FileDescriptor", b"getAppend", b"(I)Z") => Some(Some(Value::Int(0))),
+        (b"java/io/FileDescriptor", b"setInt", b"(II)V")
+        | (b"java/io/FileDescriptor", b"setLong", b"(IJ)V")
+        | (b"java/io/FileDescriptor", b"setHandle", b"(IJ)V") => Some(None),
+        (b"jdk/internal/misc/Signal", b"findSignal0", b"(Ljava/lang/String;)I") => {
+            Some(Some(Value::Int(-1)))
+        }
+        (b"java/lang/Thread", b"getNextThreadIdOffset", b"()J") => Some(Some(Value::Long(0))),
+        (b"jdk/internal/misc/Unsafe", b"getUnsafe", b"()Ljdk/internal/misc/Unsafe;") => {
+            match loader.load(b"jdk/internal/misc/Unsafe") {
+                Ok(klass) => match crate::share::oops::instanceOop::InstanceOop::new(klass) {
+                    Ok(object) => Some(Some(Value::Object(loader.alloc_object(object)))),
+                    Err(_) => Some(Some(Value::Null)),
+                },
+                Err(_) => Some(Some(Value::Null)),
+            }
+        }
+        (b"java/lang/System", b"setIn0", b"(Ljava/io/InputStream;)V")
+        | (b"java/lang/System", b"setOut0", b"(Ljava/io/PrintStream;)V")
+        | (b"java/lang/System", b"setErr0", b"(Ljava/io/PrintStream;)V") => Some(None),
+        (b"java/lang/System", b"mapLibraryName", b"(Ljava/lang/String;)Ljava/lang/String;") => {
+            arguments.first().copied().map(Some)
+        }
+        (b"jdk/internal/loader/BootLoader", b"setBootLoaderUnnamedModule0", b"(Ljava/lang/Module;)V") => {
+            Some(None)
+        }
+        (b"jdk/internal/misc/VM", b"initialize", b"()V")
+        | (b"jdk/internal/misc/VM", b"saveAndRemoveProperties", b"()V") => Some(None),
+        (b"jdk/internal/misc/VM", b"isBooted", b"()Z") => Some(Some(Value::Int(1))),
+        (b"jdk/internal/misc/VM", b"getNanoTimeAdjustment", b"(J)J") => Some(Some(Value::Long(0))),
+        (b"jdk/internal/misc/VM", b"latestUserDefinedLoader", b"()Ljava/lang/ClassLoader;") => {
+            Some(Some(Value::Null))
+        }
+        (b"java/lang/ClassLoader", b"registerAsParallelCapable", b"()Z") => {
+            Some(Some(Value::Int(1)))
         }
         (b"java/lang/System", b"currentTimeMillis", b"()J") => {
-            Some(Value::Long(Jvm::current_time_millis()))
+            Some(Some(Value::Long(Jvm::current_time_millis())))
         }
-        (b"java/lang/System", b"nanoTime", b"()J") => Some(Value::Long(Jvm::nano_time())),
-        (b"java/lang/Thread", b"currentThread", b"()Ljava/lang/Thread;") => loader
-            .currentThreadObject()
-            .ok()
-            .map(Value::Object),
-        (b"java/lang/Thread", b"currentCarrierThread", b"()Ljava/lang/Thread;") => loader
-            .currentThreadObject()
-            .ok()
-            .map(Value::Object),
-        (b"java/lang/Thread", b"registerNatives", b"()V")
-        | (b"java/lang/Thread", b"yield0", b"()V")
+        (b"java/lang/System", b"nanoTime", b"()J") => Some(Some(Value::Long(Jvm::nano_time()))),
+        (b"java/lang/Thread", b"currentThread", b"()Ljava/lang/Thread;")
+        | (b"java/lang/Thread", b"currentCarrierThread", b"()Ljava/lang/Thread;") => {
+            match current_thread(loader) {
+                Ok(value) => Some(Some(value)),
+                Err(error) => return Err(error),
+            }
+        }
+        (b"java/lang/Thread", b"yield0", b"()V")
         | (b"java/lang/Thread", b"sleep0", b"(J)V")
-        | (b"java/lang/Thread", b"clearInterruptEvent", b"()V") => {
-            return Some(Value::Null);
-        }
+        | (b"java/lang/Thread", b"clearInterruptEvent", b"()V") => Some(None),
         (b"java/lang/Thread", b"holdsLock", b"(Ljava/lang/Object;)Z") => {
-            Some(Value::Int(i32::from(matches!(
+            Some(Some(Value::Int(i32::from(matches!(
                 arguments.first(),
                 Some(Value::Null) | Some(Value::Empty)
-            ))))
+            )))))
         }
         (b"java/lang/Thread", b"getThreads", b"()[Ljava/lang/Thread;") => {
-            loader.currentThreadObject().ok().map(|handle| {
-                let array_handle = loader.obj_arrays.borrow_mut().len();
-                let mut array = crate::share::oops::objArrayOop::ObjArrayOop::withComponent(
-                    1,
-                    b"java/lang/Thread",
-                )
-                .unwrap();
-                array.elements[0] = Value::Object(handle);
-                loader.obj_arrays.borrow_mut().push(array);
-                Value::ObjectArray(array_handle)
-            })
+            match current_thread(loader) {
+                Ok(thread) => {
+                    let mut array = crate::share::oops::objArrayOop::ObjArrayOop::withComponent(
+                        1,
+                        b"java/lang/Thread",
+                    )
+                    .unwrap();
+                    array.elements[0] = thread;
+                    Some(Some(Value::ObjectArray(loader.alloc_obj_array(array))))
+                }
+                Err(error) => return Err(error),
+            }
         }
-        (b"java/lang/Thread", b"dumpThreads", b"([Ljava/lang/Thread;)[[Ljava/lang/StackTraceElement;") => {
-            let component = loader.storage.alloc_slice_copy(b"[Ljava/lang/StackTraceElement;");
-            let array = crate::share::oops::objArrayOop::ObjArrayOop::withComponent(0, component).unwrap();
-            let mut arrays = loader.obj_arrays.borrow_mut();
-            let handle = arrays.len();
-            arrays.push(array);
-            Some(Value::ObjectArray(handle))
+        (
+            b"java/lang/Thread",
+            b"dumpThreads",
+            b"([Ljava/lang/Thread;)[[Ljava/lang/StackTraceElement;",
+        ) => {
+            let component = loader
+                .storage
+                .alloc_slice_copy(b"[Ljava/lang/StackTraceElement;");
+            let array =
+                crate::share::oops::objArrayOop::ObjArrayOop::withComponent(0, component).unwrap();
+            Some(Some(Value::ObjectArray(loader.alloc_obj_array(array))))
         }
         (b"java/lang/System", b"identityHashCode", b"(Ljava/lang/Object;)I") => arguments
             .first()
-            .map(|&value| Value::Int(super::objectNatives::identity(value))),
+            .map(|&value| Some(Value::Int(super::objectNatives::identity(value)))),
         (b"java/lang/Float", b"floatToRawIntBits", b"(F)I") => {
             if let Some(Value::Float(f)) = arguments.first() {
-                Some(Value::Int(JvmNatives::float_to_raw_int_bits(*f)))
+                Some(Some(Value::Int(JvmNatives::float_to_raw_int_bits(*f))))
             } else {
                 None
             }
         }
         (b"java/lang/Float", b"intBitsToFloat", b"(I)F") => {
             if let Some(Value::Int(i)) = arguments.first() {
-                Some(Value::Float(JvmNatives::int_bits_to_float(*i)))
+                Some(Some(Value::Float(JvmNatives::int_bits_to_float(*i))))
             } else {
                 None
             }
         }
         (b"java/lang/Double", b"doubleToRawLongBits", b"(D)J") => {
             if let Some(Value::Double(d)) = arguments.first() {
-                Some(Value::Long(JvmNatives::double_to_raw_long_bits(*d)))
+                Some(Some(Value::Long(JvmNatives::double_to_raw_long_bits(*d))))
             } else {
                 None
             }
         }
         (b"java/lang/Double", b"longBitsToDouble", b"(J)D") => {
             if let Some(Value::Long(l)) = arguments.first() {
-                Some(Value::Double(JvmNatives::long_bits_to_double(*l)))
+                Some(Some(Value::Double(JvmNatives::long_bits_to_double(*l))))
             } else {
                 None
+            }
+        }
+        (b"jdk/internal/misc/CDS", b"getRandomSeedForDumping", b"()J") => {
+            Some(Some(Value::Long(Jvm::nano_time())))
+        }
+        (
+            b"jdk/internal/util/SystemProps$Raw",
+            b"platformProperties" | b"vmProperties",
+            b"()[Ljava/lang/String;",
+        ) => {
+            let mut pairs: Vec<(String, String)> =
+                super::systemProperties::platform_properties(loader);
+            {
+                let props = loader.systemProperties.borrow();
+                for (key, value) in props.iter() {
+                    pairs.push((key.clone(), (*value).to_owned()));
+                }
+            }
+            let mut array = crate::share::oops::objArrayOop::ObjArrayOop::withComponent(
+                pairs.len() as i32 * 2,
+                b"java/lang/String",
+            )
+            .unwrap();
+            let mut leaked = Vec::with_capacity(pairs.len() * 2);
+            for (index, (key, value)) in pairs.iter().enumerate() {
+                let key_ptr: &'static str = Box::leak(key.clone().into_boxed_str());
+                let value_ptr: &'static str = Box::leak(value.clone().into_boxed_str());
+                leaked.push(key_ptr);
+                leaked.push(value_ptr);
+                array.elements[index * 2] = Value::HostString(loader.storage.alloc_str(key_ptr));
+                array.elements[index * 2 + 1] =
+                    Value::HostString(loader.storage.alloc_str(value_ptr));
+            }
+            Some(Some(Value::ObjectArray(loader.alloc_obj_array(array))))
+        }
+        (b"jdk/internal/reflect/Reflection", b"getCallerClass", b"()Ljava/lang/Class;") => {
+            let stack = loader.call_stack.borrow();
+            let caller = stack
+                .len()
+                .checked_sub(2)
+                .and_then(|i| stack.get(i))
+                .or_else(|| stack.last())
+                .copied();
+            Some(Some(caller.map(Value::ClassMirror).unwrap_or(Value::Null)))
+        }
+        (
+            b"jdk/internal/reflect/Reflection",
+            b"getClassAccessFlags",
+            b"(Ljava/lang/Class;)I",
+        ) => {
+            let flags = match arguments.first() {
+                Some(Value::ClassMirror(name)) => {
+                    let mut name = *name;
+                    if name.starts_with(b":") {
+                        Some(0x0411i32)
+                    } else {
+                        while name.starts_with(b"[") {
+                            name = &name[1..];
+                            if name.starts_with(b"L") {
+                                name = &name[1..name.len() - 1];
+                                break;
+                            }
+                            if name.len() == 1 {
+                                name = b":V";
+                                break;
+                            }
+                        }
+                        if name.starts_with(b":") {
+                            Some(0x0411)
+                        } else {
+                            loader
+                                .load(name)
+                                .ok()
+                                .map(|klass| i32::from(klass.class.accessFlags))
+                        }
+                    }
+                }
+                _ => None,
+            };
+            flags.map(|f| Some(Value::Int(f)))
+        }
+        (b"java/lang/reflect/Array", b"newArray", b"(Ljava/lang/Class;I)Ljava/lang/Object;") => {
+            let length = arguments
+                .get(1)
+                .and_then(|value| match value {
+                    Value::Int(i) => Some(*i),
+                    _ => None,
+                })
+                .unwrap_or(0);
+            match arguments.first() {
+                Some(Value::ClassMirror(component)) => {
+                    let descriptor: Vec<u8> = if component.starts_with(b":") {
+                        let tag = match component.get(1..).unwrap_or(b"") {
+                            b"Z" => b'Z',
+                            b"B" => b'B',
+                            b"C" => b'C',
+                            b"S" => b'S',
+                            b"I" => b'I',
+                            b"J" => b'J',
+                            b"F" => b'F',
+                            b"D" => b'D',
+                            _ => return Ok(Some(Some(Value::Null))),
+                        };
+                        vec![b'[', tag]
+                    } else if component.starts_with(b"[") {
+                        let mut desc = Vec::with_capacity(component.len() + 1);
+                        desc.push(b'[');
+                        desc.extend_from_slice(component);
+                        desc
+                    } else {
+                        let mut desc = Vec::with_capacity(component.len() + 3);
+                        desc.extend_from_slice(b"[L");
+                        desc.extend_from_slice(component);
+                        desc.push(b';');
+                        desc
+                    };
+                    let descriptor = loader.storage.alloc_slice_copy(&descriptor);
+                    return crate::share::oops::arrayKlass::ArrayKlass::multi(
+                        loader, descriptor, &[length],
+                    )
+                    .map(|value| Some(Some(value)));
+                }
+                _ => return Ok(Some(Some(Value::Null))),
+            }
+        }
+        (b"jdk/internal/reflect/Reflection", b"getCallerClass", b"(I)Ljava/lang/Class;") => {
+            let stack = loader.call_stack.borrow();
+            let depth = arguments
+                .first()
+                .and_then(|value| match value {
+                    Value::Int(i) => Some(*i as usize),
+                    _ => None,
+                })
+                .unwrap_or(0);
+            let caller = stack
+                .len()
+                .checked_sub(depth + 2)
+                .and_then(|i| stack.get(i))
+                .copied();
+            Some(Some(caller.map(Value::ClassMirror).unwrap_or(Value::Null)))
+        }
+        _ if (owner == b"java/io/WinNTFileSystem" || owner == b"java/io/UnixFileSystem" || owner == b"java/io/FileDescriptor") => {
+            match super::fileNatives::invoke_static(loader, name, descriptor, arguments)? {
+                Some(_value) if descriptor.ends_with(b")V") => Some(None),
+                Some(value) => Some(Some(value)),
+                None => return Ok(None),
             }
         }
         _ => {
             let class_name = String::from_utf8_lossy(owner);
             let method_name = String::from_utf8_lossy(name);
             let sig = String::from_utf8_lossy(descriptor);
-            super::nativeLibraries::NativeLibraries::global().dispatch(
+            let result = super::nativeLibraries::NativeLibraries::global().dispatch(
                 &class_name,
                 &method_name,
                 &sig,
                 arguments,
-            )
+            );
+            match result {
+                Some(_) if descriptor.ends_with(b")V") => Some(None),
+                Some(value) => Some(Some(value)),
+                None => {
+                    return super::jniInvocation::invoke_dll_native(
+                        loader, owner, name, descriptor, true, arguments,
+                    );
+                }
+            }
         }
-    }
+    };
+    Ok(result)
 }
+

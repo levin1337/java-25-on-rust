@@ -104,7 +104,19 @@ fn inspectClass(path: &Path) -> Result<(), Box<dyn Error>> {
 }
 
 fn main() -> ExitCode {
-    match inspect() {
+    // The bytecode interpreter recurses per Java call; give it a large stack
+    // like a real JVM thread would have.
+    let worker = std::thread::Builder::new()
+        .stack_size(1024 * 1024 * 1024)
+        .spawn(|| inspect().map_err(|error| error.to_string()));
+    let result = match worker {
+        Ok(handle) => handle.join().unwrap_or_else(|_| {
+            eprintln!("Worker thread panicked");
+            Err("Worker thread panicked".to_owned())
+        }),
+        Err(_) => inspect().map_err(|error| error.to_string()),
+    };
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("{error}");

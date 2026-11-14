@@ -23,6 +23,7 @@ use crate::{
         method::Code,
     },
 };
+use std::cell::RefCell;
 use std::io::{self, Error, Write};
 use std::rc::Rc;
 
@@ -106,16 +107,107 @@ impl Value<'_> {
     }
 }
 
-struct Frame<'a> {
+/// Payload carried inside `io::Error` for exceptions that must be
+/// delivered to Java `catch` handlers. Holds the object-arena handle
+/// of the thrown `java.lang.Throwable` instance.
+#[derive(Debug)]
+pub struct JavaThrowable(pub usize);
+
+impl std::fmt::Display for JavaThrowable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "JavaThrowable({})", self.0)
+    }
+}
+
+impl std::error::Error for JavaThrowable {}
+
+pub(crate) fn throwable_of(error: &Error) -> Option<usize> {
+    error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<JavaThrowable>())
+        .map(|throwable| throwable.0)
+}
+
+thread_local! {
+    static ACTIVE_FRAMES: RefCell<Vec<*const Frame<'static>>> = const { RefCell::new(Vec::new()) };
+}
+
+pub(crate) fn for_each_active_frame(f: &mut impl FnMut(&Frame<'static>)) {
+    ACTIVE_FRAMES.with(|frames| {
+        for &frame in frames.borrow().iter() {
+            f(unsafe { &*frame });
+        }
+    });
+}
+
+fn current_frame_site() -> String {
+    ACTIVE_FRAMES.with(|frames| {
+        let frames = frames.borrow();
+        frames
+            .iter()
+            .rev()
+            .take(6)
+            .map(|ptr| unsafe {
+                let frame = &**ptr;
+                format!(
+                    "{}@{}",
+                    String::from_utf8_lossy(frame.owner),
+                    frame.pc
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" <- ")
+    })
+}
+
+struct FrameRegistration;
+
+impl FrameRegistration {
+    fn new<'a>(frame: &Frame<'a>) -> Self {
+        let erased: &'static Frame<'static> =
+            unsafe { std::mem::transmute::<&Frame<'a>, &'static Frame<'static>>(frame) };
+        ACTIVE_FRAMES.with(|frames| frames.borrow_mut().push(erased as *const _));
+        Self
+    }
+}
+
+impl Drop for FrameRegistration {
+    fn drop(&mut self) {
+        ACTIVE_FRAMES.with(|frames| {
+            frames.borrow_mut().pop();
+        });
+    }
+}
+
+pub(crate) struct Frame<'a> {
     code: Code<'a>,
     pc: usize,
-    locals: Vec<Value<'a>>,
-    stack: Vec<Value<'a>>,
+    pub(crate) locals: Vec<Value<'a>>,
+    pub(crate) stack: Vec<Value<'a>>,
     stackSlots: usize,
     owner: &'a [u8],
+    monitors: Vec<u64>,
 }
 
 impl<'a> Frame<'a> {
+    pub(crate) fn locals(&self) -> &[Value<'a>] {
+        &self.locals
+    }
+
+    pub(crate) fn stack(&self) -> &[Value<'a>] {
+        &self.stack
+    }
+
+    pub(crate) fn site(&self) -> String {
+        format!(
+            "{} {}.{}@{}",
+            String::from_utf8_lossy(self.owner),
+            String::from_utf8_lossy(self.code.name),
+            String::from_utf8_lossy(self.code.descriptor),
+            self.pc
+        )
+    }
+
     fn read<const N: usize>(&mut self) -> io::Result<[u8; N]> {
         let bytes = self
             .code
@@ -135,7 +227,15 @@ impl<'a> Frame<'a> {
         let value = self
             .stack
             .pop()
-            .ok_or_else(|| Error::other("Operand stack underflow"))?;
+            .ok_or_else(|| {
+                Error::other(format!(
+                    "Operand stack underflow at pc {} in {}.{}{}",
+                    self.pc,
+                    String::from_utf8_lossy(self.owner),
+                    String::from_utf8_lossy(self.code.name),
+                    String::from_utf8_lossy(self.code.descriptor)
+                ))
+            })?;
         self.stackSlots -= value.slots();
         Ok(value)
     }
@@ -148,7 +248,7 @@ impl<'a> Frame<'a> {
                 slots,
                 self.code.maxStack,
                 self.pc,
-                String::from_utf8_lossy(self.locals.first().map(|_| b"".as_slice()).unwrap_or(b""))
+                String::from_utf8_lossy(self.owner)
             )));
         }
         self.stack.push(value);
@@ -265,10 +365,8 @@ impl<'a> Frame<'a> {
                 } else if let Ok(catch_name) = klass.className(entry.catch_type) {
                     if loader.referenceAssignable(exc, catch_name).unwrap_or(false) {
                         true
-                    } else if matches!(exc, Value::Null) {
-                        true
                     } else if let Value::Object(handle) = exc {
-                        let objects = loader.objects.borrow();
+                        let objects = loader.borrow_objects();
                         if let Some(obj) = objects.get(handle) {
                             SystemDictionary::is_subclass_of(&obj.klass, catch_name)
                                 || SystemDictionary::implements_interface(&obj.klass, catch_name)
@@ -295,25 +393,118 @@ impl<'a> Frame<'a> {
     }
 }
 
+fn javaFloat(value: f32) -> String {
+    if value.is_nan() {
+        "NaN".to_owned()
+    } else if value == f32::INFINITY {
+        "Infinity".to_owned()
+    } else if value == f32::NEG_INFINITY {
+        "-Infinity".to_owned()
+    } else {
+        let text = value.to_string();
+        if text.contains(['.', 'e', 'E']) {
+            text
+        } else {
+            format!("{text}.0")
+        }
+    }
+}
+
+fn javaDouble(value: f64) -> String {
+    if value.is_nan() {
+        "NaN".to_owned()
+    } else if value == f64::INFINITY {
+        "Infinity".to_owned()
+    } else if value == f64::NEG_INFINITY {
+        "-Infinity".to_owned()
+    } else {
+        let text = value.to_string();
+        if text.contains(['.', 'e', 'E']) {
+            text
+        } else {
+            format!("{text}.0")
+        }
+    }
+}
+
+/// Renders a stack value the way `String.valueOf` would during string
+/// concatenation: strings as text, objects via their `toString()`.
+fn describeValue<'a>(
+    loader: &ClassLoader<'a>,
+    value: Value<'a>,
+    output: &mut impl Write,
+    depth: usize,
+) -> io::Result<String> {
+    match value {
+        Value::Int(value) => Ok(value.to_string()),
+        Value::Long(value) => Ok(value.to_string()),
+        Value::Float(value) => Ok(javaFloat(value)),
+        Value::Double(value) => Ok(javaDouble(value)),
+        Value::String(bytes) => decodeString(bytes),
+        Value::HostString(text) => Ok(text.to_owned()),
+        Value::Null => Ok("null".to_owned()),
+        Value::Object(handle) => {
+            if let Some(text) = crate::share::prims::stringNatives::string(loader, value)? {
+                return Ok(text.into_owned());
+            }
+            let klass = {
+                let objects = loader.borrow_objects();
+                objects.get(handle).map(|object| Rc::clone(&object.klass))
+            };
+            let Some(klass) = klass else {
+                return Ok(format!("Object@{handle:x}"));
+            };
+            match LinkResolver::resolve_virtual_call(&klass, b"toString", b"()Ljava/lang/String;") {
+                Ok((target, code)) => {
+                    let flags =
+                        methodAccessFlags(&target, b"toString", b"()Ljava/lang/String;", false);
+                    match execute(loader, &target, code, &[value], output, depth + 1, flags)? {
+                        Some(result) => describeValue(loader, result, output, depth + 1),
+                        None => Ok("null".to_owned()),
+                    }
+                }
+                Err(_) => Ok(format!("Object@{handle:x}")),
+            }
+        }
+        _ => Ok(String::new()),
+    }
+}
+
 pub(crate) fn initialize<'a>(
     loader: &ClassLoader<'a>,
     klass: &InstanceKlass<'a>,
     output: &mut impl Write,
     depth: usize,
 ) -> io::Result<()> {
+    let _rg = crate::share::recprobe::Guard::enter("initialize");
     match klass.state.get() {
         InitState::FullyInitialized | InitState::BeingInitialized => return Ok(()),
         InitState::InitializationError => {
-            return Err(Error::other("Class initialization previously failed"));
+            return Err(jex(
+                loader,
+                output,
+                depth,
+                b"java/lang/NoClassDefFoundError",
+                Some(&format!(
+                    "Could not initialize class {}",
+                    dotted(klass.class.name)
+                )),
+            ));
         }
         _ => {}
     }
     klass.state.set(InitState::BeingInitialized);
     let result = (|| {
-        if (klass.class.accessFlags & 0x0200) == 0
-            && let Some(superKlass) = &klass.super_klass
-        {
-            initialize(loader, superKlass, output, depth + 1)?;
+        if (klass.class.accessFlags & 0x0200) == 0 {
+            if let Some(superKlass) = &klass.super_klass {
+                initialize(loader, superKlass, output, depth + 1)?;
+            }
+            // JVMS §5.5 step 7: initializing a class also initializes every
+            // direct superinterface that declares a non-static concrete
+            // method (default methods).
+            for iface in klass.default_method_superinterfaces() {
+                initialize(loader, &iface, output, depth + 1)?;
+            }
         }
         let code = klass.initializer().map_err(|error| {
             Error::other(format!(
@@ -322,7 +513,7 @@ pub(crate) fn initialize<'a>(
             ))
         })?;
         if let Some(code) = code
-            && execute(loader, klass, code, &[], output, depth)?.is_some()
+            && execute(loader, klass, code, &[], output, depth, 0)?.is_some()
         {
             return Err(Error::other("Class initializer must return void"));
         }
@@ -343,9 +534,117 @@ pub fn execute<'a>(
     arguments: &[Value<'a>],
     output: &mut impl Write,
     depth: usize,
+    access_flags: u16,
+) -> io::Result<Option<Value<'a>>> {
+    execute_labeled(loader, klass, code, arguments, output, depth, access_flags, None)
+}
+
+pub fn execute_labeled<'a>(
+    loader: &ClassLoader<'a>,
+    klass: &InstanceKlass<'a>,
+    code: Code<'a>,
+    arguments: &[Value<'a>],
+    output: &mut impl Write,
+    depth: usize,
+    access_flags: u16,
+    method: Option<(&'a [u8], &'a [u8])>,
+) -> io::Result<Option<Value<'a>>> {
+    let owner = match method {
+        Some((name, descriptor)) => {
+            let text = format!(
+                "{}.{}{}",
+                String::from_utf8_lossy(klass.class.name).replace('/', "."),
+                String::from_utf8_lossy(name),
+                String::from_utf8_lossy(descriptor)
+            );
+            loader.storage.alloc_str(&text).as_bytes()
+        }
+        None => klass.class.name,
+    };
+    loader.call_stack.borrow_mut().push(klass.class.name);
+    let monitor = if access_flags & 0x0020 != 0 {
+        let target = if access_flags & 0x0008 != 0 {
+            Some(Value::ClassMirror(klass.class.name))
+        } else {
+            arguments.first().copied()
+        };
+        match target {
+            Some(value) => match monitorEnter(loader, output, depth, value) {
+                Ok(_) => Some(value),
+                Err(error) => {
+                    loader.call_stack.borrow_mut().pop();
+                    return Err(error);
+                }
+            },
+            None => None,
+        }
+    } else {
+        None
+    };
+    let result = executeFrame(loader, klass, code, arguments, output, depth, owner);
+    if let Some(value) = monitor {
+        let _ = monitorExit(loader, output, depth, value);
+    }
+    loader.call_stack.borrow_mut().pop();
+    if depth == 0
+        && let Err(error) = &result
+        && let Some(handle) = throwable_of(error)
+    {
+        if std::env::var_os("JVM25_TRACE").is_some() {
+            let stack: Vec<String> = loader
+                .call_stack
+                .borrow()
+                .iter()
+                .map(|name| String::from_utf8_lossy(name).into_owned())
+                .collect();
+            eprintln!("[uncaught] {} stack={stack:?}", throwableDescription(loader, handle));
+        }
+        return Err(Error::other(throwableDescription(loader, handle)));
+    }
+    result
+}
+
+/// Renders an uncaught throwable as `fully.qualified.Name: message`.
+fn throwableDescription(loader: &ClassLoader<'_>, handle: usize) -> String {
+    let objects = loader.borrow_objects();
+    let Some(object) = objects.get(handle) else {
+        return "Uncaught exception".to_owned();
+    };
+    let name = dotted(object.klass.class.name);
+    let message = object
+        .klass
+        .instanceField(b"detailMessage", b"Ljava/lang/String;")
+        .ok()
+        .and_then(|index| object.fields.get(index).copied())
+        .and_then(|value| match value {
+            Value::String(bytes) => Some(String::from_utf8_lossy(bytes).into_owned()),
+            Value::HostString(text) => Some(text.to_owned()),
+            _ => None,
+        })
+        .filter(|text| !text.is_empty());
+    match message {
+        Some(message) => format!("{name}: {message}"),
+        None => name,
+    }
+}
+
+fn executeFrame<'a>(
+    loader: &ClassLoader<'a>,
+    klass: &InstanceKlass<'a>,
+    code: Code<'a>,
+    arguments: &[Value<'a>],
+    output: &mut impl Write,
+    depth: usize,
+    owner: &'a [u8],
 ) -> io::Result<Option<Value<'a>>> {
     if depth >= 128 {
-        return Err(Error::other("Invalid frame or call depth exceeded"));
+        return Err(jex(
+            loader,
+            output,
+            depth,
+            b"java/lang/StackOverflowError",
+            None,
+        ));
     }
     let mut locals = vec![Value::Empty; code.maxLocals];
     let mut index = 0;
@@ -362,499 +661,995 @@ pub fn execute<'a>(
         code,
         pc: 0,
         locals,
+        owner,
+        monitors: Vec::new(),
     };
+    let _registration = FrameRegistration::new(&frame);
     loop {
-        let pc = frame.pc;
-        let opcode = frame.byte()?;
-        let value = match opcode {
-            0x00 => continue,                                                 // nop
-            0x01 => Value::Null,                                              // aconst_null
-            0x02..=0x08 => Value::Int(i32::from(opcode) - 3),                 // iconst_m1..5
-            0x09..=0x0a => Value::Long(i64::from(opcode - 9)),                // lconst_0..1
-            0x0b..=0x0d => Value::Float(f32::from(opcode - 0x0b)),            // fconst_0..2
-            0x0e..=0x0f => Value::Double(f64::from(opcode - 0x0e)),           // dconst_0..1
-            0x10 => Value::Int(i32::from(frame.byte()? as i8)),               // bipush
-            0x11 => Value::Int(i32::from(i16::from_be_bytes(frame.read()?))), // sipush
-            0x12..=0x14 => {
-                let index = if opcode == 0x12 {
-                    u16::from(frame.byte()?)
-                } else {
-                    u16::from_be_bytes(frame.read()?)
-                };
-                match (opcode, klass.constant(index)?) {
-                    (0x14, Constant::Long(value)) => Value::Long(*value),
-                    (0x14, Constant::Double(value)) => Value::Double(*value),
-                    (0x14, _) => return Err(Error::other("Invalid ldc2_w constant")),
-                    (_, Constant::Integer(value)) => Value::Int(*value),
-                    (_, Constant::Float(value)) => Value::Float(*value),
-                    (_, Constant::String(index)) => match klass.constant(*index)? {
-                        Constant::Utf8(bytes) => Value::String(bytes),
-                        _ => return Err(Error::other("Invalid string constant")),
-                    },
-                    (_, Constant::Class(c_idx)) => {
-                        let name = klass.utf8(*c_idx)?;
-                        Value::ClassMirror(name)
-                    }
-                    _ => return Err(Error::other("Unsupported ldc constant")),
+        if loader.gc_due() {
+            loader.reset_allocations();
+            let _ = crate::share::memory::heap::collect(loader);
+        }
+        let insn_pc = frame.pc;
+        match step(loader, klass, &mut frame, output, depth) {
+            Ok(Step::Push(value)) => {
+                if let Err(error) = frame.push(value) {
+                    release_frame_monitors(loader, &frame);
+                    return Err(error);
                 }
             }
-            0x15..=0x2d => {
-                let index = if opcode < 0x1a {
-                    frame.byte()?
-                } else {
-                    (opcode - 0x1a) % 4
-                };
-                let kind = if opcode < 0x1a {
-                    opcode - 0x15
-                } else {
-                    (opcode - 0x1a) / 4
-                };
-                frame.load(u16::from(index), kind)?
+            Ok(Step::Continue) => {}
+            Ok(Step::Return(value)) => return Ok(value),
+            Err(error) => match throwable_of(&error) {
+                Some(handle) => {
+                    let exc = Value::Object(handle);
+                    if !frame.handle_exception(insn_pc, exc, loader, klass) {
+                        if std::env::var_os("JVM25_TRACE").is_some() {
+                            let mut frames = Vec::new();
+                            for_each_active_frame(&mut |f| frames.push(f.site()));
+                            eprintln!("[uncaught-in-frame] stack={frames:?}");
+                        }
+                        release_frame_monitors(loader, &frame);
+                        return Err(error);
+                    }
+                }
+                None => {
+                    release_frame_monitors(loader, &frame);
+                    return Err(error);
+                }
+            },
+        }
+    }
+}
+
+enum Step<'a> {
+    Push(Value<'a>),
+    Continue,
+    Return(Option<Value<'a>>),
+}
+
+fn dotted(name: &[u8]) -> String {
+    String::from_utf8_lossy(name).replace('/', ".")
+}
+
+/// Allocates a real `java.lang.Throwable` subclass instance, runs its
+/// `<init>(String)` constructor when available, and returns the
+/// object-arena handle. The object is kept alive through
+/// `gc_extra_roots` while the constructor executes.
+fn throwableObject<'a>(
+    loader: &ClassLoader<'a>,
+    output: &mut impl Write,
+    depth: usize,
+    class_name: &[u8],
+    message: Option<&str>,
+) -> io::Result<usize> {
+    if std::env::var_os("JVM25_TRACE").is_some() {
+        eprintln!(
+            "[npe] creating {} in {}",
+            dotted(class_name),
+            loader
+                .call_stack
+                .borrow()
+                .iter()
+                .rev()
+                .take(8)
+                .map(|name| String::from_utf8_lossy(name).into_owned())
+                .collect::<Vec<_>>()
+                .join(" <- ")
+        );
+        eprintln!("{}", std::backtrace::Backtrace::force_capture());
+    }
+    let klass = loader.load(class_name)?;
+    let _ = initialize(loader, &klass, &mut io::sink(), 0);
+    let object = InstanceOop::new(klass.clone())?;
+    let handle = loader.alloc_object(object);
+    loader
+        .gc_extra_roots
+        .borrow_mut()
+        .push(Value::Object(handle));
+
+    let message_bytes: Option<&[u8]> =
+        message.map(|text| &*loader.storage.alloc_slice_copy(text.as_bytes()));
+    let init_result = (|| -> io::Result<()> {
+        let member = klass.class.methods.iter().find(|method| {
+            method.name == b"<init>"
+                && method.descriptor == b"(Ljava/lang/String;)V"
+                && method.accessFlags & 0x0008 == 0
+        });
+        if let Some(member) = member {
+            let code = Code::parse(member)?;
+            let argument = match message_bytes {
+                Some(bytes) => Value::String(bytes),
+                None => Value::Null,
+            };
+            execute(
+                loader,
+                &klass,
+                code,
+                &[Value::Object(handle), argument],
+                output,
+                depth + 1,
+                member.accessFlags,
+            )?;
+        }
+        Ok(())
+    })();
+    let root_position = {
+        let roots = loader.gc_extra_roots.borrow();
+        roots
+            .iter()
+            .rposition(|value| matches!(value, Value::Object(root) if *root == handle))
+    };
+    if let Some(position) = root_position {
+        loader.gc_extra_roots.borrow_mut().remove(position);
+    }
+    let _ = init_result;
+
+    if let (Some(bytes), Ok(index)) = (
+        message_bytes,
+        klass.instanceField(b"detailMessage", b"Ljava/lang/String;"),
+    ) {
+        let mut objects = loader.borrow_objects_mut();
+        if let Some(object) = objects.get_mut(handle)
+            && matches!(object.fields[index], Value::Null)
+        {
+            object.fields[index] = Value::String(bytes);
+        }
+    }
+    Ok(handle)
+}
+
+/// Builds an `io::Error` carrying a real throwable object for `class_name`.
+/// Falls back to a plain linkage-style error when the class cannot be
+/// loaded or instantiated (e.g. minimal bootstrap environments).
+fn jex<'a>(
+    loader: &ClassLoader<'a>,
+    output: &mut impl Write,
+    depth: usize,
+    class_name: &[u8],
+    message: Option<&str>,
+) -> Error {
+    if std::env::var_os("JVM25_TRACE").is_some() {
+        let mut frames = Vec::new();
+        for_each_active_frame(&mut |frame| frames.push(frame.site()));
+        eprintln!("[jex] {} stack={frames:?}", dotted(class_name));
+    }
+    match throwableObject(loader, output, depth, class_name, message) {
+        Ok(handle) => Error::other(JavaThrowable(handle)),
+        Err(_) => {
+            let text = dotted(class_name);
+            match message {
+                Some(message) => Error::other(format!("{text}: {message}")),
+                None => Error::other(text),
             }
-            0x2e..=0x31 | 0x33..=0x35 => {
-                let index = frame.pop()?.int()? as usize;
-                let Value::PrimitiveArray(handle) = frame.pop()? else {
-                    return Err(Error::other("Expected primitive array"));
-                };
+        }
+    }
+}
+
+/// Converts resolution/verification failures into the corresponding
+/// `java.lang.Error` throwable when the failure is a Java-level linkage
+/// error, preserving fatal VM errors otherwise.
+fn linkageExc<'a>(
+    loader: &ClassLoader<'a>,
+    output: &mut impl Write,
+    depth: usize,
+    error: Error,
+) -> Error {
+    if throwable_of(&error).is_some() {
+        return error;
+    }
+    use crate::share::classfile::linkageError::LinkageErrorKind;
+    let class_name: &[u8] = if let Some(kind) =
+        crate::share::classfile::linkageError::linkage_kind(&error)
+    {
+        match kind {
+            LinkageErrorKind::ClassNotFound => b"java/lang/ClassNotFoundException",
+            LinkageErrorKind::NoClassDefFound => b"java/lang/NoClassDefFoundError",
+            LinkageErrorKind::ClassFormat => b"java/lang/ClassFormatError",
+            LinkageErrorKind::UnsupportedClassVersion => b"java/lang/UnsupportedClassVersionError",
+            LinkageErrorKind::Verify => b"java/lang/VerifyError",
+            LinkageErrorKind::ClassCircularity => b"java/lang/ClassCircularityError",
+            LinkageErrorKind::IncompatibleClassChange => b"java/lang/IncompatibleClassChangeError",
+            LinkageErrorKind::NoSuchField => b"java/lang/NoSuchFieldError",
+            LinkageErrorKind::NoSuchMethod => b"java/lang/NoSuchMethodError",
+            LinkageErrorKind::IllegalAccess => b"java/lang/IllegalAccessError",
+            LinkageErrorKind::Instantiation => b"java/lang/InstantiationError",
+            LinkageErrorKind::ExceptionInInitializer => b"java/lang/ExceptionInInitializerError",
+            LinkageErrorKind::UnsatisfiedLink => b"java/lang/UnsatisfiedLinkError",
+        }
+    } else {
+        let message = error.to_string();
+        let prefix = message.split(':').next().unwrap_or("").trim();
+        match prefix {
+            "NoSuchMethodError" => b"java/lang/NoSuchMethodError",
+            "NoSuchFieldError" => b"java/lang/NoSuchFieldError",
+            "IncompatibleClassChangeError" => b"java/lang/IncompatibleClassChangeError",
+            "InstantiationError" => b"java/lang/InstantiationError",
+            "IllegalAccessError" => b"java/lang/IllegalAccessError",
+            "UnsatisfiedLinkError" => b"java/lang/UnsatisfiedLinkError",
+            "BootstrapMethodError" => b"java/lang/BootstrapMethodError",
+            "AbstractMethodError" => b"java/lang/AbstractMethodError",
+            "ClassCircularityError" => b"java/lang/ClassCircularityError",
+            "ExceptionInInitializerError" => b"java/lang/ExceptionInInitializerError",
+            _ if message.contains("NoSuchMethod") || message.contains("Missing method") => {
+                b"java/lang/NoSuchMethodError"
+            }
+            _ if message.contains("AbstractMethodError") => b"java/lang/AbstractMethodError",
+            _ if message.contains("Missing static method") => b"java/lang/NoSuchMethodError",
+            _ if message.contains("Missing constructor") => b"java/lang/NoSuchMethodError",
+            _ if message.contains("Missing field") => b"java/lang/NoSuchFieldError",
+            _ if message.contains("does not implement interface")
+                || message.contains("Conflicting interface") =>
+            {
+                b"java/lang/IncompatibleClassChangeError"
+            }
+            _ => return error,
+        }
+    };
+    jex(loader, output, depth, class_name, Some(&error.to_string()))
+}
+
+fn monitorKey(value: Value<'_>) -> Option<u64> {
+    const OBJ_ARRAY: u64 = 1 << 62;
+    const PRIM_ARRAY: u64 = 2 << 62;
+    const OTHER: u64 = 3 << 62;
+    match value {
+        Value::Object(handle) => Some(handle as u64),
+        Value::ObjectArray(handle) => Some(OBJ_ARRAY | handle as u64),
+        Value::PrimitiveArray(handle) => Some(PRIM_ARRAY | handle as u64),
+        Value::Output => Some(u64::MAX),
+        Value::String(bytes) | Value::ClassMirror(bytes) => {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            bytes.hash(&mut hasher);
+            Some(OTHER | (hasher.finish() & !(3 << 62)))
+        }
+        Value::HostString(text) => {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            text.hash(&mut hasher);
+            Some(OTHER | (hasher.finish() & !(3 << 62)))
+        }
+        Value::Arguments(arguments) => {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            (arguments.as_ptr() as usize, arguments.len()).hash(&mut hasher);
+            Some(OTHER | (hasher.finish() & !(3 << 62)))
+        }
+        _ => None,
+    }
+}
+
+fn monitorEnter<'a>(
+    loader: &ClassLoader<'a>,
+    output: &mut impl Write,
+    depth: usize,
+    value: Value<'a>,
+) -> io::Result<u64> {
+    if matches!(value, Value::Null) {
+        return Err(jex(
+            loader,
+            output,
+            depth,
+            b"java/lang/NullPointerException",
+            None,
+        ));
+    }
+    let Some(key) = monitorKey(value) else {
+        return Err(Error::other("Expected reference for monitor"));
+    };
+    loader.synchronizer.borrow_mut().enter_thread(
+        key as usize,
+        crate::share::runtime::synchronizer::Synchronizer::DEFAULT_THREAD_ID,
+    );
+    Ok(key)
+}
+
+fn monitorExit<'a>(
+    loader: &ClassLoader<'a>,
+    output: &mut impl Write,
+    depth: usize,
+    value: Value<'a>,
+) -> io::Result<()> {
+    if matches!(value, Value::Null) {
+        return Err(jex(
+            loader,
+            output,
+            depth,
+            b"java/lang/NullPointerException",
+            None,
+        ));
+    }
+    let Some(key) = monitorKey(value) else {
+        return Err(Error::other("Expected reference for monitor"));
+    };
+    loader
+        .synchronizer
+        .borrow_mut()
+        .exit_thread(
+            key as usize,
+            crate::share::runtime::synchronizer::Synchronizer::DEFAULT_THREAD_ID,
+        )
+        .map_err(|message| {
+            jex(
+                loader,
+                output,
+                depth,
+                b"java/lang/IllegalMonitorStateException",
+                Some(message),
+            )
+        })?;
+    Ok(())
+}
+
+fn release_frame_monitors(loader: &ClassLoader<'_>, frame: &Frame<'_>) {
+    if frame.monitors.is_empty() {
+        return;
+    }
+    let mut synchronizer = loader.synchronizer.borrow_mut();
+    for &key in &frame.monitors {
+        let _ = synchronizer.exit_thread(
+            key as usize,
+            crate::share::runtime::synchronizer::Synchronizer::DEFAULT_THREAD_ID,
+        );
+    }
+}
+
+fn methodAccessFlags<'a>(
+    klass: &InstanceKlass<'a>,
+    name: &[u8],
+    descriptor: &[u8],
+    is_static: bool,
+) -> u16 {
+    let mut current = Some(klass);
+    while let Some(owner) = current {
+        if let Some(method) = owner.class.methods.iter().find(|method| {
+            method.name == name
+                && method.descriptor == descriptor
+                && (method.accessFlags & 0x0008 != 0) == is_static
+        }) {
+            return method.accessFlags;
+        }
+        current = owner.super_klass.as_deref();
+    }
+    0
+}
+
+fn step<'a>(
+    loader: &ClassLoader<'a>,
+    klass: &InstanceKlass<'a>,
+    frame: &mut Frame<'a>,
+    output: &mut impl Write,
+    depth: usize,
+) -> io::Result<Step<'a>> {
+    let pc = frame.pc;
+    let opcode = frame.byte()?;
+    let value = match opcode {
+        0x00 => return Ok(Step::Continue),                      // nop
+        0x01 => Value::Null,                                    // aconst_null
+        0x02..=0x08 => Value::Int(i32::from(opcode) - 3),       // iconst_m1..5
+        0x09..=0x0a => Value::Long(i64::from(opcode - 9)),      // lconst_0..1
+        0x0b..=0x0d => Value::Float(f32::from(opcode - 0x0b)),  // fconst_0..2
+        0x0e..=0x0f => Value::Double(f64::from(opcode - 0x0e)), // dconst_0..1
+        0x10 => Value::Int(i32::from(frame.byte()? as i8)),     // bipush
+        0x11 => Value::Int(i32::from(i16::from_be_bytes(frame.read()?))), // sipush
+        0x12..=0x14 => {
+            let index = if opcode == 0x12 {
+                u16::from(frame.byte()?)
+            } else {
+                u16::from_be_bytes(frame.read()?)
+            };
+            match (opcode, klass.constant(index)?) {
+                (0x14, Constant::Long(value)) => Value::Long(*value),
+                (0x14, Constant::Double(value)) => Value::Double(*value),
+                (0x14, _) => return Err(Error::other("Invalid ldc2_w constant")),
+                (_, Constant::Integer(value)) => Value::Int(*value),
+                (_, Constant::Float(value)) => Value::Float(*value),
+                (_, Constant::String(index)) => match klass.constant(*index)? {
+                    Constant::Utf8(bytes) => Value::String(bytes),
+                    _ => return Err(Error::other("Invalid string constant")),
+                },
+                (_, Constant::Class(c_idx)) => {
+                    let name = klass.utf8(*c_idx)?;
+                    Value::ClassMirror(name)
+                }
+                _ => {
+                    return Err(jex(
+                        loader,
+                        output,
+                        depth,
+                        b"java/lang/LinkageError",
+                        Some("Unsupported ldc constant"),
+                    ));
+                }
+            }
+        }
+        0x15..=0x2d => {
+            let index = if opcode < 0x1a {
+                frame.byte()?
+            } else {
+                (opcode - 0x1a) % 4
+            };
+            let kind = if opcode < 0x1a {
+                opcode - 0x15
+            } else {
+                (opcode - 0x1a) / 4
+            };
+            frame.load(u16::from(index), kind)?
+        }
+        0x2e..=0x31 | 0x33..=0x35 => {
+            let index = frame.pop()?.int()? as usize;
+            let Value::PrimitiveArray(handle) = frame.pop()? else {
+                return Err(jex(
+                    loader,
+                    output,
+                    depth,
+                    b"java/lang/NullPointerException",
+                    None,
+                ));
+            };
+            let load_result = {
                 let arrays = loader.arrays.borrow();
+                arrays
+                    .get(handle)
+                    .ok_or_else(|| Error::other("Invalid array reference"))
+                    .and_then(|array| array.load(opcode - 0x2e, index))
+            };
+            match load_result.map_err(|error| {
+                jex(
+                    loader,
+                    output,
+                    depth,
+                    b"java/lang/ArrayIndexOutOfBoundsException",
+                    Some(&error.to_string()),
+                )
+            })? {
+                Element::Int(value) => Value::Int(value),
+                Element::Long(value) => Value::Long(value),
+                Element::Float(value) => Value::Float(value),
+                Element::Double(value) => Value::Double(value),
+            }
+        }
+        0x32 => {
+            let index = frame.pop()?.int()? as usize;
+            match frame.pop()? {
+                Value::Arguments(arguments) => {
+                    Value::HostString(arguments.get(index).ok_or_else(|| {
+                        jex(
+                            loader,
+                            output,
+                            depth,
+                            b"java/lang/ArrayIndexOutOfBoundsException",
+                            Some(&format!("Index {index} out of bounds")),
+                        )
+                    })?)
+                }
+                Value::ObjectArray(handle) => {
+                    let load_result = {
+                        let arrays = loader.obj_arrays.borrow();
+                        arrays
+                            .get(handle)
+                            .ok_or_else(|| Error::other("Invalid object array reference"))
+                            .and_then(|array| array.get(index))
+                    };
+                    load_result.map_err(|error| {
+                        jex(
+                            loader,
+                            output,
+                            depth,
+                            b"java/lang/ArrayIndexOutOfBoundsException",
+                            Some(&error.to_string()),
+                        )
+                    })?
+                }
+                _ => {
+                    return Err(jex(
+                        loader,
+                        output,
+                        depth,
+                        b"java/lang/NullPointerException",
+                        None,
+                    ));
+                }
+            }
+        }
+        0x36..=0x4e => {
+            let index = if opcode < 0x3b {
+                frame.byte()?
+            } else {
+                (opcode - 0x3b) % 4
+            };
+            let kind = if opcode < 0x3b {
+                opcode - 0x36
+            } else {
+                (opcode - 0x3b) / 4
+            };
+            frame.storeOperand(u16::from(index), kind)?;
+            return Ok(Step::Continue);
+        }
+        0x4f..=0x52 | 0x54..=0x56 => {
+            let value = match frame.pop()? {
+                Value::Int(value) => Element::Int(value),
+                Value::Long(value) => Element::Long(value),
+                Value::Float(value) => Element::Float(value),
+                Value::Double(value) => Element::Double(value),
+                _ => return Err(Error::other("Expected numeric array element")),
+            };
+            let index = frame.pop()?.int()? as usize;
+            let Value::PrimitiveArray(handle) = frame.pop()? else {
+                return Err(jex(
+                    loader,
+                    output,
+                    depth,
+                    b"java/lang/NullPointerException",
+                    None,
+                ));
+            };
+            let store_result = {
+                let mut arrays = loader.arrays.borrow_mut();
+                arrays
+                    .get_mut(handle)
+                    .ok_or_else(|| Error::other("Invalid array reference"))
+                    .and_then(|array| array.store(opcode - 0x4f, index, value))
+            };
+            store_result.map_err(|error| {
+                jex(
+                    loader,
+                    output,
+                    depth,
+                    b"java/lang/ArrayIndexOutOfBoundsException",
+                    Some(&error.to_string()),
+                )
+            })?;
+            return Ok(Step::Continue);
+        }
+        0x53 => {
+            let value = frame.pop()?;
+            let index = frame.pop()?.int()? as usize;
+            let Value::ObjectArray(handle) = frame.pop()? else {
+                return Err(jex(
+                    loader,
+                    output,
+                    depth,
+                    b"java/lang/NullPointerException",
+                    None,
+                ));
+            };
+            let component = {
+                let arrays = loader.obj_arrays.borrow();
                 let array = arrays
                     .get(handle)
-                    .ok_or_else(|| Error::other("Invalid array reference"))?;
-                match array.load(opcode - 0x2e, index)? {
-                    Element::Int(value) => Value::Int(value),
-                    Element::Long(value) => Value::Long(value),
-                    Element::Float(value) => Value::Float(value),
-                    Element::Double(value) => Value::Double(value),
-                }
-            }
-            0x32 => {
-                let index = frame.pop()?.int()? as usize;
-                match frame.pop()? {
-                    Value::Arguments(arguments) => Value::HostString(
-                        arguments
-                            .get(index)
-                            .ok_or_else(|| Error::other("Array index out of bounds"))?,
-                    ),
-                    Value::ObjectArray(handle) => {
-                        let arrays = loader.obj_arrays.borrow();
-                        let array = arrays
-                            .get(handle)
-                            .ok_or_else(|| Error::other("Invalid object array reference"))?;
-                        array.get(index)?
+                    .ok_or_else(|| Error::other("Invalid object array reference"))?;
+                match array.get(index) {
+                    Ok(_) => array.component,
+                    Err(error) => {
+                        drop(arrays);
+                        return Err(jex(
+                            loader,
+                            output,
+                            depth,
+                            b"java/lang/ArrayIndexOutOfBoundsException",
+                            Some(&error.to_string()),
+                        ));
                     }
-                    _ => return Err(Error::other("Expected object array or arguments")),
                 }
+            };
+            if !loader.referenceAssignable(value, component)? {
+                return Err(jex(
+                    loader,
+                    output,
+                    depth,
+                    b"java/lang/ArrayStoreException",
+                    Some("array element type mismatch"),
+                ));
             }
-            0x36..=0x4e => {
-                let index = if opcode < 0x3b {
-                    frame.byte()?
-                } else {
-                    (opcode - 0x3b) % 4
-                };
-                let kind = if opcode < 0x3b {
-                    opcode - 0x36
-                } else {
-                    (opcode - 0x3b) / 4
-                };
-                frame.storeOperand(u16::from(index), kind)?;
-                continue;
+            loader
+                .obj_arrays
+                .borrow_mut()
+                .get_mut(handle)
+                .ok_or_else(|| Error::other("Invalid object array reference"))?
+                .set(index, value)?;
+            return Ok(Step::Continue);
+        }
+        0x57 => {
+            if frame.pop()?.slots() != 1 {
+                return Err(Error::other("Invalid pop operand"));
             }
-            0x4f..=0x52 | 0x54..=0x56 => {
-                let value = match frame.pop()? {
-                    Value::Int(value) => Element::Int(value),
-                    Value::Long(value) => Element::Long(value),
-                    Value::Float(value) => Element::Float(value),
-                    Value::Double(value) => Element::Double(value),
-                    _ => return Err(Error::other("Expected numeric array element")),
-                };
-                let index = frame.pop()?.int()? as usize;
-                let Value::PrimitiveArray(handle) = frame.pop()? else {
-                    return Err(Error::other("Expected primitive array"));
-                };
-                loader
-                    .arrays
-                    .borrow_mut()
-                    .get_mut(handle)
-                    .ok_or_else(|| Error::other("Invalid array reference"))?
-                    .store(opcode - 0x4f, index, value)?;
-                continue;
+            return Ok(Step::Continue);
+        }
+        0x58 => {
+            if frame.pop()?.slots() == 1 && frame.pop()?.slots() != 1 {
+                return Err(Error::other("Invalid pop2 operands"));
             }
-            0x53 => {
-                let value = frame.pop()?;
-                let index = frame.pop()?.int()? as usize;
-                let Value::ObjectArray(handle) = frame.pop()? else {
-                    return Err(Error::other("Expected object array"));
-                };
-                let component = {
-                    let arrays = loader.obj_arrays.borrow();
-                    let array = arrays
-                        .get(handle)
-                        .ok_or_else(|| Error::other("Invalid object array reference"))?;
-                    array.get(index)?;
-                    array.component
-                };
-                if !loader.referenceAssignable(value, component)? {
-                    return Err(Error::other("ArrayStoreException"));
-                }
-                loader.obj_arrays.borrow_mut()[handle].set(index, value)?;
-                continue;
+            return Ok(Step::Continue);
+        }
+        0x59 => *frame
+            .stack
+            .last()
+            .filter(|value| value.slots() == 1)
+            .ok_or_else(|| Error::other("Invalid dup operand"))?,
+        0x5a => {
+            let v1 = frame.pop()?;
+            let v2 = frame.pop()?;
+            if v1.slots() != 1 || v2.slots() != 1 {
+                return Err(Error::other("Invalid dup_x1 operand size"));
             }
-            0x57 => {
-                if frame.pop()?.slots() != 1 {
-                    return Err(Error::other("Invalid pop operand"));
-                }
-                continue;
+            frame.push(v1)?;
+            frame.push(v2)?;
+            frame.push(v1)?;
+            return Ok(Step::Continue);
+        }
+        0x5b => {
+            let v1 = frame.pop()?;
+            if v1.slots() != 1 {
+                return Err(Error::other("Invalid dup_x2 operand size"));
             }
-            0x58 => {
-                if frame.pop()?.slots() == 1 && frame.pop()?.slots() != 1 {
-                    return Err(Error::other("Invalid pop2 operands"));
-                }
-                continue;
-            }
-            0x59 => *frame
-                .stack
-                .last()
-                .filter(|value| value.slots() == 1)
-                .ok_or_else(|| Error::other("Invalid dup operand"))?,
-            0x5a => {
-                let v1 = frame.pop()?;
-                let v2 = frame.pop()?;
-                if v1.slots() != 1 || v2.slots() != 1 {
-                    return Err(Error::other("Invalid dup_x1 operand size"));
-                }
+            let v2 = frame.pop()?;
+            if v2.slots() == 2 {
                 frame.push(v1)?;
                 frame.push(v2)?;
                 frame.push(v1)?;
-                continue;
-            }
-            0x5b => {
-                let v1 = frame.pop()?;
-                if v1.slots() != 1 {
+            } else {
+                let v3 = frame.pop()?;
+                if v3.slots() != 1 {
                     return Err(Error::other("Invalid dup_x2 operand size"));
                 }
-                let v2 = frame.pop()?;
-                if v2.slots() == 2 {
-                    frame.push(v1)?;
-                    frame.push(v2)?;
-                    frame.push(v1)?;
-                } else {
-                    let v3 = frame.pop()?;
-                    if v3.slots() != 1 {
-                        return Err(Error::other("Invalid dup_x2 operand size"));
-                    }
-                    frame.push(v1)?;
-                    frame.push(v3)?;
-                    frame.push(v2)?;
-                    frame.push(v1)?;
-                }
-                continue;
+                frame.push(v1)?;
+                frame.push(v3)?;
+                frame.push(v2)?;
+                frame.push(v1)?;
             }
-            0x5c => {
-                let v1 = frame.pop()?;
-                if v1.slots() == 2 {
-                    frame.push(v1)?;
-                    frame.push(v1)?;
-                } else {
-                    let v2 = frame.pop()?;
-                    if v2.slots() != 1 {
-                        return Err(Error::other("Invalid dup2 operand size"));
-                    }
-                    frame.push(v2)?;
-                    frame.push(v1)?;
-                    frame.push(v2)?;
-                    frame.push(v1)?;
-                }
-                continue;
-            }
-            0x5d => {
-                let v1 = frame.pop()?;
+            return Ok(Step::Continue);
+        }
+        0x5c => {
+            let v1 = frame.pop()?;
+            if v1.slots() == 2 {
+                frame.push(v1)?;
+                frame.push(v1)?;
+            } else {
                 let v2 = frame.pop()?;
-                if v1.slots() == 2 && v2.slots() == 1 {
-                    frame.push(v1)?;
-                    frame.push(v2)?;
-                    frame.push(v1)?;
-                } else if v1.slots() == 1 && v2.slots() == 1 {
-                    let v3 = frame.pop()?;
-                    if v3.slots() != 1 {
-                        return Err(Error::other("Invalid dup2_x1"));
-                    }
-                    frame.push(v2)?;
-                    frame.push(v1)?;
-                    frame.push(v3)?;
-                    frame.push(v2)?;
-                    frame.push(v1)?;
-                } else {
-                    return Err(Error::other("Invalid dup2_x1 operand size"));
+                if v2.slots() != 1 {
+                    return Err(Error::other("Invalid dup2 operand size"));
                 }
-                continue;
-            }
-            0x5e => {
-                let v1 = frame.pop()?;
-                let v2 = frame.pop()?;
-                if v1.slots() == 2 && v2.slots() == 2 {
-                    frame.push(v1)?;
-                    frame.push(v2)?;
-                    frame.push(v1)?;
-                } else if v1.slots() == 2 && v2.slots() == 1 {
-                    let v3 = frame.pop()?;
-                    if v3.slots() != 1 {
-                        return Err(Error::other("Invalid dup2_x2"));
-                    }
-                    frame.push(v1)?;
-                    frame.push(v3)?;
-                    frame.push(v2)?;
-                    frame.push(v1)?;
-                } else if v1.slots() == 1 && v2.slots() == 1 {
-                    let v3 = frame.pop()?;
-                    if v3.slots() == 2 {
-                        frame.push(v2)?;
-                        frame.push(v1)?;
-                        frame.push(v3)?;
-                        frame.push(v2)?;
-                        frame.push(v1)?;
-                    } else {
-                        let v4 = frame.pop()?;
-                        if v4.slots() != 1 {
-                            return Err(Error::other("Invalid dup2_x2"));
-                        }
-                        frame.push(v2)?;
-                        frame.push(v1)?;
-                        frame.push(v4)?;
-                        frame.push(v3)?;
-                        frame.push(v2)?;
-                        frame.push(v1)?;
-                    }
-                } else {
-                    return Err(Error::other("Invalid dup2_x2 operand size"));
-                }
-                continue;
-            }
-            0x5f => {
-                let v1 = frame.pop()?;
-                let v2 = frame.pop()?;
-                if v1.slots() != 1 || v2.slots() != 1 {
-                    return Err(Error::other("Invalid swap operand size"));
-                }
+                frame.push(v2)?;
                 frame.push(v1)?;
                 frame.push(v2)?;
-                continue;
+                frame.push(v1)?;
             }
-            0x60 | 0x64 | 0x68 | 0x6c | 0x70 | 0x78 | 0x7a | 0x7c | 0x7e | 0x80 | 0x82 => {
-                let right = frame.pop()?.int()?;
-                let left = frame.pop()?.int()?;
-                if matches!(opcode, 0x6c | 0x70) && right == 0 {
-                    if frame.handle_exception(pc, Value::Null, loader, klass) {
-                        continue;
-                    }
-                    return Err(Error::other("java.lang.ArithmeticException: / by zero"));
+            return Ok(Step::Continue);
+        }
+        0x5d => {
+            let v1 = frame.pop()?;
+            let v2 = frame.pop()?;
+            if v1.slots() == 2 && v2.slots() == 1 {
+                frame.push(v1)?;
+                frame.push(v2)?;
+                frame.push(v1)?;
+            } else if v1.slots() == 1 && v2.slots() == 1 {
+                let v3 = frame.pop()?;
+                if v3.slots() != 1 {
+                    return Err(Error::other("Invalid dup2_x1"));
                 }
-                Value::Int(match opcode {
-                    0x60 => left.wrapping_add(right),
-                    0x64 => left.wrapping_sub(right),
-                    0x68 => left.wrapping_mul(right),
-                    0x6c => left.wrapping_div(right),
-                    0x70 => left.wrapping_rem(right),
-                    0x78 => left.wrapping_shl((right as u32) & 0x1f),
-                    0x7a => left.wrapping_shr((right as u32) & 0x1f),
-                    0x7c => (left as u32).wrapping_shr((right as u32) & 0x1f) as i32,
-                    0x7e => left & right,
-                    0x80 => left | right,
-                    _ => left ^ right,
-                })
+                frame.push(v2)?;
+                frame.push(v1)?;
+                frame.push(v3)?;
+                frame.push(v2)?;
+                frame.push(v1)?;
+            } else {
+                return Err(Error::other("Invalid dup2_x1 operand size"));
             }
-            0x79 => {
-                // lshl
-                let right = frame.pop()?.int()?;
-                let left = frame.pop()?.long()?;
-                Value::Long(left.wrapping_shl((right as u32) & 0x3f))
-            }
-            0x7b => {
-                // lshr
-                let right = frame.pop()?.int()?;
-                let left = frame.pop()?.long()?;
-                Value::Long(left.wrapping_shr((right as u32) & 0x3f))
-            }
-            0x7d => {
-                // lushr
-                let right = frame.pop()?.int()?;
-                let left = frame.pop()?.long()?;
-                Value::Long((left as u64).wrapping_shr((right as u32) & 0x3f) as i64)
-            }
-            0x7f => {
-                // land
-                let right = frame.pop()?.long()?;
-                let left = frame.pop()?.long()?;
-                Value::Long(left & right)
-            }
-            0x81 => {
-                // lor
-                let right = frame.pop()?.long()?;
-                let left = frame.pop()?.long()?;
-                Value::Long(left | right)
-            }
-            0x83 => {
-                // lxor
-                let right = frame.pop()?.long()?;
-                let left = frame.pop()?.long()?;
-                Value::Long(left ^ right)
-            }
-            0x61..=0x63 | 0x65..=0x67 | 0x69..=0x6b | 0x6d..=0x6f | 0x71..=0x73 => {
-                let right = frame.pop()?;
-                let left = frame.pop()?;
-                if matches!(opcode, 0x6d | 0x71) {
-                    if let Value::Long(r) = right
-                        && r == 0
-                    {
-                        if frame.handle_exception(pc, Value::Null, loader, klass) {
-                            continue;
-                        }
-                        return Err(Error::other("java.lang.ArithmeticException: / by zero"));
-                    }
+            return Ok(Step::Continue);
+        }
+        0x5e => {
+            let v1 = frame.pop()?;
+            let v2 = frame.pop()?;
+            if v1.slots() == 2 && v2.slots() == 2 {
+                frame.push(v1)?;
+                frame.push(v2)?;
+                frame.push(v1)?;
+            } else if v1.slots() == 2 && v2.slots() == 1 {
+                let v3 = frame.pop()?;
+                if v3.slots() != 1 {
+                    return Err(Error::other("Invalid dup2_x2"));
                 }
-                numeric::binary(opcode, left, right)?
-            }
-            0x74 => Value::Int(frame.pop()?.int()?.wrapping_neg()),
-            0x75..=0x77 => match (opcode, frame.pop()?) {
-                (0x75, Value::Long(value)) => Value::Long(value.wrapping_neg()),
-                (0x76, Value::Float(value)) => Value::Float(-value),
-                (0x77, Value::Double(value)) => Value::Double(-value),
-                _ => return Err(Error::other("Invalid negation operand")),
-            },
-            0x84 => {
-                let [index, increment] = frame.read()?;
-                frame.increment(u16::from(index), i32::from(increment as i8))?;
-                continue;
-            }
-            0x85..=0x93 => numeric::convert(opcode, frame.pop()?)?,
-            0x94..=0x98 => {
-                let right = frame.pop()?;
-                Value::Int(numeric::compare(opcode, frame.pop()?, right)?)
-            }
-            0x99..=0xa4 | 0xa7 => {
-                let offset = i16::from_be_bytes(frame.read()?);
-                let jump = if opcode == 0xa7 {
-                    true
+                frame.push(v1)?;
+                frame.push(v3)?;
+                frame.push(v2)?;
+                frame.push(v1)?;
+            } else if v1.slots() == 1 && v2.slots() == 1 {
+                let v3 = frame.pop()?;
+                if v3.slots() == 2 {
+                    frame.push(v2)?;
+                    frame.push(v1)?;
+                    frame.push(v3)?;
+                    frame.push(v2)?;
+                    frame.push(v1)?;
                 } else {
-                    let right = frame.pop()?.int()?;
-                    let (left, right) = if opcode < 0x9f {
-                        (right, 0)
-                    } else {
-                        (frame.pop()?.int()?, right)
-                    };
-                    match (opcode - 0x99) % 6 {
-                        0 => left == right,
-                        1 => left != right,
-                        2 => left < right,
-                        3 => left >= right,
-                        4 => left > right,
-                        _ => left <= right,
+                    let v4 = frame.pop()?;
+                    if v4.slots() != 1 {
+                        return Err(Error::other("Invalid dup2_x2"));
                     }
-                };
-                if jump {
-                    frame.jump(pc, i32::from(offset))?;
+                    frame.push(v2)?;
+                    frame.push(v1)?;
+                    frame.push(v4)?;
+                    frame.push(v3)?;
+                    frame.push(v2)?;
+                    frame.push(v1)?;
                 }
-                continue;
+            } else {
+                return Err(Error::other("Invalid dup2_x2 operand size"));
             }
-            0xa5 | 0xa6 => {
-                let offset = i16::from_be_bytes(frame.read()?);
-                let v2 = frame.pop()?;
-                let v1 = frame.pop()?;
-                let eq = match (v1, v2) {
-                    (Value::Null, Value::Null) => true,
-                    (Value::Object(a), Value::Object(b)) => a == b,
-                    (Value::PrimitiveArray(a), Value::PrimitiveArray(b)) => a == b,
-                    (Value::ObjectArray(a), Value::ObjectArray(b)) => a == b,
-                    (Value::String(a), Value::String(b)) => a == b,
-                    (Value::ClassMirror(a), Value::ClassMirror(b)) => a == b,
-                    (Value::HostString(a), Value::HostString(b)) => a == b,
-                    _ => false,
-                };
-                if eq == (opcode == 0xa5) {
-                    frame.jump(pc, i32::from(offset))?;
-                }
-                continue;
+            return Ok(Step::Continue);
+        }
+        0x5f => {
+            let v1 = frame.pop()?;
+            let v2 = frame.pop()?;
+            if v1.slots() != 1 || v2.slots() != 1 {
+                return Err(Error::other("Invalid swap operand size"));
             }
-            0xa8 => {
-                // jsr
-                let offset = i16::from_be_bytes(frame.read()?);
-                let return_address = frame.pc;
-                frame.push(Value::ReturnAddress(return_address))?;
-                frame.jump(pc, i32::from(offset))?;
-                continue;
+            frame.push(v1)?;
+            frame.push(v2)?;
+            return Ok(Step::Continue);
+        }
+        0x60 | 0x64 | 0x68 | 0x6c | 0x70 | 0x78 | 0x7a | 0x7c | 0x7e | 0x80 | 0x82 => {
+            let right = frame.pop()?.int()?;
+            let left = frame.pop()?.int()?;
+            if matches!(opcode, 0x6c | 0x70) && right == 0 {
+                return Err(jex(
+                    loader,
+                    output,
+                    depth,
+                    b"java/lang/ArithmeticException",
+                    Some("/ by zero"),
+                ));
             }
-            0xa9 => {
-                // ret
-                let index = frame.byte()?;
-                let val = *frame.local(u16::from(index))?;
-                let Value::ReturnAddress(target_pc) = val else {
-                    return Err(Error::other("Expected return address in ret"));
-                };
-                frame.pc = target_pc;
-                continue;
-            }
-            0xaa | 0xab => {
-                frame.switch(pc, opcode == 0xaa)?;
-                continue;
-            }
-            0xac..=0xb0 => {
-                let value = frame.pop()?;
-                if !value.matchesLocal(opcode - 0xac) {
-                    return Err(Error::other("Invalid return operand"));
-                }
-                return Ok(Some(value));
-            }
-            0xb1 => return Ok(None),
-            0xb2 | 0xb3 => {
-                let [owner, name, descriptor] =
-                    klass.memberRef(u16::from_be_bytes(frame.read()?), true)?;
-                if opcode == 0xb2
-                    && [owner, name, descriptor]
-                        == [
-                            b"java/lang/System".as_slice(),
-                            b"out",
-                            b"Ljava/io/PrintStream;",
-                        ]
+            Value::Int(match opcode {
+                0x60 => left.wrapping_add(right),
+                0x64 => left.wrapping_sub(right),
+                0x68 => left.wrapping_mul(right),
+                0x6c => left.wrapping_div(right),
+                0x70 => left.wrapping_rem(right),
+                0x78 => left.wrapping_shl((right as u32) & 0x1f),
+                0x7a => left.wrapping_shr((right as u32) & 0x1f),
+                0x7c => (left as u32).wrapping_shr((right as u32) & 0x1f) as i32,
+                0x7e => left & right,
+                0x80 => left | right,
+                _ => left ^ right,
+            })
+        }
+        0x79 => {
+            // lshl
+            let right = frame.pop()?.int()?;
+            let left = frame.pop()?.long()?;
+            Value::Long(left.wrapping_shl((right as u32) & 0x3f))
+        }
+        0x7b => {
+            // lshr
+            let right = frame.pop()?.int()?;
+            let left = frame.pop()?.long()?;
+            Value::Long(left.wrapping_shr((right as u32) & 0x3f))
+        }
+        0x7d => {
+            // lushr
+            let right = frame.pop()?.int()?;
+            let left = frame.pop()?.long()?;
+            Value::Long((left as u64).wrapping_shr((right as u32) & 0x3f) as i64)
+        }
+        0x7f => {
+            // land
+            let right = frame.pop()?.long()?;
+            let left = frame.pop()?.long()?;
+            Value::Long(left & right)
+        }
+        0x81 => {
+            // lor
+            let right = frame.pop()?.long()?;
+            let left = frame.pop()?.long()?;
+            Value::Long(left | right)
+        }
+        0x83 => {
+            // lxor
+            let right = frame.pop()?.long()?;
+            let left = frame.pop()?.long()?;
+            Value::Long(left ^ right)
+        }
+        0x61..=0x63 | 0x65..=0x67 | 0x69..=0x6b | 0x6d..=0x6f | 0x71..=0x73 => {
+            let right = frame.pop()?;
+            let left = frame.pop()?;
+            if matches!(opcode, 0x6d | 0x71) {
+                if let Value::Long(r) = right
+                    && r == 0
                 {
-                    Value::Output
-                } else {
-                    if opcode == 0xb2
-                        && owner == b"jdk/internal/misc/UnsafeConstants"
-                        && let Some(value) = crate::share::prims::r#unsafe::Unsafe::platformConstant(
-                            name, descriptor,
-                        )
-                    {
-                        frame.push(Value::Int(value))?;
-                        continue;
-                    }
-                    let target = loader.load(owner)?.staticFieldOwner(name, descriptor)?;
-                    let field = target.staticField(name, descriptor)?;
-                    initialize(loader, &target, output, depth + 1)?;
-                    if opcode == 0xb3 {
-                        let mut value = frame.pop()?;
-                        if !value.matchesLocal(signature::fieldKind(descriptor)?) {
-                            return Err(Error::other("Invalid static field value"));
-                        }
-                        value = match (descriptor, value) {
-                            (b"Z", Value::Int(v)) => Value::Int(v & 1),
-                            (b"B", Value::Int(v)) => Value::Int(i32::from(v as i8)),
-                            (b"C", Value::Int(v)) => Value::Int(i32::from(v as u16)),
-                            (b"S", Value::Int(v)) => Value::Int(i32::from(v as i16)),
-                            _ => value,
-                        };
-                        field.set(value);
-                        continue;
-                    }
-                    field.get()
+                    return Err(jex(
+                        loader,
+                        output,
+                        depth,
+                        b"java/lang/ArithmeticException",
+                        Some("/ by zero"),
+                    ));
                 }
             }
-            0xb4 | 0xb5 => {
-                let [owner, name, descriptor] =
-                    klass.memberRef(u16::from_be_bytes(frame.read()?), true)?;
-                let value = (opcode == 0xb5).then(|| frame.pop()).transpose()?;
-                let Value::Object(handle) = frame.pop()? else {
-                    return Err(Error::other("Expected instance field receiver"));
+            numeric::binary(opcode, left, right)?
+        }
+        0x74 => Value::Int(frame.pop()?.int()?.wrapping_neg()),
+        0x75..=0x77 => match (opcode, frame.pop()?) {
+            (0x75, Value::Long(value)) => Value::Long(value.wrapping_neg()),
+            (0x76, Value::Float(value)) => Value::Float(-value),
+            (0x77, Value::Double(value)) => Value::Double(-value),
+            _ => return Err(Error::other("Invalid negation operand")),
+        },
+        0x84 => {
+            let [index, increment] = frame.read()?;
+            frame.increment(u16::from(index), i32::from(increment as i8))?;
+            return Ok(Step::Continue);
+        }
+        0x85..=0x93 => numeric::convert(opcode, frame.pop()?)?,
+        0x94..=0x98 => {
+            let right = frame.pop()?;
+            Value::Int(numeric::compare(opcode, frame.pop()?, right)?)
+        }
+        0x99..=0xa4 | 0xa7 => {
+            let offset = i16::from_be_bytes(frame.read()?);
+            let jump = if opcode == 0xa7 {
+                true
+            } else {
+                let right = frame.pop()?.int()?;
+                let (left, right) = if opcode < 0x9f {
+                    (right, 0)
+                } else {
+                    (frame.pop()?.int()?, right)
                 };
-                let mut objects = loader.objects.borrow_mut();
+                match (opcode - 0x99) % 6 {
+                    0 => left == right,
+                    1 => left != right,
+                    2 => left < right,
+                    3 => left >= right,
+                    4 => left > right,
+                    _ => left <= right,
+                }
+            };
+            if jump {
+                frame.jump(pc, i32::from(offset))?;
+            }
+            return Ok(Step::Continue);
+        }
+        0xa5 | 0xa6 => {
+            let offset = i16::from_be_bytes(frame.read()?);
+            let v2 = frame.pop()?;
+            let v1 = frame.pop()?;
+            let eq = match (v1, v2) {
+                (Value::Null, Value::Null) => true,
+                (Value::Object(a), Value::Object(b)) => a == b,
+                (Value::PrimitiveArray(a), Value::PrimitiveArray(b)) => a == b,
+                (Value::ObjectArray(a), Value::ObjectArray(b)) => a == b,
+                (Value::String(a), Value::String(b)) => a == b,
+                (Value::ClassMirror(a), Value::ClassMirror(b)) => a == b,
+                (Value::HostString(a), Value::HostString(b)) => a == b,
+                (Value::Arguments(a), Value::Arguments(b)) => {
+                    std::ptr::eq(a.as_ptr(), b.as_ptr()) && a.len() == b.len()
+                }
+                (Value::String(a), Value::HostString(b))
+                | (Value::HostString(b), Value::String(a)) => a == b.as_bytes(),
+                _ => false,
+            };
+            if eq == (opcode == 0xa5) {
+                frame.jump(pc, i32::from(offset))?;
+            }
+            return Ok(Step::Continue);
+        }
+        0xa8 => {
+            // jsr
+            let offset = i16::from_be_bytes(frame.read()?);
+            let return_address = frame.pc;
+            frame.push(Value::ReturnAddress(return_address))?;
+            frame.jump(pc, i32::from(offset))?;
+            return Ok(Step::Continue);
+        }
+        0xa9 => {
+            // ret
+            let index = frame.byte()?;
+            let val = *frame.local(u16::from(index))?;
+            let Value::ReturnAddress(target_pc) = val else {
+                return Err(Error::other("Expected return address in ret"));
+            };
+            frame.pc = target_pc;
+            return Ok(Step::Continue);
+        }
+        0xaa | 0xab => {
+            frame.switch(pc, opcode == 0xaa)?;
+            return Ok(Step::Continue);
+        }
+        0xac..=0xb0 => {
+            let value = frame.pop()?;
+            if !value.matchesLocal(opcode - 0xac) {
+                return Err(Error::other("Invalid return operand"));
+            }
+            return Ok(Step::Return(Some(value)));
+        }
+        0xb1 => return Ok(Step::Return(None)),
+        0xb2 | 0xb3 => {
+            let [owner, name, descriptor] =
+                klass.memberRef(u16::from_be_bytes(frame.read()?), true)?;
+            if opcode == 0xb2
+                && [owner, name, descriptor]
+                    == [
+                        b"java/lang/System".as_slice(),
+                        b"out",
+                        b"Ljava/io/PrintStream;",
+                    ]
+            {
+                Value::Output
+            } else {
+                if opcode == 0xb2
+                    && owner == b"jdk/internal/misc/UnsafeConstants"
+                    && let Some(value) =
+                        crate::share::prims::r#unsafe::Unsafe::platformConstant(name, descriptor)
+                {
+                    frame.push(Value::Int(value))?;
+                    return Ok(Step::Continue);
+                }
+                let target = loader
+                    .load(owner)
+                    .and_then(|klass| klass.staticFieldOwner(name, descriptor))
+                    .map_err(|error| linkageExc(loader, output, depth, error))?;
+                let field = target
+                    .staticField(name, descriptor)
+                    .map_err(|error| linkageExc(loader, output, depth, error))?;
+                initialize(loader, &target, output, depth + 1)?;
+                if opcode == 0xb3 {
+                    let mut value = frame.pop()?;
+                    if !value.matchesLocal(signature::fieldKind(descriptor)?) {
+                        return Err(Error::other("Invalid static field value"));
+                    }
+                    value = match (descriptor, value) {
+                        (b"Z", Value::Int(v)) => Value::Int(v & 1),
+                        (b"B", Value::Int(v)) => Value::Int(i32::from(v as i8)),
+                        (b"C", Value::Int(v)) => Value::Int(i32::from(v as u16)),
+                        (b"S", Value::Int(v)) => Value::Int(i32::from(v as i16)),
+                        _ => value,
+                    };
+                    field.set(value);
+                    return Ok(Step::Continue);
+                }
+                field.get()
+            }
+        }
+        0xb4 | 0xb5 => {
+            let [owner, name, descriptor] =
+                klass.memberRef(u16::from_be_bytes(frame.read()?), true)?;
+            let value = (opcode == 0xb5).then(|| frame.pop()).transpose()?;
+            let receiver = frame.pop()?;
+            if matches!(receiver, Value::Null) {
+                if std::env::var_os("JVM25_TRACE").is_some() {
+                    eprintln!(
+                        "[npe-site] field {}.{}{} pc={} in {} [{}]",
+                        String::from_utf8_lossy(owner),
+                        String::from_utf8_lossy(name),
+                        String::from_utf8_lossy(descriptor),
+                        pc,
+                        String::from_utf8_lossy(klass.class.name),
+                        String::from_utf8_lossy(frame.owner),
+                    );
+                }
+                return Err(jex(
+                    loader,
+                    output,
+                    depth,
+                    b"java/lang/NullPointerException",
+                    None,
+                ));
+            }
+            let Value::Object(handle) = receiver else {
+                return Err(jex(
+                    loader,
+                    output,
+                    depth,
+                    b"java/lang/IncompatibleClassChangeError",
+                    Some("Expected object field receiver"),
+                ));
+            };
+            let field_result: io::Result<Option<Value>> = (|| {
+                let mut objects = loader.borrow_objects_mut();
                 let object = objects
                     .get_mut(handle)
                     .ok_or_else(|| Error::other("Invalid object reference"))?;
@@ -863,6 +1658,9 @@ pub fn execute<'a>(
                 }
                 let ownerKlass = loader.load(owner)?;
                 let index = ownerKlass.instanceField(name, descriptor)?;
+                if index >= object.fields.len() {
+                    return Err(Error::other("Invalid instance field slot"));
+                }
                 if let Some(mut val) = value {
                     if !val.matchesLocal(signature::fieldKind(descriptor)?) {
                         return Err(Error::other("Invalid instance field value"));
@@ -875,208 +1673,410 @@ pub fn execute<'a>(
                         _ => val,
                     };
                     object.fields[index] = val;
-                    continue;
+                    return Ok(None);
                 }
-                object.fields[index]
+                Ok(Some(object.fields[index]))
+            })();
+            let value = field_result.map_err(|error| {
+                if error.to_string() == "Unsupported field receiver class" {
+                    return jex(
+                        loader,
+                        output,
+                        depth,
+                        b"java/lang/IncompatibleClassChangeError",
+                        Some("Field receiver class mismatch"),
+                    );
+                }
+                linkageExc(loader, output, depth, error)
+            })?;
+            if let Some(value) = value {
+                frame.push(value)?;
             }
-            0xb6..=0xb9 => {
-                let index = u16::from_be_bytes(frame.read()?);
-                let interfaceCount = if opcode == 0xb9 {
-                    let [count, zero] = frame.read()?;
-                    if zero != 0
-                        || !matches!(klass.constant(index)?, Constant::InterfaceMethodRef(..))
-                    {
-                        return Err(Error::other("Invalid invokeinterface operands"));
-                    }
-                    Some(usize::from(count))
+            return Ok(Step::Continue);
+        }
+        0xb6..=0xb9 => {
+            let index = u16::from_be_bytes(frame.read()?);
+            let interfaceCount = if opcode == 0xb9 {
+                let [count, zero] = frame.read()?;
+                if zero != 0 || !matches!(klass.constant(index)?, Constant::InterfaceMethodRef(..))
+                {
+                    return Err(Error::other("Invalid invokeinterface operands"));
+                }
+                Some(usize::from(count))
+            } else {
+                None
+            };
+            let [owner, name, descriptor] = klass.memberRef(index, false)?;
+
+            if matches!(opcode, 0xb6 | 0xb9)
+                && name == b"getClass"
+                && descriptor == b"()Ljava/lang/Class;"
+            {
+                let value = crate::share::prims::classNatives::classOf(loader, frame.pop()?)?;
+                frame.push(value)?;
+                return Ok(Step::Continue);
+            }
+            if opcode == 0xb6
+                && owner == b"java/io/PrintStream"
+                && (name == b"println" || name == b"print")
+            {
+                let is_println = name == b"println";
+                let value = if descriptor == b"()V" {
+                    Value::Empty
                 } else {
-                    None
+                    frame.pop()?
                 };
-                let [owner, name, descriptor] = klass.memberRef(index, false)?;
-
-                if matches!(opcode, 0xb6 | 0xb9)
-                    && name == b"getClass"
-                    && descriptor == b"()Ljava/lang/Class;"
-                {
-                    let value = crate::share::prims::classNatives::classOf(loader, frame.pop()?)?;
-                    frame.push(value)?;
-                    continue;
+                if !matches!(frame.pop()?, Value::Output) {
+                    return Err(Error::other("Invalid print receiver"));
                 }
-                if opcode == 0xb6
-                    && owner == b"java/io/PrintStream"
-                    && (name == b"println" || name == b"print")
+                match (descriptor, value) {
+                    (b"()V", _) => {
+                        if is_println {
+                            writeln!(output)?;
+                        }
+                    }
+                    (b"(I)V", Value::Int(v))
+                    | (b"(B)V", Value::Int(v))
+                    | (b"(S)V", Value::Int(v)) => {
+                        if is_println {
+                            writeln!(output, "{v}")?;
+                        } else {
+                            write!(output, "{v}")?;
+                        }
+                    }
+                    (b"(Z)V", Value::Int(v)) => {
+                        let text = if v != 0 { "true" } else { "false" };
+                        if is_println {
+                            writeln!(output, "{text}")?;
+                        } else {
+                            write!(output, "{text}")?;
+                        }
+                    }
+                    (b"(C)V", Value::Int(v)) => {
+                        let ch = char::from_u32(v as u32).unwrap_or('?');
+                        if is_println {
+                            writeln!(output, "{ch}")?;
+                        } else {
+                            write!(output, "{ch}")?;
+                        }
+                    }
+                    (b"(J)V", Value::Long(v)) => {
+                        if is_println {
+                            writeln!(output, "{v}")?;
+                        } else {
+                            write!(output, "{v}")?;
+                        }
+                    }
+                    (b"(F)V", Value::Float(v)) => {
+                        if is_println {
+                            writeln!(output, "{v}")?;
+                        } else {
+                            write!(output, "{v}")?;
+                        }
+                    }
+                    (b"(D)V", Value::Double(v)) => {
+                        if is_println {
+                            writeln!(output, "{v}")?;
+                        } else {
+                            write!(output, "{v}")?;
+                        }
+                    }
+                    (b"(Ljava/lang/String;)V", Value::HostString(v)) => {
+                        if is_println {
+                            writeln!(output, "{v}")?;
+                        } else {
+                            write!(output, "{v}")?;
+                        }
+                    }
+                    (b"(Ljava/lang/String;)V", Value::String(v)) => {
+                        let text = decodeString(v)?;
+                        if is_println {
+                            writeln!(output, "{text}")?;
+                        } else {
+                            write!(output, "{text}")?;
+                        }
+                    }
+                    (b"(Ljava/lang/Object;)V", Value::Null)
+                    | (b"(Ljava/lang/String;)V", Value::Null) => {
+                        if is_println {
+                            writeln!(output, "null")?;
+                        } else {
+                            write!(output, "null")?;
+                        }
+                    }
+                    (
+                        b"(Ljava/lang/Object;)V" | b"(Ljava/lang/String;)V",
+                        Value::Object(handle),
+                    ) => {
+                        let value = Value::Object(handle);
+                        match crate::share::prims::stringNatives::string(loader, value)? {
+                            Some(text) => {
+                                if is_println {
+                                    writeln!(output, "{text}")?;
+                                } else {
+                                    write!(output, "{text}")?;
+                                }
+                            }
+                            None => {
+                                if is_println {
+                                    writeln!(output, "Object@{handle:x}")?;
+                                } else {
+                                    write!(output, "Object@{handle:x}")?;
+                                }
+                            }
+                        }
+                    }
+                    (b"(Ljava/lang/Object;)V", Value::HostString(v)) => {
+                        if is_println {
+                            writeln!(output, "{v}")?;
+                        } else {
+                            write!(output, "{v}")?;
+                        }
+                    }
+                    (b"(Ljava/lang/Object;)V", Value::String(v)) => {
+                        let text = decodeString(v)?;
+                        if is_println {
+                            writeln!(output, "{text}")?;
+                        } else {
+                            write!(output, "{text}")?;
+                        }
+                    }
+                    _ => return Err(Error::other("Unsupported println/print signature")),
+                }
+                return Ok(Step::Continue);
+            }
+
+            let (parameters, result) = signature::method(descriptor)?;
+            let count = parameters.count();
+            let receiverSlots = usize::from(opcode != 0xb8);
+            if count + receiverSlots > 255 {
+                return Err(Error::other("Too many method parameters"));
+            }
+            let start = frame
+                .stack
+                .len()
+                .checked_sub(count + receiverSlots)
+                .ok_or_else(|| Error::other("Missing method arguments"))?;
+            let mut slots = receiverSlots;
+            for (kind, &val) in signature::method(descriptor)?
+                .0
+                .zip(&frame.stack[start + receiverSlots..])
+            {
+                if !val.matchesLocal(kind?) {
+                    return Err(Error::other("Invalid method argument"));
+                }
+                slots += val.slots();
+            }
+            if slots > 255 {
+                return Err(Error::other("Too many method argument slots"));
+            }
+            if interfaceCount.is_some_and(|count| count != slots) {
+                return Err(Error::other("Invalid invokeinterface argument count"));
+            }
+            if matches!(opcode, 0xb6 | 0xb9)
+                && let Some(value) = crate::share::prims::stringNatives::materialize(
+                    loader,
+                    frame.stack[start],
+                    output,
+                    depth + 1,
+                )?
+            {
+                frame.stack[start] = value;
+            }
+            if matches!(opcode, 0xb6 | 0xb9)
+                && owner.first() == Some(&b'[')
+                && name == b"clone"
+                && descriptor == b"()Ljava/lang/Object;"
+            {
+                let cloned = match frame.stack[start] {
+                    Value::Null => {
+                        return Err(jex(
+                            loader,
+                            output,
+                            depth,
+                            b"java/lang/NullPointerException",
+                            None,
+                        ));
+                    }
+                    Value::PrimitiveArray(handle) => {
+                        let array = {
+                            let arrays = loader.arrays.borrow();
+                            arrays
+                                .get(handle)
+                                .ok_or_else(|| Error::other("Invalid array reference"))?
+                                .clone()
+                        };
+                        Value::PrimitiveArray(loader.alloc_type_array(array))
+                    }
+                    Value::ObjectArray(handle) => {
+                        let (component, elements) = {
+                            let arrays = loader.obj_arrays.borrow();
+                            let array = arrays
+                                .get(handle)
+                                .ok_or_else(|| Error::other("Invalid array reference"))?;
+                            (array.component, array.elements.clone())
+                        };
+                        let mut array =
+                            crate::share::oops::objArrayOop::ObjArrayOop::withComponent(
+                                elements.len() as i32,
+                                component,
+                            )?;
+                        array.elements = elements;
+                        Value::ObjectArray(loader.alloc_obj_array(array))
+                    }
+                    Value::Arguments(arguments) => {
+                        let mut array =
+                            crate::share::oops::objArrayOop::ObjArrayOop::withComponent(
+                                arguments.len() as i32,
+                                b"java/lang/String",
+                            )?;
+                        array.elements = arguments
+                            .iter()
+                            .map(|arg| Value::HostString(arg.as_str()))
+                            .collect();
+                        Value::ObjectArray(loader.alloc_obj_array(array))
+                    }
+                    _ => return Err(Error::other("Expected array receiver for clone")),
+                };
+                frame.stack.truncate(start);
+                frame.stackSlots -= slots;
+                frame.push(cloned)?;
+                return Ok(Step::Continue);
+            }
+            if matches!(opcode, 0xb6 | 0xb9)
+                && matches!(
+                    owner,
+                    b"java/lang/String" | b"java/lang/CharSequence" | b"java/lang/Object"
+                )
+                && let Some(value) = crate::share::prims::stringNatives::invoke(
+                    loader,
+                    name,
+                    descriptor,
+                    &frame.stack[start..],
+                )?
+            {
+                frame.stack.truncate(start);
+                frame.stackSlots -= slots;
+                if let Some(value) = value {
+                    frame.push(value)?;
+                }
+                return Ok(Step::Continue);
+            }
+            if opcode == 0xb6
+                && owner == b"java/lang/Object"
+                && name == b"hashCode"
+                && descriptor == b"()I"
+                && let Some(hash) =
+                    crate::share::prims::objectNatives::hashCode(loader, frame.stack[start])?
+            {
+                frame.pop()?;
+                frame.push(Value::Int(hash))?;
+                return Ok(Step::Continue);
+            }
+            if opcode == 0xb6
+                && owner == b"java/lang/Class"
+                && let Some(value) = crate::share::prims::classNatives::invoke(
+                    loader,
+                    name,
+                    descriptor,
+                    &frame.stack[start..],
+                )?
+            {
+                frame.stack.truncate(start);
+                frame.stackSlots -= slots;
+                frame.push(value)?;
+                return Ok(Step::Continue);
+            }
+            if opcode != 0xb8
+                && let Some(result) = crate::share::prims::nativeLookup::invokeInstance(
+                    loader,
+                    owner,
+                    name,
+                    descriptor,
+                    &frame.stack[start..],
+                )?
+            {
+                frame.stack.truncate(start);
+                frame.stackSlots -= slots;
+                if let Some(value) = result {
+                    frame.push(value)?;
+                }
+                return Ok(Step::Continue);
+            }
+
+            if opcode == 0xb8 {
+                if owner == b"java/lang/System"
+                    && descriptor == b"(Ljava/lang/String;)V"
+                    && matches!(name, b"load" | b"loadLibrary")
                 {
-                    let is_println = name == b"println";
-                    let value = if descriptor == b"()V" {
-                        Value::Empty
+                    let value = frame.pop()?;
+                    let path = crate::share::prims::stringNatives::string(loader, value)?
+                        .ok_or_else(|| Error::other("Expected library name"))?;
+                    let libraries = crate::share::prims::nativeLibraries::NativeLibraries::global();
+                    if name == b"load" {
+                        libraries.load(std::path::Path::new(path.as_ref()))?;
                     } else {
-                        frame.pop()?
-                    };
-                    if !matches!(frame.pop()?, Value::Output) {
-                        return Err(Error::other("Invalid print receiver"));
+                        let properties = loader.systemProperties.borrow();
+                        libraries.loadLibraryWithPaths(
+                            path.as_ref(),
+                            properties.get("java.library.path").copied(),
+                        )?;
                     }
-                    match (descriptor, value) {
-                        (b"()V", _) => {
-                            if is_println {
-                                writeln!(output)?;
-                            }
-                        }
-                        (b"(I)V", Value::Int(v))
-                        | (b"(B)V", Value::Int(v))
-                        | (b"(S)V", Value::Int(v)) => {
-                            if is_println {
-                                writeln!(output, "{v}")?;
-                            } else {
-                                write!(output, "{v}")?;
-                            }
-                        }
-                        (b"(Z)V", Value::Int(v)) => {
-                            let text = if v != 0 { "true" } else { "false" };
-                            if is_println {
-                                writeln!(output, "{text}")?;
-                            } else {
-                                write!(output, "{text}")?;
-                            }
-                        }
-                        (b"(C)V", Value::Int(v)) => {
-                            let ch = char::from_u32(v as u32).unwrap_or('?');
-                            if is_println {
-                                writeln!(output, "{ch}")?;
-                            } else {
-                                write!(output, "{ch}")?;
-                            }
-                        }
-                        (b"(J)V", Value::Long(v)) => {
-                            if is_println {
-                                writeln!(output, "{v}")?;
-                            } else {
-                                write!(output, "{v}")?;
-                            }
-                        }
-                        (b"(F)V", Value::Float(v)) => {
-                            if is_println {
-                                writeln!(output, "{v}")?;
-                            } else {
-                                write!(output, "{v}")?;
-                            }
-                        }
-                        (b"(D)V", Value::Double(v)) => {
-                            if is_println {
-                                writeln!(output, "{v}")?;
-                            } else {
-                                write!(output, "{v}")?;
-                            }
-                        }
-                        (b"(Ljava/lang/String;)V", Value::HostString(v)) => {
-                            if is_println {
-                                writeln!(output, "{v}")?;
-                            } else {
-                                write!(output, "{v}")?;
-                            }
-                        }
-                        (b"(Ljava/lang/String;)V", Value::String(v)) => {
-                            let text = decodeString(v)?;
-                            if is_println {
-                                writeln!(output, "{text}")?;
-                            } else {
-                                write!(output, "{text}")?;
-                            }
-                        }
-                        (b"(Ljava/lang/Object;)V", Value::Null)
-                        | (b"(Ljava/lang/String;)V", Value::Null) => {
-                            if is_println {
-                                writeln!(output, "null")?;
-                            } else {
-                                write!(output, "null")?;
-                            }
-                        }
-                        (b"(Ljava/lang/Object;)V", Value::Object(handle)) => {
-                            if is_println {
-                                writeln!(output, "Object@{handle:x}")?;
-                            } else {
-                                write!(output, "Object@{handle:x}")?;
-                            }
-                        }
-                        (b"(Ljava/lang/Object;)V", Value::HostString(v)) => {
-                            if is_println {
-                                writeln!(output, "{v}")?;
-                            } else {
-                                write!(output, "{v}")?;
-                            }
-                        }
-                        (b"(Ljava/lang/Object;)V", Value::String(v)) => {
-                            let text = decodeString(v)?;
-                            if is_println {
-                                writeln!(output, "{text}")?;
-                            } else {
-                                write!(output, "{text}")?;
-                            }
-                        }
-                        _ => return Err(Error::other("Unsupported println/print signature")),
-                    }
-                    continue;
+                    return Ok(Step::Continue);
                 }
-
-                let (parameters, result) = signature::method(descriptor)?;
-                let count = parameters.count();
-                let receiverSlots = usize::from(opcode != 0xb8);
-                if count + receiverSlots > 255 {
-                    return Err(Error::other("Too many method parameters"));
-                }
-                let start = frame
-                    .stack
-                    .len()
-                    .checked_sub(count + receiverSlots)
-                    .ok_or_else(|| Error::other("Missing method arguments"))?;
-                let mut slots = receiverSlots;
-                for (kind, &val) in signature::method(descriptor)?
-                    .0
-                    .zip(&frame.stack[start + receiverSlots..])
+                if owner == b"java/lang/ClassLoader"
+                    && name == b"registerNatives"
+                    && descriptor == b"()V"
                 {
-                    if !val.matchesLocal(kind?) {
-                        return Err(Error::other("Invalid method argument"));
-                    }
-                    slots += val.slots();
+                    return Ok(Step::Continue);
                 }
-                if slots > 255 {
-                    return Err(Error::other("Too many method argument slots"));
-                }
-                if interfaceCount.is_some_and(|count| count != slots) {
-                    return Err(Error::other("Invalid invokeinterface argument count"));
-                }
-                if matches!(opcode, 0xb6 | 0xb9)
-                    && matches!(
-                        owner,
-                        b"java/lang/String" | b"java/lang/CharSequence" | b"java/lang/Object"
-                    )
-                    && let Some(value) = crate::share::prims::stringNatives::invoke(
-                        loader,
-                        name,
-                        descriptor,
-                        &frame.stack[start..],
-                    )?
+                if klass.class.name == b"jdk/internal/misc/Unsafe"
+                    && [owner, name, descriptor]
+                        == [
+                            b"jdk/internal/misc/Unsafe".as_slice(),
+                            b"registerNatives",
+                            b"()V",
+                        ]
                 {
-                    frame.stack.truncate(start);
-                    frame.stackSlots -= slots;
-                    if let Some(value) = value {
-                        frame.push(value)?;
-                    }
-                    continue;
+                    return Ok(Step::Continue);
                 }
-                if opcode == 0xb6
-                    && owner == b"java/lang/Object"
-                    && name == b"hashCode"
-                    && descriptor == b"()I"
-                    && let Some(hash) =
-                        crate::share::prims::objectNatives::hashCode(loader, frame.stack[start])?
+                if [owner, name, descriptor]
+                    == [
+                        b"jdk/internal/misc/CDS".as_slice(),
+                        b"initializeFromArchive",
+                        b"(Ljava/lang/Class;)V",
+                    ]
                 {
-                    frame.pop()?;
-                    frame.push(Value::Int(hash))?;
-                    continue;
+                    match frame.pop()? {
+                        Value::ClassMirror(_) => {
+                            crate::share::cds::cdsConfig::CDSConfig::initializeFromArchive()?
+                        }
+                        Value::Null => {
+                            return Err(jex(
+                                loader,
+                                output,
+                                depth,
+                                b"java/lang/NullPointerException",
+                                None,
+                            ));
+                        }
+                        _ => return Err(Error::other("Expected class mirror")),
+                    }
+                    return Ok(Step::Continue);
                 }
-                if opcode == 0xb6
-                    && owner == b"java/lang/Class"
-                    && let Some(value) = crate::share::prims::classNatives::invoke(
+                if [owner, name, descriptor]
+                    == [
+                        b"java/lang/Class".as_slice(),
+                        b"getPrimitiveClass",
+                        b"(Ljava/lang/String;)Ljava/lang/Class;",
+                    ]
+                {
+                    let value = crate::share::prims::classNatives::primitiveClass(frame.pop()?)?;
+                    frame.push(value)?;
+                    return Ok(Step::Continue);
+                }
+                if owner == b"java/lang/System"
+                    && let Some(value) = crate::share::prims::systemProperties::invoke(
                         loader,
                         name,
                         descriptor,
@@ -1086,510 +2086,652 @@ pub fn execute<'a>(
                     frame.stack.truncate(start);
                     frame.stackSlots -= slots;
                     frame.push(value)?;
-                    continue;
+                    return Ok(Step::Continue);
                 }
-                if opcode != 0xb8
-                    && let Some(result) = crate::share::prims::nativeLookup::invokeInstance(
-                        loader,
-                        owner,
-                        name,
-                        descriptor,
-                        &frame.stack[start..],
-                    )?
+                if (owner, name, descriptor)
+                    == (
+                        b"java/lang/System",
+                        b"arraycopy",
+                        b"(Ljava/lang/Object;ILjava/lang/Object;II)V",
+                    )
                 {
+                    let args = frame.stack[start..]
+                        .try_into()
+                        .map_err(|_| Error::other("Invalid arraycopy argument count"))?;
+                    crate::share::prims::arrayCopy::copy(loader, args)?;
+                    frame.stack.truncate(start);
+                    frame.stackSlots -= slots;
+                    return Ok(Step::Continue);
+                }
+                if let Some(result) = crate::share::prims::nativeLookup::invokeStatic(
+                    loader,
+                    owner,
+                    name,
+                    descriptor,
+                    &frame.stack[start..],
+                )? {
                     frame.stack.truncate(start);
                     frame.stackSlots -= slots;
                     if let Some(value) = result {
                         frame.push(value)?;
                     }
-                    continue;
+                    return Ok(Step::Continue);
                 }
-
-                if opcode == 0xb8 {
-                    if owner == b"java/lang/System"
-                        && descriptor == b"(Ljava/lang/String;)V"
-                        && matches!(name, b"load" | b"loadLibrary")
-                    {
-                        let value = frame.pop()?;
-                        let path = crate::share::prims::stringNatives::string(loader, value)?
-                            .ok_or_else(|| Error::other("Expected library name"))?;
-                        let libraries =
-                            crate::share::prims::nativeLibraries::NativeLibraries::global();
-                        if name == b"load" {
-                            libraries.load(std::path::Path::new(path.as_ref()))?;
-                        } else {
-                            let properties = loader.systemProperties.borrow();
-                            libraries.loadLibraryWithPaths(
-                                path.as_ref(),
-                                properties.get("java.library.path").copied(),
-                            )?;
-                        }
-                        continue;
-                    }
-                    if klass.class.name == b"jdk/internal/misc/Unsafe"
-                        && [owner, name, descriptor]
-                            == [
-                                b"jdk/internal/misc/Unsafe".as_slice(),
-                                b"registerNatives",
-                                b"()V",
-                            ]
-                    {
-                        continue;
-                    }
-                    if [owner, name, descriptor]
-                        == [
-                            b"jdk/internal/misc/CDS".as_slice(),
-                            b"initializeFromArchive",
-                            b"(Ljava/lang/Class;)V",
-                        ]
-                    {
-                        match frame.pop()? {
-                            Value::ClassMirror(_) => {
-                                crate::share::cds::cdsConfig::CDSConfig::initializeFromArchive()?
-                            }
-                            Value::Null => return Err(Error::other("NullPointerException")),
-                            _ => return Err(Error::other("Expected class mirror")),
-                        }
-                        continue;
-                    }
-                    if [owner, name, descriptor]
-                        == [
-                            b"java/lang/Class".as_slice(),
-                            b"getPrimitiveClass",
-                            b"(Ljava/lang/String;)Ljava/lang/Class;",
-                        ]
-                    {
-                        let value =
-                            crate::share::prims::classNatives::primitiveClass(frame.pop()?)?;
-                        frame.push(value)?;
-                        continue;
-                    }
-                    if owner == b"java/lang/System"
-                        && let Some(value) = crate::share::prims::systemProperties::invoke(
-                            loader,
-                            name,
-                            descriptor,
-                            &frame.stack[start..],
-                        )?
-                    {
-                        frame.stack.truncate(start);
-                        frame.stackSlots -= slots;
-                        frame.push(value)?;
-                        continue;
-                    }
-                    if (owner, name, descriptor)
-                        == (
-                            b"java/lang/System",
-                            b"arraycopy",
-                            b"(Ljava/lang/Object;ILjava/lang/Object;II)V",
-                        )
-                    {
-                        let args = frame.stack[start..]
-                            .try_into()
-                            .map_err(|_| Error::other("Invalid arraycopy argument count"))?;
-                        crate::share::prims::arrayCopy::copy(loader, args)?;
-                        frame.stack.truncate(start);
-                        frame.stackSlots -= slots;
-                        continue;
-                    }
-                    if let Some(value) = crate::share::prims::nativeLookup::invokeStatic(
-                        loader,
-                        owner,
-                        name,
-                        descriptor,
-                        &frame.stack[start..],
-                    ) {
-                        frame.stack.truncate(start);
-                        frame.stackSlots -= slots;
-                        frame.push(value)?;
-                        continue;
-                    }
-                }
-                if opcode == 0xb6
-                    && owner == b"jdk/internal/misc/Unsafe"
-                    && descriptor == b"(Ljava/lang/Class;)I"
-                    && matches!(name, b"arrayBaseOffset0" | b"arrayIndexScale0")
-                    && let [Value::Object(handle), Value::ClassMirror(class)] =
-                        &frame.stack[start..]
-                    && loader
-                        .objects
-                        .borrow()
-                        .get(*handle)
-                        .is_some_and(|object| object.klass.class.name == owner)
+            }
+            if opcode == 0xb6
+                && owner == b"jdk/internal/misc/Unsafe"
+                && descriptor == b"(Ljava/lang/Class;)I"
+                && matches!(name, b"arrayBaseOffset0" | b"arrayIndexScale0")
+                && let [Value::Object(handle), Value::ClassMirror(class)] = &frame.stack[start..]
+                && loader
+                    .objects
+                    .borrow()
+                    .get(*handle)
+                    .is_some_and(|object| object.klass.class.name == owner)
+            {
+                let scale = crate::share::prims::r#unsafe::Unsafe::arrayLayout(class)?;
+                frame.stack.truncate(start);
+                frame.stackSlots -= slots;
+                frame.push(Value::Int(if name == b"arrayIndexScale0" {
+                    scale
+                } else {
+                    0
+                }))?;
+                return Ok(Step::Continue);
+            }
+            let methodError = |error: Error| {
+                if throwable_of(&error).is_some()
+                    || crate::share::classfile::linkageError::linkage_kind(&error).is_some()
                 {
-                    let scale = crate::share::prims::r#unsafe::Unsafe::arrayLayout(class)?;
-                    frame.stack.truncate(start);
-                    frame.stackSlots -= slots;
-                    frame.push(Value::Int(if name == b"arrayIndexScale0" {
-                        scale
-                    } else {
-                        0
-                    }))?;
-                    continue;
-                }
-                let methodError = |error| {
+                    error
+                } else {
                     Error::other(format!(
-                        "{}.{}{}: {error}",
+                        "{}.{}{}: {}",
                         String::from_utf8_lossy(owner),
                         String::from_utf8_lossy(name),
-                        String::from_utf8_lossy(descriptor)
+                        String::from_utf8_lossy(descriptor),
+                        error
                     ))
+                }
+            };
+            let (target, code) = if opcode == 0xb8 {
+                let target = loader
+                    .load(owner)
+                    .map_err(|error| linkageExc(loader, output, depth, error))?;
+                let (target, code) = LinkResolver::resolve_static_call(&target, name, descriptor)
+                    .map_err(methodError)
+                    .map_err(|error| linkageExc(loader, output, depth, error))?;
+                initialize(loader, &target, output, depth + 1)?;
+                (target, code)
+            } else {
+                if let Value::ClassMirror(class_name) = frame.stack[start] {
+                    match (name, descriptor) {
+                        (b"equals", b"(Ljava/lang/Object;)Z") => {
+                            let equal = matches!(
+                                frame.stack.get(start + 1),
+                                Some(Value::ClassMirror(other)) if *other == class_name
+                            );
+                            frame.stack.truncate(start);
+                            frame.stackSlots -= slots;
+                            frame.push(Value::Int(i32::from(equal)))?;
+                            return Ok(Step::Continue);
+                        }
+                        (b"hashCode", b"()I") => {
+                            frame.stack.truncate(start);
+                            frame.stackSlots -= slots;
+                            frame.push(Value::Int(
+                                crate::share::prims::objectNatives::identity(Value::ClassMirror(
+                                    class_name,
+                                )),
+                            ))?;
+                            return Ok(Step::Continue);
+                        }
+                        (b"toString", b"()Ljava/lang/String;") => {
+                            frame.stack.truncate(start);
+                            frame.stackSlots -= slots;
+                            let dotted = decodeString(class_name)?.replace('/', ".");
+                            let kind =
+                                if class_name.starts_with(b"[") || class_name.starts_with(b":") {
+                                    "class"
+                                } else {
+                                    match loader.load(class_name) {
+                                        Ok(class_klass)
+                                            if class_klass.class.accessFlags & 0x0200 != 0 =>
+                                        {
+                                            "interface"
+                                        }
+                                        _ => "class",
+                                    }
+                                };
+                            let text = loader.storage.alloc_str(&format!("{kind} {dotted}"));
+                            frame.push(Value::HostString(text))?;
+                            return Ok(Step::Continue);
+                        }
+                        (b"isAssignableFrom", b"(Ljava/lang/Class;)Z") => {
+                            let result = match frame.stack.get(start + 1) {
+                                Some(Value::ClassMirror(other)) => {
+                                    if class_name == *other {
+                                        true
+                                    } else if other.starts_with(b"[") {
+                                        loader.classAssignable(other, class_name).unwrap_or(false)
+                                    } else if class_name.starts_with(b"[") {
+                                        false
+                                    } else {
+                                        match (loader.load(class_name), loader.load(other)) {
+                                            (Ok(_target), Ok(source)) => {
+                                                SystemDictionary::is_subclass_of(
+                                                    &source, class_name,
+                                                ) || SystemDictionary::implements_interface(
+                                                    &source, class_name,
+                                                )
+                                            }
+                                            _ => false,
+                                        }
+                                    }
+                                }
+                                _ => false,
+                            };
+                            frame.stack.truncate(start);
+                            frame.stackSlots -= slots;
+                            frame.push(Value::Int(i32::from(result)))?;
+                            return Ok(Step::Continue);
+                        }
+                        (b"wait", _) | (b"notify", b"()V") | (b"notifyAll", b"()V") => {
+                            frame.stack.truncate(start);
+                            frame.stackSlots -= slots;
+                            return Ok(Step::Continue);
+                        }
+                        _ => {
+                            let result = crate::share::prims::classNatives::invoke(
+                                loader,
+                                name,
+                                descriptor,
+                                &frame.stack[start..],
+                            )
+                            .map_err(|error| linkageExc(loader, output, depth, error))?;
+                            match result {
+                                Some(value) => {
+                                    frame.stack.truncate(start);
+                                    frame.stackSlots -= slots;
+                                    frame.push(value)?;
+                                    return Ok(Step::Continue);
+                                }
+                                None => {
+                                    return Err(methodError(Error::other(format!(
+                                        "Expected instance method receiver at {pc} in {}: ClassMirror",
+                                        String::from_utf8_lossy(klass.class.name)
+                                    ))));
+                                }
+                            }
+                        }
+                    }
+                }
+                let receiver = frame.stack[start];
+                if matches!(receiver, Value::Null) {
+                    if std::env::var_os("JVM25_TRACE").is_some() {
+                        eprintln!(
+                            "[npe-site] {}.{}{} pc={} in {}",
+                            String::from_utf8_lossy(owner),
+                            String::from_utf8_lossy(name),
+                            String::from_utf8_lossy(descriptor),
+                            pc,
+                            String::from_utf8_lossy(klass.class.name),
+                        );
+                    }
+                    return Err(jex(
+                        loader,
+                        output,
+                        depth,
+                        b"java/lang/NullPointerException",
+                        None,
+                    ));
+                }
+                let Value::Object(handle) = receiver else {
+                    return Err(jex(
+                        loader,
+                        output,
+                        depth,
+                        b"java/lang/IncompatibleClassChangeError",
+                        Some("Expected object receiver"),
+                    ));
                 };
-                let (target, code) = if opcode == 0xb8 {
-                    let target = loader.load(owner)?;
-                    let (target, code) =
-                        LinkResolver::resolve_static_call(&target, name, descriptor)
-                            .map_err(methodError)?;
-                    initialize(loader, &target, output, depth + 1)?;
-                    (target, code)
-                } else {
-                    let Value::Object(handle) = frame.stack[start] else {
-                        return Err(methodError(Error::other(format!(
-                            "Expected instance method receiver at {pc} in {}",
-                            String::from_utf8_lossy(klass.class.name)
-                        ))));
-                    };
-                    let objects = loader.objects.borrow();
+                let object_klass = {
+                    let objects = loader.borrow_objects();
                     let object = objects
                         .get(handle)
                         .ok_or_else(|| Error::other("Invalid object reference"))?;
-                    if opcode == 0xb9
-                        && !SystemDictionary::implements_interface(&object.klass, owner)
-                    {
-                        return Err(Error::other("Receiver does not implement interface"));
-                    }
+                    std::rc::Rc::clone(&object.klass)
+                };
+                if opcode == 0xb9 && !SystemDictionary::implements_interface(&object_klass, owner) {
+                    return Err(jex(
+                        loader,
+                        output,
+                        depth,
+                        b"java/lang/IncompatibleClassChangeError",
+                        Some("Receiver does not implement interface"),
+                    ));
+                }
 
-                    if opcode == 0xb7
-                        && owner == b"java/lang/Object"
-                        && name == b"<init>"
-                        && descriptor == b"()V"
-                    {
-                        frame.stack.truncate(start);
-                        frame.stackSlots -= slots;
-                        continue;
-                    }
+                if opcode == 0xb7
+                    && owner == b"java/lang/Object"
+                    && name == b"<init>"
+                    && descriptor == b"()V"
+                {
+                    frame.stack.truncate(start);
+                    frame.stackSlots -= slots;
+                    return Ok(Step::Continue);
+                }
 
-                    if opcode == 0xb7 {
-                        let target = loader.load(owner)?;
-                        LinkResolver::resolve_special_call(&target, name, descriptor)
-                            .map_err(methodError)?
-                    } else if opcode == 0xb9 {
-                        LinkResolver::resolve_interface_call(&object.klass, owner, name, descriptor)
-                            .map_err(methodError)?
+                if opcode == 0xb7 {
+                    let target = loader
+                        .load(owner)
+                        .map_err(|error| linkageExc(loader, output, depth, error))?;
+                    LinkResolver::resolve_special_call(&target, name, descriptor)
+                        .map_err(methodError)
+                        .map_err(|error| linkageExc(loader, output, depth, error))?
+                } else if opcode == 0xb9 {
+                    LinkResolver::resolve_interface_call(&object_klass, owner, name, descriptor)
+                        .map_err(methodError)
+                        .map_err(|error| linkageExc(loader, output, depth, error))?
+                } else {
+                    LinkResolver::resolve_virtual_call(&object_klass, name, descriptor)
+                        .map_err(methodError)
+                        .map_err(|error| linkageExc(loader, output, depth, error))?
+                }
+            };
+
+            let flags = methodAccessFlags(&target, name, descriptor, opcode == 0xb8);
+            let ret_val = execute_labeled(
+                loader,
+                &target,
+                code,
+                &frame.stack[start..],
+                output,
+                depth + 1,
+                flags,
+                Some((name, descriptor)),
+            )?;
+
+            frame.stack.truncate(start);
+            frame.stackSlots -= slots;
+            match (result, ret_val) {
+                (Some(kind), Some(val)) if val.matchesLocal(kind) => val,
+                (None, None) => return Ok(Step::Continue),
+                _ => return Err(Error::other("Invalid method return")),
+            }
+        }
+        0xba => {
+            // invokedynamic
+            let index = u16::from_be_bytes(frame.read()?);
+            let [zero1, zero2] = frame.read()?;
+            if zero1 != 0 || zero2 != 0 {
+                return Err(Error::other("Invalid invokedynamic operands"));
+            }
+            let constant = klass.constant(index)?;
+            let Constant::InvokeDynamic(bsm_attr_idx, nat_idx) = constant else {
+                return Err(Error::other("Expected InvokeDynamic constant"));
+            };
+            let Constant::NameAndType(name_idx, desc_idx) = klass.constant(*nat_idx)? else {
+                return Err(Error::other("Expected NameAndType constant"));
+            };
+            let name = klass.utf8(*name_idx)?;
+            let descriptor = klass.utf8(*desc_idx)?;
+
+            let caller_rc = Rc::new(InstanceKlass::new(
+                klass.class.clone(),
+                klass.super_klass(),
+                klass.interfaces.clone(),
+            )?);
+            let bs_info = LinkResolver::resolve_invokedynamic(
+                loader,
+                &caller_rc,
+                *bsm_attr_idx,
+                name,
+                descriptor,
+            )?;
+
+            let (parameters, _result) = signature::method(descriptor)?;
+            let count = parameters.count();
+            let start = frame
+                .stack
+                .len()
+                .checked_sub(count)
+                .ok_or_else(|| Error::other("Missing invokedynamic arguments"))?;
+            let mut slots = 0;
+            for (kind, &val) in signature::method(descriptor)?.0.zip(&frame.stack[start..]) {
+                if !val.matchesLocal(kind?) {
+                    return Err(Error::other("Invalid invokedynamic argument"));
+                }
+                slots += val.slots();
+            }
+
+            let mut is_string_concat = name == b"makeConcat" || name == b"makeConcatWithConstants";
+            if !is_string_concat {
+                if let Some(target) = bs_info.resolved_target() {
+                    if target.contains("StringConcatFactory") {
+                        is_string_concat = true;
+                    }
+                }
+            }
+
+            if is_string_concat {
+                let mut formatted = String::new();
+                let recipe = bs_info.arguments().first().and_then(|arg| {
+                    if let BootstrapArg::String(s) = arg {
+                        Some(s.as_str())
                     } else {
-                        LinkResolver::resolve_virtual_call(&object.klass, name, descriptor)
-                            .map_err(methodError)?
+                        None
                     }
-                };
+                });
 
-                let ret_result = execute(
-                    loader,
-                    &target,
-                    code,
-                    &frame.stack[start..],
-                    output,
-                    depth + 1,
-                );
+                let mut dynamic_args = Vec::with_capacity(frame.stack.len() - start);
+                for value in &frame.stack[start..] {
+                    dynamic_args.push(describeValue(loader, *value, output, depth + 1)?);
+                }
 
-                let ret_val = match ret_result {
-                    Ok(val) => val,
-                    Err(e) => {
-                        if frame.handle_exception(pc, Value::Null, loader, klass) {
-                            continue;
+                if let Some(recipe_str) = recipe {
+                    let mut arg_iter = dynamic_args.into_iter();
+                    let mut const_iter = bs_info.arguments().iter().skip(1);
+                    for ch in recipe_str.chars() {
+                        if ch == '\u{0001}' {
+                            if let Some(arg_val) = arg_iter.next() {
+                                formatted.push_str(&arg_val);
+                            }
+                        } else if ch == '\u{0002}' {
+                            if let Some(c) = const_iter.next() {
+                                match c {
+                                    BootstrapArg::String(s) => formatted.push_str(s),
+                                    BootstrapArg::Int(i) => formatted.push_str(&i.to_string()),
+                                    BootstrapArg::Long(l) => formatted.push_str(&l.to_string()),
+                                    _ => {}
+                                }
+                            }
+                        } else {
+                            formatted.push(ch);
                         }
-                        return Err(e);
                     }
-                };
+                } else {
+                    for arg_val in dynamic_args {
+                        formatted.push_str(&arg_val);
+                    }
+                }
 
                 frame.stack.truncate(start);
                 frame.stackSlots -= slots;
-                match (result, ret_val) {
-                    (Some(kind), Some(val)) if val.matchesLocal(kind) => val,
-                    (None, None) => continue,
-                    _ => return Err(Error::other("Invalid method return")),
-                }
-            }
-            0xba => {
-                // invokedynamic
-                let index = u16::from_be_bytes(frame.read()?);
-                let [zero1, zero2] = frame.read()?;
-                if zero1 != 0 || zero2 != 0 {
-                    return Err(Error::other("Invalid invokedynamic operands"));
-                }
-                let constant = klass.constant(index)?;
-                let Constant::InvokeDynamic(bsm_attr_idx, nat_idx) = constant else {
-                    return Err(Error::other("Expected InvokeDynamic constant"));
-                };
-                let Constant::NameAndType(name_idx, desc_idx) = klass.constant(*nat_idx)? else {
-                    return Err(Error::other("Expected NameAndType constant"));
-                };
-                let name = klass.utf8(*name_idx)?;
-                let descriptor = klass.utf8(*desc_idx)?;
-
-                let caller_rc = Rc::new(InstanceKlass::new(
-                    klass.class.clone(),
-                    klass.super_klass(),
-                    klass.interfaces.clone(),
-                )?);
-                let bs_info = LinkResolver::resolve_invokedynamic(
+                let allocated_str = loader.storage.alloc_str(&formatted);
+                Value::HostString(allocated_str)
+            } else {
+                frame.stack.truncate(start);
+                frame.stackSlots -= slots;
+                return Err(jex(
                     loader,
-                    &caller_rc,
-                    *bsm_attr_idx,
-                    name,
-                    descriptor,
-                )?;
-
-                let (parameters, result) = signature::method(descriptor)?;
-                let count = parameters.count();
-                let start = frame
-                    .stack
-                    .len()
-                    .checked_sub(count)
-                    .ok_or_else(|| Error::other("Missing invokedynamic arguments"))?;
-                let mut slots = 0;
-                for (kind, &val) in signature::method(descriptor)?.0.zip(&frame.stack[start..]) {
-                    if !val.matchesLocal(kind?) {
-                        return Err(Error::other("Invalid invokedynamic argument"));
-                    }
-                    slots += val.slots();
-                }
-
-                let mut is_string_concat =
-                    name == b"makeConcat" || name == b"makeConcatWithConstants";
-                if !is_string_concat {
-                    if let Some(target) = bs_info.resolved_target() {
-                        if target.contains("StringConcatFactory") {
-                            is_string_concat = true;
-                        }
-                    }
-                }
-
-                if is_string_concat {
-                    let mut formatted = String::new();
-                    let recipe = bs_info.arguments().first().and_then(|arg| {
-                        if let BootstrapArg::String(s) = arg {
-                            Some(s.as_str())
-                        } else {
-                            None
-                        }
-                    });
-
-                    let dynamic_args: Vec<String> = frame.stack[start..]
-                        .iter()
-                        .map(|v| match v {
-                            Value::Int(i) => i.to_string(),
-                            Value::Long(l) => l.to_string(),
-                            Value::Float(f) => f.to_string(),
-                            Value::Double(d) => d.to_string(),
-                            Value::String(bytes) => decodeString(bytes)
-                                .unwrap_or_else(|_| String::from_utf8_lossy(bytes).to_string()),
-                            Value::HostString(s) => s.to_string(),
-                            Value::Null => "null".to_string(),
-                            Value::Object(h) => format!("Object@{h:x}"),
-                            _ => String::new(),
-                        })
-                        .collect();
-
-                    if let Some(recipe_str) = recipe {
-                        let mut arg_iter = dynamic_args.into_iter();
-                        let mut const_iter = bs_info.arguments().iter().skip(1);
-                        for ch in recipe_str.chars() {
-                            if ch == '\u{0001}' {
-                                if let Some(arg_val) = arg_iter.next() {
-                                    formatted.push_str(&arg_val);
-                                }
-                            } else if ch == '\u{0002}' {
-                                if let Some(c) = const_iter.next() {
-                                    match c {
-                                        BootstrapArg::String(s) => formatted.push_str(s),
-                                        BootstrapArg::Int(i) => formatted.push_str(&i.to_string()),
-                                        BootstrapArg::Long(l) => formatted.push_str(&l.to_string()),
-                                        _ => {}
-                                    }
-                                }
-                            } else {
-                                formatted.push(ch);
-                            }
-                        }
-                    } else {
-                        for arg_val in dynamic_args {
-                            formatted.push_str(&arg_val);
-                        }
-                    }
-
-                    frame.stack.truncate(start);
-                    frame.stackSlots -= slots;
-                    let allocated_str = loader.storage.alloc_str(&formatted);
-                    Value::HostString(allocated_str)
-                } else {
-                    frame.stack.truncate(start);
-                    frame.stackSlots -= slots;
-                    match result {
-                        Some(_) => Value::Null,
-                        None => continue,
-                    }
-                }
+                    output,
+                    depth,
+                    b"java/lang/BootstrapMethodError",
+                    Some("invokedynamic bootstrap method is not supported"),
+                ));
             }
-            0xbb => {
-                let name = klass.className(u16::from_be_bytes(frame.read()?))?;
-                let target = loader.load(name)?;
-                if (target.class.accessFlags & 0x0600) != 0 {
-                    return Err(Error::other(
-                        "Cannot instantiate abstract class or interface",
+        }
+        0xbb => {
+            let name = klass.className(u16::from_be_bytes(frame.read()?))?;
+            let target = loader.load(name)?;
+            if (target.class.accessFlags & 0x0600) != 0 {
+                return Err(jex(
+                    loader,
+                    output,
+                    depth,
+                    b"java/lang/InstantiationError",
+                    Some("Cannot instantiate abstract class or interface"),
+                ));
+            }
+            initialize(loader, &target, output, depth + 1)?;
+            let object = InstanceOop::new(target)?;
+            Value::Object(loader.alloc_object(object))
+        }
+        0xbc => {
+            let kind = frame.byte()?;
+            ArrayKlass::primitive(loader, kind, frame.pop()?.int()?).map_err(|error| {
+                if error.to_string().contains("Negative") {
+                    jex(
+                        loader,
+                        output,
+                        depth,
+                        b"java/lang/NegativeArraySizeException",
+                        Some(&error.to_string()),
+                    )
+                } else {
+                    linkageExc(loader, output, depth, error)
+                }
+            })?
+        }
+        0xbd => {
+            let component = klass.className(u16::from_be_bytes(frame.read()?))?;
+            ArrayKlass::reference(loader, component, frame.pop()?.int()?).map_err(|error| {
+                if error.to_string().contains("Negative") {
+                    jex(
+                        loader,
+                        output,
+                        depth,
+                        b"java/lang/NegativeArraySizeException",
+                        Some(&error.to_string()),
+                    )
+                } else {
+                    linkageExc(loader, output, depth, error)
+                }
+            })?
+        }
+        0xbe => {
+            let arrayref = frame.pop()?;
+            if matches!(arrayref, Value::Null) {
+                return Err(jex(
+                    loader,
+                    output,
+                    depth,
+                    b"java/lang/NullPointerException",
+                    None,
+                ));
+            }
+            let length = match arrayref {
+                Value::Arguments(arguments) => arguments.len(),
+                Value::PrimitiveArray(handle) => loader
+                    .arrays
+                    .borrow()
+                    .get(handle)
+                    .ok_or_else(|| Error::other("Invalid array reference"))?
+                    .len(),
+                Value::ObjectArray(handle) => loader
+                    .obj_arrays
+                    .borrow()
+                    .get(handle)
+                    .ok_or_else(|| Error::other("Invalid object array reference"))?
+                    .len(),
+                _ => {
+                    return Err(jex(
+                        loader,
+                        output,
+                        depth,
+                        b"java/lang/IncompatibleClassChangeError",
+                        Some("arraylength on non-array"),
                     ));
                 }
-                initialize(loader, &target, output, depth + 1)?;
-                let object = InstanceOop::new(target)?;
-                let mut objects = loader.objects.borrow_mut();
-                let handle = objects.len();
-                objects.push(object);
-                Value::Object(handle)
+            };
+            Value::Int(length as i32)
+        }
+        0xbf => {
+            // athrow
+            let exc = frame.pop()?;
+            if matches!(exc, Value::Null) {
+                return Err(jex(
+                    loader,
+                    output,
+                    depth,
+                    b"java/lang/NullPointerException",
+                    None,
+                ));
             }
-            0xbc => {
-                let kind = frame.byte()?;
-                ArrayKlass::primitive(loader, kind, frame.pop()?.int()?)?
-            }
-            0xbd => {
-                let component = klass.className(u16::from_be_bytes(frame.read()?))?;
-                ArrayKlass::reference(loader, component, frame.pop()?.int()?)?
-            }
-            0xbe => {
-                let length = match frame.pop()? {
-                    Value::Arguments(arguments) => arguments.len(),
-                    Value::PrimitiveArray(handle) => loader
-                        .arrays
-                        .borrow()
-                        .get(handle)
-                        .ok_or_else(|| Error::other("Invalid array reference"))?
-                        .len(),
-                    Value::ObjectArray(handle) => loader
-                        .obj_arrays
-                        .borrow()
-                        .get(handle)
-                        .ok_or_else(|| Error::other("Invalid object array reference"))?
-                        .len(),
-                    _ => return Err(Error::other("Expected array")),
-                };
-                Value::Int(length as i32)
-            }
-            0xbf => {
-                // athrow
-                let exc = frame.pop()?;
-                if matches!(exc, Value::Null) {
-                    return Err(Error::other("NullPointerException"));
+            let throwable = match exc {
+                Value::Object(handle) => {
+                    let objects = loader.borrow_objects();
+                    objects.get(handle).map(|object| Rc::clone(&object.klass))
                 }
-                if frame.handle_exception(pc, exc, loader, klass) {
-                    continue;
-                }
-                return Err(Error::other(format!(
-                    "Uncaught exception at pc {pc} in {}: {exc:?} class={}",
+                _ => None,
+            };
+            let is_throwable = throwable.as_ref().is_some_and(|klass| {
+                klass.class.name == b"java/lang/Throwable"
+                    || SystemDictionary::is_subclass_of(&klass, b"java/lang/Throwable")
+            });
+            if !is_throwable {
+                return Err(jex(
+                    loader,
+                    output,
+                    depth,
+                    b"java/lang/VerifyError",
+                    Some("athrow operand is not a Throwable"),
+                ));
+            }
+            if std::env::var_os("JVM25_TRACE").is_some() {
+                let thrown = throwable
+                    .as_ref()
+                    .map(|klass| dotted(klass.class.name))
+                    .unwrap_or_default();
+                let mut frames = Vec::new();
+                for_each_active_frame(&mut |frame| frames.push(frame.site()));
+                eprintln!("[athrow] {thrown} stack={frames:?}");
+            }
+            if frame.handle_exception(pc, exc, loader, klass) {
+                return Ok(Step::Continue);
+            }
+            return Err(match exc {
+                Value::Object(handle) => Error::other(JavaThrowable(handle)),
+                _ => Error::other(format!(
+                    "Uncaught exception at pc {pc} in {}: {exc:?}",
                     String::from_utf8_lossy(klass.class.name),
-                    loader
-                        .objects
-                        .borrow()
-                        .get(match exc {
-                            Value::Object(handle) => handle,
-                            _ => usize::MAX,
-                        })
-                        .map(|object| String::from_utf8_lossy(object.klass.class.name).into_owned())
-                        .unwrap_or_else(|| "<invalid>".to_owned())
-                )));
+                )),
+            });
+        }
+        0xc0 | 0xc1 => {
+            let target = klass.className(u16::from_be_bytes(frame.read()?))?;
+            let value = frame.pop()?;
+            if opcode == 0xc1 {
+                Value::Int(i32::from(
+                    !matches!(value, Value::Null) && loader.referenceAssignable(value, target)?,
+                ))
+            } else {
+                if !loader.referenceAssignable(value, target)? {
+                    if std::env::var_os("JVM25_TRACE").is_some() {
+                        eprintln!(
+                            "[trace] checkcast fail pc={pc} in {} target={} value={value:?}",
+                            String::from_utf8_lossy(klass.class.name),
+                            String::from_utf8_lossy(target),
+                        );
+                    }
+                    return Err(jex(
+                        loader,
+                        output,
+                        depth,
+                        b"java/lang/ClassCastException",
+                        Some(&format!(
+                            "cannot cast to {}",
+                            String::from_utf8_lossy(target).replace('/', ".")
+                        )),
+                    ));
+                }
+                value
             }
-            0xc0 | 0xc1 => {
-                let target = klass.className(u16::from_be_bytes(frame.read()?))?;
-                let value = frame.pop()?;
-                if opcode == 0xc1 {
-                    Value::Int(i32::from(
-                        !matches!(value, Value::Null)
-                            && loader.referenceAssignable(value, target)?,
-                    ))
+        }
+        0xc2 | 0xc3 => {
+            let val = frame.pop()?;
+            if opcode == 0xc2 {
+                let key = monitorEnter(loader, output, depth, val)?;
+                frame.monitors.push(key);
+            } else {
+                monitorExit(loader, output, depth, val)?;
+                if let Some(key) = monitorKey(val)
+                    && let Some(position) = frame.monitors.iter().rposition(|k| *k == key)
+                {
+                    frame.monitors.remove(position);
+                }
+            }
+            return Ok(Step::Continue);
+        }
+        0xc4 => {
+            // wide
+            let instruction = frame.byte()?;
+            let index = u16::from_be_bytes(frame.read()?);
+            match instruction {
+                0x15..=0x19 => frame.load(index, instruction - 0x15)?,
+                0x36..=0x3a => {
+                    frame.storeOperand(index, instruction - 0x36)?;
+                    return Ok(Step::Continue);
+                }
+                0x84 => {
+                    let increment = i16::from_be_bytes(frame.read()?);
+                    frame.increment(index, i32::from(increment))?;
+                    return Ok(Step::Continue);
+                }
+                0xa9 => {
+                    let val = *frame.local(index)?;
+                    let Value::ReturnAddress(target_pc) = val else {
+                        return Err(Error::other("Expected return address in wide ret"));
+                    };
+                    frame.pc = target_pc;
+                    return Ok(Step::Continue);
+                }
+                _ => return Err(Error::other("Unsupported wide instruction")),
+            }
+        }
+        0xc5 => {
+            let descriptor = klass.className(u16::from_be_bytes(frame.read()?))?;
+            let dimensions = usize::from(frame.byte()?);
+            let mut lengths = [0; 255];
+            for length in lengths[..dimensions].iter_mut().rev() {
+                *length = frame.pop()?.int()?;
+            }
+            ArrayKlass::multi(loader, descriptor, &lengths[..dimensions]).map_err(|error| {
+                if error.to_string().contains("Negative") {
+                    jex(
+                        loader,
+                        output,
+                        depth,
+                        b"java/lang/NegativeArraySizeException",
+                        Some(&error.to_string()),
+                    )
                 } else {
-                    if !loader.referenceAssignable(value, target)? {
-                        if frame.handle_exception(pc, Value::Null, loader, klass) {
-                            continue;
-                        }
-                        return Err(Error::other(format!(
-                            "ClassCastException: cannot cast to {}",
-                            String::from_utf8_lossy(target)
-                        )));
-                    }
-                    value
+                    linkageExc(loader, output, depth, error)
                 }
+            })?
+        }
+        0xc6 | 0xc7 => {
+            let offset = i16::from_be_bytes(frame.read()?);
+            let value = frame.pop()?;
+            if !value.matchesLocal(4) {
+                return Err(Error::other("Expected reference for null comparison"));
             }
-            0xc2 | 0xc3 => {
-                let val = frame.pop()?;
-                if matches!(val, Value::Null) {
-                    return Err(Error::other("NullPointerException"));
-                }
-                continue;
+            if matches!(value, Value::Null) == (opcode == 0xc6) {
+                frame.jump(pc, i32::from(offset))?;
             }
-            0xc4 => {
-                // wide
-                let instruction = frame.byte()?;
-                let index = u16::from_be_bytes(frame.read()?);
-                match instruction {
-                    0x15..=0x19 => frame.load(index, instruction - 0x15)?,
-                    0x36..=0x3a => {
-                        frame.storeOperand(index, instruction - 0x36)?;
-                        continue;
-                    }
-                    0x84 => {
-                        let increment = i16::from_be_bytes(frame.read()?);
-                        frame.increment(index, i32::from(increment))?;
-                        continue;
-                    }
-                    0xa9 => {
-                        let val = *frame.local(index)?;
-                        let Value::ReturnAddress(target_pc) = val else {
-                            return Err(Error::other("Expected return address in wide ret"));
-                        };
-                        frame.pc = target_pc;
-                        continue;
-                    }
-                    _ => return Err(Error::other("Unsupported wide instruction")),
-                }
-            }
-            0xc5 => {
-                let descriptor = klass.className(u16::from_be_bytes(frame.read()?))?;
-                let dimensions = usize::from(frame.byte()?);
-                let mut lengths = [0; 255];
-                for length in lengths[..dimensions].iter_mut().rev() {
-                    *length = frame.pop()?.int()?;
-                }
-                ArrayKlass::multi(loader, descriptor, &lengths[..dimensions])?
-            }
-            0xc6 | 0xc7 => {
-                let offset = i16::from_be_bytes(frame.read()?);
-                let value = frame.pop()?;
-                if !value.matchesLocal(4) {
-                    return Err(Error::other("Expected reference for null comparison"));
-                }
-                if matches!(value, Value::Null) == (opcode == 0xc6) {
-                    frame.jump(pc, i32::from(offset))?;
-                }
-                continue;
-            }
-            0xc8 => {
-                // goto_w
-                let offset = frame.readInt()?;
-                frame.jump(pc, offset)?;
-                continue;
-            }
-            0xc9 => {
-                // jsr_w
-                let offset = frame.readInt()?;
-                let return_address = frame.pc;
-                frame.push(Value::ReturnAddress(return_address))?;
-                frame.jump(pc, offset)?;
-                continue;
-            }
-            _ => {
-                return Err(Error::other(format!(
-                    "Unsupported opcode {} (0x{opcode:02x}) at {pc}",
-                    bytecodes::name(opcode).unwrap_or("unknown")
-                )));
-            }
-        };
-        frame.push(value)?;
-    }
+            return Ok(Step::Continue);
+        }
+        0xc8 => {
+            // goto_w
+            let offset = frame.readInt()?;
+            frame.jump(pc, offset)?;
+            return Ok(Step::Continue);
+        }
+        0xc9 => {
+            // jsr_w
+            let offset = frame.readInt()?;
+            let return_address = frame.pc;
+            frame.push(Value::ReturnAddress(return_address))?;
+            frame.jump(pc, offset)?;
+            return Ok(Step::Continue);
+        }
+        _ => {
+            return Err(Error::other(format!(
+                "Unsupported opcode {} (0x{opcode:02x}) at {pc}",
+                bytecodes::name(opcode).unwrap_or("unknown")
+            )));
+        }
+    };
+    Ok(Step::Push(value))
 }

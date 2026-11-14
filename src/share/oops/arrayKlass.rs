@@ -89,10 +89,7 @@ pub struct ArrayKlass;
 impl ArrayKlass {
     pub fn primitive<'a>(loader: &ClassLoader<'a>, kind: u8, length: i32) -> io::Result<Value<'a>> {
         let array = TypeArrayOop::new(kind, length)?;
-        let mut arrays = loader.arrays.borrow_mut();
-        let handle = arrays.len();
-        arrays.push(array);
-        Ok(Value::PrimitiveArray(handle))
+        Ok(Value::PrimitiveArray(loader.alloc_type_array(array)))
     }
 
     pub fn reference<'a>(
@@ -169,9 +166,6 @@ impl ArrayKlass {
     }
 
     fn publish<'a>(loader: &ClassLoader<'a>, array: ObjArrayOop<'a>) -> Value<'a> {
-        let mut arrays = loader.obj_arrays.borrow_mut();
-        let handle = arrays.len();
-        arrays.push(array);
-        Value::ObjectArray(handle)
+        Value::ObjectArray(loader.alloc_obj_array(array))
     }
 }

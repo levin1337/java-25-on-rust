@@ -159,9 +159,21 @@ impl<'a> InstanceKlass<'a> {
             }
         }
 
-        // Build itable for interface implementations
+        // Build itable for interface implementations, covering the whole
+        // transitive superinterface hierarchy (HotSpot registers every
+        // superinterface, direct or indirect, in the itable).
         let mut itable = KlassItable::new(class_name_str);
-        for iface in &interfaces {
+        let mut all_interfaces: Vec<Rc<InstanceKlass<'a>>> = Vec::new();
+        let mut pending: Vec<Rc<InstanceKlass<'a>>> = interfaces.clone();
+        let mut seen: std::collections::HashSet<&'a [u8]> = std::collections::HashSet::new();
+        while let Some(iface) = pending.pop() {
+            if !seen.insert(iface.class.name) {
+                continue;
+            }
+            pending.extend(iface.interfaces.iter().cloned());
+            all_interfaces.push(iface);
+        }
+        for iface in &all_interfaces {
             let iface_name = String::from_utf8_lossy(iface.class.name).to_string();
             for m in &iface.class.methods {
                 let is_static = (m.accessFlags & 0x0008) != 0;
@@ -222,6 +234,51 @@ impl<'a> InstanceKlass<'a> {
     #[inline]
     pub fn static_field_size(&self) -> usize {
         self.static_field_size
+    }
+
+    /// Whether this type declares or inherits a non-static concrete
+    /// (default) interface method, mirroring HotSpot's
+    /// `has_nonstatic_concrete_methods`.
+    pub fn has_nonstatic_concrete_methods(&self) -> bool {
+        if self.is_interface() {
+            let declares_concrete = self.class.methods.iter().any(|m| {
+                (m.accessFlags & 0x0008) == 0
+                    && (m.accessFlags & 0x0400) == 0
+                    && m.code_attribute().is_some()
+            });
+            return declares_concrete
+                || self
+                    .interfaces
+                    .iter()
+                    .any(|iface| iface.has_nonstatic_concrete_methods());
+        }
+        self.interfaces
+            .iter()
+            .any(|iface| iface.has_nonstatic_concrete_methods())
+            || self
+                .super_klass
+                .as_ref()
+                .is_some_and(|super_k| super_k.has_nonstatic_concrete_methods())
+    }
+
+    /// Direct superinterfaces that must be initialized before this class,
+    /// per JVMS §5.5: every direct superinterface declaring a non-static
+    /// concrete method triggers recursive initialization.
+    pub fn default_method_superinterfaces(&self) -> Vec<Rc<InstanceKlass<'a>>> {
+        if self.is_interface() || !self.has_nonstatic_concrete_methods() {
+            return Vec::new();
+        }
+        self.interfaces
+            .iter()
+            .filter(|iface| {
+                iface.class.methods.iter().any(|m| {
+                    (m.accessFlags & 0x0008) == 0
+                        && (m.accessFlags & 0x0400) == 0
+                        && m.code_attribute().is_some()
+                })
+            })
+            .cloned()
+            .collect()
     }
 
     #[inline]

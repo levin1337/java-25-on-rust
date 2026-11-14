@@ -7,6 +7,7 @@ pub mod frame;
 pub mod handles;
 pub mod init;
 pub mod java;
+pub mod javaAssertions;
 pub mod javaCalls;
 pub mod javaThread;
 pub mod objectMonitor;

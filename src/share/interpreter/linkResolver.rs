@@ -6,14 +6,11 @@
  * invokeinterface (via itable), invokespecial, invokestatic, and invokedynamic.
  */
 
-use crate::{
-    classfile::Member,
-    share::{
-        classfile::classLoader::ClassLoader,
-        classfile::systemDictionary::SystemDictionary,
-        interpreter::bootstrapInfo::BootstrapInfo,
-        oops::{instanceKlass::InstanceKlass, method::Code, symbol::Symbol},
-    },
+use crate::share::{
+    classfile::classLoader::ClassLoader,
+    classfile::systemDictionary::SystemDictionary,
+    interpreter::bootstrapInfo::BootstrapInfo,
+    oops::{instanceKlass::InstanceKlass, method::Code, symbol::Symbol},
 };
 use std::collections::HashSet;
 use std::io::{self, Error};
@@ -75,6 +72,14 @@ impl LinkResolver {
                     && method.descriptor == descriptor
                     && method.accessFlags & 8 == 0
             }) {
+                if method.accessFlags & 0x0400 != 0 {
+                    return Err(Error::other(format!(
+                        "AbstractMethodError: {}.{}{}",
+                        String::from_utf8_lossy(k.class.name),
+                        String::from_utf8_lossy(name),
+                        String::from_utf8_lossy(descriptor)
+                    )));
+                }
                 return Ok((Rc::clone(k), Code::parse(method)?));
             }
             interfaces.extend(&k.interfaces);
@@ -113,6 +118,51 @@ impl LinkResolver {
             return Ok((Rc::clone(interface), Code::parse(method)?));
         }
 
+        {
+            let mut names = Vec::new();
+            let mut curr = Some(receiver_klass);
+            while let Some(k) = curr {
+                for m in &k.class.methods {
+                    if m.name == name {
+                        names.push(format!(
+                            "{}.{}{} flags={:#x}",
+                            String::from_utf8_lossy(k.class.name),
+                            String::from_utf8_lossy(m.name),
+                            String::from_utf8_lossy(m.descriptor),
+                            m.accessFlags
+                        ));
+                    }
+                }
+                curr = k.super_klass.as_ref();
+            }
+            eprintln!(
+                "[resolve_virtual] {}.{}{} candidates={names:?}",
+                String::from_utf8_lossy(receiver_klass.class.name),
+                String::from_utf8_lossy(name),
+                String::from_utf8_lossy(descriptor)
+            );
+        }
+        if std::env::var_os("JVM25_TRACE").is_some() {
+            eprintln!(
+                "[resolve-fail] {}.{}{}",
+                String::from_utf8_lossy(receiver_klass.class.name),
+                String::from_utf8_lossy(name),
+                String::from_utf8_lossy(descriptor),
+            );
+            eprintln!(
+                "  methods: {:?}",
+                receiver_klass
+                    .class
+                    .methods
+                    .iter()
+                    .map(|m| format!(
+                        "{}{}",
+                        String::from_utf8_lossy(m.name),
+                        String::from_utf8_lossy(m.descriptor)
+                    ))
+                    .collect::<Vec<_>>()
+            );
+        }
         Err(Error::other(format!(
             "NoSuchMethodError: {}{}",
             String::from_utf8_lossy(name),
@@ -177,21 +227,45 @@ impl LinkResolver {
     }
 
     /// Resolves invokespecial call (constructors, private methods, super calls).
+    /// Selects the method declared in the referenced class or its
+    /// superclasses without virtual override; interface owners additionally
+    /// search superinterfaces for private/default methods (JVMS §5.4.3.3).
     pub fn resolve_special_call<'a>(
         target_klass: &Rc<InstanceKlass<'a>>,
         name: &[u8],
         descriptor: &[u8],
     ) -> io::Result<(Rc<InstanceKlass<'a>>, Code<'a>)> {
-        let declared: Option<&Member<'a>> = target_klass.class.methods.iter().find(|method| {
-            method.name == name && method.descriptor == descriptor && method.accessFlags & 8 == 0
-        });
-        if let Some(method) = declared {
-            return Ok((Rc::clone(target_klass), Code::parse(method)?));
+        let mut current = Some(Rc::clone(target_klass));
+        while let Some(klass) = current {
+            if let Some(method) = klass.class.methods.iter().find(|method| {
+                method.name == name
+                    && method.descriptor == descriptor
+                    && method.accessFlags & 8 == 0
+            }) {
+                return Ok((Rc::clone(&klass), Code::parse(method)?));
+            }
+            current = klass.super_klass();
         }
-        if name == b"<init>" {
-            return Err(Error::other("Missing constructor"));
+        let mut pending: Vec<Rc<InstanceKlass<'a>>> = target_klass.interfaces.clone();
+        let mut visited = HashSet::new();
+        while let Some(iface) = pending.pop() {
+            if !visited.insert(Rc::as_ptr(&iface) as usize) {
+                continue;
+            }
+            if let Some(method) = iface.class.methods.iter().find(|method| {
+                method.name == name
+                    && method.descriptor == descriptor
+                    && method.accessFlags & 8 == 0
+            }) {
+                return Ok((Rc::clone(&iface), Code::parse(method)?));
+            }
+            pending.extend(iface.interfaces.iter().cloned());
         }
-        Self::resolve_virtual_call(target_klass, name, descriptor)
+        Err(Error::other(format!(
+            "NoSuchMethodError: {}{}",
+            String::from_utf8_lossy(name),
+            String::from_utf8_lossy(descriptor)
+        )))
     }
 
     /// Resolves invokestatic call.

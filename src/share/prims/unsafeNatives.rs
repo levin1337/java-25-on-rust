@@ -13,6 +13,7 @@ use crate::share::{
     oops::{instanceKlass::InitState, instanceOop::InstanceOop, typeArrayOop::TypeArrayOop},
 };
 use std::io::{self, Error};
+use std::rc::Rc;
 
 type NativeResult<'a> = Option<Option<Value<'a>>>;
 
@@ -612,9 +613,29 @@ fn read_offheap_raw(address: i64, size: usize) -> io::Result<u64> {
 fn write_offheap_raw(address: i64, size: usize, raw: u64) -> io::Result<()> {
     let base = u64::try_from(address).map_err(|_| invalid("Invalid Unsafe address"))?;
     for index in 0..size {
-        OffHeapMemory::global().put_byte(base + index as u64, ((raw >> (index * 8)) as u8) as i8)?;
+        OffHeapMemory::global()
+            .put_byte(base + index as u64, ((raw >> (index * 8)) as u8) as i8)?;
     }
     Ok(())
+}
+
+fn find_static_field<'a>(
+    loader: &ClassLoader<'a>,
+    class: &[u8],
+    offset: i64,
+) -> io::Result<(Rc<crate::share::oops::instanceKlass::InstanceKlass<'a>>, usize, u8)> {
+    let klass = loader.load(class)?;
+    for (index, info) in klass.static_field_infos.iter().enumerate() {
+        if i64::from(info.offset) == offset {
+            let kind = info
+                .descriptor
+                .first()
+                .copied()
+                .ok_or_else(|| invalid("Invalid field descriptor"))?;
+            return Ok((klass, index, kind));
+        }
+    }
+    Err(invalid("Invalid Unsafe static field offset"))
 }
 
 fn read_raw<'a>(
@@ -627,8 +648,17 @@ fn read_raw<'a>(
     let offset = offset_arg(arguments, object_index + 1)?;
     let raw = match object {
         Value::Null => read_offheap_raw(offset, size)?,
+        Value::ClassMirror(class) => {
+            let (klass, index, _) = find_static_field(loader, class, offset)?;
+            let value = klass
+                .static_fields
+                .get(index)
+                .map(|cell| cell.get())
+                .ok_or_else(|| invalid("Invalid static field slot"))?;
+            value_to_raw(value, size)?
+        }
         Value::Object(handle) => {
-            let objects = loader.objects.borrow();
+            let objects = loader.borrow_objects();
             let object = objects
                 .get(handle)
                 .ok_or_else(|| invalid("Invalid object reference"))?;
@@ -664,8 +694,24 @@ fn write_raw<'a>(
     let value_raw = value_to_raw(value, size)?;
     match object {
         Value::Null => write_offheap_raw(offset, size, value_raw),
+        Value::ClassMirror(class) => {
+            let (klass, index, kind) = find_static_field(loader, class, offset)?;
+            let cell = klass
+                .static_fields
+                .get(index)
+                .ok_or_else(|| invalid("Invalid static field slot"))?;
+            let old = cell.get();
+            let mut bytes = [0u8; 8];
+            bytes[..8].copy_from_slice(&value_to_raw(old, 8)?.to_le_bytes());
+            for index in 0..size {
+                bytes[index] = (value_raw >> (index * 8)) as u8;
+            }
+            let merged = u64::from_le_bytes(bytes);
+            cell.set(raw_to_value(kind, merged)?);
+            Ok(())
+        }
         Value::Object(handle) => {
-            let mut objects = loader.objects.borrow_mut();
+            let mut objects = loader.borrow_objects_mut();
             let object = objects
                 .get_mut(handle)
                 .ok_or_else(|| invalid("Invalid object reference"))?;
@@ -703,8 +749,19 @@ fn read_reference<'a>(
     let object = object_arg(arguments, object_index)?;
     let offset = offset_arg(arguments, object_index + 1)?;
     match object {
+        Value::ClassMirror(class) => {
+            let (klass, index, kind) = find_static_field(loader, class, offset)?;
+            if !matches!(kind, b'L' | b'[') {
+                return Err(invalid("Unsafe field is not a reference"));
+            }
+            klass
+                .static_fields
+                .get(index)
+                .map(|cell| cell.get())
+                .ok_or_else(|| invalid("Invalid static field slot"))
+        }
         Value::Object(handle) => {
-            let objects = loader.objects.borrow();
+            let objects = loader.borrow_objects();
             let object = objects
                 .get(handle)
                 .ok_or_else(|| invalid("Invalid object reference"))?;
@@ -740,8 +797,20 @@ fn write_reference<'a>(
     let object = object_arg(arguments, object_index)?;
     let offset = offset_arg(arguments, object_index + 1)?;
     match object {
+        Value::ClassMirror(class) => {
+            let (klass, index, kind) = find_static_field(loader, class, offset)?;
+            if !matches!(kind, b'L' | b'[') {
+                return Err(invalid("Unsafe field is not a reference"));
+            }
+            let cell = klass
+                .static_fields
+                .get(index)
+                .ok_or_else(|| invalid("Invalid static field slot"))?;
+            cell.set(value);
+            Ok(())
+        }
         Value::Object(handle) => {
-            let mut objects = loader.objects.borrow_mut();
+            let mut objects = loader.borrow_objects_mut();
             let object = objects
                 .get_mut(handle)
                 .ok_or_else(|| invalid("Invalid object reference"))?;
@@ -823,8 +892,20 @@ fn write_reference_with_value<'a>(
     let object = object_arg(arguments, object_index)?;
     let offset = offset_arg(arguments, object_index + 1)?;
     match object {
+        Value::ClassMirror(class) => {
+            let (klass, index, kind) = find_static_field(loader, class, offset)?;
+            if !matches!(kind, b'L' | b'[') {
+                return Err(invalid("Unsafe field is not a reference"));
+            }
+            let cell = klass
+                .static_fields
+                .get(index)
+                .ok_or_else(|| invalid("Invalid static field slot"))?;
+            cell.set(value);
+            Ok(())
+        }
         Value::Object(handle) => {
-            let mut objects = loader.objects.borrow_mut();
+            let mut objects = loader.borrow_objects_mut();
             let object = objects
                 .get_mut(handle)
                 .ok_or_else(|| invalid("Invalid object reference"))?;
@@ -937,7 +1018,7 @@ fn field_member<'a>(
     let Value::Object(handle) = field else {
         return Err(invalid("Expected java.lang.reflect.Field"));
     };
-    let objects = loader.objects.borrow();
+    let objects = loader.borrow_objects();
     let object = objects
         .get(handle)
         .ok_or_else(|| invalid("Invalid field object"))?;
@@ -1057,10 +1138,7 @@ fn allocate_instance<'a>(loader: &ClassLoader<'a>, class: &[u8]) -> io::Result<V
         return Err(invalid("InstantiationException"));
     }
     let object = InstanceOop::new(klass)?;
-    let mut objects = loader.objects.borrow_mut();
-    let handle = objects.len();
-    objects.push(object);
-    Ok(Value::Object(handle))
+    Ok(Value::Object(loader.alloc_object(object)))
 }
 
 fn write_bytes<'a>(

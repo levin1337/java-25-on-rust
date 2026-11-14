@@ -10,3 +10,4 @@ pub mod invocationCounter;
 pub mod linkResolver;
 pub(crate) mod numeric;
 pub mod oopMapCache;
+pub mod templateTable;

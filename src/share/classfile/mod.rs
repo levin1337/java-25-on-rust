@@ -3,11 +3,14 @@ pub mod classFileStream;
 pub mod classLoader;
 pub mod javaClasses;
 pub mod jimage;
+pub mod jimageDecompressor;
+pub mod linkageError;
 pub mod modules;
 pub mod stringTable;
 pub mod symbolTable;
 pub mod systemDictionary;
 pub mod verifier;
+pub mod vmIntrinsics;
 pub mod vmSymbols;
 
 pub use classFileParser::{
@@ -28,6 +31,8 @@ pub use javaClasses::{
     java_lang_System, java_lang_Thread, java_lang_Throwable, java_lang_boxing_object,
 };
 pub use jimage::{JIMAGE_MAGIC, JImageHeader, JImageReader};
+pub use jimageDecompressor::{StringsProvider, decompress_resource};
+pub use linkageError::{LinkageError, LinkageErrorKind, linkage_kind};
 pub use modules::{ModuleEntry, ModuleTable, Modules};
 pub use stringTable::StringTable;
 pub use symbolTable::{SymbolTable, TableStatistics, hash_symbol};
@@ -36,4 +41,5 @@ pub use verifier::{
     ClassVerifier, ErrorContext, FaultType, StackMapFrame, StackMapTable, TypeOrigin,
     VerificationType, Verifier,
 };
+pub use vmIntrinsics::{IntrinsicId, VmIntrinsics};
 pub use vmSymbols::VmSymbols;

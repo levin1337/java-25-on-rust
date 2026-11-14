@@ -12,6 +12,7 @@ pub mod nmt;
 pub mod oops;
 pub mod opto;
 pub mod prims;
+pub mod recprobe;
 pub mod runtime;
 pub mod services;
 pub mod utilities;

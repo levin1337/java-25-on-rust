@@ -103,6 +103,7 @@ name = "jvm25-rust"
 version = "0.1.0"
 dependencies = [
  "bumpalo",
+ "flate2",
  "libloading",
  "zip",
 ]

@@ -194,6 +194,9 @@ pub(crate) fn invoke<'a>(
             string(loader, *other)?.as_deref() == Some(text.as_ref()),
         )),
         (b"toString", b"()Ljava/lang/String;", []) => receiver,
+        // Canonicalization is approximated: lightweight strings already
+        // compare by content, and materialized receivers keep their identity.
+        (b"intern", b"()Ljava/lang/String;", []) => receiver,
         _ => return Ok(None),
     };
     Ok(Some(Some(result)))

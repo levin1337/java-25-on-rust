@@ -148,7 +148,8 @@ pub(crate) fn invoke<'a>(
                 && !class.starts_with(b":")
                 && loader.load(class)?.class.accessFlags & 0x0200 != 0,
         )),
-        (b"getClassLoader", b"()Ljava/lang/ClassLoader;") => {
+        (b"getClassLoader", b"()Ljava/lang/ClassLoader;")
+        | (b"getClassLoader0", b"()Ljava/lang/ClassLoader;") => {
             if class.starts_with(b"[") || class.starts_with(b":") {
                 Value::Null
             } else if loader.bootImage.is_some() {

@@ -1,9 +1,11 @@
 /*
  * Port of OpenJDK 25 HotSpot MemTag (share/nmt/memTag.hpp)
  *
- * Defines Native Memory Tracking (NMT) subsystem memory classification tags.
- * The tag set mirrors MEMORY_TAG_DO in memTag.hpp exactly (order matters —
- * tags are numbered for the bitmap and reports).
+ * Native Memory Tracking (NMT) subsystem memory classification tags.
+ * The tag set mirrors MEMORY_TAG_DO in memTag.hpp exactly — order and
+ * count matter: tags are numbered for snapshots, the malloc site table
+ * and reports. mtNone ("Unknown") is a valid tag value used for regions
+ * reserved before their final tag is known.
  */
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -36,7 +38,9 @@ pub enum MemTag {
     MtMetaspace = 24,
     MtStringDedup = 25,
     MtObjectMonitor = 26,
-    MtNumberOfTags = 27,
+    MtNone = 27,
+    /// Sentinel: number of memory tags (mt_number_of_tags). Not a tag.
+    MtNumberOfTags = 28,
 }
 
 /// Backwards-compatible alias used by earlier ports.
@@ -79,28 +83,70 @@ impl MemTag {
             Self::MtMetaspace => "Metaspace",
             Self::MtStringDedup => "String Deduplication",
             Self::MtObjectMonitor => "Object Monitors",
+            Self::MtNone => "Unknown",
             Self::MtNumberOfTags => "<end>",
         }
     }
 
-    /// NMT report category order (memReporter groups by this).
+    /// Literalized enum name, e.g. "mtNMT" (NMTUtil::tag_to_enum_name).
+    pub fn enum_name(self) -> &'static str {
+        match self {
+            Self::MtJavaHeap => "mtJavaHeap",
+            Self::MtClass => "mtClass",
+            Self::MtThread => "mtThread",
+            Self::MtThreadStack => "mtThreadStack",
+            Self::MtCode => "mtCode",
+            Self::MtGC => "mtGC",
+            Self::MtGCCardSet => "mtGCCardSet",
+            Self::MtCompiler => "mtCompiler",
+            Self::MtJvmci => "mtJVMCI",
+            Self::MtInternal => "mtInternal",
+            Self::MtOther => "mtOther",
+            Self::MtSymbol => "mtSymbol",
+            Self::MtNmt => "mtNMT",
+            Self::MtClassShared => "mtClassShared",
+            Self::MtChunk => "mtChunk",
+            Self::MtTest => "mtTest",
+            Self::MtTracing => "mtTracing",
+            Self::MtLogging => "mtLogging",
+            Self::MtStatistics => "mtStatistics",
+            Self::MtArguments => "mtArguments",
+            Self::MtModule => "mtModule",
+            Self::MtSafepoint => "mtSafepoint",
+            Self::MtSynchronizer => "mtSynchronizer",
+            Self::MtServiceability => "mtServiceability",
+            Self::MtMetaspace => "mtMetaspace",
+            Self::MtStringDedup => "mtStringDedup",
+            Self::MtObjectMonitor => "mtObjectMonitor",
+            Self::MtNone => "mtNone",
+            Self::MtNumberOfTags => "mtNumberOfTags",
+        }
+    }
+
+    /// NMT report category order (same as enum order).
     pub fn report_order(self) -> u8 {
         self as u8
     }
 
+    /// Map index to MemTag; None for the MtNumberOfTags sentinel.
     pub fn from_index(i: usize) -> Option<Self> {
         if i < Self::MtNumberOfTags as usize {
-            // SAFETY-free: transmute via match is verbose; use the fact that
-            // discriminants are contiguous.
             Some(unsafe { std::mem::transmute(i as u8) })
         } else {
             None
         }
     }
 
-    /// All trackable tags in report order.
+    /// All tags in report order, including mtNone (which normally
+    /// carries zero usage and is omitted from reports).
     pub fn all() -> impl Iterator<Item = Self> {
         (0..Self::MtNumberOfTags as usize).filter_map(Self::from_index)
+    }
+
+    /// Trackable tags only (excludes the mtNone sentinel usage — mtNone
+    /// itself is a real tag value and is included).
+    pub fn is_tag(self) -> bool {
+        self != Self::MtNumberOfTags
     }
 }
 
@@ -110,8 +156,17 @@ mod tests {
 
     #[test]
     fn tag_count_and_names() {
-        assert_eq!(MemTag::MtNumberOfTags as usize, 27);
+        assert_eq!(MemTag::MtNumberOfTags as usize, 28);
+        assert_eq!(MemTag::MtNone as usize, 27);
         assert_eq!(MemTag::MtJavaHeap.name(), "Java Heap");
         assert_eq!(MemTag::MtNmt.name(), "Native Memory Tracking");
+        assert_eq!(MemTag::MtNone.name(), "Unknown");
+        assert_eq!(MemTag::MtObjectMonitor.enum_name(), "mtObjectMonitor");
+    }
+
+    #[test]
+    fn tag_iteration_covers_all() {
+        assert_eq!(MemTag::all().count(), 28);
+        assert_eq!(MemTag::all().last(), Some(MemTag::MtNone));
     }
 }

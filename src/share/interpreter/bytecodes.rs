@@ -247,12 +247,18 @@ pub enum Code {
     FastAldcW = 231,
     ReturnRegisterFinalizer = 232,
     Invokehandle = 233,
-    ShouldNotReachHere = 234,
+    // Bytecodes rewritten at CDS dump time so they are not rewritten again
+    // at run time (share/interpreter/bytecodes.hpp).
+    NofastGetfield = 234,
+    NofastPutfield = 235,
+    NofastAload0 = 236,
+    NofastIload = 237,
+    ShouldNotReachHere = 238,
 }
 
 impl Code {
     pub fn from_u8(opcode: u8) -> Option<Self> {
-        static CODES: [Code; 235] = [
+        static CODES: [Code; 239] = [
             Code::Nop,
             Code::AconstNull,
             Code::IconstM1,
@@ -487,6 +493,10 @@ impl Code {
             Code::FastAldcW,
             Code::ReturnRegisterFinalizer,
             Code::Invokehandle,
+            Code::NofastGetfield,
+            Code::NofastPutfield,
+            Code::NofastAload0,
+            Code::NofastIload,
             Code::ShouldNotReachHere,
         ];
         CODES.get(opcode as usize).copied()
@@ -501,7 +511,7 @@ pub const NUMBER_OF_JAVA_CODES: usize = 203;
 
 pub fn name(opcode: u8) -> Option<&'static str> {
     #[allow(non_upper_case_globals)]
-    const NAMES: [&str; 203] = [
+    const NAMES: [&str; NUMBER_OF_CODES] = [
         "nop",
         "aconst_null",
         "iconst_m1",
@@ -705,12 +715,50 @@ pub fn name(opcode: u8) -> Option<&'static str> {
         "goto_w",
         "jsr_w",
         "breakpoint",
+        "fast_agetfield",
+        "fast_bgetfield",
+        "fast_cgetfield",
+        "fast_dgetfield",
+        "fast_fgetfield",
+        "fast_igetfield",
+        "fast_lgetfield",
+        "fast_sgetfield",
+        "fast_aputfield",
+        "fast_bputfield",
+        "fast_zputfield",
+        "fast_cputfield",
+        "fast_dputfield",
+        "fast_fputfield",
+        "fast_iputfield",
+        "fast_lputfield",
+        "fast_sputfield",
+        "fast_aload_0",
+        "fast_iaccess_0",
+        "fast_aaccess_0",
+        "fast_faccess_0",
+        "fast_iload",
+        "fast_iload2",
+        "fast_icaload",
+        "fast_invokevfinal",
+        "fast_linearswitch",
+        "fast_binaryswitch",
+        "fast_aldc",
+        "fast_aldc_w",
+        "return_register_finalizer",
+        "invokehandle",
+        "nofast_getfield",
+        "nofast_putfield",
+        "nofast_aload_0",
+        "nofast_iload",
+        "_shouldnotreachhere",
     ];
     NAMES.get(usize::from(opcode)).copied()
 }
 
+pub const NUMBER_OF_CODES: usize = 239;
+
 pub fn is_valid(opcode: i32) -> bool {
-    (0..=234).contains(&opcode)
+    (0..NUMBER_OF_CODES as i32).contains(&opcode)
 }
 
 pub fn is_java_code(opcode: u8) -> bool {
@@ -721,6 +769,11 @@ pub fn is_defined(opcode: u8) -> bool {
     name(opcode).is_some()
 }
 
+// Fixed instruction lengths derived from the format strings in
+// bytecodes.cpp (`_lengths` table).  Returns 0 for variable-length
+// instructions (wide, tableswitch, lookupswitch and the JVM-internal
+// fast switch variants) and -1 for undefined opcodes, matching
+// `Bytecodes::length_for`.
 pub fn length_for(opcode: u8) -> i32 {
     match opcode {
         0x00..=0x0f
@@ -730,7 +783,8 @@ pub fn length_for(opcode: u8) -> i32 {
         | 0x85..=0x98
         | 0xac..=0xb1
         | 0xbe..=0xbf
-        | 0xc2..=0xc3 => 1,
+        | 0xc2..=0xc3
+        | 0xca => 1,
         0x10 | 0x12 | 0x15..=0x19 | 0x36..=0x3a | 0xa9 | 0xbc => 2,
         0x11
         | 0x13..=0x14
@@ -743,8 +797,17 @@ pub fn length_for(opcode: u8) -> i32 {
         | 0xc6..=0xc7 => 3,
         0xc5 => 4,
         0xb9 | 0xba | 0xc8 | 0xc9 => 5,
-        0xaa | 0xab | 0xc4 => -1, // variable length
-        _ => 1,
+        // Variable-length instructions: wide, tableswitch, lookupswitch.
+        0xaa | 0xab | 0xc4 => 0,
+        // JVM-internal bytecodes (codes 203..=238), formats "bJJ" etc.
+        0xcb..=0xd2 | 0xd3..=0xdb | 0xe3 | 0xe7 | 0xe9 | 0xea | 0xeb | 0xee => 3,
+        0xdc | 0xe8 | 0xec => 1,
+        0xdd..=0xdf | 0xe1 => 4,
+        0xe0 | 0xe6 => 2,
+        0xe2 => 3,
+        0xe4 | 0xe5 => 0, // fast_linearswitch, fast_binaryswitch
+        0xed => 2,        // nofast_iload "bi"
+        _ => -1,
     }
 }
 
@@ -790,7 +853,8 @@ pub fn is_field_code(opcode: u8) -> bool {
 
 pub fn can_trap(opcode: u8) -> bool {
     match opcode {
-        0x2e..=0x35 // *aload
+        0x2a // aload_0 (may rewrite to a trapping access)
+        | 0x2e..=0x35 // *aload
         | 0x4f..=0x56 // *astore
         | 0x6c..=0x6f // *div
         | 0x70..=0x73 // *rem
@@ -801,24 +865,467 @@ pub fn can_trap(opcode: u8) -> bool {
         | 0xc0 // checkcast
         | 0xc2..=0xc3 // monitorenter, monitorexit
         | 0xc5 => true, // multianewarray
+        // JVM-internal codes.
+        203..=223 // fast_*getfield/putfield/aload_0/access_0
+        | 227 // fast_invokevfinal
+        | 230..=236 => true, // fast_aldc*, return_register_finalizer, invokehandle, nofast_getfield/putfield/aload_0
         _ => false,
     }
 }
 
-pub fn length_at(code: &[u8], bci: usize) -> usize {
-    if bci >= code.len() {
-        return 1;
-    }
-    let opcode = code[bci];
-    if opcode == 0xc4 {
-        if bci + 1 < code.len() {
-            let wide_len = wide_length_for(code[bci + 1]);
-            if wide_len > 0 {
-                return wide_len as usize;
+// `Bytecodes::special_length_at`: length of a variable-length
+// instruction at `bci` inside the code array `code`.  Returns -1 when
+// the instruction would read past the end of `code` or is malformed.
+pub fn special_length_at(code: &[u8], bci: usize) -> i32 {
+    let opcode = match code.get(bci) {
+        Some(&opcode) => opcode,
+        None => return -1,
+    };
+    match opcode {
+        0xc4 => {
+            // wide
+            match code.get(bci + 1) {
+                Some(&sub) => wide_length_for(sub),
+                None => -1,
             }
         }
-        return 1;
+        0xaa | 0xe4 => {
+            // tableswitch, fast_linearswitch
+            let aligned = align4(bci + 1);
+            let (Some(lo), Some(hi)) = (
+                be_i32_at(code, aligned + 4),
+                be_i32_at(code, aligned + 8),
+            ) else {
+                return -1;
+            };
+            if lo > hi {
+                return -1;
+            }
+            let len = (aligned - bci) as i64 + (3 + hi as i64 - lo as i64 + 1) * 4;
+            if len > 0 && len <= i32::MAX as i64 {
+                len as i32
+            } else {
+                -1
+            }
+        }
+        0xab | 0xe5 => {
+            // lookupswitch, fast_binaryswitch
+            let aligned = align4(bci + 1);
+            let Some(npairs) = be_i32_at(code, aligned + 4) else {
+                return -1;
+            };
+            if npairs < 0 {
+                return -1;
+            }
+            let len = (aligned - bci) as i64 + (2 + 2 * npairs as i64) * 4;
+            if len > 0 && len <= i32::MAX as i64 {
+                len as i32
+            } else {
+                -1
+            }
+        }
+        _ => 0,
     }
-    let len = length_for(opcode);
+}
+
+fn align4(offset: usize) -> usize {
+    (offset + 3) & !3
+}
+
+fn be_i32_at(code: &[u8], offset: usize) -> Option<i32> {
+    let bytes: [u8; 4] = code.get(offset..offset + 4)?.try_into().ok()?;
+    Some(i32::from_be_bytes(bytes))
+}
+
+// `Bytecodes::length_for_code_at`: fixed length, or the variable
+// length computed by `special_length_at` when `length_for` returns 0.
+pub fn length_for_code_at(code: &Code, bci: usize, bytes: &[u8]) -> i32 {
+    let len = length_for(*code as u8);
+    if len > 0 {
+        len
+    } else {
+        special_length_at(bytes, bci)
+    }
+}
+
+// `Bytecodes::code_at` for a raw code array: byte value mapped through
+// the `Code` enum (breakpoint decoding is the caller's concern).
+pub fn code_at(bytes: &[u8], bci: usize) -> Option<Code> {
+    code_from_u8(*bytes.get(bci)?)
+}
+
+// `Bytecodes::java_code_at`: the canonical Java bytecode for a
+// (possibly JVM-internal rewritten) code value.
+pub fn java_code_at(bytes: &[u8], bci: usize) -> Option<Code> {
+    code_at(bytes, bci).map(java_code)
+}
+
+// `Bytecodes::java_length_at`.
+pub fn java_length_at(bytes: &[u8], bci: usize) -> i32 {
+    match java_code_at(bytes, bci) {
+        Some(code) => length_for_code_at(&code, bci, bytes),
+        None => -1,
+    }
+}
+
+// Convenience wrapper kept for existing callers: instruction length in
+// bytes, clamped to at least 1 for malformed input.
+pub fn length_at(code: &[u8], bci: usize) -> usize {
+    let len = instruction_length_at(code, bci);
     if len > 0 { len as usize } else { 1 }
 }
+
+// `Bytecodes::length_at` over a raw code array.
+pub fn instruction_length_at(bytes: &[u8], bci: usize) -> i32 {
+    match code_at(bytes, bci) {
+        Some(code) => length_for_code_at(&code, bci, bytes),
+        None => -1,
+    }
+}
+
+// Iterate over instruction boundaries in a code array.  Yields
+// `(bci, code, length)`; stops at malformed input.  Variable-length
+// instructions are sized via `special_length_at`.
+pub fn instructions(bytes: &[u8]) -> InstructionIter<'_> {
+    InstructionIter { bytes, bci: 0 }
+}
+
+pub struct InstructionIter<'a> {
+    bytes: &'a [u8],
+    bci: usize,
+}
+
+impl<'a> Iterator for InstructionIter<'a> {
+    type Item = (usize, Code, usize);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.bci >= self.bytes.len() {
+            return None;
+        }
+        let code = code_at(self.bytes, self.bci)?;
+        let len = length_for_code_at(&code, self.bci, self.bytes);
+        if len <= 0 || self.bci + len as usize > self.bytes.len() {
+            return None;
+        }
+        let item = (self.bci, code, len as usize);
+        self.bci += len as usize;
+        Some(item)
+    }
+}
+
+/// HotSpot `BasicType` (globalDefinitions.hpp), including the
+/// analysis-only values used by the interpreter's operand-stack
+/// simulation (`T_ADDRESS`, `T_CONFLICT`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(i32)]
+pub enum BasicType {
+    Boolean = 0,
+    Char = 1,
+    Float = 2,
+    Double = 3,
+    Byte = 4,
+    Short = 5,
+    Int = 6,
+    Long = 7,
+    Object = 8,
+    Array = 9,
+    Address = 10,
+    Void = 11,
+    Conflict = 12,
+    Illegal = 13,
+}
+
+/// `type2size`: slot count of a value of the given type.
+pub fn type2size(basic_type: BasicType) -> usize {
+    match basic_type {
+        BasicType::Long | BasicType::Double => 2,
+        BasicType::Void | BasicType::Conflict | BasicType::Illegal => 0,
+        _ => 1,
+    }
+}
+
+/// `Bytecodes::result_type`: the type pushed by the bytecode (T_ILLEGAL
+/// for instructions without a fixed result).
+pub fn result_type(code: Code) -> BasicType {
+    use BasicType::*;
+    let i = code as i32;
+    match i {
+        1 => Object,                    // aconst_null
+        2..=8 => Int,                   // iconst_*
+        9 | 10 => Long,                 // lconst_*
+        11..=13 => Float,               // fconst_*
+        14 | 15 => Double,              // dconst_*
+        16 | 17 => Int,                 // bipush, sipush
+        21 => Int,
+        22 => Long,
+        23 => Float,
+        24 => Double,
+        25 => Object,
+        26..=29 => Int,                 // iload*
+        30..=33 => Long,                // lload*
+        34..=37 => Float,               // fload*
+        38..=41 => Double,              // dload*
+        42..=45 => Object,              // aload*
+        46 => Int,                      // iaload
+        47 => Long,                     // laload
+        48 => Float,                    // faload
+        49 => Double,                   // daload
+        50 => Object,                   // aaload
+        51..=53 => Int,                 // baload, caload, saload
+        96..=115 => match (i - 96) % 4 { // iadd..drem
+            0 => Int,
+            1 => Long,
+            2 => Float,
+            _ => Double,
+        },
+        116..=119 => match i - 116 {   // ineg..dneg
+            0 => Int,
+            1 => Long,
+            2 => Float,
+            _ => Double,
+        },
+        120 | 122 | 124 | 126 | 128 | 130 => Int, // ish*/iand/ior/ixor
+        121 | 123 | 125 | 127 | 129 | 131 => Long, // lsh*/land/lor/lxor
+        133 => Long,                    // i2l
+        134 => Float,                   // i2f
+        135 => Double,                  // i2d
+        136 => Int,                     // l2i
+        137 => Float,                   // l2f
+        138 => Double,                  // l2d
+        139 => Int,                     // f2i
+        140 => Long,                    // f2l
+        141 => Double,                  // f2d
+        142 => Int,                     // d2i
+        143 => Long,                    // d2l
+        144 => Float,                   // d2f
+        145 => Byte,                    // i2b
+        146 => Char,                    // i2c
+        147 => Short,                   // i2s
+        168 | 201 => Int,               // jsr, jsr_w push return address slot
+        172 => Int,                     // ireturn
+        173 => Long,                    // lreturn
+        174 => Float,                   // freturn
+        175 => Double,                  // dreturn
+        176 => Object,                  // areturn
+        187 | 188 | 189 | 197 => Object, // new, newarray, anewarray, multianewarray
+        190 => Int,                     // arraylength
+        192 => Object,                  // checkcast
+        203 => Object,                  // fast_agetfield
+        204 => Int,                     // fast_bgetfield
+        205 => Char,                    // fast_cgetfield
+        206 => Double,                  // fast_dgetfield
+        207 => Float,                   // fast_fgetfield
+        208 => Int,                     // fast_igetfield
+        209 => Long,                    // fast_lgetfield
+        210 => Short,                   // fast_sgetfield
+        220 => Object,                  // fast_aload_0
+        221 => Int,                     // fast_iaccess_0
+        222 => Object,                  // fast_aaccess_0
+        223 => Object,                  // fast_faccess_0
+        224 | 225 | 226 => Int,         // fast_iload, fast_iload2, fast_icaload
+        230 | 231 => Object,            // fast_aldc, fast_aldc_w
+        236 => Object,                  // nofast_aload_0
+        237 => Int,                     // nofast_iload
+        193 => Int,                     // instanceof
+        _ => Illegal,
+    }
+}
+
+/// `Bytecodes::depth`: net operand-stack effect in slots (negative for
+/// pops).  `T_ILLEGAL` results for field/invoke instructions are
+/// resolved dynamically by callers.
+pub fn depth(code: Code) -> i32 {
+    use BasicType::*;
+    let _ = (Void, Illegal);
+    let i = code as i32;
+    match i {
+        0 => 0,                         // nop
+        1 => 1,                         // aconst_null
+        2..=8 => 1,                     // iconst_*
+        9 | 10 => 2,                    // lconst_*
+        11..=13 => 1,                   // fconst_*
+        14 | 15 => 2,                   // dconst_*
+        16 | 17 => 1,                   // bipush, sipush
+        18 | 19 => 1,                   // ldc, ldc_w
+        20 => 2,                        // ldc2_w
+        21 => 1,
+        22 => 2,
+        23 => 1,
+        24 => 2,
+        25 => 1,
+        26..=29 => 1,
+        30..=33 => 2,
+        34..=37 => 1,
+        38..=41 => 2,
+        42..=45 => 1,
+        46 | 48 | 50..=53 => -1,        // *aload (1-slot element)
+        47 | 49 => 0,                   // laload, daload (2-slot element)
+        54 | 56 | 58 => -1,             // istore, fstore, astore
+        55 | 57 => -2,                  // lstore, dstore
+        59..=62 | 67..=70 | 75..=78 => -1,
+        63..=66 | 71..=74 => -2,
+        79 | 81 | 83..=86 => -3,        // iastore..sastore (1-slot value)
+        80 | 82 => -4,                  // lastore, dastore
+        87 => -1,                       // pop
+        88 => -2,                       // pop2
+        89 | 90 | 91 => 1,              // dup, dup_x1, dup_x2
+        92..=94 => 2,                   // dup2, dup2_x1, dup2_x2
+        95 => 0,                        // swap
+        96..=115 => match (i - 96) % 4 { // iadd..drem
+            1 | 3 => -2,                // long/double
+            _ => -1,
+        },
+        116..=119 => 0,                 // ineg..dneg
+        120..=125 => -1,                // shifts (i- and l- variants pop 2)
+        126..=131 => match i % 2 {      // iand..lxor
+            0 => -1,
+            _ => -2,
+        },
+        132 => 0,                       // iinc
+        133 => 1,                       // i2l
+        134 | 135 => 0,                 // i2f, i2d
+        136 | 137 => -1,                // l2i, l2f
+        138 => 0,                       // l2d
+        139 | 142 | 144 => 0,           // f2i, d2i, d2f
+        140 | 141 => 1,                 // f2l, f2d
+        143 => 0,                       // d2l
+        145..=147 => 0,                 // i2b, i2c, i2s
+        148 | 151 | 152 => -3,          // lcmp, dcmpl, dcmpg
+        149 | 150 => -1,                // fcmpl, fcmpg
+        153..=158 => -1,                // if*
+        159..=166 => -2,                // if_icmp*, if_acmp*
+        167 | 200 => 0,                 // goto, goto_w
+        168 | 201 => 0,                 // jsr, jsr_w (push handled by caller)
+        169 => 0,                       // ret
+        170 | 171 | 0xe4 | 0xe5 => -1,  // *switch
+        172 => -1,
+        173 => -2,
+        174 => -1,
+        175 => -2,
+        176 => -1,                      // areturn
+        177 => 0,                       // return
+        178 => 1,                       // getstatic
+        179 => -1,                      // putstatic
+        180 => 0,                       // getfield
+        181 => -2,                      // putfield
+        182..=185 => -1,                // invokevirtual..invokeinterface
+        186 | 233 => 0,                 // invokedynamic, invokehandle
+        187 => 1,                       // new
+        188..=189 => 0,                 // newarray, anewarray
+        190 => 0,                       // arraylength
+        191 => -1,                      // athrow
+        192 | 193 => 0,                 // checkcast, instanceof
+        194 | 195 => -1,                // monitorenter, monitorexit
+        196 => 0,                       // wide
+        197 => 1,                       // multianewarray
+        198 | 199 => -1,                // ifnull, ifnonnull
+        202 => 0,                       // breakpoint
+        203..=210 => 0,                 // fast_*getfield
+        211..=219 => 0,                 // fast_*putfield
+        220 => 1,                       // fast_aload_0
+        221..=223 => 1,                 // fast_*access_0
+        224 => 1,                       // fast_iload
+        225 => 2,                       // fast_iload2
+        226 => 0,                       // fast_icaload
+        227 => -1,                      // fast_invokevfinal
+        230 | 231 => 1,                 // fast_aldc*
+        232 => 0,                       // return_register_finalizer
+        234 => 0,                       // nofast_getfield
+        235 => -2,                      // nofast_putfield
+        236 => 1,                       // nofast_aload_0
+        237 => 1,                       // nofast_iload
+        238 => 0,                       // shouldnotreachhere
+        _ => 0,
+    }
+}
+
+/// `Bytecodes::java_code`: canonical Java bytecode for a code value.
+pub fn java_code(code: Code) -> Code {
+    match code {
+        Code::FastAgetfield
+        | Code::FastBgetfield
+        | Code::FastCgetfield
+        | Code::FastDgetfield
+        | Code::FastFgetfield
+        | Code::FastIgetfield
+        | Code::FastLgetfield
+        | Code::FastSgetfield
+        | Code::NofastGetfield => Code::Getfield,
+        Code::FastAputfield
+        | Code::FastBputfield
+        | Code::FastZputfield
+        | Code::FastCputfield
+        | Code::FastDputfield
+        | Code::FastFputfield
+        | Code::FastIputfield
+        | Code::FastLputfield
+        | Code::FastSputfield
+        | Code::NofastPutfield => Code::Putfield,
+        Code::FastAload0 | Code::FastAaccess0 | Code::FastFaccess0 | Code::NofastAload0 => {
+            Code::Aload0
+        }
+        Code::FastIload | Code::FastIload2 | Code::FastIcaload | Code::NofastIload => {
+            Code::Iload
+        }
+        Code::FastIaccess0 => Code::Iload,
+        Code::FastInvokevfinal | Code::Invokehandle => Code::Invokevirtual,
+        Code::FastLinearswitch | Code::FastBinaryswitch => Code::Lookupswitch,
+        Code::FastAldc => Code::Ldc,
+        Code::FastAldcW => Code::LdcW,
+        Code::ReturnRegisterFinalizer => Code::Return,
+        _ => code,
+    }
+}
+
+// `Bytecodes::can_rewrite`: the bytecode has a JVM-internal rewritten
+// form (i.e. `java_code(code) != code`).
+pub fn can_rewrite(code: Code) -> bool {
+    java_code(code) != code
+}
+
+// `Bytecodes::must_rewrite` / `check_must_rewrite`: most rewritable
+// bytecodes must be rewritten before execution; the exceptions are
+// `aload_0` (rewrite may be delayed), `lookupswitch` (rewritten by the
+// Rewriter, not the interpreter) and `new` (not always rewritten).
+pub fn must_rewrite(code: Code) -> bool {
+    if !can_rewrite(code) {
+        return false;
+    }
+    !matches!(
+        code,
+        Code::FastAload0 | Code::NofastAload0 | Code::FastLinearswitch | Code::FastBinaryswitch | Code::New
+    )
+}
+
+// `Bytecodes::uses_cp_cache` (`_fmt_has_j`): the instruction carries a
+// constant-pool-cache index operand ('j'/'J' in the format string).
+pub fn uses_cp_cache(code: Code) -> bool {
+    matches!(code as i32,
+        0xb2..=0xba // getstatic..invokedynamic ("bJJ"/"bJJJJ")
+        | 203..=219   // fast_*getfield/fast_*putfield ("bJJ")
+        | 221..=223   // fast_*access_0 ("b_JJ")
+        | 227         // fast_invokevfinal ("bJJ")
+        | 230         // fast_aldc ("bj")
+        | 231         // fast_aldc_w ("bJJ")
+        | 233         // invokehandle ("bJJ")
+        | 234..=235   // nofast_getfield/nofast_putfield ("bJJ")
+    )
+}
+
+// `Bytecodes::native_byte_order` (`_fmt_has_nbo`): the instruction
+// carries a native-order ('J') operand written by the Rewriter.
+pub fn native_byte_order(code: Code) -> bool {
+    matches!(code as i32,
+        0xb2..=0xba // getstatic..invokedynamic
+        | 203..=219   // fast_*getfield/fast_*putfield
+        | 221..=223   // fast_*access_0
+        | 227         // fast_invokevfinal
+        | 231         // fast_aldc_w
+        | 233         // invokehandle
+        | 234..=235   // nofast_getfield/nofast_putfield
+    )
+}
+
+// `Bytecodes::is_defined` for internal codes uses the name table;
+// `flags`-style predicates above cover the semantic attributes.
+

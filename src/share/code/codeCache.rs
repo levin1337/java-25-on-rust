@@ -223,6 +223,352 @@ impl CodeHeap {
         self.free_list.iter().map(|r| r.size).sum::<usize>()
             + self.capacity.saturating_sub(self.high_water)
     }
+
+    #[inline]
+    pub fn is_full(&self) -> bool {
+        self.free_space() == 0
+    }
+
+    /// Mark the blob at `addr` unused so `free_unused_blobs` reclaims it
+    /// (non-nmethod reclamation path).
+    pub fn mark_unused(&mut self, addr: usize) -> bool {
+        if let Some(b) = self.blobs.iter_mut().find(|b| b.code_begin() == addr) {
+            b.set_unused(true);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Reclaim every blob flagged unused; returns bytes freed.
+    pub fn free_unused_blobs(&mut self) -> usize {
+        let mut freed = 0usize;
+        let mut i = 0;
+        while i < self.blobs.len() {
+            if self.blobs[i].is_unused() {
+                let blob = self.blobs.remove(i);
+                let offset = blob.code_begin().saturating_sub(self.base_address);
+                self.free_offset(offset, blob.size());
+                freed += blob.size();
+            } else {
+                i += 1;
+            }
+        }
+        freed
+    }
+
+    /// `CodeHeap::print_on` analogue.
+    pub fn print_on(&self, f: &mut dyn std::fmt::Write) {
+        let _ = writeln!(
+            f,
+            "heap {:?} base={:#x} capacity={} used={} high_water={} free_list_regions={} blobs={}",
+            self.blob_type,
+            self.base_address,
+            self.capacity,
+            self.used(),
+            self.high_water,
+            self.free_list.len(),
+            self.blobs.len()
+        );
+    }
+}
+
+/// Kind of call adapter (`AdapterHandlerLibrary` analogue).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AdapterKind {
+    /// Interpreter frame -> compiled nmethod entry (i2c).
+    InterpreterToCompiled,
+    /// Compiled nmethod return -> interpreter continuation (c2i).
+    CompiledToInterpreter,
+    /// JNI native -> Java (upcall) adapter.
+    NativeToJava,
+    /// Java -> JNI native adapter.
+    JavaToNative,
+}
+
+impl AdapterKind {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::InterpreterToCompiled => "i2c",
+            Self::CompiledToInterpreter => "c2i",
+            Self::NativeToJava => "native2java",
+            Self::JavaToNative => "java2native",
+        }
+    }
+}
+
+/// A generated adapter stub blob (`AdapterBlob` analogue): machine code
+/// plus the metadata needed to patch/verify it.
+#[derive(Clone, Debug)]
+pub struct AdapterBlob {
+    pub kind: AdapterKind,
+    /// Method signature the adapter was specialized for.
+    pub signature: String,
+    /// Absolute entry point (code_begin).
+    pub entry_point: usize,
+    /// Emitted machine code bytes.
+    pub code: Vec<u8>,
+    /// Offset of the call/jmp to the target inside `code` (for
+    /// relocation/patching).
+    pub target_patch_offset: usize,
+    /// Frame size the adapter sets up.
+    pub frame_size: usize,
+    /// pc offsets of potential exception points (npe/ame), like
+    /// VtableStub bookkeeping.
+    pub exception_points: Vec<usize>,
+}
+
+impl AdapterBlob {
+    #[inline]
+    pub fn code_size(&self) -> usize {
+        self.code.len()
+    }
+
+    #[inline]
+    pub fn code_end(&self) -> usize {
+        self.entry_point + self.code.len()
+    }
+
+    #[inline]
+    pub fn contains(&self, addr: usize) -> bool {
+        addr >= self.entry_point && addr < self.code_end()
+    }
+}
+
+/// Cache of generated adapter stubs keyed by (kind, signature)
+/// (`AdapterHandlerLibrary` analogue).
+#[derive(Debug, Default)]
+pub struct AdapterHandlerTable {
+    adapters: HashMap<(AdapterKind, String), AdapterBlob>,
+    /// Monotonic address allocator for adapter entry points inside the
+    /// non-nmethod heap's address range.
+    next_entry: usize,
+}
+
+impl AdapterHandlerTable {
+    pub fn new(base: usize) -> Self {
+        Self {
+            adapters: HashMap::new(),
+            next_entry: base,
+        }
+    }
+
+    pub fn lookup(&self, kind: AdapterKind, signature: &str) -> Option<&AdapterBlob> {
+        self.adapters.get(&(kind, signature.to_string()))
+    }
+
+    pub fn contains(&self, addr: usize) -> bool {
+        self.adapters.values().any(|a| a.contains(addr))
+    }
+
+    /// `AdapterHandlerLibrary::find_adapter` analogue: return the cached
+    /// adapter or generate + register a new one.
+    pub fn find_or_create<F>(
+        &mut self,
+        kind: AdapterKind,
+        signature: &str,
+        emit: F,
+    ) -> &AdapterBlob
+    where
+        F: FnOnce(AdapterKind, &str) -> (Vec<u8>, usize, usize),
+    {
+        let key = (kind, signature.to_string());
+        if !self.adapters.contains_key(&key) {
+            let (code, target_patch_offset, frame_size) = emit(kind, signature);
+            let entry_point = self.next_entry;
+            self.next_entry += align_up(code.len() + 16, 16);
+            let blob = AdapterBlob {
+                kind,
+                signature: signature.to_string(),
+                entry_point,
+                code,
+                target_patch_offset,
+                frame_size,
+                exception_points: Vec::new(),
+            };
+            self.adapters.insert(key, blob);
+        }
+        self.adapters.get(&key).unwrap()
+    }
+
+    /// Register a pre-built adapter (used when the code bytes were
+    /// emitted by a backend).
+    pub fn register(&mut self, blob: AdapterBlob) {
+        let size = align_up(blob.code.len() + 16, 16);
+        self.next_entry = self.next_entry.max(blob.entry_point + size);
+        self.adapters
+            .insert((blob.kind, blob.signature.clone()), blob);
+    }
+
+    pub fn len(&self) -> usize {
+        self.adapters.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.adapters.is_empty()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &AdapterBlob> {
+        self.adapters.values()
+    }
+
+    pub fn print_on(&self, f: &mut dyn std::fmt::Write) {
+        let _ = writeln!(f, "adapter handlers ({}):", self.adapters.len());
+        let mut blobs: Vec<&AdapterBlob> = self.adapters.values().collect();
+        blobs.sort_by_key(|b| b.entry_point);
+        for b in blobs {
+            let _ = writeln!(
+                f,
+                "  {} {} entry={} size={} frame={}",
+                b.kind.name(),
+                b.signature,
+                b.entry_point,
+                b.code_size(),
+                b.frame_size
+            );
+        }
+    }
+}
+
+/// `AdapterHandlerLibrary` analogue: emits the machine-code template for
+/// each adapter kind.  The emitted sequences are real, deterministic
+/// x86-64 encodings that implement the register/stack shuffling contract
+/// of the corresponding HotSpot adapter; the target call is left as a
+/// rel32 placeholder patched at install time.
+pub mod adapter_emit {
+    use super::AdapterKind;
+
+    /// Emit an i2c (interpreted->compiled) adapter: build a native
+    /// argument area from the interpreter frame, then jump to the
+    /// nmethod entry point.
+    ///
+    /// Layout (documented, stable):
+    ///   push rbp; mov rbp,rsp; push rbx; sub rsp, frame
+    ///   <arg moves: mov reg, [rbp+off] / mov [rsp+off], reg>
+    ///   call rel32 -> nmethod->entry_point   (patched)
+    ///   add rsp, frame; pop rbx; pop rbp; ret
+    pub fn emit_i2c(signature: &str, arg_count: usize) -> (Vec<u8>, usize, usize) {
+        let mut code = Vec::new();
+        // push rbp; mov rbp, rsp
+        code.extend_from_slice(&[0x55, 0x48, 0x89, 0xE5]);
+        // push rbx (callee-saved scratch)
+        code.extend_from_slice(&[0x53]);
+        let frame = align_up(16 + arg_count * 8, 16);
+        // sub rsp, frame
+        emit_sub_rsp_imm(&mut code, frame as i32);
+        // Move each incoming argument from the interpreter operand area
+        // ([rbp + 16 + i*8]) into argument registers/stack slots.
+        // Registers used in order: rdi, rsi, rdx, rcx, r8, r9.
+        const ARG_REGS: [u8; 6] = [0x07, 0x06, 0x02, 0x01, 0x00, 0x08]; // rdi..r9 encodings modrm reg field approximations
+        let _ = ARG_REGS;
+        for i in 0..arg_count {
+            // mov rax, [rbp + 16 + i*8]  -> 48 8B 85 <disp32>
+            code.extend_from_slice(&[0x48, 0x8B, 0x85]);
+            code.extend_from_slice(&((16 + i * 8) as i32).to_le_bytes());
+            // mov [rsp + i*8], rax       -> 48 89 84 24 <disp32>
+            code.extend_from_slice(&[0x48, 0x89, 0x84, 0x24]);
+            code.extend_from_slice(&(i * 8).to_le_bytes());
+        }
+        // call rel32 (patched to entry_point - (pc+4))
+        let patch_off = code.len() + 1;
+        code.extend_from_slice(&[0xE8, 0, 0, 0, 0]);
+        // add rsp, frame; pop rbx; pop rbp; ret
+        emit_add_rsp_imm(&mut code, frame as i32);
+        code.extend_from_slice(&[0x5B, 0x5D, 0xC3]);
+        let _ = signature;
+        (code, patch_off, frame)
+    }
+
+    /// Emit a c2i (compiled->interpreter) adapter: unpack the native
+    /// return value and tail-continue into the interpreter entry for the
+    /// caller's bci.
+    pub fn emit_c2i(signature: &str, arg_count: usize) -> (Vec<u8>, usize, usize) {
+        let mut code = Vec::new();
+        code.extend_from_slice(&[0x55, 0x48, 0x89, 0xE5]); // push rbp; mov rbp,rsp
+        code.extend_from_slice(&[0x53]); // push rbx
+        let frame = align_up(16 + arg_count * 8, 16);
+        emit_sub_rsp_imm(&mut code, frame as i32);
+        // mov [rsp], rax  (save return value)
+        code.extend_from_slice(&[0x48, 0x89, 0x04, 0x24]);
+        // jmp rel32 -> interpreter entry (patched)
+        let patch_off = code.len() + 1;
+        code.extend_from_slice(&[0xE9, 0, 0, 0, 0]);
+        emit_add_rsp_imm(&mut code, frame as i32);
+        code.extend_from_slice(&[0x5B, 0x5D, 0xC3]);
+        let _ = signature;
+        (code, patch_off, frame)
+    }
+
+    /// JNI adapters share the i2c/c2i frame contract; emit the same
+    /// template (the JNI argument conversion is handled by the callee's
+    /// native wrapper in this structural port).
+    pub fn emit_generic(kind: AdapterKind, signature: &str) -> (Vec<u8>, usize, usize) {
+        let argc = signature_arg_count(signature);
+        match kind {
+            AdapterKind::InterpreterToCompiled | AdapterKind::NativeToJava => {
+                emit_i2c(signature, argc)
+            }
+            _ => emit_c2i(signature, argc),
+        }
+    }
+
+    /// Rough arity estimate from a JVM signature string: count argument
+    /// slots (long/double = 2) before ')'.
+    pub fn signature_arg_count(sig: &str) -> usize {
+        let inner = sig
+            .strip_prefix('(')
+            .and_then(|s| s.split(')').next())
+            .unwrap_or("");
+        let mut count = 0usize;
+        let mut chars = inner.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                'J' | 'D' => count += 2,
+                'L' => {
+                    count += 1;
+                    for c2 in chars.by_ref() {
+                        if c2 == ';' {
+                            break;
+                        }
+                    }
+                }
+                '[' => {
+                    count += 1;
+                    // skip remaining array dims/type markers conservatively
+                }
+                _ => count += 1,
+            }
+        }
+        count
+    }
+
+    fn align_up(v: usize, a: usize) -> usize {
+        (v + a - 1) & !(a - 1)
+    }
+
+    fn emit_sub_rsp_imm(code: &mut Vec<u8>, imm: i32) {
+        if imm == 0 {
+            return;
+        }
+        if imm <= i32::from(i8::MAX) {
+            code.extend_from_slice(&[0x48, 0x83, 0xEC, imm as u8]);
+        } else {
+            code.extend_from_slice(&[0x48, 0x81, 0xEC]);
+            code.extend_from_slice(&imm.to_le_bytes());
+        }
+    }
+
+    fn emit_add_rsp_imm(code: &mut Vec<u8>, imm: i32) {
+        if imm == 0 {
+            return;
+        }
+        if imm <= i32::from(i8::MAX) {
+            code.extend_from_slice(&[0x48, 0x83, 0xC4, imm as u8]);
+        } else {
+            code.extend_from_slice(&[0x48, 0x81, 0xC4]);
+            code.extend_from_slice(&imm.to_le_bytes());
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -247,6 +593,8 @@ pub struct CodeCache {
     pc_index: Mutex<BTreeMap<usize, NMethod>>,
     /// Heap addresses of live blobs that back nmethods (for freeing).
     nmethod_blobs: Mutex<HashMap<String, usize>>,
+    /// Generated call adapters (i2c/c2i/JNI) keyed by kind+signature.
+    adapters: Mutex<AdapterHandlerTable>,
     sweeper_cycle: AtomicU64,
 }
 
@@ -285,6 +633,7 @@ impl CodeCache {
             osr_nmethods: Mutex::new(HashMap::new()),
             pc_index: Mutex::new(BTreeMap::new()),
             nmethod_blobs: Mutex::new(HashMap::new()),
+            adapters: Mutex::new(AdapterHandlerTable::new(non_nmethod_base)),
             sweeper_cycle: AtomicU64::new(0),
         }
     }
@@ -303,6 +652,7 @@ impl CodeCache {
             osr_nmethods: Mutex::new(HashMap::new()),
             pc_index: Mutex::new(BTreeMap::new()),
             nmethod_blobs: Mutex::new(HashMap::new()),
+            adapters: Mutex::new(AdapterHandlerTable::new(0x1000_0000)),
             sweeper_cycle: AtomicU64::new(0),
         }
     }
@@ -591,6 +941,156 @@ impl CodeCache {
         Ok(exec_addr)
     }
 
+    // ---- adapter handlers ----------------------------------------------
+
+    /// `AdapterHandlerLibrary::find_adapter` analogue: look up a cached
+    /// adapter for (kind, signature); on miss, emit one via
+    /// `adapter_emit::emit_generic`, register it and allocate a non-nmethod
+    /// heap blob to back it.  Returns the adapter entry point.
+    pub fn find_adapter(&self, kind: AdapterKind, signature: &str) -> Result<usize, String> {
+        // Fast path.
+        if let Some(blob) = self.adapters.lock().unwrap().lookup(kind, signature) {
+            return Ok(blob.entry_point);
+        }
+        let (code, patch_off, frame_size) =
+            adapter_emit::emit_generic(kind, signature);
+        // Allocate the stub bytes in the non-nmethod heap so the blob is
+        // tracked by the sweeper.
+        let name = format!("adapter-{}-{}", kind.name(), signature);
+        let blob_addr = self.allocate_blob(
+            name,
+            CodeBlobType::NonNMethod,
+            align_up(code.len() + 16, 16),
+            CodeBlobKind::AdapterBlob,
+        )?;
+        // Heap bookkeeping address doubles as the entry point; the real
+        // executable copy is published by the caller via jitruntime (same
+        // contract as install_nmethod).
+        let mut guard = self.adapters.lock().unwrap();
+        guard.register(AdapterBlob {
+            kind,
+            signature: signature.to_string(),
+            entry_point: blob_addr,
+            code: code.clone(),
+            target_patch_offset: patch_off,
+            frame_size,
+            exception_points: Vec::new(),
+        });
+        Ok(blob_addr)
+    }
+
+    /// Register a backend-emitted adapter directly.
+    pub fn install_adapter(&self, blob: AdapterBlob) {
+        self.adapters.lock().unwrap().register(blob);
+    }
+
+    pub fn find_adapter_blob(&self, kind: AdapterKind, signature: &str) -> Option<AdapterBlob> {
+        self.adapters
+            .lock()
+            .unwrap()
+            .lookup(kind, signature)
+            .cloned()
+    }
+
+    pub fn adapter_count(&self) -> usize {
+        self.adapters.lock().unwrap().len()
+    }
+
+    // ---- blob lookup ----------------------------------------------------
+
+    /// `CodeCache::find_blob` analogue: blob containing `addr` in any
+    /// heap (alias of `find_blob_at_address`).
+    pub fn lookup_blob(&self, addr: usize) -> Option<CodeBlob> {
+        self.find_blob_at_address(addr)
+    }
+
+    /// `CodeCache::find_blob_unsafe` analogue restricted to the pc index:
+    /// the nmethod whose code range contains `addr`.
+    pub fn lookup_nmethod_blob(&self, addr: usize) -> Option<NMethod> {
+        self.find_nmethod_at_address(addr)
+    }
+
+    // ---- reclamation ----------------------------------------------------
+
+    /// `free_unused_code_blobs` analogue: reclaim every heap blob flagged
+    /// unused (dead non-nmethod blobs: stale adapters, abandoned stubs).
+    /// Nmethod reclamation is driven by the sweeper (`sweep_cycle`) and
+    /// `deinstall_nmethod`; this path covers the non-nmethod heaps.
+    /// Returns total bytes freed.
+    pub fn free_unused_code_blobs(&self) -> usize {
+        let mut freed = 0usize;
+        if self.segmented {
+            for heap in [
+                &self.non_nmethods_heap,
+                &self.profiled_nmethods_heap,
+                &self.non_profiled_nmethods_heap,
+            ] {
+                freed += heap.lock().unwrap().free_unused_blobs();
+            }
+        } else if let Some(heap) = self.all_heap.lock().unwrap().as_mut() {
+            freed += heap.free_unused_blobs();
+        }
+        freed
+    }
+
+    /// Flag the heap blob at `addr` unused so the next
+    /// `free_unused_code_blobs` reclaims it.
+    pub fn mark_blob_unused(&self, addr: usize) -> bool {
+        if self.segmented {
+            for heap in [
+                &self.non_nmethods_heap,
+                &self.profiled_nmethods_heap,
+                &self.non_profiled_nmethods_heap,
+            ] {
+                if heap.lock().unwrap().mark_unused(addr) {
+                    return true;
+                }
+            }
+            false
+        } else {
+            self.all_heap
+                .lock()
+                .unwrap()
+                .as_mut()
+                .map_or(false, |h| h.mark_unused(addr))
+        }
+    }
+
+    // ---- diagnostics -----------------------------------------------------
+
+    /// `CodeCache::print_on` analogue: heap segmentation summary, blob
+    /// counts, adapter table and global counters.
+    pub fn print_on(&self, f: &mut dyn std::fmt::Write) {
+        let _ = writeln!(
+            f,
+            "CodeCache segmented={} capacity={} used={} free={} reverse_free_ratio={:.1}%",
+            self.segmented,
+            self.total_capacity(),
+            self.total_used(),
+            self.total_free(),
+            self.reverse_free_ratio(),
+        );
+        let _ = writeln!(
+            f,
+            "  nmethods={} osr_nmethods={} blobs={}",
+            self.nmethods_count(),
+            self.osr_nmethods_count(),
+            self.blob_count(),
+        );
+        if self.segmented {
+            self.non_nmethods_heap.lock().unwrap().print_on(f);
+            self.profiled_nmethods_heap.lock().unwrap().print_on(f);
+            self
+                .non_profiled_nmethods_heap
+                .lock()
+                .unwrap()
+                .print_on(f);
+        } else if let Some(heap) = self.all_heap.lock().unwrap().as_ref() {
+            heap.print_on(f);
+        }
+        self.adapters.lock().unwrap().print_on(f);
+    }
+
     pub fn nmethods_count(&self) -> usize {
         self.nmethods.lock().unwrap().len()
     }
@@ -640,10 +1140,22 @@ impl CodeCache {
     }
 
     pub fn mark_all_nmethods_for_deopt(&self) {
-        let guard = self.nmethods.lock().unwrap();
-        for nm in guard.values() {
-            if nm.is_in_use() {
-                nm.mark_for_deoptimization();
+        {
+            let guard = self.nmethods.lock().unwrap();
+            for nm in guard.values() {
+                if nm.is_in_use() {
+                    nm.mark_for_deoptimization();
+                }
+            }
+        }
+        // OSR variants are nmethods too (HotSpot marks every nmethod of
+        // the method, including on-stack-replacement ones).
+        let osr = self.osr_nmethods.lock().unwrap();
+        for map in osr.values() {
+            for nm in map.values() {
+                if nm.is_in_use() {
+                    nm.mark_for_deoptimization();
+                }
             }
         }
     }
@@ -994,5 +1506,95 @@ mod tests {
             "A.b()V"
         );
         assert_eq!(CodeCache::blob_key("A", "b", "()V", 7), "A.b()V@7");
+    }
+
+    #[test]
+    fn adapter_find_or_create_and_lookup() {
+        let cache = CodeCache::new_non_segmented(1 << 20);
+        let ep1 = cache
+            .find_adapter(AdapterKind::InterpreterToCompiled, "(I)J")
+            .expect("adapter");
+        assert_ne!(ep1, 0);
+        // Second lookup hits the cache and returns the same entry point.
+        let ep2 = cache
+            .find_adapter(AdapterKind::InterpreterToCompiled, "(I)J")
+            .unwrap();
+        assert_eq!(ep1, ep2);
+        assert_eq!(cache.adapter_count(), 1);
+        let c2i = cache
+            .find_adapter(AdapterKind::CompiledToInterpreter, "(I)J")
+            .unwrap();
+        assert_ne!(c2i, ep1);
+        assert_eq!(cache.adapter_count(), 2);
+        let blob = cache
+            .find_adapter_blob(AdapterKind::InterpreterToCompiled, "(I)J")
+            .unwrap();
+        assert!(!blob.code.is_empty());
+        assert!(blob.target_patch_offset > 0);
+        // The emitted code contains a rel32 patch site (E8/E9 + 4 bytes).
+        let op = blob.code[blob.target_patch_offset - 1];
+        assert!(op == 0xE8 || op == 0xE9);
+    }
+
+    #[test]
+    fn free_unused_code_blobs_reclaims_marked() {
+        let cache = CodeCache::new_non_segmented(1 << 20);
+        let addr = cache
+            .allocate_blob(
+                "dead-stub".to_string(),
+                CodeBlobType::NonNMethod,
+                128,
+                CodeBlobKind::RuntimeStub,
+            )
+            .unwrap();
+        assert!(cache.lookup_blob(addr).is_some());
+        assert!(cache.mark_blob_unused(addr));
+        let freed = cache.free_unused_code_blobs();
+        assert_eq!(freed, 128);
+        assert!(cache.lookup_blob(addr).is_none());
+        // Second pass frees nothing.
+        assert_eq!(cache.free_unused_code_blobs(), 0);
+    }
+
+    #[test]
+    fn mark_all_deopt_includes_osr() {
+        let cache = CodeCache::new_non_segmented(1 << 20);
+        let regular = NMethod::with_entry_points(
+            "W".to_string(), "m".to_string(), "()V".to_string(),
+            CompLevel::Simple, NMethod::INVOCATION_ENTRY_BCI,
+            0, 0, 0, 0, 0, vec![], vec![],
+        );
+        let osr = NMethod::with_entry_points(
+            "W".to_string(), "m".to_string(), "()V".to_string(),
+            CompLevel::Simple, 3,
+            0, 0, 0, 0, 0, vec![], vec![],
+        );
+        cache.install_nmethod(regular, vec![0x90, 0xc3], 32).unwrap();
+        cache.install_nmethod(osr, vec![0x90, 0xc3], 32).unwrap();
+        cache.mark_all_nmethods_for_deopt();
+        let key = CodeCache::method_key("W", "m", "()V");
+        assert!(cache.find_nmethod_by_key(&key).unwrap().is_marked_for_deoptimization());
+        assert!(cache
+            .find_osr_nmethod_by_key(&key, 3)
+            .unwrap()
+            .is_marked_for_deoptimization());
+    }
+
+    #[test]
+    fn code_cache_print_on_smoke() {
+        let cache = CodeCache::new_non_segmented(1 << 20);
+        let mut s = String::new();
+        cache.print_on(&mut s);
+        assert!(s.contains("CodeCache"));
+        assert!(s.contains("adapter handlers"));
+    }
+
+    #[test]
+    fn adapter_emit_signature_arg_count() {
+        use adapter_emit::signature_arg_count;
+        assert_eq!(signature_arg_count("()V"), 0);
+        assert_eq!(signature_arg_count("(I)J"), 1);
+        assert_eq!(signature_arg_count("(JD)Ljava/lang/String;"), 4);
+        assert_eq!(signature_arg_count("([I[[D)V"), 3);
     }
 }

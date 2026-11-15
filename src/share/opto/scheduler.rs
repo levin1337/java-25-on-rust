@@ -86,8 +86,8 @@ pub fn mem_index(op: &Opcode) -> Option<usize> {
     match op {
         LoadI | LoadL | LoadF | LoadD | LoadP | LoadB | LoadC | LoadS
         | StoreI | StoreL | StoreF | StoreD | StoreP | StoreB | StoreC | StoreS
-        | New(_) | NewArray(_) | NewArrayRef(_) | Call(_) | CheckCast(_) | InstanceOf(_)
-        | MonitorEnter | MonitorExit | Athrow => Some(0),
+        | New(_) | NewArray(_) | NewArrayRef(_) | MultianewArray | Call(_)
+        | CheckCast(_) | InstanceOf(_) | MonitorEnter | MonitorExit | Athrow => Some(0),
         _ => None,
     }
 }
@@ -100,8 +100,8 @@ pub fn ctrl_index(op: &Opcode) -> Option<usize> {
         Athrow => Some(1),
         LoadI | LoadL | LoadF | LoadD | LoadP | LoadB | LoadC | LoadS
         | StoreI | StoreL | StoreF | StoreD | StoreP | StoreB | StoreC | StoreS
-        | New(_) | NewArray(_) | NewArrayRef(_) | Call(_) | CheckCast(_) | InstanceOf(_)
-        | MonitorEnter | MonitorExit | ArrayLength => Some(1),
+        | New(_) | NewArray(_) | NewArrayRef(_) | MultianewArray | Call(_)
+        | CheckCast(_) | InstanceOf(_) | MonitorEnter | MonitorExit | ArrayLength => Some(1),
         _ => None,
     }
 }
@@ -122,6 +122,9 @@ pub fn produces_mem(op: &Opcode) -> bool {
             | Opcode::New(_)
             | Opcode::NewArray(_)
             | Opcode::NewArrayRef(_)
+            | Opcode::MultianewArray
+            | Opcode::MonitorEnter
+            | Opcode::MonitorExit
             | Opcode::Call(_)
     )
 }
@@ -142,6 +145,7 @@ pub fn produces_value(op: &Opcode) -> bool {
             | Opcode::New(_)
             | Opcode::NewArray(_)
             | Opcode::NewArrayRef(_)
+            | Opcode::MultianewArray
             | Opcode::CheckCast(_)
             | Opcode::InstanceOf(_)
             | Opcode::ArrayLength
@@ -158,6 +162,7 @@ pub fn updates_ctrl(op: &Opcode) -> bool {
         Opcode::New(_)
             | Opcode::NewArray(_)
             | Opcode::NewArrayRef(_)
+            | Opcode::MultianewArray
             | Opcode::Call(_)
             | Opcode::MonitorEnter
             | Opcode::MonitorExit
@@ -333,12 +338,23 @@ impl<'a> Scheduler<'a> {
         let mut emitted_fx: HashSet<NodeId> = HashSet::new();
         let entry_op = self.gvn.node(entry).op.clone();
         loop {
-            // Candidates control-dependent on this block's entry control.
-            let candidates = self
+            // Candidates control-dependent on this block's entry control,
+            // plus effects chained onto the current exit control token
+            // (calls/news/monitors advance it inside the block).
+            let mut candidates = self
                 .ctrl_users
                 .get(&entry)
                 .cloned()
                 .unwrap_or_default();
+            if exit_ctrl != entry
+                && let Some(extra) = self.ctrl_users.get(&exit_ctrl)
+            {
+                for &n in extra {
+                    if !candidates.contains(&n) {
+                        candidates.push(n);
+                    }
+                }
+            }
             // Emit every non-memory-updating effect that reads cur_mem.
             let mut emitted_effect = false;
             for &n in &candidates {
@@ -583,6 +599,7 @@ pub fn collect_materialized(
         | Opcode::New(_)
         | Opcode::NewArray(_)
         | Opcode::NewArrayRef(_)
+        | Opcode::MultianewArray
         | Opcode::CheckCast(_)
         | Opcode::InstanceOf(_)
         | Opcode::ArrayLength

@@ -324,4 +324,85 @@ mod tests {
         // skip first encoded int (1 -> single byte 0x02)
         assert_eq!(r.read_int(), Some(22));
     }
+
+    #[test]
+    fn boundary_191_192() {
+        // 191 is the single-byte ceiling; 192 is the first multibyte.
+        for v in [190u32, 191] {
+            let mut buf = Vec::new();
+            write_uint(v, &mut buf);
+            assert_eq!(buf.len(), 1, "value {} must be single-byte", v);
+        }
+        let mut buf = Vec::new();
+        write_uint(192, &mut buf);
+        assert_eq!(buf.len(), 2);
+        assert_eq!(buf[0], 192);
+        let mut pos = 0usize;
+        assert_eq!(read_uint(&buf, &mut pos), Some(192));
+        // Just below and above the 2-byte ceiling (8191/8192 per the
+        // 7-bits-per-continuation-byte layout).
+        for v in [8190u32, 8191, 8192, 1 << 20, u32::MAX] {
+            let mut buf = Vec::new();
+            write_uint(v, &mut buf);
+            let mut pos = 0usize;
+            assert_eq!(read_uint(&buf, &mut pos), Some(v), "round trip {}", v);
+            assert_eq!(pos, buf.len());
+        }
+    }
+
+    #[test]
+    fn encoded_length_boundaries() {
+        assert_eq!(encoded_length(191), 1);
+        assert_eq!(encoded_length(192), 2);
+        assert_eq!(encoded_length(8191), 2);
+        assert_eq!(encoded_length(8192), 3);
+        assert_eq!(encoded_length(u32::MAX), 5);
+    }
+
+    #[test]
+    fn malformed_continuations() {
+        // Marker byte promises continuation bytes; a truncated or
+        // zero-containing sequence must be rejected.
+        for first in [192u8, 200, 255] {
+            assert_eq!(read_uint(&[first], &mut 0), None, "byte {}", first);
+            assert_eq!(read_uint(&[first, 1], &mut 0), None, "byte {}+1", first);
+        }
+        // Zero continuation byte is excluded.
+        let mut buf = Vec::new();
+        write_uint(1000, &mut buf);
+        // Corrupt a continuation byte to 0.
+        if buf.len() >= 3 {
+            buf[2] = 0;
+            assert_eq!(read_uint(&buf, &mut 0), None);
+        }
+    }
+
+    #[test]
+    fn concatenated_multibyte() {
+        let mut w = CompressedWriteStream::new();
+        for v in [0u32, 191, 192, 500, u32::MAX] {
+            w.write_int(v);
+        }
+        let data = w.into_buffer();
+        let mut r = CompressedReadStream::new(&data);
+        for expected in [0u32, 191, 192, 500, u32::MAX] {
+            assert_eq!(r.read_int(), Some(expected));
+        }
+        assert!(r.eof());
+    }
+
+    #[test]
+    fn seek_position_reads() {
+        let mut w = CompressedWriteStream::new();
+        w.write_int(42);
+        w.write_int(5000);
+        w.write_int(7);
+        let data = w.into_buffer();
+        // Record the offset of the second value by streaming.
+        let mut probe = CompressedReadStream::new(&data);
+        assert_eq!(probe.read_int(), Some(42));
+        let off2 = probe.position();
+        let mut r = CompressedReadStream::new_at(&data, off2);
+        assert_eq!(r.read_int(), Some(5000));
+    }
 }

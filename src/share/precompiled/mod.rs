@@ -1,3 +1,1 @@
-/*
- * OpenJDK 25 HotSpot precompiled/ port
- */
+pub mod precompiled;

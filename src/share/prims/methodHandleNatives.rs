@@ -578,13 +578,6 @@ fn natives_init<'a>(loader: &ClassLoader<'a>, arguments: &[Value<'a>]) -> io::Re
         } else {
             IS_METHOD
         };
-        flags |= (if reflect_name == b"java/lang/reflect/Constructor" {
-            REF_NEW_INVOKE_SPECIAL
-        } else if modifiers & u32::from(ACC_STATIC) != 0 {
-            REF_INVOKE_STATIC
-        } else {
-            REF_INVOKE_VIRTUAL
-        }) << REF_KIND_SHIFT;
         // Build the MethodType via MethodType.methodType(rtype, ptypes).
         let rtype = if reflect_name == b"java/lang/reflect/Constructor" {
             clazz_value

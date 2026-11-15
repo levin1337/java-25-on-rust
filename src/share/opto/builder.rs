@@ -9,9 +9,12 @@
  */
 
 use super::gvn::PhaseGVN;
-use super::node::{ArrayElemKind, CmpCondition, NodeId, Opcode, NONE};
+use super::node::{
+    call_pack, ArrayElemKind, CallResult, CmpCondition, NodeId, Opcode, NONE,
+};
 use crate::share::interpreter::bytecode::{self, Bytecode};
 use crate::share::interpreter::bytecodes::{self, Code};
+use super::ci_shim::{CiSignature, CiSignatureKind};
 use std::collections::{BTreeSet, HashMap};
 
 pub const CON_P_NULL: u32 = 0;
@@ -39,9 +42,30 @@ pub struct FieldAccess {
 
 #[derive(Clone, Copy, Debug)]
 pub struct MethodAccess {
+    /// Number of argument values popped from the operand stack
+    /// (receiver excluded; long/double count as one stack value).
     pub nargs: usize,
     pub has_receiver: bool,
-    pub result_slots: u8,
+    pub result: CallResult,
+}
+
+impl MethodAccess {
+    pub fn from_descriptor(desc: &str, has_receiver: bool) -> Option<Self> {
+        let sig = CiSignature::parse(desc)?;
+        let result = match sig.ret {
+            CiSignatureKind::Void => CallResult::Void,
+            CiSignatureKind::Int => CallResult::I32,
+            CiSignatureKind::Long => CallResult::I64,
+            CiSignatureKind::Float => CallResult::F32,
+            CiSignatureKind::Double => CallResult::F64,
+            CiSignatureKind::Object => CallResult::Ref,
+        };
+        Some(Self {
+            nargs: sig.args.len(),
+            has_receiver,
+            result,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -53,10 +77,22 @@ pub enum ConstVal {
     String(u32),
 }
 
+/// Resolved constant-pool site triple (owner class / member name /
+/// descriptor) consumed by the runtime stubs through a leaked
+/// `StubSite` pointer — the C2 analogue of the ciInterface field /
+/// method / klass resolution in `share/opto/parse*.cpp`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SiteInfo {
+    pub class: String,
+    pub name: String,
+    pub desc: String,
+}
+
 pub struct BuilderContext<'a> {
     pub fields: &'a HashMap<u16, FieldAccess>,
     pub methods: &'a HashMap<u16, MethodAccess>,
     pub constants: &'a HashMap<u16, ConstVal>,
+    pub sites: &'a HashMap<u16, SiteInfo>,
 }
 
 impl<'a> BuilderContext<'a> {
@@ -67,11 +103,20 @@ impl<'a> BuilderContext<'a> {
             std::sync::LazyLock::new(HashMap::new);
         static EMPTY_C: std::sync::LazyLock<HashMap<u16, ConstVal>> =
             std::sync::LazyLock::new(HashMap::new);
+        static EMPTY_S: std::sync::LazyLock<HashMap<u16, SiteInfo>> =
+            std::sync::LazyLock::new(HashMap::new);
         Self {
             fields: &EMPTY_F,
             methods: &EMPTY_M,
             constants: &EMPTY_C,
+            sites: &EMPTY_S,
         }
+    }
+
+    pub fn with_sites(sites: &'a HashMap<u16, SiteInfo>) -> Self {
+        let mut ctx = Self::empty();
+        ctx.sites = sites;
+        ctx
     }
 }
 
@@ -180,6 +225,7 @@ pub struct BytecodeGraphBuilder<'a> {
     root_id: NodeId,
     zero: NodeId,
     halt: NodeId,
+    site_cache: HashMap<u16, NodeId>,
     result: BuildResult,
 }
 
@@ -204,6 +250,7 @@ impl<'a> BytecodeGraphBuilder<'a> {
             root_id: root,
             zero: NONE,
             halt: NONE,
+            site_cache: HashMap::new(),
             result: BuildResult::default(),
         };
         b.zero = b.gvn.con_i(0);
@@ -807,6 +854,37 @@ impl<'a> BytecodeGraphBuilder<'a> {
         })
     }
 
+    fn site_node(&mut self, cp: u16) -> NodeId {
+        if let Some(&n) = self.site_cache.get(&cp) {
+            return n;
+        }
+        let ptr = self
+            .ctx
+            .sites
+            .get(&cp)
+            .map(|s| leak_stub_site(s))
+            .unwrap_or(0);
+        let n = self.gvn.transform(Opcode::SitePtr(ptr), vec![]);
+        self.site_cache.insert(cp, n);
+        n
+    }
+
+    fn field_kind_for(&self, cp: u16, fa: Option<&FieldAccess>) -> Option<FieldKind> {
+        if let Some(fa) = fa {
+            return Some(fa.kind);
+        }
+        let site = self.ctx.sites.get(&cp)?;
+        kind_from_desc(&site.desc)
+    }
+
+    fn method_access_for(&self, cp: u16, has_receiver: bool) -> Option<MethodAccess> {
+        if let Some(m) = self.ctx.methods.get(&cp) {
+            return Some(*m);
+        }
+        let site = self.ctx.sites.get(&cp)?;
+        MethodAccess::from_descriptor(&site.desc, has_receiver)
+    }
+
     fn exec_instr(&mut self, bci: usize, method: &MethodCode, frame: &mut Frame) {
         let op_byte = self.code[bci];
         if op_byte == 0xc4 {
@@ -1353,28 +1431,26 @@ impl<'a> BytecodeGraphBuilder<'a> {
                 self.result.returns += 1;
             }
             Getstatic | Putstatic => {
-                let cp = bc.get_u2(1).unwrap_or(0);
-                match self.ctx.fields.get(&cp) {
-                    Some(fa) => {
+                let cp = bc.get_u2(1).unwrap_or(0) as u16;
+                let fa = self.ctx.fields.get(&cp).copied();
+                match self.field_kind_for(cp, fa.as_ref()) {
+                    Some(kind) => {
+                        let site = self.site_node(cp);
                         if code == Getstatic {
-                            let op = Self::load_op(fa.kind);
-                            let base = self.gvn.con_p(CON_P_STATIC);
-                            let off = self.gvn.con_i(fa.offset as i32);
-                            let n = self.gvn.transform(
-                                op,
-                                vec![frame.mem, frame.ctrl, base, off],
-                            );
+                            let op = Self::load_op(kind);
+                            let n = self
+                                .gvn
+                                .transform(op, vec![frame.mem, frame.ctrl, site]);
                             let cat2 =
-                                matches!(fa.kind, FieldKind::Long | FieldKind::Double);
+                                matches!(kind, FieldKind::Long | FieldKind::Double);
                             self.push(frame, n, cat2);
+                            self.maybe_throw(bci, n, frame);
                         } else {
                             let v = self.pop(frame);
-                            let op = Self::store_op(fa.kind);
-                            let base = self.gvn.con_p(CON_P_STATIC);
-                            let off = self.gvn.con_i(fa.offset as i32);
+                            let op = Self::store_op(kind);
                             let n = self.gvn.alloc(
                                 op,
-                                vec![frame.mem, frame.ctrl, base, off, v],
+                                vec![frame.mem, frame.ctrl, v, site],
                             );
                             frame.mem = n;
                             self.maybe_throw(bci, n, frame);
@@ -1384,29 +1460,31 @@ impl<'a> BytecodeGraphBuilder<'a> {
                 }
             }
             Getfield | Putfield => {
-                let cp = bc.get_u2(1).unwrap_or(0);
-                match self.ctx.fields.get(&cp) {
-                    Some(fa) => {
+                let cp = bc.get_u2(1).unwrap_or(0) as u16;
+                let fa = self.ctx.fields.get(&cp).copied();
+                match self.field_kind_for(cp, fa.as_ref()) {
+                    Some(kind) => {
+                        let site = self.site_node(cp);
+                        let off = fa.map(|f| f.offset as i32).unwrap_or(0);
+                        let offn = self.gvn.con_i(off);
                         if code == Getfield {
                             let obj = self.pop(frame);
-                            let op = Self::load_op(fa.kind);
-                            let off = self.gvn.con_i(fa.offset as i32);
+                            let op = Self::load_op(kind);
                             let n = self.gvn.transform(
                                 op,
-                                vec![frame.mem, frame.ctrl, obj, off],
+                                vec![frame.mem, frame.ctrl, obj, offn, site],
                             );
                             let cat2 =
-                                matches!(fa.kind, FieldKind::Long | FieldKind::Double);
+                                matches!(kind, FieldKind::Long | FieldKind::Double);
                             self.push(frame, n, cat2);
                             self.maybe_throw(bci, n, frame);
                         } else {
                             let v = self.pop(frame);
                             let obj = self.pop(frame);
-                            let op = Self::store_op(fa.kind);
-                            let off = self.gvn.con_i(fa.offset as i32);
+                            let op = Self::store_op(kind);
                             let n = self.gvn.alloc(
                                 op,
-                                vec![frame.mem, frame.ctrl, obj, off, v],
+                                vec![frame.mem, frame.ctrl, obj, offn, v, site],
                             );
                             frame.mem = n;
                             self.maybe_throw(bci, n, frame);
@@ -1417,13 +1495,14 @@ impl<'a> BytecodeGraphBuilder<'a> {
             }
             Invokevirtual | Invokespecial | Invokestatic | Invokeinterface
             | Invokedynamic => {
-                let cp = bc.get_u2(1).unwrap_or(0);
-                let ma = self.ctx.methods.get(&cp).copied();
-                let (nargs, has_recv, res) = match ma {
-                    Some(m) => (m.nargs, m.has_receiver, m.result_slots),
+                let cp = bc.get_u2(1).unwrap_or(0) as u16;
+                let has_recv = !matches!(code, Invokestatic | Invokedynamic);
+                let ma = self.method_access_for(cp, has_recv);
+                let (nargs, has_receiver, res) = match ma {
+                    Some(m) => (m.nargs, m.has_receiver, m.result),
                     None => {
                         self.unsupported(bci, "invoke unresolved");
-                        (0, false, 0)
+                        (0, false, CallResult::Void)
                     }
                 };
                 let mut args: Vec<NodeId> = Vec::with_capacity(nargs);
@@ -1431,7 +1510,7 @@ impl<'a> BytecodeGraphBuilder<'a> {
                     args.push(self.pop(frame));
                 }
                 args.reverse();
-                let recv = if has_recv {
+                let recv = if has_receiver {
                     Some(self.pop(frame))
                 } else {
                     None
@@ -1441,19 +1520,26 @@ impl<'a> BytecodeGraphBuilder<'a> {
                     inputs.push(r);
                 }
                 inputs.extend(args);
-                let call = self.gvn.alloc(Opcode::Call(cp as u32), inputs);
+                inputs.push(self.site_node(cp));
+                let payload = call_pack(
+                    cp as u32,
+                    code as u8,
+                    res,
+                );
+                let call = self.gvn.alloc(Opcode::Call(payload), inputs);
                 frame.ctrl = call;
                 frame.mem = call;
-                if res > 0 {
-                    self.push(frame, call, res == 2);
+                if res != CallResult::Void {
+                    self.push(frame, call, matches!(res, CallResult::I64 | CallResult::F64));
                 }
                 self.maybe_throw(bci, call, frame);
             }
             New => {
-                let cp = bc.get_u2(1).unwrap_or(0);
+                let cp = bc.get_u2(1).unwrap_or(0) as u16;
+                let site = self.site_node(cp);
                 let n = self
                     .gvn
-                    .alloc(Opcode::New(cp as u32), vec![frame.mem, frame.ctrl]);
+                    .alloc(Opcode::New(cp as u32), vec![frame.mem, frame.ctrl, site]);
                 frame.ctrl = n;
                 frame.mem = n;
                 self.push(frame, n, false);
@@ -1472,18 +1558,32 @@ impl<'a> BytecodeGraphBuilder<'a> {
                 self.maybe_throw(bci, n, frame);
             }
             Anewarray => {
-                let cp = bc.get_u2(1).unwrap_or(0);
+                let cp = bc.get_u2(1).unwrap_or(0) as u16;
                 let size = self.pop(frame);
+                let site = self.site_node(cp);
                 let n = self.gvn.alloc(
                     Opcode::NewArrayRef(cp as u32),
-                    vec![frame.mem, frame.ctrl, size],
+                    vec![frame.mem, frame.ctrl, size, site],
                 );
                 frame.ctrl = n;
                 frame.mem = n;
                 self.push(frame, n, false);
                 self.maybe_throw(bci, n, frame);
             }
-            Multianewarray => self.unsupported(bci, "multianewarray"),
+            Multianewarray => {
+                let dims = bc.get_u1(2).unwrap_or(0) as usize;
+                for _ in 0..dims {
+                    self.pop(frame);
+                }
+                let n = self.gvn.alloc(
+                    Opcode::MultianewArray,
+                    vec![frame.mem, frame.ctrl],
+                );
+                frame.ctrl = n;
+                frame.mem = n;
+                self.push(frame, n, false);
+                self.maybe_throw(bci, n, frame);
+            }
             Arraylength => {
                 let arr = self.pop(frame);
                 let n = self.gvn.alloc(
@@ -1504,21 +1604,23 @@ impl<'a> BytecodeGraphBuilder<'a> {
                 }
             }
             Checkcast => {
-                let cp = bc.get_u2(1).unwrap_or(0);
+                let cp = bc.get_u2(1).unwrap_or(0) as u16;
                 let obj = self.pop(frame);
+                let site = self.site_node(cp);
                 let n = self.gvn.transform(
                     Opcode::CheckCast(cp as u32),
-                    vec![frame.mem, frame.ctrl, obj],
+                    vec![frame.mem, frame.ctrl, obj, site],
                 );
                 self.push(frame, n, false);
                 self.maybe_throw(bci, n, frame);
             }
             Instanceof => {
-                let cp = bc.get_u2(1).unwrap_or(0);
+                let cp = bc.get_u2(1).unwrap_or(0) as u16;
                 let obj = self.pop(frame);
+                let site = self.site_node(cp);
                 let n = self.gvn.alloc(
                     Opcode::InstanceOf(cp as u32),
-                    vec![frame.mem, frame.ctrl, obj],
+                    vec![frame.mem, frame.ctrl, obj, site],
                 );
                 self.push(frame, n, false);
                 self.maybe_throw(bci, n, frame);
@@ -1532,6 +1634,7 @@ impl<'a> BytecodeGraphBuilder<'a> {
                 };
                 let n = self.gvn.alloc(op, vec![frame.mem, frame.ctrl, obj]);
                 frame.ctrl = n;
+                frame.mem = n;
                 self.maybe_throw(bci, n, frame);
             }
             _ => self.unsupported(bci, "unhandled"),
@@ -1782,4 +1885,96 @@ impl<'a> BytecodeGraphBuilder<'a> {
             }
         }
     }
+}
+
+fn leak_bytes(bytes: &[u8]) -> *const u8 {
+    let leaked: &'static mut [u8] = Box::leak(bytes.to_vec().into_boxed_slice());
+    leaked.as_ptr()
+}
+
+pub fn leak_stub_site(site: &SiteInfo) -> u64 {
+    let leaked = Box::leak(Box::new(crate::share::c1::c1_LIR::StubSite {
+        class: leak_bytes(site.class.as_bytes()),
+        class_len: site.class.len(),
+        name: leak_bytes(site.name.as_bytes()),
+        name_len: site.name.len(),
+        desc: leak_bytes(site.desc.as_bytes()),
+        desc_len: site.desc.len(),
+    }));
+    leaked as *const crate::share::c1::c1_LIR::StubSite as u64
+}
+
+pub fn kind_from_desc(desc: &str) -> Option<FieldKind> {
+    Some(match desc.as_bytes().first()? {
+        b'I' => FieldKind::Int,
+        b'J' => FieldKind::Long,
+        b'F' => FieldKind::Float,
+        b'D' => FieldKind::Double,
+        b'B' => FieldKind::Byte,
+        b'C' => FieldKind::Char,
+        b'S' => FieldKind::Short,
+        b'Z' => FieldKind::Bool,
+        b'L' | b'[' => FieldKind::Ref,
+        _ => return None,
+    })
+}
+
+pub fn resolve_sites(
+    klass: &crate::share::oops::instanceKlass::InstanceKlass<'_>,
+    code: &[u8],
+) -> HashMap<u16, SiteInfo> {
+    let mut sites = HashMap::new();
+    let mut bci = 0usize;
+    while bci + 2 < code.len() {
+        let op = code[bci];
+        let cp_ops = matches!(
+            op,
+            0xb2..=0xba | 0xbb | 0xbd | 0xc0 | 0xc1 | 0xc5
+        );
+        if cp_ops {
+            let idx = u16::from_be_bytes([code[bci + 1], code[bci + 2]]);
+            if idx != 0 && !sites.contains_key(&idx) {
+                match op {
+                    0xb6..=0xba => {
+                        if let Ok([owner, name, desc]) = klass.memberRef(idx, false) {
+                            sites.insert(
+                                idx,
+                                SiteInfo {
+                                    class: String::from_utf8_lossy(owner).into_owned(),
+                                    name: String::from_utf8_lossy(name).into_owned(),
+                                    desc: String::from_utf8_lossy(desc).into_owned(),
+                                },
+                            );
+                        }
+                    }
+                    0xb2..=0xb5 => {
+                        if let Ok([owner, name, desc]) = klass.memberRef(idx, true) {
+                            sites.insert(
+                                idx,
+                                SiteInfo {
+                                    class: String::from_utf8_lossy(owner).into_owned(),
+                                    name: String::from_utf8_lossy(name).into_owned(),
+                                    desc: String::from_utf8_lossy(desc).into_owned(),
+                                },
+                            );
+                        }
+                    }
+                    _ => {
+                        if let Ok(class) = klass.className(idx) {
+                            sites.insert(
+                                idx,
+                                SiteInfo {
+                                    class: String::from_utf8_lossy(class).into_owned(),
+                                    name: String::new(),
+                                    desc: String::new(),
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        bci += 1;
+    }
+    sites
 }

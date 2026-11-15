@@ -85,8 +85,8 @@ fn control_input_indices(op: &Opcode, ninputs: usize) -> Vec<usize> {
         }
         LoadI | LoadL | LoadF | LoadD | LoadP | LoadB | LoadC | LoadS | StoreI | StoreL
         | StoreF | StoreD | StoreP | StoreB | StoreC | StoreS | Call(_) | New(_)
-        | NewArray(_) | NewArrayRef(_) | CheckCast(_) | InstanceOf(_) | ArrayLength
-        | MonitorEnter | MonitorExit => {
+        | NewArray(_) | NewArrayRef(_) | MultianewArray | CheckCast(_)
+        | InstanceOf(_) | ArrayLength | MonitorEnter | MonitorExit => {
             if ninputs > 1 {
                 vec![1]
             } else {

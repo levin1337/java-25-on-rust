@@ -7,137 +7,173 @@
  * Tracking levels mirror -XX:NativeMemoryTracking={off,summary,detail}:
  *   off     — no accounting
  *   summary — per-tag totals only
- *   detail  — per-tag totals + call-site granularity (approximated by
- *             recording the allocating thread id as the site key)
+ *   detail  — per-tag totals + per-call-site granularity
  */
 
 use super::memReporter::MemReporter;
 use super::memTag::MemTag;
+use super::mallocTracker::{FreeInfo, MallocHeader, MallocTracker};
+use super::nativeCallStack::{self, NativeCallStack};
+use super::nmtCommon::NmtUtil;
 use super::virtualMemoryTracker::{TagVmTotals, VirtualMemoryTracker};
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 
 /// Backwards-compatible name for the tag enum (earlier ports used
 /// MemoryType; the HotSpot name is MemTag).
 pub use super::memTag::MemoryType;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NmtLevel {
-    Off,
-    Summary,
-    Detail,
-}
+/// Tracking level type (C++ NMT_TrackingLevel). The name NmtLevel is
+/// kept for backwards compatibility with earlier ports.
+pub use super::nmtCommon::{NmtLevel, NmtTrackingLevel};
 
-impl NmtLevel {
-    pub fn from_flag(s: &str) -> Self {
-        match s.to_ascii_lowercase().as_str() {
-            "off" => Self::Off,
-            "summary" => Self::Summary,
-            "detail" | "detailed" => Self::Detail,
-            _ => Self::Summary,
-        }
-    }
+pub struct MemTracker;
 
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::Off => "off",
-            Self::Summary => "summary",
-            Self::Detail => "detail",
-        }
-    }
-}
-
-/// Per-call-site detail entry (detail level only).
-#[derive(Debug, Clone, Copy, Default)]
-pub struct SiteStats {
-    pub count: u64,
-    pub bytes: usize,
-}
-
-pub struct MemTracker {
-    /// malloc-side committed bytes per tag.
-    allocations: Mutex<HashMap<MemTag, usize>>,
-    /// detail level: (tag, site_key) → stats. site_key approximates
-    /// NativeCallStack by using the allocating thread id.
-    sites: Mutex<HashMap<(MemTag, u64), SiteStats>>,
-}
-
-static GLOBAL_MEM_TRACKER: OnceLock<MemTracker> = OnceLock::new();
-static TRACKING_LEVEL: AtomicU8 = AtomicU8::new(NmtLevel::Off as u8);
+static TRACKING_LEVEL: AtomicU8 = AtomicU8::new(NmtTrackingLevel::Unknown as u8);
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
+static GENERATION_BLOCK: OnceLock<()> = OnceLock::new();
 
 impl MemTracker {
-    fn new() -> Self {
-        Self {
-            allocations: Mutex::new(HashMap::new()),
-            sites: Mutex::new(HashMap::new()),
-        }
-    }
-
     /// memTracker.cpp: MemTracker::initialize() — level comes from
-    /// -XX:NativeMemoryTracking (default summary when enabled via flag).
-    pub fn initialize(level: NmtLevel) {
-        TRACKING_LEVEL.store(level as u8, Ordering::Relaxed);
-        INITIALIZED.store(true, Ordering::Relaxed);
+    /// -XX:NativeMemoryTracking.
+    pub fn initialize(level: NmtTrackingLevel) -> bool {
+        if INITIALIZED.swap(true, Ordering::AcqRel) {
+            // Already initialized; adopt the requested level.
+            TRACKING_LEVEL.store(level as u8, Ordering::Release);
+            return true;
+        }
+        TRACKING_LEVEL.store(level as u8, Ordering::Release);
+        let ok = level == NmtTrackingLevel::Off
+            || VirtualMemoryTracker::global().initialize(level)
+                && MallocTracker::initialize(level);
+        let _ = GENERATION_BLOCK.set(());
+        ok
     }
 
-    pub fn initialize_from_flag(value: Option<&str>) -> NmtLevel {
-        let level = value.map(NmtLevel::from_flag).unwrap_or(NmtLevel::Summary);
+    /// Parse -XX:NativeMemoryTracking value. `None` keeps Unknown
+    /// (pre-init); explicit "off" disables tracking.
+    pub fn initialize_from_flag(value: Option<&str>) -> NmtTrackingLevel {
+        let level = NmtUtil::parse_tracking_level(value);
+        if level == NmtTrackingLevel::Unknown {
+            // Unknown flag value is treated as off (HotSpot errors out;
+            // this port degrades gracefully).
+            Self::initialize(NmtTrackingLevel::Off);
+            return NmtTrackingLevel::Off;
+        }
         Self::initialize(level);
         level
     }
 
     #[inline]
-    pub fn tracking_level() -> NmtLevel {
-        match TRACKING_LEVEL.load(Ordering::Relaxed) {
-            1 => NmtLevel::Summary,
-            2 => NmtLevel::Detail,
-            _ => NmtLevel::Off,
+    pub fn tracking_level() -> NmtTrackingLevel {
+        match TRACKING_LEVEL.load(Ordering::Acquire) {
+            1 => NmtTrackingLevel::Off,
+            2 => NmtTrackingLevel::Summary,
+            3 => NmtTrackingLevel::Detail,
+            _ => NmtTrackingLevel::Unknown,
         }
     }
 
     #[inline]
     pub fn is_initialized() -> bool {
-        INITIALIZED.load(Ordering::Relaxed)
+        INITIALIZED.load(Ordering::Acquire)
     }
 
     #[inline]
     pub fn is_active() -> bool {
-        Self::tracking_level() != NmtLevel::Off
+        Self::is_initialized() && Self::tracking_level() != NmtTrackingLevel::Off
+    }
+
+    /// NMT tracking enabled at summary or detail level (C++
+    /// MemTracker::is_tracking_on). Also true pre-init at Unknown level
+    /// only if explicitly requested — callers gate on is_initialized.
+    #[inline]
+    pub fn is_tracking_on() -> bool {
+        Self::tracking_level() >= NmtTrackingLevel::Summary
     }
 
     pub fn global() -> &'static MemTracker {
-        GLOBAL_MEM_TRACKER.get_or_init(Self::new)
+        static INSTANCE: OnceLock<MemTracker> = OnceLock::new();
+        INSTANCE.get_or_init(|| MemTracker)
     }
 
     #[inline]
-    pub fn level(&self) -> NmtLevel {
+    pub fn level(&self) -> NmtTrackingLevel {
         Self::tracking_level()
+    }
+
+    /// Generation-block marker used to reset tracker state between
+    /// independent runs (tests). Mirrors the C++ generation-block idiom.
+    pub fn generation_block(&self) {
+        let _ = GENERATION_BLOCK.get_or_init(|| ());
     }
 
     // -- malloc accounting ------------------------------------------------------
 
-    pub fn record_malloc(&self, size: usize, mem_type: MemTag) {
-        if Self::tracking_level() == NmtLevel::Off || size == 0 {
+    /// Record a malloc; returns the MallocHeader handle which must be
+    /// passed to record_free_block when the block is freed.
+    pub fn record_malloc(&self, size: usize, mem_type: MemTag) -> MallocHeader {
+        if !Self::is_tracking_on() || size == 0 {
+            return MallocHeader::new(size, mem_type, 0);
+        }
+        let detail = Self::tracking_level() == NmtTrackingLevel::Detail;
+        let stack = nativeCallStack::current_pc(detail);
+        MallocTracker::record_malloc(size, mem_type, &stack)
+    }
+
+    /// Record a malloc with an explicit call stack (callers that already
+    /// captured the site, e.g. arena code).
+    pub fn record_malloc_with_stack(
+        &self,
+        size: usize,
+        mem_type: MemTag,
+        stack: &NativeCallStack,
+    ) -> MallocHeader {
+        if !Self::is_tracking_on() || size == 0 {
+            return MallocHeader::new(size, mem_type, 0);
+        }
+        MallocTracker::record_malloc(size, mem_type, stack)
+    }
+
+    /// Record free given the header returned by record_malloc.
+    pub fn record_free_block(&self, header: &MallocHeader) {
+        MallocTracker::record_free_block(header);
+    }
+
+    /// Record free given raw (size, tag). Detail-level site accounting
+    /// requires the MallocHeader; this form only updates summary
+    /// counters (marker 0 → site table no-op).
+    pub fn record_free(&self, size: usize, mem_type: MemTag) {
+        if !Self::is_tracking_on() || size == 0 {
             return;
         }
-        *self.allocations.lock().unwrap().entry(mem_type).or_insert(0) += size;
-        if Self::tracking_level() == NmtLevel::Detail {
-            let site = Self::current_site_key();
-            let mut sites = self.sites.lock().unwrap();
-            let e = sites.entry((mem_type, site)).or_default();
-            e.count += 1;
-            e.bytes += size;
+        MallocTracker::deaccount(FreeInfo {
+            size,
+            mem_tag: mem_type,
+            mst_marker: 0,
+        });
+    }
+
+    // -- arena accounting (for arenas / code cache callers) ----------------------
+
+    #[inline]
+    pub fn record_new_arena(&self, mem_tag: MemTag) {
+        if Self::is_tracking_on() {
+            MallocTracker::record_new_arena(mem_tag);
         }
     }
 
-    pub fn record_free(&self, size: usize, mem_type: MemTag) {
-        if Self::tracking_level() == NmtLevel::Off {
-            return;
+    #[inline]
+    pub fn record_arena_free(&self, mem_tag: MemTag) {
+        if Self::is_tracking_on() {
+            MallocTracker::record_arena_free(mem_tag);
         }
-        if let Some(entry) = self.allocations.lock().unwrap().get_mut(&mem_type) {
-            *entry = entry.saturating_sub(size);
+    }
+
+    #[inline]
+    pub fn record_arena_size_change(&self, size: isize, mem_tag: MemTag) {
+        if Self::is_tracking_on() {
+            MallocTracker::record_arena_size_change(size, mem_tag);
         }
     }
 
@@ -154,8 +190,10 @@ impl MemTracker {
     ) -> std::io::Result<usize> {
         use crate::share::platform::windows::OsWindows;
         let base = OsWindows::reserve_memory(addr, bytes)?;
-        if Self::is_active() {
-            VirtualMemoryTracker::global().record_reserve(base, bytes, tag);
+        if Self::is_tracking_on() {
+            let detail = Self::tracking_level() == NmtTrackingLevel::Detail;
+            let stack = nativeCallStack::current_pc(detail);
+            VirtualMemoryTracker::global().add_reserved_region(base, bytes, stack, tag);
         }
         Ok(base)
     }
@@ -171,8 +209,10 @@ impl MemTracker {
     ) -> std::io::Result<()> {
         use crate::share::platform::windows::OsWindows;
         OsWindows::commit_memory(addr, bytes, exec)?;
-        if Self::is_active() {
-            VirtualMemoryTracker::global().record_commit(addr, bytes, tag);
+        if Self::is_tracking_on() {
+            let detail = Self::tracking_level() == NmtTrackingLevel::Detail;
+            let stack = nativeCallStack::current_pc(detail);
+            VirtualMemoryTracker::global().add_committed_region(addr, bytes, stack);
         }
         Ok(())
     }
@@ -182,8 +222,8 @@ impl MemTracker {
     pub fn uncommit_memory(&self, addr: usize, bytes: usize) -> std::io::Result<()> {
         use crate::share::platform::windows::OsWindows;
         OsWindows::uncommit_memory(addr, bytes)?;
-        if Self::is_active() {
-            VirtualMemoryTracker::global().record_uncommit(addr, bytes);
+        if Self::is_tracking_on() {
+            VirtualMemoryTracker::global().remove_uncommitted_region(addr, bytes);
         }
         Ok(())
     }
@@ -193,8 +233,8 @@ impl MemTracker {
     pub fn release_memory(&self, addr: usize, bytes: usize) -> std::io::Result<()> {
         use crate::share::platform::windows::OsWindows;
         OsWindows::release_memory(addr, bytes)?;
-        if Self::is_active() {
-            VirtualMemoryTracker::global().record_release(addr, bytes);
+        if Self::is_tracking_on() {
+            VirtualMemoryTracker::global().remove_released_region(addr, bytes);
         }
         Ok(())
     }
@@ -214,12 +254,18 @@ impl MemTracker {
 
     // -- reporting ---------------------------------------------------------------
 
+    /// Total malloc-tracked bytes (excl. VM reservations).
     pub fn total_allocated(&self) -> usize {
-        self.allocations.lock().unwrap().values().sum()
+        super::mallocTracker::MallocMemorySummary::global()
+            .snapshot()
+            .total()
     }
 
+    /// Malloc-side bytes for a tag (malloc + arena).
     pub fn allocated_for_type(&self, mem_type: MemTag) -> usize {
-        self.allocations.lock().unwrap().get(&mem_type).copied().unwrap_or(0)
+        let snap = super::mallocTracker::MallocMemorySummary::global().snapshot();
+        let m = snap.by_tag(mem_type);
+        m.malloc_size() + m.arena_size()
     }
 
     pub fn vm_totals_for(&self, tag: MemTag) -> TagVmTotals {
@@ -236,28 +282,20 @@ impl MemTracker {
         self.generate_report()
     }
 
+    /// Detail report: summary plus per-site sections.
     pub fn detail_report(&self) -> String {
         let mut out = self.generate_report();
-        out.push_str("\nCall site details (detail level):\n");
-        let sites = self.sites.lock().unwrap();
-        let mut entries: Vec<_> = sites.iter().collect();
-        entries.sort_by_key(|(_, s)| std::cmp::Reverse(s.bytes));
-        for ((tag, site), stats) in entries.iter().take(64) {
-            out.push_str(&format!(
-                "  {:<20} site={:#x} count={} bytes={}KB\n",
-                tag.name(),
-                site,
-                stats.count,
-                stats.bytes / 1024
-            ));
-        }
+        out.push_str("\nCall Site Detail (malloc):\n");
+        out.push_str(&super::mallocSiteTable::MallocSiteTable::global().detail_section());
+        out.push_str("\nVirtual Memory Allocation Sites:\n");
+        out.push_str(&super::virtualMemoryTracker::VirtualMemoryTracker::global().site_section());
         out
     }
 
     /// NMT diagnostic command output (jcmd VM.native_memory).
     pub fn native_memory_report(detail: bool) -> String {
         let tracker = Self::global();
-        if detail && Self::tracking_level() == NmtLevel::Detail {
+        if detail && Self::tracking_level() == NmtTrackingLevel::Detail {
             tracker.detail_report()
         } else {
             tracker.summary_report()
@@ -265,38 +303,27 @@ impl MemTracker {
     }
 
     pub fn reset(&self) {
-        self.allocations.lock().unwrap().clear();
-        self.sites.lock().unwrap().clear();
         VirtualMemoryTracker::global().reset();
+        super::mallocSiteTable::MallocSiteTable::global().reset();
+        super::mallocTracker::MallocMemorySummary::global().reset();
+        super::memoryFileTracker::MemoryFileTrackerInstance::global().reset();
+        self.baseline().reset();
     }
 
-    /// Site key: thread id approximates the NativeCallStack site grouping at
-    /// detail level (documented simplification).
-    fn current_site_key() -> u64 {
-        #[cfg(windows)]
-        {
-            crate::share::platform::windows::OsWindows::current_thread_id() as u64
-        }
-        #[cfg(not(windows))]
-        {
-            use std::sync::atomic::{AtomicU64, Ordering};
-            use std::collections::HashMap;
-            use std::sync::Mutex;
-            static MAP: Mutex<Option<HashMap<std::thread::ThreadId, u64>>> = Mutex::new(None);
-            static NEXT: AtomicU64 = AtomicU64::new(1);
-            let tid = std::thread::current().id();
-            let mut guard = MAP.lock().unwrap();
-            let map = guard.get_or_insert_with(HashMap::new);
-            *map.entry(tid).or_insert_with(|| NEXT.fetch_add(1, Ordering::Relaxed))
-        }
+    /// Establish a new baseline (MemBaseline owner inside MemTracker,
+    /// mirroring MemTracker::set_baseline in C++).
+    pub fn baseline(&self) -> std::sync::MutexGuard<'_, super::memBaseline::MemBaseline> {
+        static BASELINE: OnceLock<std::sync::Mutex<super::memBaseline::MemBaseline>> = OnceLock::new();
+        BASELINE
+            .get_or_init(|| std::sync::Mutex::new(super::memBaseline::MemBaseline::new()))
+            .lock()
+            .unwrap()
     }
-}
 
-impl Default for MemTracker {
-    fn default() -> Self {
-        // Default-off like HotSpot until -XX:NativeMemoryTracking is parsed.
-        Self::initialize(NmtLevel::Off);
-        Self::new()
+    /// Take a fresh baseline at the current tracking level.
+    pub fn take_baseline(&self, summary_only: bool) {
+        let mut b = self.baseline();
+        b.baseline(summary_only);
     }
 }
 
@@ -306,22 +333,22 @@ mod tests {
 
     #[test]
     fn levels() {
-        assert_eq!(NmtLevel::from_flag("summary"), NmtLevel::Summary);
-        assert_eq!(NmtLevel::from_flag("detail"), NmtLevel::Detail);
-        assert_eq!(NmtLevel::from_flag("off"), NmtLevel::Off);
+        assert_eq!(NmtUtil::parse_tracking_level(Some("summary")), NmtTrackingLevel::Summary);
+        assert_eq!(NmtUtil::parse_tracking_level(Some("detail")), NmtTrackingLevel::Detail);
+        assert_eq!(NmtUtil::parse_tracking_level(Some("off")), NmtTrackingLevel::Off);
     }
 
     #[test]
     fn record_and_report() {
-        // Force summary level for this test process.
-        MemTracker::initialize(NmtLevel::Summary);
+        MemTracker::initialize(NmtTrackingLevel::Summary);
         let t = MemTracker::global();
-        t.record_malloc(4096, MemTag::MtSymbol);
-        t.record_malloc(2048, MemTag::MtSymbol);
+        let h1 = t.record_malloc(4096, MemTag::MtSymbol);
+        let h2 = t.record_malloc(2048, MemTag::MtSymbol);
         assert_eq!(t.allocated_for_type(MemTag::MtSymbol), 6144);
         let report = t.summary_report();
         assert!(report.contains("Native Memory Tracking"));
-        t.record_free(1024, MemTag::MtSymbol);
-        assert_eq!(t.allocated_for_type(MemTag::MtSymbol), 5120);
+        t.record_free_block(&h1);
+        t.record_free_block(&h2);
+        assert_eq!(t.allocated_for_type(MemTag::MtSymbol), 0);
     }
 }

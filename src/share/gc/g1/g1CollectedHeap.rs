@@ -6,7 +6,7 @@
  */
 
 use super::g1Policy::G1Policy;
-use super::heapRegion::{HeapRegion, HeapRegionType};
+use super::heapRegion::{G1HeapRegionType, HeapRegion};
 use crate::share::gc::shared::collectedHeap::{CollectedHeap, CollectedHeapKind};
 use crate::share::gc::shared::gcCause::GCCause;
 use std::io::{self, Error};
@@ -19,6 +19,7 @@ pub struct G1CollectedHeap {
     young_collection_count: usize,
     full_collection_count: usize,
     last_collection_set: Vec<usize>,
+    survivor_ages: Vec<u32>,
 }
 
 impl G1CollectedHeap {
@@ -39,6 +40,7 @@ impl G1CollectedHeap {
             young_collection_count: 0,
             full_collection_count: 0,
             last_collection_set: Vec::new(),
+            survivor_ages: vec![0; count],
         }
     }
 
@@ -128,7 +130,7 @@ impl G1CollectedHeap {
 
         // Need a new eden region
         if let Some(idx) = self.find_free_region() {
-            self.regions[idx].set_type(HeapRegionType::Eden);
+            self.regions[idx].set_region_type(G1HeapRegionType::Eden);
             self.current_eden_region_idx = Some(idx);
             return self.regions[idx]
                 .allocate(size)
@@ -140,7 +142,7 @@ impl G1CollectedHeap {
 
         // Retry after Young GC
         if let Some(idx) = self.find_free_region() {
-            self.regions[idx].set_type(HeapRegionType::Eden);
+            self.regions[idx].set_region_type(G1HeapRegionType::Eden);
             self.current_eden_region_idx = Some(idx);
             return self.regions[idx]
                 .allocate(size)
@@ -151,7 +153,7 @@ impl G1CollectedHeap {
         self.do_full_gc()?;
 
         if let Some(idx) = self.find_free_region() {
-            self.regions[idx].set_type(HeapRegionType::Eden);
+            self.regions[idx].set_region_type(G1HeapRegionType::Eden);
             self.current_eden_region_idx = Some(idx);
             self.regions[idx]
                 .allocate(size)
@@ -184,8 +186,10 @@ impl G1CollectedHeap {
         if run_len == regions_needed {
             let start = run_start.unwrap();
             let addr = self.regions[start].bottom();
-            for i in start..start + regions_needed {
-                self.regions[i].set_type(HeapRegionType::Humongous);
+            let end = start + regions_needed - 1;
+            self.regions[start].set_starts_humongous(end, size);
+            for i in start + 1..=end {
+                self.regions[i].set_continues_humongous(start);
                 let _ = self.regions[i]
                     .allocate(self.region_size.min(size - (i - start) * self.region_size));
             }
@@ -201,15 +205,17 @@ impl G1CollectedHeap {
         self.young_collection_count += 1;
 
         // Evacuate Eden regions into Survivor or Old regions
-        for region in &mut self.regions {
+        for (index, region) in self.regions.iter_mut().enumerate() {
             if region.is_eden() {
                 region.reset();
+                self.survivor_ages[index] = 0;
             } else if region.is_survivor() {
-                let age = region.age() + 1;
+                let age = self.survivor_ages[index] + 1;
                 if age >= self.policy.tenuring_threshold() {
-                    region.set_type(HeapRegionType::Old);
+                    region.set_region_type(G1HeapRegionType::Old);
+                    self.survivor_ages[index] = 0;
                 } else {
-                    region.set_age(age);
+                    self.survivor_ages[index] = age;
                 }
             }
         }

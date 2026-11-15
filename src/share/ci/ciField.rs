@@ -14,35 +14,9 @@ use crate::share::classfile::classFileParser::Constant;
 use crate::share::interpreter::bytecodeInterpreter::Value;
 use crate::share::oops::fieldInfo::FieldInfo;
 
-/// `ciConstant`: the constant value of a static final / stable field.
-#[derive(Debug, Clone, PartialEq)]
-pub enum CiConstant {
-    Int(i32),
-    Long(i64),
-    Float(f32),
-    Double(f64),
-    String(Vec<u8>),
-    /// Null reference or zero primitive — HotSpot `ciConstant::is_null_or_zero`.
-    NullOrZero,
-}
-
-impl CiConstant {
-    #[inline]
-    pub fn is_valid(&self) -> bool {
-        !matches!(self, Self::NullOrZero)
-    }
-
-    #[inline]
-    pub fn basic_type(&self) -> BasicType {
-        match self {
-            Self::Int(_) => BasicType::Int,
-            Self::Long(_) => BasicType::Long,
-            Self::Float(_) => BasicType::Float,
-            Self::Double(_) => BasicType::Double,
-            Self::String(_) | Self::NullOrZero => BasicType::Object,
-        }
-    }
-}
+/// `ciConstant` — moved to `ci_constant.rs`; re-exported so existing
+/// `ciField::CiConstant` paths keep working.
+pub use super::ciConstant::CiConstant;
 
 /// `FoldStableValues` product flag analogue (default true in HotSpot).
 const FOLD_STABLE_VALUES: bool = true;

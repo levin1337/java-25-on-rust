@@ -49,6 +49,32 @@ impl ResolvedFieldEntry {
         }
     }
 
+    /// Whether either access direction has been resolved.
+    #[inline]
+    pub fn is_unresolved(&self) -> bool {
+        self.get_code == 0 && self.put_code == 0
+    }
+
+    /// Clears both get/put resolutions (dependency invalidation).
+    pub fn clear(&mut self) {
+        self.field_holder = None;
+        self.field_offset = 0;
+        self.field_index = 0;
+        self.tos_state = 0;
+        self.flags = 0;
+        self.get_code = 0;
+        self.put_code = 0;
+    }
+
+    /// Whether the cached resolution applies to the given bytecode
+    /// (getfield/getstatic share `get_code`; putfield/putstatic share
+    /// `put_code` in HotSpot).
+    #[inline]
+    pub fn matches_bytecode(&self, is_put: bool, bytecode: u8) -> bool {
+        let code = if is_put { self.put_code } else { self.get_code };
+        code != 0 && code == bytecode
+    }
+
     #[inline]
     pub fn field_holder(&self) -> Option<&str> {
         self.field_holder.as_deref()

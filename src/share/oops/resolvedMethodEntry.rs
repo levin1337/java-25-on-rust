@@ -53,6 +53,35 @@ impl ResolvedMethodEntry {
         self.bytecode1 == bytecode || self.bytecode2 == bytecode
     }
 
+    /// HotSpot `ResolvedMethodEntry::is_resolved` for any invoke
+    /// bytecode: false while both bytecode slots are zero.
+    #[inline]
+    pub fn is_unresolved(&self) -> bool {
+        self.bytecode1 == 0 && self.bytecode2 == 0
+    }
+
+    /// HotSpot `ResolvedMethodEntry::clear`: returns the entry to the
+    /// unresolved state (used by dependency invalidation).
+    pub fn clear(&mut self) {
+        self.klass_name = None;
+        self.method_name = None;
+        self.signature = None;
+        self.vtable_index = Self::NONVIRTUAL_VTABLE_INDEX;
+        self.itable_index = -1;
+        self.number_of_parameters = 0;
+        self.flags = 0;
+        self.bytecode1 = 0;
+        self.bytecode2 = 0;
+    }
+
+    /// Whether the cached resolution applies to `bytecode`
+    /// (invokevirtual/invokespecial share bytecode2, see HotSpot
+    /// `check_and_update` two-bytecode scheme).
+    #[inline]
+    pub fn matches_bytecode(&self, bytecode: u8) -> bool {
+        self.bytecode1 == bytecode || self.bytecode2 == bytecode
+    }
+
     #[inline]
     pub fn klass_name(&self) -> Option<&str> {
         self.klass_name.as_deref()

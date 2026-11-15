@@ -66,6 +66,10 @@ pub struct CodeBlob {
     data_end: usize,
     code_bytes: Vec<u8>,
     oop_maps: crate::share::compiler::oopMap::OopMapSet,
+    /// Sweeper/reclamation marker: non-nmethod blobs (adapters, stale
+    /// stubs) can be flagged unused and reclaimed by
+    /// `CodeCache::free_unused_code_blobs`.
+    unused: bool,
 }
 
 impl CodeBlob {
@@ -99,6 +103,7 @@ impl CodeBlob {
             data_end: code_end,
             code_bytes: Vec::new(),
             oop_maps: crate::share::compiler::oopMap::OopMapSet::new(),
+            unused: false,
         }
     }
 
@@ -153,6 +158,7 @@ impl CodeBlob {
             data_end,
             code_bytes: Vec::new(),
             oop_maps: crate::share::compiler::oopMap::OopMapSet::new(),
+            unused: false,
         }
     }
 
@@ -354,6 +360,18 @@ impl CodeBlob {
         }
         let pc_offset = (pc - self.code_begin) as i32;
         self.oop_maps.map_for_pc(pc_offset).cloned()
+    }
+
+    /// Sweeper marker (`CodeBlob` has no liveness bits in HotSpot — nmethods
+    /// carry state; non-nmethod blobs here can be flagged for reclaim).
+    #[inline]
+    pub fn is_unused(&self) -> bool {
+        self.unused
+    }
+
+    #[inline]
+    pub fn set_unused(&mut self, unused: bool) {
+        self.unused = unused;
     }
 
     pub fn adjust_size(&mut self, used: usize) {

@@ -1,6 +1,14 @@
 pub mod accessFlags;
+pub mod bitMap;
+pub mod decoder;
+pub mod decoder_amd64;
+pub mod formatBuffer;
+pub mod hashtable;
+pub mod json;
 pub mod constantTag;
 pub mod exceptions;
 pub mod globalDefinitions;
 pub mod growableArray;
 pub mod ostream;
+pub mod utf8;
+pub mod xmlstream;

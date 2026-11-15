@@ -6,9 +6,10 @@
  * exception handler tables, oop maps and scope/pC-desc debug info.
  */
 
+use super::dependencies::DependencySet;
 use super::exceptionHandlerTable::{ExceptionHandlerTable, PcRangeHandlerTable};
 use super::pcDesc::{PcDesc, PcDescContainer};
-use super::scopeDesc::{decode_scope_chain, ScopeDesc};
+use super::scopeDesc::{decode_scope_chain_with_objects, ScopeDesc};
 use crate::share::compiler::compilerDefinitions::CompLevel;
 use crate::share::compiler::oopMap::OopMapSet;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -158,17 +159,53 @@ impl InvalidationReason {
     }
 }
 
+/// `nmethod::DeoptimizationStatus` (share/code/nmethod.hpp): handshake
+/// state of stack deoptimization for this nmethod.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u64)]
+pub enum DeoptimizationStatus {
+    NotMarked = 0,
+    Deoptimize = 1,
+    DeoptimizeNoUpdate = 2,
+    DeoptimizeDone = 3,
+}
+
+/// Code-section layout of an installed nmethod
+/// (`nmethod` SECT_CONSTS + immutable-data layout analogue).  All
+/// addresses are absolute (code-cache) addresses; `metadata_*` spans the
+/// immutable data section that holds dependencies, the handler table,
+/// serialized pc descs and the scopes-data blob offsets.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NMethodSections {
+    /// SECT_CONSTS: constant pool / metadata constants emitted before
+    /// the instruction stream (HotSpot: consts_begin..consts_end ==
+    /// content_begin..code_begin).
+    pub consts_begin: usize,
+    pub consts_end: usize,
+    /// Immutable data section (C-heap analogue `_immutable_data`).
+    pub metadata_begin: usize,
+    pub metadata_end: usize,
+    /// Serialized PcDesc array region inside the metadata section
+    /// (`scopes_pcs_begin..scopes_pcs_end` analogue).
+    pub scopes_pcs_begin: usize,
+    pub scopes_pcs_end: usize,
+}
+
 /// Shared, atomically-updated state of an installed nmethod.
 /// Mirrors the mutable nmethod header fields that the sweeper, deopt
 /// machinery and stack walking update concurrently.
 #[derive(Debug)]
 pub struct NMethodShared {
     state: AtomicU64, // NMethodState as u64
-    marked_for_deoptimization: AtomicU64,
-    deoptimized_done: AtomicU64,
+    deopt_status: AtomicU64, // DeoptimizationStatus as u64
     lock_count: AtomicU64,
     stack_traversal_mark: AtomicU64,
     has_unsafe_access: AtomicU64,
+    has_monitors: AtomicU64,
+    has_scoped_access: AtomicU64,
+    has_wide_vectors: AtomicU64,
+    has_method_handle_invokes: AtomicU64,
+    has_flushed_dependencies: AtomicU64,
     pub invalidation_reason: std::sync::Mutex<Option<InvalidationReason>>,
     /// Compiled machine code bytes (empty until a backend installs them).
     pub code_bytes: std::sync::Mutex<Vec<u8>>,
@@ -185,17 +222,24 @@ pub struct NMethodShared {
     /// Compiled frame size in bytes (needed to unwind/rebuild the
     /// interpreter frame on deopt).
     pub frame_size: AtomicU64,
+    /// Dependencies recorded at compile time (klass/method unloading
+    /// assumptions; `Dependencies` analogue).
+    pub dependencies: std::sync::Mutex<DependencySet>,
 }
 
 impl NMethodShared {
     fn new() -> Self {
         Self {
             state: AtomicU64::new(NMethodState::InUse as u64),
-            marked_for_deoptimization: AtomicU64::new(0),
-            deoptimized_done: AtomicU64::new(0),
+            deopt_status: AtomicU64::new(DeoptimizationStatus::NotMarked as u64),
             lock_count: AtomicU64::new(0),
             stack_traversal_mark: AtomicU64::new(0),
             has_unsafe_access: AtomicU64::new(0),
+            has_monitors: AtomicU64::new(0),
+            has_scoped_access: AtomicU64::new(0),
+            has_wide_vectors: AtomicU64::new(0),
+            has_method_handle_invokes: AtomicU64::new(0),
+            has_flushed_dependencies: AtomicU64::new(0),
             invalidation_reason: std::sync::Mutex::new(None),
             code_bytes: std::sync::Mutex::new(Vec::new()),
             scope_data: std::sync::Mutex::new(Vec::new()),
@@ -204,6 +248,7 @@ impl NMethodShared {
             oop_maps: std::sync::Mutex::new(OopMapSet::new()),
             live_maps: std::sync::Mutex::new(Vec::new()),
             frame_size: AtomicU64::new(0),
+            dependencies: std::sync::Mutex::new(DependencySet::new()),
         }
     }
 }
@@ -222,6 +267,7 @@ pub struct NMethod {
     osr_entry_point: usize,
     pc_descs: Vec<PcDesc>,
     scopes: Vec<ScopeDesc>,
+    sections: NMethodSections,
     shared: Arc<NMethodShared>,
 }
 
@@ -240,6 +286,7 @@ impl Clone for NMethod {
             osr_entry_point: self.osr_entry_point,
             pc_descs: self.pc_descs.clone(),
             scopes: self.scopes.clone(),
+            sections: self.sections,
             shared: Arc::clone(&self.shared),
         }
     }
@@ -273,6 +320,7 @@ impl NMethod {
             osr_entry_point: code_offset,
             pc_descs,
             scopes,
+            sections: NMethodSections::default(),
             shared: Arc::new(NMethodShared::new()),
         }
     }
@@ -305,6 +353,7 @@ impl NMethod {
             osr_entry_point,
             pc_descs,
             scopes,
+            sections: NMethodSections::default(),
             shared: Arc::new(NMethodShared::new()),
         }
     }
@@ -339,18 +388,37 @@ impl NMethod {
             osr_entry_point,
             pc_descs,
             scopes,
+            sections: NMethodSections::default(),
             shared,
         }
     }
 
     /// Relocate the nmethod to its allocated code-cache address
-    /// (called once at install time, before publication).
+    /// (called once at install time, before publication).  Absolute
+    /// section addresses recorded in `sections` are shifted by the same
+    /// delta.
     pub fn set_code_location(&mut self, offset: usize, size: usize) {
+        let delta = offset as isize - self.code_offset as isize;
         self.code_offset = offset;
         self.code_size = size;
         self.entry_point = offset;
         self.verified_entry_point = offset;
         self.osr_entry_point = offset;
+        if delta != 0 {
+            let s = &mut self.sections;
+            for addr in [
+                &mut s.consts_begin,
+                &mut s.consts_end,
+                &mut s.metadata_begin,
+                &mut s.metadata_end,
+                &mut s.scopes_pcs_begin,
+                &mut s.scopes_pcs_end,
+            ] {
+                if *addr != 0 {
+                    *addr = (*addr as isize + delta) as usize;
+                }
+            }
+        }
     }
 
     #[inline]
@@ -454,13 +522,317 @@ impl NMethod {
     }
 
     #[inline]
+    pub fn set_entry_point(&mut self, addr: usize) {
+        self.entry_point = addr;
+    }
+
+    #[inline]
     pub fn verified_entry_point(&self) -> usize {
         self.verified_entry_point
+    }
+
+    /// `nmethod::verified_entry_offset` analogue.
+    #[inline]
+    pub fn verified_entry_offset(&self) -> usize {
+        self.verified_entry_point.saturating_sub(self.code_begin())
+    }
+
+    pub fn set_verified_entry_point(&mut self, addr: usize) {
+        self.verified_entry_point = addr;
     }
 
     #[inline]
     pub fn osr_entry_point(&self) -> usize {
         self.osr_entry_point
+    }
+
+    /// `nmethod::osr_entry_bci` analogue (== entry_bci for OSR nmethods).
+    #[inline]
+    pub fn osr_entry_bci(&self) -> i32 {
+        debug_assert!(self.is_osr_method(), "wrong kind of nmethod");
+        self.entry_bci
+    }
+
+    /// `nmethod::osr_entry` analogue.
+    #[inline]
+    pub fn osr_entry(&self) -> usize {
+        debug_assert!(self.is_osr_method(), "wrong kind of nmethod");
+        self.osr_entry_point
+    }
+
+    pub fn set_osr_entry_point(&mut self, addr: usize) {
+        self.osr_entry_point = addr;
+    }
+
+    /// `nmethod::is_entrant` analogue: the nmethod may be entered by new
+    /// activations (in_use).  NotEntrant code stays alive for existing
+    /// frames but takes no new ones.
+    #[inline]
+    pub fn is_entrant(&self) -> bool {
+        self.is_in_use()
+    }
+
+    /// `nmethod::is_java_method` analogue: every nmethod in this port
+    /// describes a Java method (native wrappers are not modelled).
+    #[inline]
+    pub fn is_java_method(&self) -> bool {
+        true
+    }
+
+    /// `nmethod::can_be_deoptimized`: java methods can; native wrappers
+    /// cannot.
+    #[inline]
+    pub fn can_be_deoptimized(&self) -> bool {
+        self.is_java_method()
+    }
+
+    // ---- code sections (consts / immutable metadata) ------------------
+
+    #[inline]
+    pub fn sections(&self) -> NMethodSections {
+        self.sections
+    }
+
+    pub fn set_sections(&mut self, sections: NMethodSections) {
+        self.sections = sections;
+    }
+
+    /// SECT_CONSTS region (`nmethod::consts_begin/end` analogue).
+    #[inline]
+    pub fn consts_begin(&self) -> usize {
+        self.sections.consts_begin
+    }
+
+    #[inline]
+    pub fn consts_end(&self) -> usize {
+        self.sections.consts_end
+    }
+
+    #[inline]
+    pub fn consts_size(&self) -> usize {
+        self.sections.consts_end.saturating_sub(self.sections.consts_begin)
+    }
+
+    #[inline]
+    pub fn consts_contains(&self, addr: usize) -> bool {
+        addr >= self.sections.consts_begin && addr < self.sections.consts_end
+    }
+
+    /// Immutable data section (`nmethod::immutable_data_begin/end`).
+    #[inline]
+    pub fn metadata_begin(&self) -> usize {
+        self.sections.metadata_begin
+    }
+
+    #[inline]
+    pub fn metadata_end(&self) -> usize {
+        self.sections.metadata_end
+    }
+
+    #[inline]
+    pub fn metadata_size(&self) -> usize {
+        self.sections.metadata_end.saturating_sub(self.sections.metadata_begin)
+    }
+
+    /// Dependencies occupy the head of the immutable data section
+    /// (`nmethod::dependencies_begin/end` analogue).
+    #[inline]
+    pub fn dependencies_begin(&self) -> usize {
+        self.sections.metadata_begin
+    }
+
+    #[inline]
+    pub fn dependencies_end(&self) -> usize {
+        self.sections.metadata_begin + self.dependencies_size()
+    }
+
+    #[inline]
+    pub fn dependencies_size(&self) -> usize {
+        self.shared.dependencies.lock().unwrap().size_in_bytes()
+    }
+
+    /// Serialized PcDesc region inside the metadata section
+    /// (`nmethod::scopes_pcs_begin/end` analogue).
+    #[inline]
+    pub fn scopes_pcs_begin(&self) -> usize {
+        self.sections.scopes_pcs_begin
+    }
+
+    #[inline]
+    pub fn scopes_pcs_end(&self) -> usize {
+        self.sections.scopes_pcs_end
+    }
+
+    #[inline]
+    pub fn scopes_pcs_size(&self) -> usize {
+        self.sections.scopes_pcs_end.saturating_sub(self.sections.scopes_pcs_begin)
+    }
+
+    #[inline]
+    pub fn has_dependencies(&self) -> bool {
+        self.dependencies_size() != 0
+    }
+
+    // ---- header flags --------------------------------------------------
+
+    #[inline]
+    pub fn has_monitors(&self) -> bool {
+        self.shared.has_monitors.load(Ordering::Acquire) != 0
+    }
+
+    pub fn set_has_monitors(&self, val: bool) {
+        self.shared.has_monitors.store(val as u64, Ordering::Release);
+    }
+
+    #[inline]
+    pub fn has_scoped_access(&self) -> bool {
+        self.shared.has_scoped_access.load(Ordering::Acquire) != 0
+    }
+
+    pub fn set_has_scoped_access(&self, val: bool) {
+        self.shared
+            .has_scoped_access
+            .store(val as u64, Ordering::Release);
+    }
+
+    #[inline]
+    pub fn has_wide_vectors(&self) -> bool {
+        self.shared.has_wide_vectors.load(Ordering::Acquire) != 0
+    }
+
+    pub fn set_has_wide_vectors(&self, val: bool) {
+        self.shared.has_wide_vectors.store(val as u64, Ordering::Release);
+    }
+
+    #[inline]
+    pub fn has_method_handle_invokes(&self) -> bool {
+        self.shared.has_method_handle_invokes.load(Ordering::Acquire) != 0
+    }
+
+    pub fn set_has_method_handle_invokes(&self, val: bool) {
+        self.shared
+            .has_method_handle_invokes
+            .store(val as u64, Ordering::Release);
+    }
+
+    #[inline]
+    pub fn has_flushed_dependencies(&self) -> bool {
+        self.shared.has_flushed_dependencies.load(Ordering::Acquire) != 0
+    }
+
+    /// `nmethod::set_has_flushed_dependencies` (one-shot in HotSpot).
+    pub fn set_has_flushed_dependencies(&self, val: bool) {
+        self.shared
+            .has_flushed_dependencies
+            .store(val as u64, Ordering::Release);
+    }
+
+    // ---- dependencies ---------------------------------------------------
+
+    /// Record a dependency (`nmethod::add_dependency` analogue, via the
+    /// Dependencies recorder).
+    pub fn add_dependency(&self, dep: super::dependencies::Dependency) {
+        self.shared.dependencies.lock().unwrap().add(dep);
+    }
+
+    /// Snapshot of the recorded dependency set.
+    pub fn dependencies(&self) -> DependencySet {
+        self.shared.dependencies.lock().unwrap().clone()
+    }
+
+    /// `nmethod::flush_dependencies` analogue: drop all recorded
+    /// dependencies and mark the nmethod as flushed.
+    pub fn flush_dependencies(&self) {
+        self.shared.dependencies.lock().unwrap().clear();
+        self.set_has_flushed_dependencies(true);
+    }
+
+    /// `nmethod::print_dependencies_on` analogue.
+    pub fn print_dependencies_on(&self, f: &mut dyn std::fmt::Write) {
+        let deps = self.shared.dependencies.lock().unwrap();
+        deps.print_on(f);
+    }
+
+    /// Check whether any recorded dependency is invalidated by a change
+    /// to `klass_name`.  `is_subtype(a, b)` reports whether klass `a`
+    /// is a subtype of `b` (DependencyContext analogue).
+    pub fn dependencies_affected_by<F>(&self, klass_name: &str, is_subtype: F) -> bool
+    where
+        F: Fn(&str, &str) -> bool,
+    {
+        self.shared
+            .dependencies
+            .lock()
+            .unwrap()
+            .has_dependency_on(klass_name, is_subtype)
+    }
+
+    // ---- verification ---------------------------------------------------
+
+    /// Structural verification of inline-cache / debug-info legality
+    /// (`verify_legal_inline_cache` analogue): every PcDesc must point
+    /// inside the code stream, pc_descs must be sorted, scope decode
+    /// offsets must reference the scopes-data blob, and the handler
+    /// tables must stay inside the code range.  Returns the first
+    /// problem found.
+    pub fn verify_legal_inline_cache(&self) -> Result<(), String> {
+        let code_size = self.code_size as i64;
+        let scope_len = self.shared.scope_data.lock().unwrap().len() as i64;
+        let mut prev = i64::MIN;
+        for (i, pd) in self.pc_descs.iter().enumerate() {
+            let off = pd.pc_offset() as i64;
+            // Sentinel records bracket the array and legitimately sit
+            // outside the code stream.
+            if off == PcDesc::LOWER_OFFSET_LIMIT as i64
+                || off == PcDesc::UPPER_OFFSET_LIMIT as i64
+            {
+                continue;
+            }
+            if off < 0 || off > code_size {
+                return Err(format!(
+                    "pc_desc[{}] pc_offset {} outside code [0, {})",
+                    i, off, code_size
+                ));
+            }
+            if i > 0 && off < prev {
+                return Err(format!(
+                    "pc_desc[{}] out of order: {} < {}",
+                    i, off, prev
+                ));
+            }
+            prev = off;
+            let sdo = pd.scope_decode_offset() as i64;
+            if sdo != super::scopeDesc::SERIALIZED_NULL as i64
+                && sdo != super::scopeDesc::NO_SENDER_DECODE_OFFSET as i64
+                && (sdo < 0 || scope_len == 0 || sdo >= scope_len)
+            {
+                return Err(format!(
+                    "pc_desc[{}] scope_decode_offset {} outside scopes data (len {})",
+                    i, sdo, scope_len
+                ));
+            }
+            if pd.is_method_handle_invoke() && sdo <= 0 {
+                return Err(format!(
+                    "pc_desc[{}] method-handle invoke without scope info",
+                    i
+                ));
+            }
+        }
+        // Handler tables must reference pcs inside the code stream.
+        let pc_handlers = self.shared.pc_handlers.lock().unwrap();
+        for e in pc_handlers.entries() {
+            if e.start_pc < 0
+                || e.end_pc > self.code_size as i32
+                || e.handler_pc < 0
+                || e.handler_pc >= self.code_size as i32
+            {
+                return Err(format!(
+                    "handler entry [{},{}) -> {} outside code size {}",
+                    e.start_pc, e.end_pc, e.handler_pc, self.code_size
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Lifecycle: transition InUse -> NotEntrant (nmethod::make_not_entrant).
@@ -493,26 +865,90 @@ impl NMethod {
         self.make_not_entrant_with_reason(InvalidationReason::NotUsed);
     }
 
-    /// Mark for deoptimization (nmethod::mark_for_deoptimization).
-    pub fn mark_for_deoptimization(&self) {
-        self.shared
-            .marked_for_deoptimization
-            .store(1, Ordering::Release);
-    }
+    // ---- deoptimization status ----------------------------------------
 
     #[inline]
-    pub fn is_marked_for_deoptimization(&self) -> bool {
-        self.shared.marked_for_deoptimization.load(Ordering::Acquire) != 0
+    pub fn deoptimization_status(&self) -> DeoptimizationStatus {
+        match self.shared.deopt_status.load(Ordering::Acquire) {
+            1 => DeoptimizationStatus::Deoptimize,
+            2 => DeoptimizationStatus::DeoptimizeNoUpdate,
+            3 => DeoptimizationStatus::DeoptimizeDone,
+            _ => DeoptimizationStatus::NotMarked,
+        }
     }
 
-    /// Called when the deoptimization has completed on all stacks.
+    fn set_deoptimization_status(&self, status: DeoptimizationStatus) {
+        self.shared
+            .deopt_status
+            .store(status as u64, Ordering::Release);
+    }
+
+    /// Mark for deoptimization (nmethod::mark_for_deoptimization):
+    /// transitions not_marked -> deoptimize.  Returns true if this call
+    /// performed the transition.
+    pub fn mark_for_deoptimization(&self) -> bool {
+        self.shared
+            .deopt_status
+            .compare_exchange(
+                DeoptimizationStatus::NotMarked as u64,
+                DeoptimizationStatus::Deoptimize as u64,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    /// Mark for deoptimization without recompile-count update
+    /// (deoptimize_noupdate, e.g. uncommon traps).
+    pub fn mark_for_deoptimization_noupdate(&self) -> bool {
+        self.shared
+            .deopt_status
+            .compare_exchange(
+                DeoptimizationStatus::NotMarked as u64,
+                DeoptimizationStatus::DeoptimizeNoUpdate as u64,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    /// `nmethod::is_marked_for_deoptimization`: true for every status
+    /// other than not_marked (including deoptimize_done).
+    #[inline]
+    pub fn is_marked_for_deoptimization(&self) -> bool {
+        self.deoptimization_status() != DeoptimizationStatus::NotMarked
+    }
+
+    /// `nmethod::has_been_deoptimized`.
+    #[inline]
+    pub fn has_been_deoptimized(&self) -> bool {
+        self.deoptimization_status() == DeoptimizationStatus::DeoptimizeDone
+    }
+
+    /// `nmethod::update_recompile_counts`: whether the caller should
+    /// update invocation/backedge recompile counts.
+    #[inline]
+    pub fn update_recompile_counts(&self) -> bool {
+        !matches!(
+            self.deoptimization_status(),
+            DeoptimizationStatus::DeoptimizeNoUpdate | DeoptimizationStatus::DeoptimizeDone
+        )
+    }
+
+    /// Called when the deoptimization has completed on all stacks
+    /// (`nmethod::set_deoptimized_done`).
     pub fn deoptimization_done(&self) {
-        self.shared.deoptimized_done.store(1, Ordering::Release);
+        self.set_deoptimization_status(DeoptimizationStatus::DeoptimizeDone);
+    }
+
+    /// `nmethod::set_deoptimized_done` alias.
+    pub fn set_deoptimized_done(&self) {
+        self.deoptimization_done();
     }
 
     #[inline]
     pub fn is_deoptimization_done(&self) -> bool {
-        self.shared.deoptimized_done.load(Ordering::Acquire) != 0
+        self.deoptimization_status() == DeoptimizationStatus::DeoptimizeDone
     }
 
     /// Transition NotEntrant -> Zombie once no activations remain
@@ -607,14 +1043,28 @@ impl NMethod {
     }
 
     /// `ScopeDesc` lookup for a pc: find the PcDesc, then decode the
-    /// scope chain from the scopes-data blob.
+    /// scope chain from the scopes-data blob.  PcDesc flags
+    /// (reexecute/return_oop/rethrow/has_ea_local/arg_escape) are applied
+    /// to the top scope, matching `ScopeDesc::decode_body` + PcDesc flag
+    /// reads in HotSpot.
     pub fn scope_desc_at_pc(&self, pc: usize) -> Vec<ScopeDesc> {
         let data = self.shared.scope_data.lock().unwrap();
         if data.is_empty() {
             return Vec::new();
         }
         if let Some(pd) = self.pc_desc_at(pc) {
-            return decode_scope_chain(&data, pd.scope_decode_offset());
+            let mut chain =
+                decode_scope_chain_with_objects(&data, pd.scope_decode_offset(), pd.obj_decode_offset());
+            if let Some(top) = chain.first_mut() {
+                top.apply_pc_desc_flags(
+                    pd.should_reexecute(),
+                    pd.is_return_oop(),
+                    pd.rethrow_exception(),
+                    pd.has_ea_local_in_scope(),
+                    pd.arg_escape(),
+                );
+            }
+            return chain;
         }
         Vec::new()
     }
@@ -800,6 +1250,8 @@ impl NMethod {
             .sum()
     }
 
+    /// `nmethod::print_on` analogue: header line plus dependency, pc-desc,
+    /// scope, handler-table and live-map summaries.
     pub fn print_on(&self, f: &mut dyn std::fmt::Write) {
         let _ = writeln!(
             f,
@@ -815,17 +1267,86 @@ impl NMethod {
             self.code_end(),
             self.code_size,
         );
+        let _ = writeln!(
+            f,
+            "  entry_point={} verified={} osr_entry={} frame_size={}",
+            self.entry_point,
+            self.verified_entry_point,
+            self.osr_entry_point,
+            self.frame_size(),
+        );
+        if self.sections.consts_begin != 0 || self.sections.metadata_begin != 0 {
+            let _ = writeln!(
+                f,
+                "  consts=[{}..{}) metadata=[{}..{}) scopes_pcs=[{}..{}) deps_size={}",
+                self.sections.consts_begin,
+                self.sections.consts_end,
+                self.sections.metadata_begin,
+                self.sections.metadata_end,
+                self.sections.scopes_pcs_begin,
+                self.sections.scopes_pcs_end,
+                self.dependencies_size(),
+            );
+        }
         if let Some(reason) = self.invalidation_reason() {
             let _ = writeln!(f, "  invalidation: {}", reason.as_str());
         }
+        let _ = writeln!(f, "  deopt_status={:?}", self.deoptimization_status());
         if self.is_marked_for_deoptimization() {
             let _ = writeln!(f, "  marked for deoptimization");
         }
-        let _ = writeln!(f, "  pc_descs={} scopes={} oop_maps={} live_maps={}",
+        let flags = [
+            ("monitors", self.has_monitors()),
+            ("scoped_access", self.has_scoped_access()),
+            ("wide_vectors", self.has_wide_vectors()),
+            ("method_handle_invokes", self.has_method_handle_invokes()),
+            ("unsafe_access", self.has_unsafe_access()),
+        ];
+        let active: Vec<&str> = flags
+            .iter()
+            .filter(|(_, v)| *v)
+            .map(|(n, _)| *n)
+            .collect();
+        if !active.is_empty() {
+            let _ = writeln!(f, "  flags: {}", active.join(", "));
+        }
+        let _ = writeln!(
+            f,
+            "  pc_descs={} scopes={} oop_maps={} live_maps={}",
             self.pc_descs.len(),
             self.scopes.len(),
             self.shared.oop_maps.lock().unwrap().size(),
-            self.shared.live_maps.lock().unwrap().len());
+            self.shared.live_maps.lock().unwrap().len(),
+        );
+        // Compact pc-desc listing (HotSpot prints each PcDesc under
+        // PrintNMethods/PrintCompilation).
+        for pd in self.pc_descs.iter().take(64) {
+            let _ = writeln!(
+                f,
+                "    pc_desc offset={} scope_off={} obj_off={} bci={} flags=0x{:x}",
+                pd.pc_offset(),
+                pd.scope_decode_offset(),
+                pd.obj_decode_offset(),
+                pd.bci(),
+                pd.flags(),
+            );
+        }
+        if self.pc_descs.len() > 64 {
+            let _ = writeln!(f, "    ... {} more pc_descs", self.pc_descs.len() - 64);
+        }
+        self.print_dependencies_on(f);
+        // Scope summary: decode the recorded in-memory scopes.
+        for s in self.scopes.iter().take(16) {
+            s.print_on(f);
+        }
+        if self.scopes.len() > 16 {
+            let _ = writeln!(f, "    ... {} more scopes", self.scopes.len() - 16);
+        }
+        let ht = self.shared.handler_table.lock().unwrap();
+        if !ht.is_empty() {
+            let _ = writeln!(f, "  handler_table:");
+            ht.print_on(f, Some(self.code_begin()));
+        }
     }
 }
 
@@ -922,5 +1443,118 @@ mod tests {
         assert_eq!(nm.frame_size(), 0);
         nm.set_frame_size(48);
         assert_eq!(nm.frame_size(), 48);
+    }
+
+    #[test]
+    fn deopt_status_transitions() {
+        let nm = test_nm();
+        assert_eq!(nm.deoptimization_status(), DeoptimizationStatus::NotMarked);
+        assert!(nm.update_recompile_counts());
+        assert!(nm.mark_for_deoptimization());
+        // Second mark is a no-op (already past not_marked).
+        assert!(!nm.mark_for_deoptimization());
+        assert!(nm.is_marked_for_deoptimization());
+        assert!(!nm.has_been_deoptimized());
+        nm.deoptimization_done();
+        assert!(nm.has_been_deoptimized());
+        assert!(nm.is_marked_for_deoptimization());
+        assert!(!nm.update_recompile_counts());
+        // noupdate variant
+        let nm2 = test_nm();
+        assert!(nm2.mark_for_deoptimization_noupdate());
+        assert!(!nm2.update_recompile_counts());
+    }
+
+    #[test]
+    fn sections_and_dependencies() {
+        let mut nm = test_nm();
+        nm.set_sections(NMethodSections {
+            consts_begin: 0x800,
+            consts_end: 0x900,
+            metadata_begin: 0x900,
+            metadata_end: 0xA00,
+            scopes_pcs_begin: 0x920,
+            scopes_pcs_end: 0x980,
+        });
+        assert_eq!(nm.consts_size(), 0x100);
+        assert!(nm.consts_contains(0x850));
+        assert_eq!(nm.metadata_size(), 0x100);
+        assert_eq!(nm.scopes_pcs_size(), 0x60);
+        assert_eq!(nm.dependencies_begin(), 0x900);
+        nm.add_dependency(super::dependencies::Dependency::new(
+            super::dependencies::DepType::LeafType,
+            vec![super::dependencies::DependencyArgument::Klass(
+                "pkg/Base".to_string(),
+            )],
+        ));
+        assert!(nm.has_dependencies());
+        assert!(nm.dependencies_affected_by("pkg/Base", |a, b| a == b));
+        assert!(nm.dependencies_affected_by("pkg/Sub", |a, b| b == "pkg/Base"));
+        assert!(!nm.dependencies_affected_by("pkg/Other", |_, _| false));
+        let deps = nm.dependencies();
+        assert_eq!(deps.len(), 1);
+        nm.flush_dependencies();
+        assert!(!nm.has_dependencies());
+        assert!(nm.has_flushed_dependencies());
+        // Relocation shifts absolute section addresses.
+        nm.set_sections(NMethodSections {
+            consts_begin: 0x800,
+            consts_end: 0x900,
+            metadata_begin: 0x900,
+            metadata_end: 0xA00,
+            scopes_pcs_begin: 0,
+            scopes_pcs_end: 0,
+        });
+        nm.set_code_location(0x2000, 256);
+        // delta = 0x2000 - 0x1000 = 0x1000; 0x800 + 0x1000 = 0x1800.
+        assert_eq!(nm.consts_begin(), 0x1800);
+        assert_eq!(nm.metadata_begin(), 0x1900);
+    }
+
+    #[test]
+    fn verify_legal_inline_cache_ok_and_bad() {
+        let nm = test_nm();
+        // pc_descs offsets are within code_size=256; scope offsets are 0
+        // (serialized_null) so verification passes.
+        assert!(nm.verify_legal_inline_cache().is_ok());
+        // Corrupt: unsorted pc_descs.
+        let mut nm2 = test_nm();
+        nm2.pc_descs = vec![
+            PcDesc::new(PcDesc::LOWER_OFFSET_LIMIT, 0, 0),
+            PcDesc::with_bci(100, 0, 0, 0, 1),
+            PcDesc::with_bci(50, 0, 0, 0, 2),
+            PcDesc::new(PcDesc::UPPER_OFFSET_LIMIT, 0, 0),
+        ];
+        assert!(nm2.verify_legal_inline_cache().is_err());
+        // Out-of-range handler entry.
+        let nm3 = test_nm();
+        nm3.set_pc_handlers({
+            let mut t = PcRangeHandlerTable::new();
+            t.add(0, 300, 10, None);
+            t
+        });
+        assert!(nm3.verify_legal_inline_cache().is_err());
+    }
+
+    #[test]
+    fn header_flags() {
+        let nm = test_nm();
+        assert!(!nm.has_monitors());
+        nm.set_has_monitors(true);
+        nm.set_has_method_handle_invokes(true);
+        assert!(nm.has_monitors());
+        assert!(nm.has_method_handle_invokes());
+        assert!(nm.is_entrant());
+        assert!(nm.can_be_deoptimized());
+        let osr_nm = NMethod::with_entry_points(
+            "O".to_string(), "osr".to_string(), "()V".to_string(),
+            CompLevel::Simple, 7, 0, 0, 0, 0, 0, vec![], vec![],
+        );
+        assert_eq!(osr_nm.osr_entry_bci(), 7);
+        assert!(osr_nm.is_osr_method());
+        let mut s = String::new();
+        nm.print_on(&mut s);
+        assert!(s.contains("nmethod"));
+        assert!(s.contains("dependencies"));
     }
 }

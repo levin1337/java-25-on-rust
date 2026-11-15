@@ -177,6 +177,68 @@ impl ExceptionHandlerTable {
         self.table.len() * 12
     }
 
+    /// `ExceptionHandlerTable::subtable_for_pco` style lookup returning
+    /// every handler entry reachable from catch site `catch_pco`.
+    pub fn handlers_for_catch_pco(&self, catch_pco: i32) -> Vec<&HandlerTableEntry> {
+        match self.subtable_for(catch_pco) {
+            Some(start) => {
+                let header = &self.table[start];
+                let len = header.len() as usize;
+                let end = (start + 1 + len).min(self.table.len());
+                self.table[start + 1..end].iter().collect()
+            }
+            None => Vec::new(),
+        }
+    }
+
+    /// Handler pco for `(catch_pco, handler_bci, scope_depth)` — the
+    /// compiled-code dispatch lookup used when materializing an
+    /// exception handler frame.
+    pub fn handler_pco_for(
+        &self,
+        catch_pco: i32,
+        handler_bci: i32,
+        scope_depth: i32,
+    ) -> Option<i32> {
+        self.entry_for(catch_pco, handler_bci, scope_depth)
+            .map(|e| e.pco())
+    }
+
+    /// Number of subtables (catch sites).
+    pub fn subtable_count(&self) -> usize {
+        self.subtables().len()
+    }
+
+    /// Structural verification: every subtable header length must keep
+    /// the walk inside the table and entries must have non-negative
+    /// pcos.
+    pub fn verify(&self) -> Result<(), String> {
+        let mut i = 0usize;
+        while i < self.table.len() {
+            let header = &self.table[i];
+            let len = header.len();
+            if len < 0 {
+                return Err(format!("subtable at {} has negative length {}", i, len));
+            }
+            let end = i + 1 + len as usize;
+            if end > self.table.len() {
+                return Err(format!(
+                    "subtable at {} (len {}) overruns table of {}",
+                    i,
+                    len,
+                    self.table.len()
+                ));
+            }
+            for e in &self.table[i + 1..end] {
+                if e.pco() < 0 {
+                    return Err(format!("negative handler pco {}", e.pco()));
+                }
+            }
+            i = end;
+        }
+        Ok(())
+    }
+
     /// Encode the table as raw little-endian i32 triples.
     pub fn copy_bytes_to(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.size_in_bytes());
@@ -344,6 +406,78 @@ impl PcRangeHandlerTable {
         self.entries.iter().filter(move |e| e.covers(pc))
     }
 
+    /// `PcDesc`-based dispatch: first handler covering `pc` whose catch
+    /// type matches `thrown_type` (exact match unless `is_subtype`
+    /// resolves supertypes).  Returns the handler pc offset.
+    pub fn handler_pc_for(
+        &self,
+        pc: i32,
+        thrown_type: &Symbol,
+        is_subtype: Option<&dyn Fn(&Symbol, &Symbol) -> bool>,
+    ) -> Option<i32> {
+        self.lookup(pc, thrown_type, is_subtype).map(|e| e.handler_pc)
+    }
+
+    /// Whether the table is sorted by start_pc and non-overlapping in
+    /// dispatch order (stable-sorted insertion keeps class-file order
+    /// for equal starts).
+    pub fn is_sorted(&self) -> bool {
+        self.entries
+            .windows(2)
+            .all(|w| w[0].start_pc <= w[1].start_pc)
+    }
+
+    /// Structural verification: sorted order, valid ranges
+    /// (start < end, handler >= 0).
+    pub fn verify(&self) -> Result<(), String> {
+        if !self.is_sorted() {
+            return Err("pc-range handler table not sorted by start_pc".to_string());
+        }
+        for (i, e) in self.entries.iter().enumerate() {
+            if e.start_pc < 0 || e.end_pc <= e.start_pc {
+                return Err(format!(
+                    "entry {} has invalid range [{},{})",
+                    i, e.start_pc, e.end_pc
+                ));
+            }
+            if e.handler_pc < 0 {
+                return Err(format!("entry {} has negative handler_pc", i));
+            }
+        }
+        Ok(())
+    }
+
+    /// `print_on` analogue for the pc-range table.
+    pub fn print_on(&self, f: &mut dyn std::fmt::Write, base: Option<usize>) {
+        let _ = writeln!(f, "pc-range handler table ({} entries):", self.entries.len());
+        for e in &self.entries {
+            let catch = e
+                .catch_type
+                .as_ref()
+                .map_or_else(|| "any".to_string(), |s| s.to_string());
+            match base {
+                Some(b) => {
+                    let _ = writeln!(
+                        f,
+                        "  [{},{}) -> handler {} (pc={}) catch {}",
+                        e.start_pc,
+                        e.end_pc,
+                        e.handler_pc,
+                        b as i64 + e.handler_pc as i64,
+                        catch
+                    );
+                }
+                None => {
+                    let _ = writeln!(
+                        f,
+                        "  [{},{}) -> handler {} catch {}",
+                        e.start_pc, e.end_pc, e.handler_pc, catch
+                    );
+                }
+            }
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.entries.len()
     }
@@ -462,5 +596,42 @@ mod tests {
         assert_eq!(t.entries()[0].start_pc, 0);
         assert_eq!(t.entries()[0].end_pc, 40);
         assert_eq!(t.entries()[0].handler_pc, 80);
+    }
+
+    #[test]
+    fn subtable_dispatch_helpers() {
+        let mut t = ExceptionHandlerTable::new(8);
+        t.add_subtable(10, &[20, 30], Some(&[0, 1]), &[100, 200]);
+        assert_eq!(t.subtable_count(), 1);
+        let handlers = t.handlers_for_catch_pco(10);
+        assert_eq!(handlers.len(), 2);
+        assert_eq!(t.handler_pco_for(10, 30, 1), Some(200));
+        assert_eq!(t.handler_pco_for(10, 99, 0), None);
+        assert_eq!(t.handler_pco_for(77, 20, 0), None);
+        assert!(t.verify().is_ok());
+    }
+
+    #[test]
+    fn pc_range_dispatch_and_verify() {
+        let mut t = PcRangeHandlerTable::new();
+        let io = Symbol::new(b"java/io/IOException");
+        t.add(0, 50, 200, None);
+        t.add(60, 70, 100, Some(io.clone()));
+        // Subtype-aware dispatch: thrown subtype of expected matches.
+        let sub = Symbol::new(b"java/io/FileNotFoundException");
+        let is_sub = |thrown: &Symbol, expected: &Symbol| {
+            thrown == expected || (thrown.as_str().starts_with("java/io/") && expected == &io)
+        };
+        assert_eq!(t.handler_pc_for(65, &sub, Some(&is_sub)), Some(100));
+        assert_eq!(t.handler_pc_for(15, &sub, Some(&is_sub)), Some(200));
+        assert!(t.is_sorted());
+        assert!(t.verify().is_ok());
+        let mut bad = PcRangeHandlerTable::new();
+        bad.add_entry(PcRangeHandlerEntry::new(50, 40, 10, None));
+        assert!(bad.verify().is_err());
+        let mut s = String::new();
+        t.print_on(&mut s, Some(0x1000));
+        assert!(s.contains("pc-range handler table"));
+        assert!(s.contains("catch any"));
     }
 }

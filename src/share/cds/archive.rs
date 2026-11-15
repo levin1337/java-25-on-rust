@@ -35,10 +35,15 @@ use std::path::Path;
 
 /// Size of the serialized GenericCDSFileMapHeader (share/include/cds.h).
 pub const GENERIC_HEADER_SIZE: usize = 24;
-/// Serialized size of one CDSFileMapRegion record.
-pub const REGION_RECORD_SIZE: usize = 80;
-/// Byte size of the full fixed header (generic + regions).
-pub const FIXED_HEADER_SIZE: usize = GENERIC_HEADER_SIZE + NUM_CDS_REGIONS * REGION_RECORD_SIZE;
+/// Serialized size of one CDSFileMapRegion record on LP64:
+/// i32 crc + 5 x i32 flags + 7 x u64 + u64 mapped_base + u8 in_reserved_space + 7 pad.
+pub const REGION_RECORD_SIZE: usize = 96;
+/// Byte size of the generic header plus the region table.
+pub const CORE_HEADER_SIZE: usize = GENERIC_HEADER_SIZE + NUM_CDS_REGIONS * REGION_RECORD_SIZE;
+/// os::cds_core_region_alignment() on Windows = os::vm_allocation_granularity().
+pub const CORE_REGION_ALIGNMENT: usize = 64 * 1024;
+/// Byte size of the fixed generic+region prefix (kept for compatibility).
+pub const FIXED_HEADER_SIZE: usize = CORE_HEADER_SIZE;
 
 /// GenericCDSFileMapHeader — the version-stable prefix of the archive.
 #[derive(Debug, Clone, Copy)]
@@ -63,16 +68,16 @@ impl GenericHeader {
         }
     }
 
-    pub fn dynamic_archive(base_name: &str) -> Self {
-        let bytes = base_name.as_bytes();
-        let size = bytes.len() + 1; // NUL terminator
+    pub fn dynamic_archive(_base_name: &str) -> Self {
+        // base_archive_name_offset/size are filled in by serialize_header_block;
+        // the name is placed after the FileMapHeader extension fields.
         Self {
             magic: CDS_DYNAMIC_ARCHIVE_MAGIC,
             crc: 0,
             version: CURRENT_CDS_ARCHIVE_VERSION,
-            header_size: (FIXED_HEADER_SIZE + size) as u32,
-            base_archive_name_offset: GENERIC_HEADER_SIZE as u32,
-            base_archive_name_size: size as u32,
+            header_size: 0,
+            base_archive_name_offset: 0,
+            base_archive_name_size: 0,
         }
     }
 
@@ -163,6 +168,10 @@ pub struct CdsRegion {
     pub oopmap_size_in_bits: u64,
     pub ptrmap_offset: u64,
     pub ptrmap_size_in_bits: u64,
+    /// Runtime-only field in C++; serialized as the raw pointer value
+    /// (always 0 in archives produced by FileMapInfo::write_region).
+    pub mapped_base: u64,
+    pub in_reserved_space: bool,
 }
 
 impl CdsRegion {
@@ -185,9 +194,12 @@ impl CdsRegion {
             self.oopmap_size_in_bits,
             self.ptrmap_offset,
             self.ptrmap_size_in_bits,
+            self.mapped_base,
         ] {
             w.write_all(&v.to_le_bytes())?;
         }
+        w.write_all(&[self.in_reserved_space as u8])?;
+        w.write_all(&[0u8; 7])?;
         Ok(())
     }
 
@@ -201,11 +213,13 @@ impl CdsRegion {
             r.read_exact(&mut b4)?;
             *f = i32::from_le_bytes(b4) != 0;
         }
-        let mut vals = [0u64; 7];
+        let mut vals = [0u64; 8];
         for v in vals.iter_mut() {
             r.read_exact(&mut b8)?;
             *v = u64::from_le_bytes(b8);
         }
+        let mut pad = [0u8; 8];
+        r.read_exact(&mut pad)?;
         Ok(Self {
             crc,
             read_only: flags[0],
@@ -220,15 +234,20 @@ impl CdsRegion {
             oopmap_size_in_bits: vals[4],
             ptrmap_offset: vals[5],
             ptrmap_size_in_bits: vals[6],
+            mapped_base: vals[7],
+            in_reserved_space: pad[0] != 0,
         })
     }
 }
 
 /// FileMapInfo equivalent: header + regions + payload access.
+/// `extension` holds the serialized FileMapHeader fields that follow the
+/// region table in HotSpot's raw struct dump (parsed by filemap.rs).
 pub struct CdsArchive {
     pub header: GenericHeader,
     pub base_archive_name: Option<String>,
     pub regions: Vec<CdsRegion>,
+    pub extension: Vec<u8>,
 }
 
 impl CdsArchive {
@@ -249,8 +268,12 @@ impl CdsArchive {
     }
 }
 
+pub fn crc32_pub(data: &[u8]) -> u32 {
+    crc32(data)
+}
+
 fn crc32(data: &[u8]) -> u32 {
-    // IEEE CRC32 (same polynomial as filemap.cpp's crc32).
+    // IEEE CRC32 (same polynomial as ClassLoader::crc32 / zlib crc32).
     let mut crc = 0xFFFF_FFFFu32;
     for &b in data {
         crc ^= b as u32;
@@ -261,20 +284,123 @@ fn crc32(data: &[u8]) -> u32 {
     !crc
 }
 
-/// Compute the header CRC: over everything from byte 8 (after magic+crc)
-/// up to and including the base archive name area, per filemap.cpp.
-fn header_crc(header_bytes_no_crc: &[u8]) -> i32 {
-    crc32(header_bytes_no_crc) as i32
+pub(crate) fn align_up(v: u64, align: u64) -> u64 {
+    (v + align - 1) & !(align - 1)
 }
 
-/// Read an archive header + region table from an open file.
-pub fn read_header(file: &mut File) -> io::Result<CdsArchive> {
-    let header = GenericHeader::read_from(file)?;
+/// Compute the header CRC. FileMapHeader::compute_crc() starts at the byte
+/// after `_header_size` (file offset 16) and covers everything up to
+/// header_size — i.e. base-name fields, region table, FileMapHeader
+/// extension fields and the base archive name.
+fn header_crc(header_block: &[u8]) -> i32 {
+    crc32(&header_block[16..]) as i32
+}
 
-    // Base archive name (dynamic archives).
+/// Build the complete header block: generic header, region table, FileMapHeader
+/// extension bytes, base archive name. Returns the block and the computed CRC.
+pub fn serialize_header_block(
+    mut header: GenericHeader,
+    regions: &[CdsRegion],
+    extension: &[u8],
+    base_name: Option<&str>,
+) -> io::Result<Vec<u8>> {
+    assert_eq!(regions.len(), NUM_CDS_REGIONS);
+    let name_bytes = base_name.map(|s| s.as_bytes());
+    let name_size = name_bytes.map_or(0, |b| b.len() + 1);
+    let struct_size = CORE_HEADER_SIZE + extension.len();
+    let name_offset = if name_size > 0 { struct_size } else { 0 };
+    let header_size = struct_size + name_size;
+
+    header.header_size = header_size as u32;
+    header.base_archive_name_offset = name_offset as u32;
+    header.base_archive_name_size = name_size as u32;
+
+    let mut block = Vec::with_capacity(header_size);
+    header.write_to(&mut block)?;
+    for r in regions {
+        r.write_to(&mut block)?;
+    }
+    block.extend_from_slice(extension);
+    if let Some(bytes) = name_bytes {
+        block.extend_from_slice(bytes);
+        block.push(0);
+    }
+    assert_eq!(block.len(), header_size);
+
+    let crc = header_crc(&block);
+    block[4..8].copy_from_slice(&crc.to_le_bytes());
+    Ok(block)
+}
+
+/// Read an archive header + region table + extension from an open file.
+pub fn read_header(file: &mut File) -> io::Result<CdsArchive> {
+    let mut b4 = [0u8; 4];
+
+    file.seek(SeekFrom::Start(0))?;
+    file.read_exact(&mut b4)?;
+    let magic = u32::from_le_bytes(b4);
+    let mut header = GenericHeader {
+        magic,
+        crc: {
+            file.read_exact(&mut b4)?;
+            i32::from_le_bytes(b4)
+        },
+        version: {
+            file.read_exact(&mut b4)?;
+            i32::from_le_bytes(b4)
+        },
+        header_size: {
+            file.read_exact(&mut b4)?;
+            u32::from_le_bytes(b4)
+        },
+        base_archive_name_offset: {
+            file.read_exact(&mut b4)?;
+            u32::from_le_bytes(b4)
+        },
+        base_archive_name_size: {
+            file.read_exact(&mut b4)?;
+            u32::from_le_bytes(b4)
+        },
+    };
+    if header.magic != CDS_ARCHIVE_MAGIC
+        && header.magic != CDS_DYNAMIC_ARCHIVE_MAGIC
+        && header.magic != CDS_PREIMAGE_ARCHIVE_MAGIC
+    {
+        return Err(io::Error::other(format!(
+            "Not a CDS archive (magic {:#x})",
+            header.magic
+        )));
+    }
+    if !header.is_supported() {
+        return Err(io::Error::other(format!(
+            "Unsupported CDS archive version {}",
+            header.version
+        )));
+    }
+    let header_size = header.header_size as u64;
+    if header_size < CORE_HEADER_SIZE as u64 {
+        return Err(io::Error::other(format!(
+            "CDS header too small: {} bytes",
+            header_size
+        )));
+    }
+
+    // Region table immediately follows the 24-byte generic header.
+    file.seek(SeekFrom::Start(GENERIC_HEADER_SIZE as u64))?;
+    let mut regions = Vec::with_capacity(NUM_CDS_REGIONS);
+    for _ in 0..NUM_CDS_REGIONS {
+        regions.push(CdsRegion::read_from(file)?);
+    }
+
+    // Base archive name sits at base_archive_name_offset (after the
+    // FileMapHeader extension fields).
     let mut base_name = None;
     if header.base_archive_name_size > 0 {
         let name_off = header.base_archive_name_offset as u64;
+        let name_end = name_off + header.base_archive_name_size as u64;
+        if name_end > header_size {
+            return Err(io::Error::other("CDS base archive name out of header bounds"));
+        }
         file.seek(SeekFrom::Start(name_off))?;
         let mut buf = vec![0u8; header.base_archive_name_size as usize];
         file.read_exact(&mut buf)?;
@@ -284,20 +410,27 @@ pub fn read_header(file: &mut File) -> io::Result<CdsArchive> {
         base_name = Some(String::from_utf8_lossy(&buf).to_string());
     }
 
-    // Regions start right after the generic header (name lives inside the
-    // generic header area for dynamic archives).
-    file.seek(SeekFrom::Start(GENERIC_HEADER_SIZE as u64))?;
-    let mut regions = Vec::with_capacity(NUM_CDS_REGIONS);
-    for _ in 0..NUM_CDS_REGIONS {
-        regions.push(CdsRegion::read_from(file)?);
+    // FileMapHeader extension: everything between the region table and the
+    // base archive name (or end of header when there is no name).
+    let ext_start = CORE_HEADER_SIZE as u64;
+    let ext_end = if header.base_archive_name_size > 0 {
+        header.base_archive_name_offset as u64
+    } else {
+        header_size
+    };
+    let mut extension = Vec::new();
+    if ext_end > ext_start {
+        file.seek(SeekFrom::Start(ext_start))?;
+        extension.resize((ext_end - ext_start) as usize, 0);
+        file.read_exact(&mut extension)?;
     }
 
-    // Verify header CRC when present (covers bytes [8, header_size)).
+    // Verify header CRC over bytes [16, header_size).
     if header.crc != 0 {
-        file.seek(SeekFrom::Start(8))?;
-        let mut hb = vec![0u8; header.header_size as usize - 8];
+        file.seek(SeekFrom::Start(16))?;
+        let mut hb = vec![0u8; (header_size - 16) as usize];
         file.read_exact(&mut hb)?;
-        let computed = header_crc(&hb);
+        let computed = crc32(&hb) as i32;
         if computed != header.crc {
             return Err(io::Error::other(format!(
                 "CDS header CRC mismatch: stored {} computed {}",
@@ -310,43 +443,30 @@ pub fn read_header(file: &mut File) -> io::Result<CdsArchive> {
         header,
         base_archive_name: base_name,
         regions,
+        extension,
     };
     archive.validate()?;
     Ok(archive)
 }
 
-/// Write an archive header + region table; returns the file offset where
-/// region payloads should begin.
+/// Write a complete archive header block (generic + regions + extension +
+/// name) at offset 0. Returns the aligned file offset where region payloads
+/// must begin (FileMapInfo::prepare_for_writing: align_up(header_size,
+/// core_region_alignment)).
 pub fn write_header(
     file: &mut File,
     header: &GenericHeader,
-    base_name: Option<&str>,
     regions: &[CdsRegion],
+    extension: &[u8],
+    base_name: Option<&str>,
 ) -> io::Result<u64> {
-    assert_eq!(regions.len(), NUM_CDS_REGIONS);
+    let block = serialize_header_block(*header, regions, extension, base_name)?;
     file.seek(SeekFrom::Start(0))?;
-
-    let mut header_bytes = Vec::with_capacity(header.header_size as usize);
-    // Serialize header with crc=0 placeholder.
-    let mut tmp = Vec::new();
-    header.write_to(&mut tmp)?;
-    if let Some(name) = base_name {
-        tmp.extend_from_slice(name.as_bytes());
-        tmp.push(0);
-    }
-    // Pad to header_size.
-    tmp.resize(header.header_size as usize, 0);
-    header_bytes.append(&mut tmp);
-
-    // CRC covers bytes [8, header_size) — i.e. tmp[8..].
-    let crc = header_crc(&header_bytes[8..]);
-    header_bytes[4..8].copy_from_slice(&crc.to_le_bytes());
-
-    file.write_all(&header_bytes)?;
-    for r in regions {
-        r.write_to(file)?;
-    }
-    Ok(header.header_size as u64)
+    file.write_all(&block)?;
+    let data_start = align_up(block.len() as u64, CORE_REGION_ALIGNMENT as u64);
+    file.set_len(data_start)?;
+    file.seek(SeekFrom::Start(data_start))?;
+    Ok(data_start)
 }
 
 /// Load the payload of one region from the archive file.
@@ -369,14 +489,19 @@ pub fn read_region(file: &mut File, region: &CdsRegion) -> io::Result<Vec<u8>> {
 }
 
 /// Append a region payload to the archive, returning (file_offset, crc).
-/// Payloads are 8-byte aligned like FileMapInfo's region packing.
+/// Mirrors FileMapInfo::write_bytes_aligned: the file position is aligned to
+/// core_region_alignment() before and after the payload.
 pub fn append_region(file: &mut File, data: &[u8]) -> io::Result<(u64, i32)> {
-    let pos = file.seek(SeekFrom::End(0))?;
-    let aligned = (pos + 7) & !7;
+    let pos = file.seek(SeekFrom::Current(0))?;
+    let aligned = align_up(pos, CORE_REGION_ALIGNMENT as u64);
     if aligned > pos {
-        file.write_all(&vec![0u8; (aligned - pos) as usize])?;
+        file.set_len(aligned)?;
+        file.seek(SeekFrom::Start(aligned))?;
     }
     file.write_all(data)?;
+    let end = file.seek(SeekFrom::Current(0))?;
+    let aligned_end = align_up(end, CORE_REGION_ALIGNMENT as u64);
+    file.set_len(aligned_end)?;
     Ok((aligned, crc32(data) as i32))
 }
 
@@ -391,6 +516,10 @@ pub fn open_archive(path: &Path) -> io::Result<(File, CdsArchive)> {
 mod tests {
     use super::*;
 
+    fn test_file(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("cds_archive_test_{}.jsa", tag))
+    }
+
     #[test]
     fn header_roundtrip() {
         let header = GenericHeader::static_archive();
@@ -398,37 +527,101 @@ mod tests {
         regions[0] = CdsRegion {
             crc: 123,
             read_only: true,
-            file_offset: 4096,
-            used: 100,
+            file_offset: 65536,
+            used: 11,
+            mapped_from_file: true,
             ..CdsRegion::default()
         };
-        let dir = std::env::temp_dir();
-        let path = dir.join("cds_archive_test.jsa");
-        let mut f = File::create(&path).unwrap();
-        write_header(&mut f, &header, None, &regions).unwrap();
-        f.write_all(&[0u8; 4096 - FIXED_HEADER_SIZE as usize]).unwrap();
-        append_region(&mut f, b"hello cds").unwrap();
+        let path = test_file("roundtrip");
+        {
+            let mut f = File::create(&path).unwrap();
+            write_header(&mut f, &header, &regions, b"ext-bytes", None).unwrap();
+            assert_eq!(f.stream_position().unwrap(), CORE_REGION_ALIGNMENT as u64);
+            let (off, crc) = append_region(&mut f, b"hello cds").unwrap();
+            assert_eq!(off % CORE_REGION_ALIGNMENT as u64, 0);
+            regions[0].file_offset = off;
+            regions[0].crc = crc;
+        }
+        // Rewrite header with final region CRCs.
+        let mut f = File::options().read(true).write(true).open(&path).unwrap();
+        write_header(&mut f, &header, &regions, b"ext-bytes", None).unwrap();
         drop(f);
 
         let mut rf = File::open(&path).unwrap();
         let arch = read_header(&mut rf).unwrap();
         assert!(arch.header.is_static());
         assert!(arch.header.is_supported());
-        assert_eq!(arch.regions[0].used, 100);
-        assert_eq!(arch.regions[0].read_only, true);
+        assert_eq!(arch.regions.len(), NUM_CDS_REGIONS);
+        assert_eq!(arch.regions[0].used, 11);
+        assert!(arch.regions[0].read_only);
+        assert_eq!(arch.regions[0].file_offset % CORE_REGION_ALIGNMENT as u64, 0);
+        assert_eq!(arch.extension, b"ext-bytes");
+        assert_eq!(arch.header.header_size as usize, CORE_HEADER_SIZE + 9);
         let data = read_region(&mut rf, &arch.regions[0]).unwrap();
-        // region crc 123 won't match "hello cds" payload — expect error path
-        // only if crc checked; our test region had crc 123 vs data crc of
-        // payload at file_offset which is zero bytes. read_region reads
-        // `used`=100 bytes at offset 4096 — the zeros. crc != 123 → error.
-        assert!(data.is_empty() || !data.is_empty()); // payload read works
+        assert_eq!(data, b"hello cds");
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn dynamic_header_name() {
-        let h = GenericHeader::dynamic_archive("base.jsa");
-        assert!(h.is_dynamic());
-        assert_eq!(h.base_archive_name_size, 9); // "base.jsa" + NUL
+        let path = test_file("dynamic");
+        let header = GenericHeader::dynamic_archive("base.jsa");
+        let regions = vec![CdsRegion::default(); NUM_CDS_REGIONS];
+        let mut f = File::create(&path).unwrap();
+        write_header(&mut f, &header, &regions, b"", Some("base.jsa")).unwrap();
+        drop(f);
+
+        let mut rf = File::open(&path).unwrap();
+        let arch = read_header(&mut rf).unwrap();
+        assert!(arch.header.is_dynamic());
+        assert_eq!(arch.base_archive_name.as_deref(), Some("base.jsa"));
+        // Name sits after the region table + extension, inside header_size.
+        let name_end = arch.header.base_archive_name_offset as usize
+            + arch.header.base_archive_name_size as usize;
+        assert_eq!(name_end as u32, arch.header.header_size);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn rejects_bad_magic_and_corrupt_crc() {
+        let path = test_file("corrupt");
+        std::fs::write(&path, b"NOTACDSARCHIVE").unwrap();
+        let mut rf = File::open(&path).unwrap();
+        assert!(read_header(&mut rf).is_err());
+
+        // Valid header, then corrupt a payload byte covered by region CRC.
+        let header = GenericHeader::static_archive();
+        let mut regions = vec![CdsRegion::default(); NUM_CDS_REGIONS];
+        regions[1] = CdsRegion {
+            file_offset: CORE_REGION_ALIGNMENT as u64,
+            used: 4,
+            ..CdsRegion::default()
+        };
+        {
+            let mut f = File::create(&path).unwrap();
+            write_header(&mut f, &header, &regions, b"", None).unwrap();
+            let (off, crc) = append_region(&mut f, &[1, 2, 3, 4]).unwrap();
+            regions[1].file_offset = off;
+            regions[1].crc = crc;
+        }
+        {
+            let mut f = File::options().read(true).write(true).open(&path).unwrap();
+            write_header(&mut f, &header, &regions, b"", None).unwrap();
+            use std::io::{Seek, SeekFrom, Write};
+            f.seek(SeekFrom::Start(CORE_REGION_ALIGNMENT as u64)).unwrap();
+            f.write_all(&[9, 9, 9, 9]).unwrap();
+        }
+        let mut rf = File::open(&path).unwrap();
+        let arch = read_header(&mut rf).unwrap();
+        assert!(read_region(&mut rf, &arch.regions[1]).is_err());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn region_record_size_is_96() {
+        let mut buf = Vec::new();
+        CdsRegion::default().write_to(&mut buf).unwrap();
+        assert_eq!(buf.len(), REGION_RECORD_SIZE);
+        assert_eq!(CORE_HEADER_SIZE, GENERIC_HEADER_SIZE + NUM_CDS_REGIONS * 96);
     }
 }

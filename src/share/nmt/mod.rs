@@ -1,4 +1,13 @@
+pub mod allocationSite;
+pub mod mallocLimit;
+pub mod mallocSiteTable;
+pub mod mallocTracker;
+pub mod memBaseline;
 pub mod memReporter;
 pub mod memTag;
 pub mod memTracker;
+pub mod memoryFileTracker;
+pub mod nativeCallStack;
+pub mod nmtCommon;
+pub mod threadStackTracker;
 pub mod virtualMemoryTracker;

@@ -286,9 +286,16 @@ pub fn mainClass<'a>(
         }
         eprintln!("[phase] 2 {:?}", t0.elapsed());
         let mut args = JavaCallArguments::new();
-        args.push_int(0);
-        args.push_int(0);
-        let _ = JavaCalls::call_static(loader, &system, b"initPhase2", b"(ZZ)I", &args, output);
+        args.push_int(1);
+        args.push_int(1);
+        let phase2 = JavaCalls::call_static(loader, &system, b"initPhase2", b"(ZZ)I", &args, output)?;
+        if let Some(Value::Int(result)) = phase2
+            && result != 0
+        {
+            return Err(io::Error::other(format!(
+                "System.initPhase2 failed with status {result}"
+            )));
+        }
         eprintln!("[phase] 3 {:?}", t0.elapsed());
         let args = JavaCallArguments::new();
         let _ = JavaCalls::call_static(loader, &system, b"initPhase3", b"()V", &args, output);

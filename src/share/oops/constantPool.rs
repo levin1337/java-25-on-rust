@@ -22,6 +22,76 @@ pub enum MemberRefKind {
     InterfaceMethod,
 }
 
+/// JVMS §4.4.8 method handle reference kinds (tag 15).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MethodHandleKind {
+    GetField = 1,
+    GetStatic = 2,
+    PutField = 3,
+    PutStatic = 4,
+    InvokeVirtual = 5,
+    InvokeStatic = 6,
+    InvokeSpecial = 7,
+    NewInvokeSpecial = 8,
+    InvokeInterface = 9,
+}
+
+impl MethodHandleKind {
+    pub fn from_u8(value: u8) -> Option<Self> {
+        Some(match value {
+            1 => Self::GetField,
+            2 => Self::GetStatic,
+            3 => Self::PutField,
+            4 => Self::PutStatic,
+            5 => Self::InvokeVirtual,
+            6 => Self::InvokeStatic,
+            7 => Self::InvokeSpecial,
+            8 => Self::NewInvokeSpecial,
+            9 => Self::InvokeInterface,
+            _ => return None,
+        })
+    }
+
+    #[inline]
+    pub fn reference_kind(self) -> u8 {
+        self as u8
+    }
+
+    /// Whether this handle kind invokes a method (vs. accesses a field).
+    #[inline]
+    pub fn is_invoke(self) -> bool {
+        matches!(
+            self,
+            Self::InvokeVirtual
+                | Self::InvokeStatic
+                | Self::InvokeSpecial
+                | Self::NewInvokeSpecial
+                | Self::InvokeInterface
+        )
+    }
+}
+
+/// Resolved view of a CONSTANT_MethodHandle_info (tag 15): the handle
+/// kind plus the constant-pool index of the referenced field/method.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MethodHandleRef {
+    pub kind: MethodHandleKind,
+    /// Constant-pool index of the referenced Fieldref/Methodref/
+    /// InterfaceMethodref.
+    pub reference_index: u16,
+}
+
+/// Resolved view of a CONSTANT_Dynamic_info (tag 17) or
+/// CONSTANT_InvokeDynamic_info (tag 18): bootstrap method attribute
+/// index plus the name-and-type pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CallSiteRef<'a> {
+    /// Index into the class file's BootstrapMethods attribute table.
+    pub bootstrap_method_index: u16,
+    pub name: &'a [u8],
+    pub descriptor: &'a [u8],
+}
+
 /// Resolved view of a Fieldref/Methodref/InterfaceMethodref constant:
 /// owner class internal name plus member name and descriptor.  This is
 /// the exact triple JIT stub sites and resolved cache entries need.
@@ -216,6 +286,120 @@ impl<'a> ConstantPool<'a> {
             Constant::Double(v) => Ok(*v),
             _ => Err(Error::other("Expected Double constant")),
         }
+    }
+
+    // ---- Remaining constant kinds (JVMS §4.4) ----
+
+    /// Resolves a CONSTANT_MethodHandle_info (tag 15).
+    pub fn method_handle_at(&self, index: u16) -> io::Result<MethodHandleRef> {
+        match self.get(index)? {
+            Constant::MethodHandle(kind, ref_index) => {
+                let kind = MethodHandleKind::from_u8(*kind)
+                    .ok_or_else(|| Error::other("Invalid method handle reference kind"))?;
+                Ok(MethodHandleRef {
+                    kind,
+                    reference_index: *ref_index,
+                })
+            }
+            _ => Err(Error::other("Expected MethodHandle constant")),
+        }
+    }
+
+    /// Resolves a CONSTANT_MethodType_info (tag 16): the method
+    /// descriptor as a Utf8 slice.
+    pub fn method_type_at(&self, index: u16) -> io::Result<&'a [u8]> {
+        match self.get(index)? {
+            Constant::MethodType(sig_index) => self.utf8_at(*sig_index),
+            _ => Err(Error::other("Expected MethodType constant")),
+        }
+    }
+
+    /// Resolves a CONSTANT_Dynamic_info (tag 17).
+    pub fn dynamic_at(&self, index: u16) -> io::Result<CallSiteRef<'a>> {
+        match self.get(index)? {
+            Constant::Dynamic(bsm_index, nat_index) => {
+                self.call_site_ref(*bsm_index, *nat_index)
+            }
+            _ => Err(Error::other("Expected Dynamic constant")),
+        }
+    }
+
+    /// Resolves a CONSTANT_InvokeDynamic_info (tag 18).
+    pub fn invoke_dynamic_at(&self, index: u16) -> io::Result<CallSiteRef<'a>> {
+        match self.get(index)? {
+            Constant::InvokeDynamic(bsm_index, nat_index) => {
+                self.call_site_ref(*bsm_index, *nat_index)
+            }
+            _ => Err(Error::other("Expected InvokeDynamic constant")),
+        }
+    }
+
+    fn call_site_ref(&self, bsm_index: u16, nat_index: u16) -> io::Result<CallSiteRef<'a>> {
+        let (name, descriptor) = self.name_and_type_at(nat_index)?;
+        Ok(CallSiteRef {
+            bootstrap_method_index: bsm_index,
+            name,
+            descriptor,
+        })
+    }
+
+    /// Resolves a CONSTANT_Module_info (tag 19): the module name.
+    pub fn module_at(&self, index: u16) -> io::Result<&'a [u8]> {
+        match self.get(index)? {
+            Constant::Module(name_index) => self.utf8_at(*name_index),
+            _ => Err(Error::other("Expected Module constant")),
+        }
+    }
+
+    /// Resolves a CONSTANT_Package_info (tag 20): the package name.
+    pub fn package_at(&self, index: u16) -> io::Result<&'a [u8]> {
+        match self.get(index)? {
+            Constant::Package(name_index) => self.utf8_at(*name_index),
+            _ => Err(Error::other("Expected Package constant")),
+        }
+    }
+
+    /// Whether the constant at `index` is a reference-type constant
+    /// (Class, String, Fieldref, Methodref, InterfaceMethodref,
+    /// MethodHandle, Dynamic, InvokeDynamic, Module, Package) that the
+    /// resolved-references cache stores.
+    pub fn is_reference_constant(&self, index: u16) -> io::Result<bool> {
+        Ok(matches!(
+            self.tag_at(index)?,
+            ConstantTag::Class
+                | ConstantTag::String
+                | ConstantTag::Fieldref
+                | ConstantTag::Methodref
+                | ConstantTag::InterfaceMethodref
+                | ConstantTag::MethodHandle
+                | ConstantTag::Dynamic
+                | ConstantTag::InvokeDynamic
+                | ConstantTag::Module
+                | ConstantTag::Package
+        ))
+    }
+
+    /// Number of constant-pool slots a constant occupies (JVMS §4.4:
+    /// Long and Double take two entries).
+    #[inline]
+    pub fn slot_count(tag: ConstantTag) -> usize {
+        match tag {
+            ConstantTag::Long | ConstantTag::Double => 2,
+            _ => 1,
+        }
+    }
+
+    /// Whether the constant at `index` occupies two pool slots
+    /// (Long/Double); the following index is unusable.
+    #[inline]
+    pub fn is_double_slot(&self, index: u16) -> io::Result<bool> {
+        Ok(Self::slot_count(self.tag_at(index)?) == 2)
+    }
+
+    /// Whether `index` is a valid (in-bounds) constant-pool index.
+    #[inline]
+    pub fn is_valid_index(&self, index: u16) -> bool {
+        usize::from(index) < self.constants.len()
     }
 }
 

@@ -1,3 +1,4 @@
+use super::arrayOop::ArrayOopDesc;
 use super::objLayout::ObjLayoutMode;
 use std::io::{self, Error};
 
@@ -191,13 +192,49 @@ impl TypeArrayOop {
     }
 
     pub fn element_offset(&self, mode: ObjLayoutMode, index: usize) -> usize {
-        let align = self.element_align();
-        let base = mode.array_base_offset(self.element_size(), align);
-        base + index * self.element_size()
+        ArrayOopDesc::element_offset_in_bytes(
+            mode,
+            index,
+            self.element_size(),
+            self.element_align(),
+        )
     }
 
+    /// Byte offset of the `length` field for the given layout mode.
+    #[inline]
+    pub fn length_offset_in_bytes(mode: ObjLayoutMode) -> usize {
+        ArrayOopDesc::length_offset_in_bytes(mode)
+    }
+
+    /// Byte offset of element 0 for the given layout mode.
+    #[inline]
+    pub fn data_offset_in_bytes(&self, mode: ObjLayoutMode) -> usize {
+        self.element_offset(mode, 0)
+    }
+
+    /// Allocated size in bytes including the aligned array header.
     pub fn object_size_in_bytes(&self, mode: ObjLayoutMode) -> usize {
         mode.array_allocation_size_in_bytes(self.len(), self.element_size(), self.element_align())
+    }
+
+    /// Allocated size in heap words.
+    pub fn object_size_in_words(&self, mode: ObjLayoutMode) -> usize {
+        self.object_size_in_bytes(mode) / 8
+    }
+
+    /// Maximum legal length for a primitive array of `kind`
+    /// (HotSpot `typeArrayKlass::max_elements`).
+    #[inline]
+    pub fn max_length_for_kind(kind: u8) -> i32 {
+        ArrayOopDesc::max_array_length(Self::element_size_for_kind(kind).unwrap_or(0))
+    }
+
+    /// Whether the array is a reference-free (primitive) array —
+    /// always true for `TypeArrayOop`, kept for symmetry with
+    /// `ObjArrayOop`.
+    #[inline]
+    pub fn is_primitive(&self) -> bool {
+        true
     }
 
     pub fn byte_at(&self, which: usize) -> io::Result<i8> {

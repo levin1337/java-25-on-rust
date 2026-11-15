@@ -122,6 +122,44 @@ impl KlassVtable {
         self.table.len()
     }
 
+    /// HotSpot `klassVtable::vtable_length()`: one extra slot for the
+    /// header/klass word preceding method entries.
+    #[inline]
+    pub fn vtable_length(&self) -> usize {
+        self.table.len() + 1
+    }
+
+    /// HotSpot `klassVtable::is_valid_index`.
+    #[inline]
+    pub fn is_valid_index(&self, index: usize) -> bool {
+        index < self.table.len()
+    }
+
+    /// HotSpot `klassVtable::method_at`: the entry at `index`.
+    #[inline]
+    pub fn method_at(&self, index: usize) -> Option<&VtableEntry> {
+        self.table.get(index)
+    }
+
+    /// HotSpot `klassVtable::set_method_at`: replaces the entry at
+    /// `index` (used when patching overrides during class linking).
+    pub fn set_method_at(&mut self, index: usize, entry: VtableEntry) -> bool {
+        if let Some(slot) = self.table.get_mut(index) {
+            *slot = entry;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Replaces an existing entry in place without changing slot
+    /// ordering; returns the slot index.
+    pub fn replace_method(&mut self, method_name: &str, signature: &str, entry: VtableEntry) -> Option<usize> {
+        let index = self.index_of_method(method_name, signature)?;
+        self.table[index] = entry;
+        Some(index)
+    }
+
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.table.is_empty()
@@ -370,5 +408,38 @@ impl KlassItable {
         // Each interface offset entry is 2 words (interface_klass ptr + offset)
         // Each method entry is 2 words (method ptr + code offset / vtable index)
         (iface_count * 2) + (self.entries.len() * 2)
+    }
+
+    /// Number of interface method entries registered.
+    #[inline]
+    pub fn method_count(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// HotSpot `klassItable::interface_offset`: the itable offset (in
+    /// method-entry units) of `interface_klass`, i.e. where that
+    /// interface's method block starts.
+    pub fn interface_offset(&self, interface_klass: &str) -> Option<usize> {
+        self.compute_offset_table()
+            .into_iter()
+            .find(|entry| entry.interface_klass == interface_klass)
+            .map(|entry| entry.offset)
+    }
+
+    /// Whether `interface_klass` is registered in this itable.
+    pub fn has_interface(&self, interface_klass: &str) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| entry.interface_klass == interface_klass)
+    }
+
+    /// Iterator over all method entries declared by `interface_klass`.
+    pub fn entries_of_interface(
+        &self,
+        interface_klass: &str,
+    ) -> impl Iterator<Item = &ItableMethodEntry> {
+        self.entries
+            .iter()
+            .filter(move |entry| entry.interface_klass == interface_klass)
     }
 }

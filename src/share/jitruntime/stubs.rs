@@ -1448,9 +1448,9 @@ fn stub_entries() -> &'static [StubEntry] {
 /// produced and `rip` lands where the pending outcome is read back
 /// into TLS by Rust.
 fn trampoline_bytes(handler_addr: usize) -> Vec<u8> {
-    let check_addr = stub_flow_check as usize;
-    let xmm_addr = stub_xmm_result as usize;
-    let unwind_addr = jit_unwind as usize;
+    let check_addr = stub_flow_check as *const () as usize;
+    let xmm_addr = stub_xmm_result as *const () as usize;
+    let unwind_addr = jit_unwind as *const () as usize;
     let mut b = Vec::with_capacity(112);
     b.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp,0x28
     // Win64 stack argument 5 ([rsp+0x20] after the sub, i.e. the qword

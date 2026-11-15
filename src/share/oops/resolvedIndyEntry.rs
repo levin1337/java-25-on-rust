@@ -65,4 +65,13 @@ impl ResolvedIndyEntry {
         self.call_site_target = Some(target);
         self.flags |= Self::FLAG_IS_RESOLVED;
     }
+
+    /// Returns the entry to the unresolved state (linkage error /
+    /// dependency invalidation).
+    pub fn reset(&mut self) {
+        self.method_name = None;
+        self.signature = None;
+        self.call_site_target = None;
+        self.flags &= !Self::FLAG_IS_RESOLVED;
+    }
 }

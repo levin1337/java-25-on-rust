@@ -23,7 +23,12 @@ use std::ffi::c_void;
 use std::fs::File;
 use std::io;
 use std::os::windows::io::AsRawHandle;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::OnceLock;
+
+pub mod cpu_features;
+pub mod file_io;
+pub mod thread_sync;
 
 pub type Handle = *mut c_void;
 pub type Address = usize;
@@ -62,7 +67,6 @@ pub const MEM_IMAGE: u32 = 0x1000000;
 
 const FILE_MAP_READ: u32 = 0x0000_0004;
 const FILE_MAP_WRITE: u32 = 0x0000_0002;
-const FILE_MAP_ALL_ACCESS: u32 = 0x001F_01FF;
 const PAGE_READONLY_MAP: u32 = 0x02;
 const PAGE_READWRITE_MAP: u32 = 0x04;
 const INVALID_HANDLE_VALUE: Handle = -1isize as Handle;
@@ -124,7 +128,7 @@ pub struct MemoryStatusEx {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct FileTime {
     pub low: u32,
     pub high: u32,
@@ -225,6 +229,34 @@ pub struct ExceptionPointers {
 
 pub type TopLevelExceptionFilter =
     unsafe extern "system" fn(*const ExceptionPointers) -> i32;
+
+/// LPTHREAD_START_ROUTINE (winbase.h).
+pub type ThreadStartRoutine = unsafe extern "system" fn(*mut c_void) -> u32;
+
+/// BY_HANDLE_FILE_INFORMATION (fileapi.h).
+#[repr(C)]
+#[derive(Default)]
+pub struct ByHandleFileInformation {
+    pub file_attributes: u32,
+    pub creation_time: FileTime,
+    pub last_access_time: FileTime,
+    pub last_write_time: FileTime,
+    pub volume_serial_number: u32,
+    pub file_size_high: u32,
+    pub file_size_low: u32,
+    pub number_of_links: u32,
+    pub file_index_high: u32,
+    pub file_index_low: u32,
+}
+
+/// GROUP_AFFINITY (winnt.h, x64: KAFFINITY mask + group + reserved).
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct GroupAffinity {
+    pub mask: usize,
+    pub group: u16,
+    pub reserved: [u16; 3],
+}
 
 /// HotSpot os::ProtType.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -378,6 +410,109 @@ unsafe extern "system" {
         dw_minimum_working_set_size: usize,
         dw_maximum_working_set_size: usize,
     ) -> i32;
+    fn CreateFileW(
+        lp_file_name: *const u16,
+        dw_desired_access: u32,
+        dw_share_mode: u32,
+        lp_security_attributes: *mut c_void,
+        dw_creation_disposition: u32,
+        dw_flags_and_attributes: u32,
+        h_template_file: Handle,
+    ) -> Handle;
+    fn ReadFile(
+        h_file: Handle,
+        lp_buffer: *mut u8,
+        n_number_of_bytes_to_read: u32,
+        lp_number_of_bytes_read: *mut u32,
+        lp_overlapped: *mut c_void,
+    ) -> i32;
+    fn WriteFile(
+        h_file: Handle,
+        lp_buffer: *const u8,
+        n_number_of_bytes_to_write: u32,
+        lp_number_of_bytes_written: *mut u32,
+        lp_overlapped: *mut c_void,
+    ) -> i32;
+    fn GetFileSizeEx(h_file: Handle, lp_file_size: *mut i64) -> i32;
+    fn SetFilePointerEx(
+        h_file: Handle,
+        li_distance_to_move: i64,
+        lp_new_file_pointer: *mut i64,
+        dw_move_method: u32,
+    ) -> i32;
+    fn GetFileInformationByHandle(
+        h_file: Handle,
+        lp_file_information: *mut ByHandleFileInformation,
+    ) -> i32;
+    fn SetEndOfFile(h_file: Handle) -> i32;
+    fn MoveFileExW(
+        lp_existing_file_name: *const u16,
+        lp_new_file_name: *const u16,
+        dw_flags: u32,
+    ) -> i32;
+    fn DeleteFileW(lp_file_name: *const u16) -> i32;
+    fn GetFileAttributesW(lp_file_name: *const u16) -> u32;
+    fn CreateThread(
+        lp_thread_attributes: *mut c_void,
+        dw_stack_size: usize,
+        lp_start_address: ThreadStartRoutine,
+        lp_parameter: *mut c_void,
+        dw_creation_flags: u32,
+        lp_thread_id: *mut u32,
+    ) -> Handle;
+    fn OpenThread(
+        dw_desired_access: u32,
+        b_inherit_handle: i32,
+        dw_thread_id: u32,
+    ) -> Handle;
+    fn SuspendThread(h_thread: Handle) -> u32;
+    fn ResumeThread(h_thread: Handle) -> u32;
+    fn TerminateThread(h_thread: Handle, dw_exit_code: u32) -> i32;
+    fn WaitForSingleObject(h_handle: Handle, dw_milliseconds: u32) -> u32;
+    fn GetExitCodeThread(h_thread: Handle, lp_exit_code: *mut u32) -> i32;
+    fn CreateEventW(
+        lp_event_attributes: *mut c_void,
+        b_manual_reset: i32,
+        b_initial_state: i32,
+        lp_name: *const u16,
+    ) -> Handle;
+    fn SetEvent(h_event: Handle) -> i32;
+    fn ResetEvent(h_event: Handle) -> i32;
+    fn PulseEvent(h_event: Handle) -> i32;
+    fn CreateMutexW(
+        lp_mutex_attributes: *mut c_void,
+        b_initial_owner: i32,
+        lp_name: *const u16,
+    ) -> Handle;
+    fn ReleaseMutex(h_mutex: Handle) -> i32;
+    fn CreateSemaphoreW(
+        lp_semaphore_attributes: *mut c_void,
+        l_initial_count: i32,
+        l_maximum_count: i32,
+        lp_name: *const u16,
+    ) -> Handle;
+    fn ReleaseSemaphore(
+        h_semaphore: Handle,
+        l_release_count: i32,
+        lp_previous_count: *mut i32,
+    ) -> i32;
+    fn GetThreadGroupAffinity(
+        h_thread: Handle,
+        lp_group_affinity: *mut GroupAffinity,
+    ) -> i32;
+    fn SetThreadGroupAffinity(
+        h_thread: Handle,
+        group_affinity: *mut GroupAffinity,
+        previous_group_affinity: *mut GroupAffinity,
+    ) -> i32;
+    fn GetMaximumProcessorGroupCount() -> u16;
+    fn GetCurrentProcessorNumber() -> u32;
+}
+
+#[link(name = "advapi32")]
+unsafe extern "system" {
+    // RtlGenRandom (a.k.a. SystemFunction036), advapi32.dll export.
+    fn SystemFunction036(random_buffer: *mut u8, random_buffer_length: u32) -> u8;
 }
 
 #[link(name = "ntdll")]
@@ -410,6 +545,9 @@ pub struct PlatformInfo {
 static PLATFORM: OnceLock<PlatformInfo> = OnceLock::new();
 static PERF_FREQUENCY: OnceLock<i64> = OnceLock::new();
 static INITIAL_PERF_COUNTER: OnceLock<i64> = OnceLock::new();
+
+/// os::_rand_seed (os.cpp:96) — Park-Miller LCG state behind os::random().
+static RAND_SEED: AtomicU32 = AtomicU32::new(1234567);
 
 const FILETIME_UNIX_OFFSET_TICKS: i64 = 116_444_736_000_000_000;
 
@@ -666,6 +804,15 @@ impl OsWindows {
         unsafe {
             let mut st = SystemTime::default();
             GetLocalTime(&mut st);
+            st
+        }
+    }
+
+    /// UTC wall-clock time via GetSystemTime (uncached SYSTEMTIME).
+    pub fn system_time() -> SystemTime {
+        unsafe {
+            let mut st = SystemTime::default();
+            GetSystemTime(&mut st);
             st
         }
     }
@@ -1063,7 +1210,7 @@ impl OsWindows {
                 return Err(last_error_io("CreateFileMappingW"));
             }
             let access = if writable {
-                FILE_MAP_ALL_ACCESS
+                FILE_MAP_WRITE
             } else {
                 FILE_MAP_READ
             };
@@ -1283,6 +1430,99 @@ impl OsWindows {
     pub fn get_host_name() -> Option<String> {
         // HOSTNAME env var is always set on Windows; fall back to COMPUTERNAME.
         Self::getenv("COMPUTERNAME").or_else(|| Self::getenv("HOSTNAME"))
+    }
+
+    /// os::setenv(name, value): process environment mutation.
+    pub fn setenv(name: &str, value: &str) -> io::Result<()> {
+        // SAFETY: Rust 2024 marks set_var unsafe because concurrent getenv in
+        // other threads may observe torn state; HotSpot calls setenv during
+        // single-threaded VM init only, same contract applies here.
+        unsafe { std::env::set_var(name, value) };
+        Ok(())
+    }
+
+    /// os::unsetenv.
+    pub fn unsetenv(name: &str) -> io::Result<()> {
+        unsafe { std::env::remove_var(name) };
+        Ok(())
+    }
+
+    /// Cryptographically secure random bytes via advapi32!SystemFunction036
+    /// (RtlGenRandom) — used to seed the os::random LCG and any
+    /// java.util.Random / ThreadLocalRandom entropy needs.
+    pub fn random_bytes(buf: &mut [u8]) -> io::Result<()> {
+        unsafe {
+            let mut done = 0usize;
+            while done < buf.len() {
+                let chunk = (buf.len() - done).min(u32::MAX as usize) as u32;
+                if SystemFunction036(buf.as_mut_ptr().add(done), chunk) == 0 {
+                    return Err(last_error_io("SystemFunction036"));
+                }
+                done += chunk as usize;
+            }
+        }
+        Ok(())
+    }
+
+    // -- os::random (os.cpp Park-Miller LCG over AtomicU32) ---------------------
+
+    /// os::init_random(initval).
+    pub fn init_random(initval: u32) {
+        RAND_SEED.store(initval, Ordering::Relaxed);
+    }
+
+    /// os::next_random(seed): (16807 * seed) mod (2^31 - 1), Park-Miller
+    /// "minimal standard" generator (Schrage decomposition, 32-bit safe).
+    pub fn next_random(rand_seed: u32) -> u32 {
+        const A: u32 = 16807;
+        const M: u32 = 2147483647;
+        let mut lo = A.wrapping_mul(rand_seed & 0xFFFF);
+        let hi = A.wrapping_mul(rand_seed >> 16);
+        lo = lo.wrapping_add((hi & 0x7FFF) << 16);
+        if lo > M {
+            lo &= M;
+            lo = lo.wrapping_add(1);
+        }
+        lo = lo.wrapping_add(hi >> 15);
+        if lo > M {
+            lo &= M;
+            lo = lo.wrapping_add(1);
+        }
+        lo
+    }
+
+    /// os::random(): thread-safe draw; cmpxchg loop over the shared seed.
+    pub fn random() -> i32 {
+        loop {
+            let seed = RAND_SEED.load(Ordering::Relaxed);
+            let rand = Self::next_random(seed);
+            if RAND_SEED
+                .compare_exchange_weak(seed, rand, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                return rand as i32;
+            }
+        }
+    }
+
+    /// Native (non-WoW64) system info — GetNativeSystemInfo.
+    pub fn native_system_info() -> SystemInfo {
+        unsafe {
+            let mut si = SystemInfo::default();
+            GetNativeSystemInfo(&mut si);
+            si
+        }
+    }
+
+    /// os::win32::processor_group_count / max groups on the machine.
+    pub fn maximum_processor_group_count() -> u32 {
+        unsafe { GetMaximumProcessorGroupCount() as u32 }
+    }
+
+    /// Processor number (within its group) of the calling thread —
+    /// os::processor_id equivalent on Windows.
+    pub fn current_processor_number() -> u32 {
+        unsafe { GetCurrentProcessorNumber() }
     }
 
     // -- crash handling -------------------------------------------------------------
@@ -1525,7 +1765,6 @@ mod tests {
     fn version_and_errors() {
         OsWindows::init().unwrap();
         assert!(nt_version().is_some());
-        assert!(OsWindows::get_last_error() >= 0);
         assert!(!OsWindows::lasterror().is_empty() || OsWindows::get_last_error() == 0);
     }
 }

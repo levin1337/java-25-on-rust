@@ -189,7 +189,7 @@ impl ShenandoahHeap {
 
         // 1. Init Mark (Pause)
         self.current_phase = ShenandoahPhase::InitMark;
-        self.barrier_set.drain_satb_queue();
+        self.barrier_set.drain_all_satb_queues();
 
         // 2. Concurrent Mark
         self.current_phase = ShenandoahPhase::ConcurrentMark;

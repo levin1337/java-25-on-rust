@@ -17,6 +17,32 @@ pub struct InvocationCounter {
 
 impl InvocationCounter {
     pub const COUNT_MASK: u32 = 0x7FFF_FFFF;
+    /// HotSpot `InvocationCounter::number_of_noncount_bits`: the low bit
+    /// is reserved for the carry flag, the count occupies the high 31
+    /// bits (`count_shift` = 1).
+    pub const NUMBER_OF_NONCOUNT_BITS: u32 = 1;
+    pub const COUNT_SHIFT: u32 = Self::NUMBER_OF_NONCOUNT_BITS;
+
+    /// Raw counter word including the carry flag in the low bit, as
+    /// stored in the metaspace object.
+    #[inline]
+    pub fn raw_value(&self) -> u32 {
+        (self.count << Self::COUNT_SHIFT) | u32::from(self.carry)
+    }
+
+    /// Reconstructs from a raw counter word.
+    #[inline]
+    pub fn from_raw_value(raw: u32) -> Self {
+        Self {
+            count: (raw >> Self::COUNT_SHIFT) & Self::COUNT_MASK,
+            carry: (raw & 1) != 0,
+        }
+    }
+
+    #[inline]
+    pub fn is_zero(&self) -> bool {
+        self.count == 0 && !self.carry
+    }
 
     pub fn new() -> Self {
         Self {
@@ -66,6 +92,16 @@ pub struct MethodCounters {
     interpreter_throwout_count: u16,
     invoke_mask: u32,
     backedge_mask: u32,
+    /// MDO-side interpreter counters (HotSpot tracks these in
+    /// MethodData; kept here so compile policy can read one snapshot).
+    interpreter_invocation_count: u32,
+    interpreter_backedge_count: u32,
+    /// Bitmask of compilation levels currently locked by the compiler
+    /// (`_compiler_locks` in earlier HotSpot releases; used to veto
+    /// recompilation while a compile is in flight).
+    compiler_locks: u32,
+    /// JVMTI breakpoint count (`_number_of_breakpoints`).
+    number_of_breakpoints: u16,
 }
 
 impl MethodCounters {
@@ -84,6 +120,10 @@ impl MethodCounters {
             interpreter_throwout_count: 0,
             invoke_mask: 0,
             backedge_mask: 0,
+            interpreter_invocation_count: 0,
+            interpreter_backedge_count: 0,
+            compiler_locks: 0,
+            number_of_breakpoints: 0,
         }
     }
 
@@ -176,6 +216,89 @@ impl MethodCounters {
         self.backedge_mask = mask;
     }
 
+    // ---- Interpreter counters (MethodData-side in HotSpot) ----
+
+    #[inline]
+    pub fn interpreter_invocation_count(&self) -> u32 {
+        self.interpreter_invocation_count
+    }
+
+    #[inline]
+    pub fn interpreter_backedge_count(&self) -> u32 {
+        self.interpreter_backedge_count
+    }
+
+    #[inline]
+    pub fn increment_interpreter_invocation_count(&mut self) {
+        self.interpreter_invocation_count =
+            self.interpreter_invocation_count.saturating_add(1);
+    }
+
+    #[inline]
+    pub fn increment_interpreter_backedge_count(&mut self) {
+        self.interpreter_backedge_count =
+            self.interpreter_backedge_count.saturating_add(1);
+    }
+
+    #[inline]
+    pub fn set_interpreter_invocation_count(&mut self, count: u32) {
+        self.interpreter_invocation_count = count;
+    }
+
+    #[inline]
+    pub fn set_interpreter_backedge_count(&mut self, count: u32) {
+        self.interpreter_backedge_count = count;
+    }
+
+    // ---- Compiler locks ----
+
+    /// HotSpot `compiler_locks()`: bitmask of locked compilation levels.
+    #[inline]
+    pub fn compiler_locks(&self) -> u32 {
+        self.compiler_locks
+    }
+
+    /// HotSpot `has_compiler_locks()`.
+    #[inline]
+    pub fn has_compiler_locks(&self) -> bool {
+        self.compiler_locks != 0
+    }
+
+    /// Locks the given compilation level (bit position = level).
+    #[inline]
+    pub fn lock_compiler(&mut self, level: u8) {
+        self.compiler_locks |= 1u32 << level.min(31);
+    }
+
+    /// Unlocks the given compilation level.
+    #[inline]
+    pub fn unlock_compiler(&mut self, level: u8) {
+        self.compiler_locks &= !(1u32 << level.min(31));
+    }
+
+    /// Whether the given compilation level is locked.
+    #[inline]
+    pub fn is_compiler_locked(&self, level: u8) -> bool {
+        (self.compiler_locks & (1u32 << level.min(31))) != 0
+    }
+
+    // ---- JVMTI breakpoints ----
+
+    #[inline]
+    pub fn number_of_breakpoints(&self) -> u16 {
+        self.number_of_breakpoints
+    }
+
+    #[inline]
+    pub fn set_number_of_breakpoints(&mut self, count: u16) {
+        self.number_of_breakpoints = count;
+    }
+
+    #[inline]
+    pub fn increment_breakpoint_count(&mut self) {
+        self.number_of_breakpoints = self.number_of_breakpoints.saturating_add(1);
+    }
+
     #[inline]
     pub fn should_compile(&self, threshold: u32) -> bool {
         self.invocation_count() >= threshold
@@ -218,6 +341,10 @@ impl MethodCounters {
         self.prev_time_ms = 0;
         self.prev_event_count = 0;
         self.interpreter_throwout_count = 0;
+        self.interpreter_invocation_count = 0;
+        self.interpreter_backedge_count = 0;
+        self.compiler_locks = 0;
+        self.number_of_breakpoints = 0;
     }
 }
 

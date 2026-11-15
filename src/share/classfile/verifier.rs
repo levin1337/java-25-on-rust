@@ -457,87 +457,193 @@ pub struct StackMapTable {
     pub frames: Vec<(u16, StackMapFrame)>,
 }
 
+/// Reads one `verification_type_info` (JVMS §4.7.4) at `bytes[*pos]`,
+/// advancing the cursor. Object types are resolved through the constant
+/// pool to their internal names.
+fn read_verification_type<'a>(
+    bytes: &[u8],
+    pos: &mut usize,
+    constants: &[Constant<'a>],
+) -> io::Result<VerificationType> {
+    let tag = *bytes
+        .get(*pos)
+        .ok_or_else(|| Error::other("StackMapTable truncated"))?;
+    *pos += 1;
+    Ok(match tag {
+        0 => VerificationType::Top,
+        1 => VerificationType::Integer,
+        2 => VerificationType::Float,
+        3 => VerificationType::Double,
+        4 => VerificationType::Long,
+        5 => VerificationType::Null,
+        6 => VerificationType::UninitializedThis,
+        7 => {
+            let index = read_u2(bytes, pos)?;
+            let name = match constants.get(usize::from(index)) {
+                Some(Constant::Class(name_index)) => match constants
+                    .get(usize::from(*name_index))
+                {
+                    Some(Constant::Utf8(name)) => {
+                        String::from_utf8_lossy(name).into_owned()
+                    }
+                    _ => {
+                        return Err(Error::other(
+                            "StackMapTable Object verification type is not a class",
+                        ))
+                    }
+                },
+                _ => {
+                    return Err(Error::other(
+                        "StackMapTable Object verification type is not a class",
+                    ))
+                }
+            };
+            VerificationType::Object(name)
+        }
+        8 => VerificationType::Uninitialized(read_u2(bytes, pos)?),
+        _ => {
+            return Err(Error::other(format!(
+                "Illegal verification type tag {tag}"
+            )))
+        }
+    })
+}
+
+fn read_u2(bytes: &[u8], pos: &mut usize) -> io::Result<u16> {
+    let value = bytes
+        .get(*pos..*pos + 2)
+        .ok_or_else(|| Error::other("StackMapTable truncated"))?;
+    *pos += 2;
+    Ok(u16::from_be_bytes([value[0], value[1]]))
+}
+
 impl StackMapTable {
-    pub fn parse(bytes: &[u8], max_locals: usize) -> io::Result<Self> {
+    /// Fully decodes a StackMapTable attribute (JVMS §4.7.4): every frame
+    /// type (same_frame, same_locals_1_stack_item[_extended], chop,
+    /// same_frame_extended, append, full_frame) is expanded into concrete
+    /// locals/stack verification types, with delta offsets resolved
+    /// against the previous frame.
+    pub fn parse(
+        bytes: &[u8],
+        max_locals: usize,
+        constants: &[Constant<'_>],
+    ) -> io::Result<Self> {
         let mut frames = Vec::new();
         if bytes.len() < 2 {
             return Ok(Self { frames });
         }
         let num_entries = u16::from_be_bytes([bytes[0], bytes[1]]) as usize;
-        let mut offset = 2;
-        let mut current_offset = 0u16;
+        let mut pos = 2usize;
+        let mut offset = 0u32;
+        let mut first_frame = true;
+        // The implicit frame preceding the first entry carries the method's
+        // incoming arguments; callers seed `prev_locals` accordingly when
+        // they need precise chop/append decoding, so start empty here.
+        let mut prev_locals: Vec<VerificationType> = Vec::new();
 
         for _ in 0..num_entries {
-            if offset >= bytes.len() {
-                break;
-            }
-            let frame_type = bytes[offset];
-            offset += 1;
-
-            if frame_type <= 63 {
-                // SAME frame
-                current_offset += frame_type as u16;
-                frames.push((current_offset, StackMapFrame::new(max_locals)));
-            } else if frame_type <= 127 {
-                // SAME_LOCALS_1_STACK_ITEM
-                current_offset += (frame_type - 64) as u16;
-                let mut frame = StackMapFrame::new(max_locals);
-                frame
-                    .push(VerificationType::Integer)
-                    .map_err(|e| Error::other(e.to_string()))?;
-                frames.push((current_offset, frame));
-                offset += 1;
-            } else if frame_type == 247 {
-                // SAME_LOCALS_1_STACK_ITEM_EXTENDED
-                if offset + 2 <= bytes.len() {
-                    let delta = u16::from_be_bytes([bytes[offset], bytes[offset + 1]]);
-                    offset += 2;
-                    current_offset += delta + 1;
-                    let mut frame = StackMapFrame::new(max_locals);
-                    frame
-                        .push(VerificationType::Integer)
-                        .map_err(|e| Error::other(e.to_string()))?;
-                    frames.push((current_offset, frame));
-                    offset += 1;
-                }
-            } else if frame_type <= 250 {
-                // CHOP
-                if offset + 2 <= bytes.len() {
-                    let delta = u16::from_be_bytes([bytes[offset], bytes[offset + 1]]);
-                    offset += 2;
-                    current_offset += delta + 1;
-                    frames.push((current_offset, StackMapFrame::new(max_locals)));
-                }
-            } else if frame_type == 251 {
-                // SAME_FRAME_EXTENDED
-                if offset + 2 <= bytes.len() {
-                    let delta = u16::from_be_bytes([bytes[offset], bytes[offset + 1]]);
-                    offset += 2;
-                    current_offset += delta + 1;
-                    frames.push((current_offset, StackMapFrame::new(max_locals)));
-                }
-            } else if frame_type <= 254 {
-                // APPEND
-                if offset + 2 <= bytes.len() {
-                    let delta = u16::from_be_bytes([bytes[offset], bytes[offset + 1]]);
-                    offset += 2;
-                    current_offset += delta + 1;
-                    frames.push((current_offset, StackMapFrame::new(max_locals)));
-                    let k = (frame_type - 251) as usize;
-                    offset += k;
-                }
-            } else if frame_type == 255 {
-                // FULL_FRAME
-                if offset + 2 <= bytes.len() {
-                    let delta = u16::from_be_bytes([bytes[offset], bytes[offset + 1]]);
-                    offset += 2;
-                    current_offset += delta + 1;
-                    frames.push((current_offset, StackMapFrame::new(max_locals)));
-                }
-            }
+            let frame_type = *bytes
+                .get(pos)
+                .ok_or_else(|| Error::other("StackMapTable truncated"))?;
+            pos += 1;
+            let (delta, locals, stack): (u32, Vec<VerificationType>, Vec<VerificationType>) =
+                if frame_type <= 63 {
+                    // same_frame
+                    (u32::from(frame_type), prev_locals.clone(), Vec::new())
+                } else if frame_type <= 127 {
+                    // same_locals_1_stack_item
+                    let vt = read_verification_type(bytes, &mut pos, constants)?;
+                    let mut stack = Vec::new();
+                    expand_type_into(&mut stack, vt);
+                    (
+                        u32::from(frame_type - 64),
+                        prev_locals.clone(),
+                        stack,
+                    )
+                } else if frame_type == 247 {
+                    // same_locals_1_stack_item_extended
+                    let d = u32::from(read_u2(bytes, &mut pos)?);
+                    let vt = read_verification_type(bytes, &mut pos, constants)?;
+                    let mut stack = Vec::new();
+                    expand_type_into(&mut stack, vt);
+                    (d, prev_locals.clone(), stack)
+                } else if (248..=250).contains(&frame_type) {
+                    // chop_frame: k counts logical locals; a category-2
+                    // value consumes its primary and 2nd-marker slots.
+                    let d = u32::from(read_u2(bytes, &mut pos)?);
+                    let k = usize::from(251 - frame_type);
+                    let mut locals = prev_locals.clone();
+                    for _ in 0..k {
+                        if matches!(locals.pop(), Some(vt) if vt.is_category2_2nd()) {
+                            locals.pop();
+                        }
+                    }
+                    (d, locals, Vec::new())
+                } else if frame_type == 251 {
+                    // same_frame_extended
+                    let d = u32::from(read_u2(bytes, &mut pos)?);
+                    (d, prev_locals.clone(), Vec::new())
+                } else if (252..=254).contains(&frame_type) {
+                    // append_frame
+                    let d = u32::from(read_u2(bytes, &mut pos)?);
+                    let k = usize::from(frame_type - 251);
+                    let mut locals = prev_locals.clone();
+                    for _ in 0..k {
+                        let vt = read_verification_type(bytes, &mut pos, constants)?;
+                        expand_type_into(&mut locals, vt);
+                    }
+                    (d, locals, Vec::new())
+                } else if frame_type == 255 {
+                    // full_frame
+                    let d = u32::from(read_u2(bytes, &mut pos)?);
+                    let nlocals = usize::from(read_u2(bytes, &mut pos)?);
+                    let mut locals = Vec::with_capacity(nlocals);
+                    for _ in 0..nlocals {
+                        let vt = read_verification_type(bytes, &mut pos, constants)?;
+                        expand_type_into(&mut locals, vt);
+                    }
+                    let nstack = usize::from(read_u2(bytes, &mut pos)?);
+                    let mut stack = Vec::with_capacity(nstack);
+                    for _ in 0..nstack {
+                        let vt = read_verification_type(bytes, &mut pos, constants)?;
+                        expand_type_into(&mut stack, vt);
+                    }
+                    (d, locals, stack)
+                } else {
+                    return Err(Error::other(format!(
+                        "Illegal stack map frame type {frame_type}"
+                    )));
+                };
+            offset = if first_frame {
+                first_frame = false;
+                delta
+            } else {
+                offset + delta + 1
+            };
+            let mut frame = StackMapFrame::new(max_locals);
+            frame.locals = locals.clone();
+            frame.stack = stack;
+            frames.push((offset as u16, frame));
+            prev_locals = locals;
         }
-
+        if pos != bytes.len() {
+            return Err(Error::other("Trailing bytes in StackMapTable"));
+        }
         Ok(Self { frames })
+    }
+}
+
+fn expand_type_into(target: &mut Vec<VerificationType>, vt: VerificationType) {
+    match vt {
+        VerificationType::Long => {
+            target.push(VerificationType::Long);
+            target.push(VerificationType::Long2nd);
+        }
+        VerificationType::Double => {
+            target.push(VerificationType::Double);
+            target.push(VerificationType::Double2nd);
+        }
+        other => target.push(other),
     }
 }
 
@@ -615,6 +721,7 @@ fn verify_class_structure<'a>(
     const ACC_ANNOTATION: u16 = 0x2000;
     const ACC_ENUM: u16 = 0x4000;
     const ACC_MODULE: u16 = 0x8000;
+    const ACC_RECORD: u16 = 0x10000;
     const ALLOWED_CLASS_FLAGS: u16 = ACC_PUBLIC
         | ACC_FINAL
         | ACC_SUPER
@@ -623,7 +730,8 @@ fn verify_class_structure<'a>(
         | ACC_SYNTHETIC
         | ACC_ANNOTATION
         | ACC_ENUM
-        | ACC_MODULE;
+        | ACC_MODULE
+        | ACC_RECORD;
 
     let flags = class.accessFlags;
     if flags & !ALLOWED_CLASS_FLAGS != 0 {
@@ -653,7 +761,61 @@ fn verify_class_structure<'a>(
         }
     }
     // <init> / <clinit> shape rules (JVMS 4.6 / 5.5).
+    const FIELD_FLAGS: u16 = 0x0001 | 0x0002 | 0x0004 | 0x0008 | 0x0010 | 0x0040
+        | 0x0080 | 0x1000 | 0x4000 | 0x8000 | 0x20000;
+    const METHOD_FLAGS: u16 = 0x0001 | 0x0002 | 0x0004 | 0x0008 | 0x0010 | 0x0020
+        | 0x0040 | 0x0080 | 0x0100 | 0x0400 | 0x0800 | 0x1000 | 0x8000 | 0x20000;
+    for field in &class.fields {
+        if field.accessFlags & !FIELD_FLAGS != 0 {
+            return Err(Error::other(format!(
+                "ClassFormatError: Illegal field access flags {:#06x}",
+                field.accessFlags
+            )));
+        }
+        // JVMS §4.5: ACC_FINAL and ACC_VOLATILE are mutually exclusive.
+        if field.accessFlags & 0x0010 != 0 && field.accessFlags & 0x0040 != 0 {
+            return Err(Error::other(
+                "ClassFormatError: field cannot be both final and volatile",
+            ));
+        }
+        // JVMS §4.5: every interface field is implicitly public static final.
+        if is_interface
+            && (field.accessFlags & 0x0001 == 0
+                || field.accessFlags & 0x0008 == 0
+                || field.accessFlags & 0x0010 == 0)
+        {
+            return Err(Error::other(
+                "ClassFormatError: interface field must be public static final",
+            ));
+        }
+    }
     for method in &class.methods {
+        if method.accessFlags & !METHOD_FLAGS != 0 {
+            return Err(Error::other(format!(
+                "ClassFormatError: Illegal method access flags {:#06x}",
+                method.accessFlags
+            )));
+        }
+        // JVMS §4.6: ACC_ABSTRACT cannot be combined with ACC_FINAL,
+        // ACC_NATIVE or ACC_PRIVATE.
+        if method.accessFlags & 0x0400 != 0 {
+            if method.accessFlags & 0x0010 != 0 {
+                return Err(Error::other(
+                    "ClassFormatError: abstract method cannot be final",
+                ));
+            }
+            if method.accessFlags & 0x0100 != 0 {
+                return Err(Error::other(
+                    "ClassFormatError: abstract method cannot be native",
+                ));
+            }
+        }
+        // JVMS §4.6: interface methods may not be final.
+        if is_interface && method.accessFlags & 0x0010 != 0 {
+            return Err(Error::other(
+                "ClassFormatError: interface method cannot be final",
+            ));
+        }
         let is_static = (method.accessFlags & 0x0008) != 0;
         if method.name == b"<init>" {
             if is_static {
@@ -692,6 +854,34 @@ fn verify_class_structure<'a>(
                 "UnsupportedClassVersionError: constant pool tag requires class file version {required}.0"
             )));
         }
+    }
+
+    // ACC_RECORD (JVMS §4.1 / §8.10): records were finalized in class file
+    // version 60.0; the flag and the Record attribute must agree.
+    let is_record_flag = (flags & ACC_RECORD) != 0;
+    if is_record_flag {
+        if class.majorVersion < 60 {
+            return Err(Error::other(
+                "UnsupportedClassVersionError: ACC_RECORD requires class file version 60.0",
+            ));
+        }
+        if !class.is_record_class() {
+            return Err(Error::other(
+                "ClassFormatError: ACC_RECORD class must have a Record attribute",
+            ));
+        }
+    } else if class.is_record_class() {
+        return Err(Error::other(
+            "ClassFormatError: Record attribute requires ACC_RECORD",
+        ));
+    }
+
+    // JVMS §5.3.5 / §8.1.6: a class with a PermittedSubclasses attribute
+    // must not be final.
+    if !class.permitted_subclasses().is_empty() && (flags & ACC_FINAL) != 0 {
+        return Err(Error::other(
+            "ClassFormatError: class with PermittedSubclasses cannot be final",
+        ));
     }
     Ok(())
 }

@@ -108,4 +108,71 @@ impl<'a> ObjArrayOop<'a> {
     pub fn component_name(&self) -> &'a [u8] {
         self.component
     }
+
+    /// JVM type descriptor of this array (`[Ljava/lang/Object;`,
+    /// `[[I`, ...).  `component` stores the element name without the
+    /// `L...;` wrapper for reference types.
+    pub fn descriptor(&self) -> Vec<u8> {
+        let mut desc = Vec::with_capacity(self.component.len() + 4);
+        desc.push(b'[');
+        if self.component.first() == Some(&b'[') {
+            desc.extend_from_slice(self.component);
+        } else {
+            desc.push(b'L');
+            desc.extend_from_slice(self.component);
+            desc.push(b';');
+        }
+        desc
+    }
+
+    /// Number of array dimensions (`[[I` -> 2).
+    pub fn dimension(&self) -> usize {
+        self.descriptor().iter().take_while(|b| **b == b'[').count()
+    }
+
+    /// Whether this is a multi-dimensional array (elements are
+    /// themselves arrays).
+    pub fn is_multi_dimensional(&self) -> bool {
+        self.component.first() == Some(&b'[')
+    }
+
+    /// Element descriptor: the array descriptor minus its outermost
+    /// dimension (`[I` -> `I`, `[[Ljava/lang/String;` -> `[Ljava/lang/String;`).
+    pub fn element_descriptor(&self) -> Vec<u8> {
+        self.descriptor()[1..].to_vec()
+    }
+
+    /// Byte offset of the `length` field for the given layout mode.
+    #[inline]
+    pub fn length_offset_in_bytes(mode: ObjLayoutMode) -> usize {
+        ArrayOopDesc::length_offset_in_bytes(mode)
+    }
+
+    /// Byte offset of element `index` for the given layout mode
+    /// (compressed-oop elements).
+    #[inline]
+    pub fn obj_at_offset(mode: ObjLayoutMode, index: usize) -> usize {
+        Self::base_offset_in_bytes(mode) + index * mode.narrow_oop_size()
+    }
+
+    /// Fills every element with `value` (HotSpot `ObjArrayOop::fill`).
+    pub fn fill(&mut self, value: Value<'a>) {
+        self.elements.fill(value);
+    }
+
+    /// Copies `src` elements into this array from `src_offset` for
+    /// `count` elements (HotSpot `ObjArrayOop::obj_at_put` bulk form).
+    pub fn copy_elements_from(
+        &mut self,
+        src: &[Value<'a>],
+        src_offset: usize,
+        count: usize,
+    ) -> io::Result<()> {
+        if src_offset + count > src.len() || count > self.elements.len() {
+            return Err(Error::other("ArrayIndexOutOfBoundsException"));
+        }
+        self.elements[..count]
+            .copy_from_slice(&src[src_offset..src_offset + count]);
+        Ok(())
+    }
 }

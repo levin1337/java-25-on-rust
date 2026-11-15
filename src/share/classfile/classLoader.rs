@@ -271,6 +271,14 @@ pub struct ClassLoader<'a> {
     module_objects: Share<HashMap<String, usize>>,
     /// Lazily created `java.lang.Package` objects keyed by package name.
     package_objects: Share<HashMap<String, usize>>,
+    /// Defined packages (JVMS §5.3 / java.lang.Package table), mirroring
+    /// HotSpot `ClassLoader::packages`.
+    packages: Share<HashMap<String, PackageEntry>>,
+    /// Whether this loader supports parallel class loading
+    /// (`ClassLoader.registerAsParallelCapable` semantics). All loaders in
+    /// this port synchronize definition through `load_lock` and use
+    /// lock-free `Share` arenas, so they are parallel capable.
+    parallel_capable: bool,
     current_thread_object: Share<Option<usize>>,
     pub(crate) call_stack: CallStack,
     pub(crate) lambda_cache: Share<HashMap<(Vec<u8>, u16), Arc<InstanceKlass<'a>>>>,
@@ -601,6 +609,8 @@ impl<'a> ClassLoader<'a> {
             delegate_loaders: Share::new(Vec::new()),
             module_objects: Share::new(HashMap::new()),
             package_objects: Share::new(HashMap::new()),
+            packages: Share::new(HashMap::new()),
+            parallel_capable: true,
             current_thread_object: Share::new(None),
             call_stack: CallStack,
             lambda_cache: Share::new(HashMap::new()),
@@ -694,6 +704,8 @@ impl<'a> ClassLoader<'a> {
             delegate_loaders: Share::new(Vec::new()),
             module_objects: Share::new(HashMap::new()),
             package_objects: Share::new(HashMap::new()),
+            packages: Share::new(HashMap::new()),
+            parallel_capable: true,
             current_thread_object: Share::new(None),
             call_stack: CallStack,
             lambda_cache: Share::new(HashMap::new()),
@@ -1319,6 +1331,113 @@ impl<'a> ClassLoader<'a> {
     pub fn define_class(&self, class: ClassFile<'a>) -> io::Result<Arc<InstanceKlass<'a>>> {
         let _load_guard = self.load_lock.lock();
         self.defineParsed(class)
+    }
+
+    /// HotSpot `ClassLoader::find_class` equivalent: searches only this
+    /// loader's own class path entries and the boot image, without the
+    /// Java-loader delegate fallback performed by `load`.
+    pub fn find_class(&self, name: &[u8]) -> io::Result<Arc<InstanceKlass<'a>>> {
+        let _load_guard = self.load_lock.lock();
+        self.loadClass(name)
+    }
+
+    /// Loads and links the named class (JVMS §5.3.5 resolution + §5.4.3.1
+    /// preparation is performed lazily by the interpreter; this performs
+    /// loading and marks the class `Linked`).
+    pub fn resolve(&self, name: &[u8]) -> io::Result<Arc<InstanceKlass<'a>>> {
+        let klass = self.load(name)?;
+        use crate::share::oops::instanceKlass::InitState;
+        if *klass.state.borrow() == InitState::Loaded {
+            klass.state.set(InitState::Linked);
+        }
+        Ok(klass)
+    }
+
+    /// Whether this loader supports parallel class loading
+    /// (`ClassLoader.registerAsParallelCapable`).
+    pub fn parallel_capable(&self) -> bool {
+        self.parallel_capable
+    }
+
+    /// Builder-style override for `parallel_capable`.
+    pub fn with_parallel_capable(mut self, capable: bool) -> Self {
+        self.parallel_capable = capable;
+        self
+    }
+
+    /// JVMS §5.3 package definition: records `name` in this loader's
+    /// package table. Defining the same package twice is idempotent.
+    pub fn define_package(&self, name: &[u8]) -> io::Result<PackageEntry> {
+        let name = super::classFileParser::decodeString(name)?;
+        let valid = !name.is_empty()
+            && !name.starts_with('.')
+            && !name.ends_with('.')
+            && !name.contains("..")
+            && name
+                .split('.')
+                .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$'));
+        if !valid {
+            return Err(Error::other(format!(
+                "Illegal package name: {name}"
+            )));
+        }
+        let mut packages = self.packages.borrow_mut();
+        Ok(packages
+            .entry(name.clone())
+            .or_insert_with(|| PackageEntry {
+                name,
+                is_exported: true,
+            })
+            .clone())
+    }
+
+    /// Looks up a defined package by dot-separated name.
+    pub fn get_package(&self, name: &[u8]) -> io::Result<Option<PackageEntry>> {
+        let name = super::classFileParser::decodeString(name)?;
+        Ok(self.packages.borrow().get(&name).cloned())
+    }
+
+    /// All packages defined by this loader.
+    pub fn get_packages(&self) -> Vec<PackageEntry> {
+        self.packages.borrow().values().cloned().collect()
+    }
+
+    /// `java.lang.ClassLoader.getResource` equivalent: returns the
+    /// resource path inside this loader's class path / boot image when the
+    /// named resource exists.
+    pub fn get_resource(&self, name: &[u8]) -> io::Result<Option<String>> {
+        let rel_path = super::classFileParser::decodeString(name)?;
+        if rel_path.is_empty() || rel_path.starts_with('/') || rel_path.contains("..") {
+            return Ok(None);
+        }
+        if let Some(image) = &self.bootImage {
+            let mut image = image.borrow_mut();
+            if let Some(path) = image.matchingResources(&rel_path).next() {
+                return Ok(Some(path));
+            }
+        }
+        let mut sources = self.sources.borrow_mut();
+        for source in sources.iter_mut() {
+            match source {
+                ClassSource::Jar { archive: zip, .. } => {
+                    if zip.by_name(&rel_path).is_ok() {
+                        return Ok(Some(rel_path));
+                    }
+                }
+                ClassSource::Directory(dir) => {
+                    if dir.join(&rel_path).is_file() {
+                        return Ok(Some(rel_path));
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// `java.lang.ClassLoader.getResourceAsStream` equivalent: reads the
+    /// named resource's bytes, `None` when absent.
+    pub fn get_resource_as_stream(&self, name: &[u8]) -> io::Result<Option<Vec<u8>>> {
+        self.open_resource(name)
     }
 
     /// Returns the cached synthetic lambda class for an invokedynamic call

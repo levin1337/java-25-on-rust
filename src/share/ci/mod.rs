@@ -1,4 +1,6 @@
 pub mod ciArrayKlass;
+pub mod ciConstant;
+pub mod ciSignature;
 pub mod ciEnv;
 pub mod ciField;
 pub mod ciInstanceKlass;

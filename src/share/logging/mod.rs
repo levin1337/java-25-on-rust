@@ -1,7 +1,10 @@
 pub mod log;
+pub mod logAsyncWriter;
+pub mod logSelection;
 pub mod logConfiguration;
 pub mod logDecorations;
 pub mod logLevel;
 pub mod logOutput;
 pub mod logStream;
 pub mod logTag;
+pub mod logTagSet;

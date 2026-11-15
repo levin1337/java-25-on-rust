@@ -142,6 +142,7 @@ pub enum Opcode {
     New(u32),
     NewArray(u32),
     NewArrayRef(u32),
+    MultianewArray,
     ArrayLength,
     CheckCast(u32),
     InstanceOf(u32),
@@ -149,7 +150,75 @@ pub enum Opcode {
     MonitorExit,
     Athrow,
 
-    Call(u32),
+    /// Constant leaked `StubSite` pointer (owner/name/descriptor) passed
+    /// to runtime-stub-backed field/class/call sites.  The payload is
+    /// the raw `u64` address of a `c1_LIR::StubSite`; 0 means the
+    /// constant-pool site was unresolved and the stub deoptimizes.
+    SitePtr(u64),
+
+    /// Method invocation lowered to the `UnresolvedCall` runtime stub.
+    /// Payload packs `pack_call(cp_index, invoke_opcode, result_kind)`.
+    Call(u64),
+}
+
+/// Result category of a `Call` node, packed into the `Call` payload and
+/// used by the register allocator / emitter to pick the result channel
+/// (rax vs xmm0) and width.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CallResult {
+    Void,
+    I32,
+    I64,
+    F32,
+    F64,
+    Ref,
+}
+
+impl CallResult {
+    pub fn code(self) -> u64 {
+        match self {
+            Self::Void => 0,
+            Self::I32 => 1,
+            Self::I64 => 2,
+            Self::F32 => 3,
+            Self::F64 => 4,
+            Self::Ref => 5,
+        }
+    }
+
+    pub fn from_code(code: u64) -> Self {
+        match code {
+            1 => Self::I32,
+            2 => Self::I64,
+            3 => Self::F32,
+            4 => Self::F64,
+            5 => Self::Ref,
+            _ => Self::Void,
+        }
+    }
+
+    pub fn is_xmm(self) -> bool {
+        matches!(self, Self::F32 | Self::F64)
+    }
+
+    pub fn is_wide_gp(self) -> bool {
+        matches!(self, Self::I64 | Self::Ref)
+    }
+}
+
+/// Packs a `Call` node payload: bits[0:16) constant-pool index,
+/// bits[16:24) JVM invoke opcode, bits[24:32) `CallResult` code.
+pub fn call_pack(cp: u32, invoke_opcode: u8, result: CallResult) -> u64 {
+    (cp as u64 & 0xffff) | ((invoke_opcode as u64) << 16) | (result.code() << 24)
+}
+
+/// Inverse of `call_pack`.
+pub fn call_unpack(payload: u64) -> (u32, u8, CallResult) {
+    (
+        (payload & 0xffff) as u32,
+        ((payload >> 16) & 0xff) as u8,
+        CallResult::from_code((payload >> 24) & 0xff),
+    )
 }
 
 impl Opcode {
@@ -172,6 +241,7 @@ impl Opcode {
                 | New(_)
                 | NewArray(_)
                 | NewArrayRef(_)
+                | MultianewArray
                 | MonitorEnter
                 | MonitorExit
                 | Athrow
@@ -196,6 +266,7 @@ impl Opcode {
                 | Opcode::ConD(_)
                 | Opcode::ConP(_)
                 | Opcode::Bool(_)
+                | Opcode::SitePtr(_)
         )
     }
 
@@ -412,7 +483,8 @@ fn compute_type(op: &Opcode) -> Type {
         ConL(_) | LoadL => Type::Long,
         ConF(_) | LoadF => Type::Float,
         ConD(_) | LoadD => Type::Double,
-        ConP(_) | LoadP | CheckCast(_) | New(_) | NewArray(_) | NewArrayRef(_) => Type::Ref,
+        ConP(_) | LoadP | CheckCast(_) | New(_) | NewArray(_) | NewArrayRef(_)
+        | MultianewArray => Type::Ref,
         Bool(_) | BoolCmp(_) => Type::Bool,
         Parm(_) | Call(_) => Type::Any,
         L2I => Type::Int,

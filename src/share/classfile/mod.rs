@@ -1,3 +1,4 @@
+pub mod attributes;
 pub mod bytecodeVerifier;
 pub mod classFileParser;
 pub mod classFileStream;
@@ -15,6 +16,17 @@ pub mod verifier;
 pub mod vmIntrinsics;
 pub mod vmSymbols;
 
+pub use attributes::{
+    AttributeCursor, BootstrapMethodEntry, BootstrapMethodSpec, CallSiteInfo,
+    ClassTypeSegment, ClassTypeSignature, EnclosingMethodInfo, GenericSignature,
+    InnerClassEntry, MethodResult, ModuleExports, ModuleInfo, ModuleOpens,
+    ModuleProvides, ModuleRequires, RecordComponentInfo, ResolvedModuleExports,
+    ResolvedModuleInfo, ResolvedModuleOpens, ResolvedModuleProvides,
+    ResolvedModuleRequires, TypeAnnotation, TypeAnnotationTarget, TypeArgument,
+    TypeSignature, parse_annotations, parse_bootstrap_methods, parse_module_attribute,
+    parse_method_type_signature, parse_parameter_annotations, parse_type_annotations,
+    parse_type_signature,
+};
 pub use classFileParser::{
     Attribute, ClassError, ClassFile, ClassFileParser, Constant, FieldLayoutInfo,
     JAVA_CLASSFILE_MAGIC, JAVA_MAX_SUPPORTED_VERSION, JAVA_MIN_SUPPORTED_VERSION,

@@ -85,7 +85,7 @@ fn invalid(message: &'static str) -> Error {
     Error::other(message)
 }
 
-fn iae<'a>(loader: &ClassLoader<'a>, message: &str) -> Error {
+pub(crate) fn iae<'a>(loader: &ClassLoader<'a>, message: &str) -> Error {
     throw_java(loader, b"java/lang/IllegalArgumentException", Some(message))
 }
 
@@ -194,7 +194,7 @@ fn class_display_name(name: &[u8]) -> String {
     dotted_name(name)
 }
 
-fn string_value<'a>(loader: &ClassLoader<'a>, text: &str) -> Value<'a> {
+pub(crate) fn string_value<'a>(loader: &ClassLoader<'a>, text: &str) -> Value<'a> {
     Value::HostString(loader.storage.alloc_str(text))
 }
 
@@ -295,7 +295,7 @@ fn new_throwable<'a>(
 }
 
 /// Throws `class_name` as a Java exception, optionally with a message.
-fn throw_java<'a>(loader: &ClassLoader<'a>, class_name: &[u8], message: Option<&str>) -> Error {
+pub(crate) fn throw_java<'a>(loader: &ClassLoader<'a>, class_name: &[u8], message: Option<&str>) -> Error {
     let result = (|| -> io::Result<usize> {
         match message {
             Some(text) => {
@@ -1205,7 +1205,7 @@ fn parameter_mirrors<'a>(member: &Member<'a>) -> io::Result<Vec<&'a [u8]>> {
 }
 
 /// Creates a `java.lang.reflect.Method` object for a declared method.
-fn new_method_object<'a>(
+pub(crate) fn new_method_object<'a>(
     loader: &ClassLoader<'a>,
     klass: &InstanceKlass<'a>,
     member: &Member<'a>,
@@ -1234,7 +1234,7 @@ fn new_method_object<'a>(
 }
 
 /// Creates a `java.lang.reflect.Field` object for a declared field.
-fn new_field_object<'a>(
+pub(crate) fn new_field_object<'a>(
     loader: &ClassLoader<'a>,
     klass: &InstanceKlass<'a>,
     member: &Member<'a>,
@@ -1265,7 +1265,7 @@ fn new_field_object<'a>(
 }
 
 /// Creates a `java.lang.reflect.Constructor` object.
-fn new_constructor_object<'a>(
+pub(crate) fn new_constructor_object<'a>(
     loader: &ClassLoader<'a>,
     klass: &InstanceKlass<'a>,
     member: &Member<'a>,
@@ -2573,7 +2573,22 @@ pub(crate) fn class_invoke<'a>(
         }
         (b"getRawAnnotations", b"()[B") | (b"getRawTypeAnnotations", b"()[B") => Value::Null,
         (b"getConstantPool", b"()Ljava/lang/constant/ConstantPool;")
-        | (b"getConstantPool", b"()Ljdk/internal/reflect/ConstantPool;") => Value::Null,
+        | (b"getConstantPool", b"()Ljdk/internal/reflect/ConstantPool;") => {
+            if is_array || is_primitive {
+                Value::Null
+            } else {
+                new_member_object(
+                    loader,
+                    b"jdk/internal/reflect/ConstantPool",
+                    &[(
+                        b"constantPoolOop",
+                        b"Ljava/lang/Object;",
+                        Value::ClassMirror(class),
+                    )],
+                )
+                .map(Value::Object)?
+            }
+        }
         (b"getRecordComponents0", b"()[Ljava/lang/reflect/RecordComponent;") => Value::Null,
         (b"getNestHost0", b"()Ljava/lang/Class;") => {
             if is_array || is_primitive {

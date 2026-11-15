@@ -17,7 +17,7 @@
 
 use super::logDecorations::Decorations;
 use super::logLevel::LogLevel;
-use super::logOutput::{FileOutput, LogOutput, NullOutput, StderrOutput, StdoutOutput};
+use super::logOutput::{LogOutput, NullOutput, StreamLogOutput};
 use super::logTag::LogTag;
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -73,10 +73,10 @@ impl LogConfiguration {
             } else {
                 (part, "info")
             };
-            let level = LogLevel::from_str(level_str)
+            let level = LogLevel::from_string(level_str)
                 .ok_or_else(|| format!("Invalid log level '{}'", level_str))?;
             for t_str in tag_str.split('+') {
-                let tag = LogTag::from_str(t_str)
+                let tag = LogTag::from_string(t_str)
                     .ok_or_else(|| format!("Invalid log tag '{}'", t_str))?;
                 self.set_level(tag, level);
             }
@@ -109,7 +109,7 @@ impl LogConfiguration {
             };
             let level = match level_str {
                 "" => LogLevel::Info,
-                s => LogLevel::from_str(s)
+                s => LogLevel::from_string(s)
                     .ok_or_else(|| format!("Invalid log level '{}'", s))?,
             };
             for t_str in tag_str.split('+') {
@@ -122,7 +122,7 @@ impl LogConfiguration {
                     LogTag::from_prefix(prefix)
                         .ok_or_else(|| format!("Invalid log tag '{}'", t_str))?
                 } else {
-                    LogTag::from_str(t_str)
+                    LogTag::from_string(t_str)
                         .ok_or_else(|| format!("Invalid log tag '{}'", t_str))?
                 };
                 self.set_level(tag, level);
@@ -207,17 +207,14 @@ impl LogConfiguration {
     pub fn outputs(&self) -> Vec<Box<dyn LogOutput>> {
         let entries = self.outputs.lock().unwrap();
         if entries.is_empty() {
-            return vec![Box::new(StderrOutput)];
+            return vec![Box::new(StreamLogOutput::stderr())];
         }
         entries
             .iter()
             .map(|e| match &e.kind {
-                OutputKind::Stderr => Box::new(StderrOutput) as Box<dyn LogOutput>,
-                OutputKind::Stdout => Box::new(StdoutOutput),
-                OutputKind::File(p) => match FileOutput::create(p) {
-                    Ok(f) => Box::new(f) as Box<dyn LogOutput>,
-                    Err(_) => Box::new(NullOutput),
-                },
+                OutputKind::Stderr => Box::new(StreamLogOutput::stderr()) as Box<dyn LogOutput>,
+                OutputKind::Stdout => Box::new(StreamLogOutput::stdout()),
+                OutputKind::File(p) => Box::new(StreamLogOutput::file(&p.to_string_lossy(), "")),
                 OutputKind::Null => Box::new(NullOutput),
             })
             .collect()

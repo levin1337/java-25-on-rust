@@ -1121,6 +1121,22 @@ impl CompileBroker {
 
     /// Execute one task through its compiler and install the nmethod.
     pub fn invoke_compiler_on_method(&self, task: &CompileTask) {
+        // JVM25_JIT_SKIP: comma-separated substrings; matching method keys
+        // are rejected before compilation (debugging miscompiles).
+        if let Some(skip) = std::env::var_os("JVM25_JIT_SKIP") {
+            let skip = skip.to_string_lossy().into_owned();
+            let key = format!(
+                "{}.{}{}",
+                task.method.class_name.as_str(),
+                task.method.method_name.as_str(),
+                task.method.descriptor.as_str()
+            );
+            if skip.split(',').any(|pat| !pat.is_empty() && key.contains(pat)) {
+                task.set_failure_reason("jit-skip");
+                self.finish_task(task);
+                return;
+            }
+        }
         // Bridge: populate `method_obj` from the live ClassLoader so the
         // compiler backend can read bytecode/locals/flags.  Tasks created
         // by the broker carry only `MethodIdentity` (Symbols); resolve the

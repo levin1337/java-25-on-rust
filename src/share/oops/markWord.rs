@@ -5,7 +5,7 @@
  * - 2 lock bits (locked: 00, unlocked: 01, monitor: 10, marked: 11)
  * - 1 self-forward bit
  * - 4 age bits (0..15)
- * - 1 unused gap bit
+ * - 4 unused gap bits (reserved for Valhalla)
  * - 31 identity hash bits
  * - 22 compact klass bits (when compact object headers are enabled)
  */
@@ -28,19 +28,20 @@ impl MarkWord {
     pub const MONITOR_VALUE: usize = Self::MONITORED;
     pub const MARKED_VALUE: usize = Self::MARKED;
 
-    // Bitfield specifications
+    // Bitfield specifications (markWord.hpp, LP64):
+    //   lock:2 | self-fwd:1 | age:4 | unused_gap:4 | hash:31 | klass:22
     pub const LOCK_BITS: usize = 2;
     pub const SELF_FWD_BITS: usize = 1;
     pub const AGE_BITS: usize = 4;
-    pub const UNUSED_GAP_BITS: usize = 1;
+    pub const UNUSED_GAP_BITS: usize = 4;
     pub const HASH_BITS: usize = 31;
     pub const KLASS_BITS: usize = 22;
 
     pub const LOCK_SHIFT: usize = 0;
     pub const SELF_FWD_SHIFT: usize = Self::LOCK_SHIFT + Self::LOCK_BITS; // 2
     pub const AGE_SHIFT: usize = Self::SELF_FWD_SHIFT + Self::SELF_FWD_BITS; // 3
-    pub const HASH_SHIFT: usize = 8; // Bit 7 reserved gap, hash starts at bit 8
-    pub const KLASS_SHIFT: usize = 42; // Upper 22 bits for compact klass pointer
+    pub const HASH_SHIFT: usize = Self::AGE_SHIFT + Self::AGE_BITS + Self::UNUSED_GAP_BITS; // 11
+    pub const KLASS_SHIFT: usize = Self::HASH_SHIFT + Self::HASH_BITS; // 42
 
     pub const LOCK_MASK_IN_PLACE: usize = Self::LOCK_MASK;
     pub const SELF_FWD_MASK: usize = (1 << Self::SELF_FWD_BITS) - 1;
@@ -53,7 +54,17 @@ impl MarkWord {
     pub const KLASS_MASK: usize = (1 << Self::KLASS_BITS) - 1;
     pub const KLASS_MASK_IN_PLACE: usize = Self::KLASS_MASK << Self::KLASS_SHIFT;
 
+    /// `klass_shift_at_offset`: shift used to extract the narrow klass
+    /// from a mark word observed through a 4-byte (`klass_offset_in_bytes`)
+    /// window (compact object headers read the upper 32 bits of the
+    /// 64-bit mark word).
+    pub const KLASS_OFFSET_IN_BYTES: usize = 4;
+    pub const KLASS_SHIFT_AT_OFFSET: usize =
+        Self::KLASS_SHIFT - Self::KLASS_OFFSET_IN_BYTES * 8;
+
     pub const NO_HASH: usize = 0;
+    pub const NO_HASH_IN_PLACE: usize = Self::NO_HASH << Self::HASH_SHIFT;
+    pub const NO_LOCK_IN_PLACE: usize = Self::UNLOCKED_VALUE;
 
     #[inline]
     pub const fn from_raw(value: usize) -> Self {
@@ -88,9 +99,12 @@ impl MarkWord {
         (self.value & Self::LOCK_MASK) == Self::UNLOCKED
     }
 
+    /// HotSpot `is_locked`: true for every non-unlocked lock state
+    /// (locked 00, monitor 10, marked 11).  Use `is_fast_locked` /
+    /// `has_locker` for the stack-lock-only check.
     #[inline]
     pub fn is_locked(&self) -> bool {
-        (self.value & Self::LOCK_MASK) == Self::LOCKED
+        (self.value & Self::LOCK_MASK) != Self::UNLOCKED
     }
 
     #[inline]
@@ -138,11 +152,13 @@ impl MarkWord {
         !self.is_unlocked() || !self.has_no_hash()
     }
 
-    // Lock synchronization routines
+    /// Lock synchronization routines
+    /// HotSpot `set_unlocked`: ORs the unlocked bits in place (callers
+    /// only use it when the lock bits are already `LOCKED`).
     #[inline]
     pub fn set_unlocked(&self) -> Self {
         Self {
-            value: (self.value & !Self::LOCK_MASK) | Self::UNLOCKED_VALUE,
+            value: self.value | Self::UNLOCKED_VALUE,
         }
     }
 
@@ -189,6 +205,13 @@ impl MarkWord {
         }
     }
 
+    #[inline]
+    pub fn set_unmarked(&self) -> Self {
+        Self {
+            value: (self.value & !Self::LOCK_MASK) | Self::UNLOCKED_VALUE,
+        }
+    }
+
     // Age operations
     #[inline]
     pub fn age(&self) -> u32 {
@@ -222,8 +245,8 @@ impl MarkWord {
 
     #[inline]
     pub fn set_hash(&mut self, hash: usize) {
-        let h = hash & Self::HASH_MASK;
-        self.value = (self.value & 0xFF) | (h << Self::HASH_SHIFT);
+        self.value = (self.value & !Self::HASH_MASK_IN_PLACE)
+            | ((hash & Self::HASH_MASK) << Self::HASH_SHIFT);
     }
 
     #[inline]
@@ -240,9 +263,20 @@ impl MarkWord {
     }
 
     #[inline]
-    pub fn set_narrow_klass(&mut self, narrow_klass: u32) {
-        let nk = (narrow_klass as usize) & Self::KLASS_MASK;
-        self.value = (self.value & !Self::KLASS_MASK_IN_PLACE) | (nk << Self::KLASS_SHIFT);
+    pub fn set_narrow_klass(&self, narrow_klass: u32) -> Self {
+        Self {
+            value: (self.value & !Self::KLASS_MASK_IN_PLACE)
+                | (((narrow_klass as usize) & Self::KLASS_MASK) << Self::KLASS_SHIFT),
+        }
+    }
+
+    /// `klass_shift_at_offset` variant: extracts the narrow klass from
+    /// the upper 32 bits of the mark word (the window a compact-header
+    /// object header exposes).
+    #[inline]
+    pub fn narrow_klass_from_high_word(high_word: u32) -> u32 {
+        let shifted = (high_word as usize) >> Self::KLASS_SHIFT_AT_OFFSET;
+        (shifted as u32) & (Self::KLASS_MASK as u32)
     }
 
     // Pointer encoding / decoding for safe reference tracking
@@ -251,9 +285,18 @@ impl MarkWord {
         Self::from_raw(ptr_val).set_marked()
     }
 
+    /// HotSpot `decode_pointer`: recovers the oop address stored in the
+    /// mark word (forwarding pointer or monitor pointer) by clearing
+    /// the lock bits.
     #[inline]
-    pub fn decode_pointer_value(&self) -> usize {
+    pub fn decode_pointer(&self) -> usize {
         self.clear_lock_bits().value
+    }
+
+    /// HotSpot `forwardee`: the forwarding target of a forwarded object.
+    #[inline]
+    pub fn forwardee(&self) -> usize {
+        self.decode_pointer()
     }
 
     /// Safe text representation of the mark word matching HotSpot markWord::print_on.

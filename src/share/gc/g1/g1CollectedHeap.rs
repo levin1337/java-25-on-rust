@@ -18,6 +18,7 @@ pub struct G1CollectedHeap {
     current_eden_region_idx: Option<usize>,
     young_collection_count: usize,
     full_collection_count: usize,
+    last_collection_set: Vec<usize>,
 }
 
 impl G1CollectedHeap {
@@ -37,6 +38,7 @@ impl G1CollectedHeap {
             current_eden_region_idx: None,
             young_collection_count: 0,
             full_collection_count: 0,
+            last_collection_set: Vec::new(),
         }
     }
 
@@ -83,6 +85,32 @@ impl G1CollectedHeap {
 
     fn find_free_region(&mut self) -> Option<usize> {
         self.regions.iter().position(|r| r.is_free())
+    }
+
+    /// G1 evacuation-set selection: candidate regions are ranked by
+    /// collection efficiency (reclaimed bytes per used byte, garbage
+    /// first) and the top `max_regions` are taken. Ties break on region
+    /// index for determinism.
+    pub fn select_collection_set(&self, candidates: &[usize], max_regions: usize) -> Vec<usize> {
+        let mut ranked: Vec<(usize, f64)> = candidates
+            .iter()
+            .map(|&index| (index, self.regions[index].collection_efficiency()))
+            .collect();
+        ranked.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.0.cmp(&b.0))
+        });
+        ranked
+            .into_iter()
+            .take(max_regions)
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    #[inline]
+    pub fn last_collection_set(&self) -> &[usize] {
+        &self.last_collection_set
     }
 
     pub fn allocate(&mut self, size: usize) -> io::Result<usize> {
@@ -186,6 +214,22 @@ impl G1CollectedHeap {
             }
         }
 
+        // G1 young collections also evacuate a bounded set of old
+        // regions selected garbage-first; cap at ~10% of the heap like
+        // the HotSpot old-CSet heuristics.
+        let candidates: Vec<usize> = self
+            .regions
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.is_old() && r.used() > 0)
+            .map(|(i, _)| i)
+            .collect();
+        let max_old = (self.regions.len() / 10).max(1);
+        self.last_collection_set = self.select_collection_set(&candidates, max_old);
+        for &index in &self.last_collection_set {
+            self.regions[index].reset();
+        }
+
         self.current_eden_region_idx = None;
         Ok(())
     }
@@ -193,7 +237,13 @@ impl G1CollectedHeap {
     pub fn do_full_gc(&mut self) -> io::Result<()> {
         self.full_collection_count += 1;
 
-        // Full GC resets all young and humongous regions
+        self.last_collection_set = self
+            .regions
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| !r.is_free())
+            .map(|(i, _)| i)
+            .collect();
         for region in &mut self.regions {
             region.reset();
         }

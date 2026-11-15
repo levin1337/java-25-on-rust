@@ -3997,17 +3997,47 @@ unsafe extern "system" fn jni_get_object_ref_type(
 }
 
 unsafe extern "system" fn jni_get_module(
-    _env: *mut NativeEnvironment,
-    _clazz: JniClass,
+    env: *mut NativeEnvironment,
+    clazz: JniClass,
 ) -> JniObject {
-    ptr::null_mut()
+    if pending(env) {
+        return ptr::null_mut();
+    }
+    if clazz.is_null() {
+        throw_error(env, b"java/lang/NullPointerException", Some("class is null"));
+        return ptr::null_mut();
+    }
+    let Some(loader) = (unsafe { vm_of(env) }).and_then(JavaVm::class_loader) else {
+        return ptr::null_mut();
+    };
+    let Ok(name) = class_name_of(env, clazz) else {
+        if matches!(resolve_target(env, clazz), Ok(JniRefTarget::Object(_))) {
+            throw_error(env, b"java/lang/IllegalArgumentException", Some("Invalid class"));
+        }
+        return ptr::null_mut();
+    };
+    match super::reflectionNatives::class_module_object(loader, &name) {
+        Some(Value::Object(handle)) => new_local(env, JniRefTarget::Object(Oop::Instance(handle))),
+        _ => ptr::null_mut(),
+    }
 }
 
 unsafe extern "system" fn jni_is_virtual_thread(
-    _env: *mut NativeEnvironment,
-    _obj: JniObject,
+    env: *mut NativeEnvironment,
+    obj: JniObject,
 ) -> u8 {
-    0
+    let Ok(Oop::Instance(handle)) = resolve_oop(env, obj) else {
+        return 0;
+    };
+    let Some(loader) = (unsafe { vm_of(env) }).and_then(JavaVm::class_loader) else {
+        return 0;
+    };
+    u8::from(loader.objects.borrow().get(handle).is_some_and(|thread| {
+        crate::share::classfile::systemDictionary::SystemDictionary::is_subclass_of(
+            &thread.klass,
+            b"java/lang/BaseVirtualThread",
+        )
+    }))
 }
 
 // ---------------------------------------------------------------------------

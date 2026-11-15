@@ -21,12 +21,54 @@ use crate::share::{
         instanceKlass::InstanceKlass, instanceOop::InstanceOop, objArrayOop::ObjArrayOop,
         typeArrayOop::TypeArrayOop,
     },
-    runtime::reflection::Reflection,
+    runtime::{javaCalls::{JavaCallArguments, JavaCalls}, reflection::Reflection},
 };
 use std::io::{self, Error};
 use std::sync::Arc;
 
 type NativeResult<'a> = Option<Option<Value<'a>>>;
+
+/// `Class.forName0` fallback for names missing from the VM's flat class
+/// store: invokes `ClassLoader.loadClass(String)` on the Java loader object
+/// passed as the third argument, letting URLClassLoader/custom loaders run
+/// their own `findClass`. Returns `Ok(None)` when no usable loader object
+/// was supplied.
+fn delegate_load_class<'a>(
+    loader: &ClassLoader<'a>,
+    loader_arg: Value<'a>,
+    class_name: &str,
+) -> io::Result<Option<Value<'a>>> {
+    let Value::Object(handle) = loader_arg else {
+        return Ok(None);
+    };
+    let klass = {
+        let objects = loader.borrow_objects();
+        let Some(object) = objects.get(handle) else {
+            return Ok(None);
+        };
+        Arc::clone(&object.klass)
+    };
+    if klass.class.name != b"java/lang/ClassLoader"
+        && !crate::share::classfile::systemDictionary::SystemDictionary::is_subclass_of(
+            klass.as_ref(),
+            b"java/lang/ClassLoader",
+        )
+    {
+        return Ok(None);
+    }
+    let name = loader.storage.alloc_str(class_name);
+    let mut call = JavaCallArguments::with_receiver(Value::Object(handle));
+    call.push_oop(Value::HostString(name));
+    let result = JavaCalls::call_virtual(
+        loader,
+        &klass,
+        b"loadClass",
+        b"(Ljava/lang/String;)Ljava/lang/Class;",
+        &call,
+        &mut io::sink(),
+    )?;
+    Ok(Some(result.unwrap_or(Value::Null)))
+}
 
 const ACC_PUBLIC: u16 = 0x0001;
 const ACC_PRIVATE: u16 = 0x0002;
@@ -1020,7 +1062,7 @@ fn inner_class_access_flags<'a>(klass: &InstanceKlass<'a>) -> u16 {
 /// module that defined the class. Array classes defer to their element type;
 /// primitives resolve to `java.base`. Falls back to the unnamed module when
 /// no named module object has been registered yet.
-fn class_module_object<'a>(
+pub(super) fn class_module_object<'a>(
     loader: &ClassLoader<'a>,
     class: &[u8],
 ) -> Option<Value<'a>> {
@@ -1028,10 +1070,13 @@ fn class_module_object<'a>(
     while let Some(rest) = name.strip_prefix(b"[") {
         name = rest;
     }
+    let primitive = name.starts_with(b":")
+        || (class.starts_with(b"[")
+            && matches!(name, [b'Z' | b'B' | b'C' | b'S' | b'I' | b'J' | b'F' | b'D']));
     if name.starts_with(b"L") && name.ends_with(b";") && name.len() >= 2 {
         name = &name[1..name.len() - 1];
     }
-    let module_name = if name.starts_with(b":") {
+    let module_name = if primitive {
         Some("java.base".to_owned())
     } else {
         loader.class_module_name(name)
@@ -1045,6 +1090,21 @@ fn class_module_object<'a>(
         .unnamedModuleObject()
         .ok()
         .map(Value::Object)
+}
+
+#[cfg(test)]
+#[test]
+fn primitiveArraysBelongToJavaBase() {
+    let arena = crate::share::runtime::syncBump::SyncBump::new();
+    let loader = ClassLoader::open(std::path::Path::new("."), &arena).unwrap();
+    loader.register_module_object("java.base", 42);
+
+    for class in [b":I".as_slice(), b"[I", b"[[I"] {
+        assert!(matches!(
+            class_module_object(&loader, class),
+            Some(Value::Object(42))
+        ));
+    }
 }
 
 /// `Class.getModifiers()` value: class access flags merged with the
@@ -2771,13 +2831,27 @@ pub(crate) fn invoke_static<'a>(
                     Some(&class_name),
                 ));
             }
-            let klass = loader.load(internal.as_bytes()).map_err(|_| {
-                throw_java(
-                    loader,
-                    b"java/lang/ClassNotFoundException",
-                    Some(&class_name),
-                )
-            })?;
+            let klass = match loader.load(internal.as_bytes()) {
+                Ok(klass) => klass,
+                Err(load_error) => {
+                    // Custom Java loaders (URLClassLoader and friends) resolve
+                    // classes through their own `findClass`; give the loader
+                    // object a chance via `ClassLoader.loadClass` before
+                    // reporting ClassNotFoundException.
+                    let loader_arg = arguments.get(2).copied().unwrap_or(Value::Null);
+                    if let Some(value) =
+                        delegate_load_class(loader, loader_arg, &class_name)?
+                    {
+                        return Ok(Some(Some(value)));
+                    }
+                    let _ = load_error;
+                    return Err(throw_java(
+                        loader,
+                        b"java/lang/ClassNotFoundException",
+                        Some(&class_name),
+                    ));
+                }
+            };
             if initialize {
                 bytecodeInterpreter::initialize(loader, &klass, &mut io::sink(), 0)?;
             }

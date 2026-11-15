@@ -10,7 +10,7 @@
 
 use super::constMethod::ConstMethod;
 use super::methodCounters::MethodCounters;
-use crate::classfile::Member;
+use crate::classfile::{Constant, Member, Reader};
 use std::io::{self, Error};
 use std::sync::Arc;
 
@@ -30,6 +30,7 @@ pub struct Code<'a> {
     pub exception_table: Vec<ExceptionTableEntry>,
     pub name: &'a [u8],
     pub descriptor: &'a [u8],
+    attributes: &'a [u8],
 }
 
 impl<'a> Code<'a> {
@@ -90,7 +91,30 @@ impl<'a> Code<'a> {
             exception_table,
             name: method.name,
             descriptor: method.descriptor,
+            attributes: &tail[pos..],
         })
+    }
+
+    pub fn lineNumber(&self, constants: &[Constant<'_>], bci: u16) -> Option<u16> {
+        let mut reader = Reader(self.attributes);
+        let mut best = None;
+        for _ in 0..reader.readU16().ok()? {
+            let index = usize::from(reader.readU16().ok()?);
+            let length = u32::from_be_bytes(reader.read().ok()?) as usize;
+            let data = reader.take(length).ok()?;
+            if !matches!(constants.get(index), Some(Constant::Utf8(b"LineNumberTable"))) {
+                continue;
+            }
+            let mut table = Reader(data);
+            for _ in 0..table.readU16().ok()? {
+                let start = table.readU16().ok()?;
+                let line = table.readU16().ok()?;
+                if start <= bci && best.is_none_or(|(previous, _)| start >= previous) {
+                    best = Some((start, line));
+                }
+            }
+        }
+        best.map(|(_, line)| line)
     }
 }
 

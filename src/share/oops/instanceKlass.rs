@@ -126,6 +126,30 @@ impl<'a> InstanceKlass<'a> {
             }
         }
 
+        // JVM-injected fields (HotSpot `@Injected`): these members are added
+        // by the VM at class-load time and are absent from the class file.
+        // - java.lang.invoke.ResolvedMethodName: `vmtarget` (JVM_Method*),
+        //   `vmholder` (declaring Class).
+        // - java.lang.invoke.MemberName: `vmindex` (vtable index/offset).
+        match class.name {
+            b"java/lang/invoke/ResolvedMethodName" => {
+                instance_field_infos.push(FieldInfo::new(0, b"vmtarget", b"J", instance_slot));
+                instance_slot += 1;
+                instance_field_infos.push(FieldInfo::new(
+                    0,
+                    b"vmholder",
+                    b"Ljava/lang/Class;",
+                    instance_slot,
+                ));
+                instance_slot += 1;
+            }
+            b"java/lang/invoke/MemberName" => {
+                instance_field_infos.push(FieldInfo::new(0, b"vmindex", b"J", instance_slot));
+                instance_slot += 1;
+            }
+            _ => {}
+        }
+
         let total_instance_fields = instance_slot;
 
         // Compute memory layout and field byte offsets
@@ -479,11 +503,37 @@ impl<'a> InstanceKlass<'a> {
     }
 
     pub fn memberRef(&self, index: u16, field: bool) -> io::Result<[&'a [u8]; 3]> {
+        let kind = |c: &Constant<'a>| match c {
+            Constant::Unusable => "Unusable",
+            Constant::FieldRef(..) => "FieldRef",
+            Constant::MethodRef(..) => "MethodRef",
+            Constant::InterfaceMethodRef(..) => "InterfaceMethodRef",
+            Constant::Class(_) => "Class",
+            Constant::NameAndType(..) => "NameAndType",
+            Constant::Utf8(_) => "Utf8",
+            Constant::Integer(_) => "Integer",
+            Constant::Float(_) => "Float",
+            Constant::Long(_) => "Long",
+            Constant::Double(_) => "Double",
+            Constant::String(_) => "String",
+            Constant::MethodHandle(..) => "MethodHandle",
+            Constant::MethodType(_) => "MethodType",
+            Constant::Dynamic(..) => "Dynamic",
+            Constant::InvokeDynamic(..) => "InvokeDynamic",
+            Constant::Module(_) => "Module",
+            Constant::Package(_) => "Package",
+        };
         let (owner, member) = match (self.constant(index)?, field) {
             (Constant::FieldRef(owner, member), true)
             | (Constant::MethodRef(owner, member), false)
             | (Constant::InterfaceMethodRef(owner, member), false) => (*owner, *member),
-            _ => return Err(Error::other("Invalid member reference")),
+            (other, _) => {
+                return Err(Error::other(format!(
+                    "Invalid member reference #{}: {}",
+                    index,
+                    kind(other)
+                )));
+            }
         };
         match (self.constant(owner)?, self.constant(member)?) {
             (Constant::Class(owner), Constant::NameAndType(name, descriptor)) => Ok([
@@ -491,7 +541,12 @@ impl<'a> InstanceKlass<'a> {
                 self.utf8(*name)?,
                 self.utf8(*descriptor)?,
             ]),
-            _ => Err(Error::other("Invalid member reference")),
+            (o, m) => Err(Error::other(format!(
+                "Invalid member reference #{}: {}/{}",
+                index,
+                kind(o),
+                kind(m)
+            ))),
         }
     }
 }

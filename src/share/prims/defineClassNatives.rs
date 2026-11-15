@@ -61,6 +61,9 @@ pub(crate) fn define_class0<'a>(
 ) -> io::Result<Option<Value<'a>>> {
     // (loader, pdClass, name, bytes, offset, length, protectionDomain,
     //  initialize, mode, classData)
+    if let Value::Object(handle) = arguments.first().copied().unwrap_or(Value::Null) {
+        loader.register_delegate_loader(handle);
+    }
     let bytes_value = arguments.get(3).copied().unwrap_or(Value::Null);
     let offset = arguments
         .get(4)
@@ -94,6 +97,9 @@ pub(crate) fn define_class2<'a>(
     arguments: &[Value<'a>],
 ) -> io::Result<Option<Value<'a>>> {
     // (loader, name, buffer, offset, length, protectionDomain, source)
+    if let Value::Object(handle) = arguments.first().copied().unwrap_or(Value::Null) {
+        loader.register_delegate_loader(handle);
+    }
     let Value::Object(handle) = arguments.get(2).copied().unwrap_or(Value::Null) else {
         return Err(io::Error::other("defineClass2: expected ByteBuffer"));
     };
@@ -147,6 +153,9 @@ pub(crate) fn define_class1<'a>(
     arguments: &[Value<'a>],
 ) -> io::Result<Option<Value<'a>>> {
     // (loader, name, bytes, offset, length, protectionDomain, source)
+    if let Value::Object(handle) = arguments.first().copied().unwrap_or(Value::Null) {
+        loader.register_delegate_loader(handle);
+    }
     let bytes_value = arguments.get(2).copied().unwrap_or(Value::Null);
     let offset = arguments
         .get(3)

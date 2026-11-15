@@ -9,7 +9,10 @@
 
 use crate::share::{
     classfile::classLoader::ClassLoader,
-    interpreter::bytecodeInterpreter::{self, Value},
+    interpreter::{
+        bytecodeInterpreter::{self, Value},
+        linkResolver::LinkResolver,
+    },
     oops::{instanceKlass::InstanceKlass, instanceOop::InstanceOop},
 };
 use std::io::{self, Write};
@@ -96,9 +99,13 @@ impl JavaCalls {
         args: &JavaCallArguments<'a>,
         output: &mut dyn Write,
     ) -> io::Result<Option<Value<'a>>> {
-        let code = klass.staticCode(name, descriptor, false)?;
+        // Resolve through the hierarchy so `execute` runs with the
+        // *declaring* class's constant pool — running a superclass method
+        // body under the receiver's klass would decode cp indexes against
+        // the wrong constant pool.
+        let (target, code) = LinkResolver::resolve_static_call(klass, name, descriptor)?;
         bytecodeInterpreter::initialize(loader, klass, output, 0)?;
-        bytecodeInterpreter::execute(loader, klass, code, args.parameters(), output, 0, 0)
+        bytecodeInterpreter::execute(loader, &target, code, args.parameters(), output, 0, 0)
     }
 
     /// Dispatches a special method call (invokespecial: constructors, private methods, super calls)
@@ -110,9 +117,9 @@ impl JavaCalls {
         args: &JavaCallArguments<'a>,
         output: &mut dyn Write,
     ) -> io::Result<Option<Value<'a>>> {
-        let code = klass.methodCode(name, descriptor, false, false)?;
+        let (target, code) = LinkResolver::resolve_special_call(klass, name, descriptor)?;
         bytecodeInterpreter::initialize(loader, klass, output, 0)?;
-        bytecodeInterpreter::execute(loader, klass, code, args.parameters(), output, 0, 0)
+        bytecodeInterpreter::execute(loader, &target, code, args.parameters(), output, 0, 0)
     }
 
     /// Dispatches a virtual method call with vtable dynamic dispatch (invokevirtual)
@@ -124,38 +131,18 @@ impl JavaCalls {
         args: &JavaCallArguments<'a>,
         output: &mut dyn Write,
     ) -> io::Result<Option<Value<'a>>> {
-        let method_name = String::from_utf8_lossy(name);
-        let method_sig = String::from_utf8_lossy(descriptor);
-
-        // Resolve virtual method using receiver class vtable
-        if let Some(_v_idx) = receiver_klass
-            .vtable()
-            .index_of_method(&method_name, &method_sig)
-        {
-            let code = receiver_klass.methodCode(name, descriptor, false, false)?;
-            bytecodeInterpreter::initialize(loader, receiver_klass, output, 0)?;
-            bytecodeInterpreter::execute(
-                loader,
-                receiver_klass,
-                code,
-                args.parameters(),
-                output,
-                0,
-                0,
-            )
-        } else {
-            let code = receiver_klass.methodCode(name, descriptor, false, false)?;
-            bytecodeInterpreter::initialize(loader, receiver_klass, output, 0)?;
-            bytecodeInterpreter::execute(
-                loader,
-                receiver_klass,
-                code,
-                args.parameters(),
-                output,
-                0,
-                0,
-            )
-        }
+        let (target, code) =
+            LinkResolver::resolve_virtual_call(receiver_klass, name, descriptor)?;
+        bytecodeInterpreter::initialize(loader, &target, output, 0)?;
+        bytecodeInterpreter::execute(
+            loader,
+            &target,
+            code,
+            args.parameters(),
+            output,
+            0,
+            0,
+        )
     }
 }
 
@@ -406,6 +393,70 @@ fn dump_throwable_chain<'a>(loader: &ClassLoader<'a>, mut handle: usize) {
         match &message {
             Some(message) => eprintln!("[throw] {class_name}: {message}"),
             None => eprintln!("[throw] {class_name}"),
+        }
+        // Print the captured backtrace (`StackTraceElement[]` stored by
+        // `Throwable.fillInStackTrace`) so fatal errors show where they
+        // were raised even though System.err routing may be limited.
+        {
+            let objects = loader.borrow_objects();
+            if let Some(object) = objects.get(handle)
+                && let Ok(slot) = object
+                    .klass
+                    .instanceField(b"backtrace", b"Ljava/lang/Object;")
+                && let Some(Value::ObjectArray(array_handle)) = object.fields.get(slot).copied()
+            {
+                let elements: Vec<usize> = {
+                    let obj_arrays = loader.obj_arrays.borrow();
+                    match obj_arrays.get(array_handle) {
+                        Some(array) => array
+                            .elements
+                            .iter()
+                            .filter_map(|v| match v {
+                                Value::Object(h) => Some(*h),
+                                _ => None,
+                            })
+                            .collect(),
+                        _ => Vec::new(),
+                    }
+                };
+                for element in elements.into_iter().take(24) {
+                    let line = {
+                        let objects = loader.borrow_objects();
+                        let Some(obj) = objects.get(element) else { continue };
+                        let get_str = |name: &[u8], desc: &[u8]| -> Option<String> {
+                            let slot = obj.klass.instanceField(name, desc).ok()?;
+                            match obj.fields.get(slot).copied()? {
+                                Value::HostString(s) => Some(s.to_string()),
+                                Value::String(b) => {
+                                    crate::share::prims::stringNatives::string(loader, Value::String(b))
+                                        .ok()
+                                        .flatten()
+                                        .map(|c| c.into_owned())
+                                }
+                                _ => None,
+                            }
+                        };
+                        let get_int = |name: &[u8]| -> i32 {
+                            obj.klass
+                                .instanceField(name, b"I")
+                                .ok()
+                                .and_then(|s| match obj.fields.get(s).copied()? {
+                                    Value::Int(v) => Some(v),
+                                    _ => None,
+                                })
+                                .unwrap_or(-1)
+                        };
+                        format!(
+                            "\tat {}.{}({}:{})",
+                            get_str(b"declaringClass", b"Ljava/lang/String;").unwrap_or_default(),
+                            get_str(b"methodName", b"Ljava/lang/String;").unwrap_or_default(),
+                            get_str(b"fileName", b"Ljava/lang/String;").unwrap_or_default(),
+                            get_int(b"lineNumber")
+                        )
+                    };
+                    eprintln!("{line}");
+                }
+            }
         }
         match cause {
             // Throwable.cause == this is the JDK "unset" sentinel.

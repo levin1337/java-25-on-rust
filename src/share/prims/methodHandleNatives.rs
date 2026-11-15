@@ -187,7 +187,7 @@ fn mirror_descriptor(name: &[u8]) -> Vec<u8> {
 }
 
 /// Reads an instance field of a heap object by slot name.
-fn object_field<'a>(
+pub(super) fn object_field<'a>(
     loader: &ClassLoader<'a>,
     handle: usize,
     name: &[u8],
@@ -240,7 +240,7 @@ fn class_name<'a>(loader: &ClassLoader<'a>, value: Value<'a>) -> io::Result<Vec<
 }
 
 /// Builds the method descriptor for a `java.lang.invoke.MethodType` object.
-fn method_type_descriptor<'a>(loader: &ClassLoader<'a>, value: Value<'a>) -> io::Result<Vec<u8>> {
+pub(super) fn method_type_descriptor<'a>(loader: &ClassLoader<'a>, value: Value<'a>) -> io::Result<Vec<u8>> {
     let Value::Object(handle) = value else {
         return Err(invalid("Expected java.lang.invoke.MethodType"));
     };
@@ -2040,7 +2040,7 @@ fn field_method_handle<'a>(
     }
 }
 
-fn method_handle_invoke<'a>(
+pub(crate) fn method_handle_invoke<'a>(
     loader: &ClassLoader<'a>,
     mh: usize,
     name: &[u8],

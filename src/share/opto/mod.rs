@@ -2,6 +2,7 @@
  * OpenJDK 25 HotSpot C2 Server Compiler (share/opto/)
  */
 
+pub mod builder;
 pub mod compile;
 pub mod gvn;
 pub mod node;

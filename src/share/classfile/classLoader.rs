@@ -12,6 +12,7 @@ use crate::share::oops::instanceOop::InstanceOop;
 use crate::share::oops::method::Code;
 use crate::share::oops::objArrayOop::ObjArrayOop;
 use crate::share::oops::typeArrayOop::TypeArrayOop;
+use crate::share::runtime::javaCalls::{JavaCallArguments, JavaCalls};
 use crate::share::runtime::synchronizer::Synchronizer;
 use crate::{classfile::ClassFile, share::oops::instanceKlass::InstanceKlass};
 use crate::share::runtime::shareCell::{Share, ShareMut, ShareRef};
@@ -38,6 +39,12 @@ thread_local! {
     /// `Reflection.getCallerClass`) and exception stack traces.
     static CALL_STACK: std::cell::RefCell<Vec<&'static [u8]>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// Internal names currently being resolved through a Java `ClassLoader`
+    /// delegate on this thread. While a name is in this set, re-entrant
+    /// `load` calls for it must report "not found" (not circularity) so the
+    /// Java loader's parent-first delegation can proceed to `findClass`.
+    static DELEGATING: std::cell::RefCell<std::collections::HashSet<Vec<u8>>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
 }
 
 /// Per-thread Java call stack. Zero-sized; all state lives in the
@@ -255,10 +262,26 @@ pub struct ClassLoader<'a> {
     pub(crate) synchronizer: Share<Synchronizer>,
     class_loader_object: Share<Option<usize>>,
     unnamed_module_object: Share<Option<usize>>,
+    /// Java `ClassLoader` object handles that have defined classes through
+    /// the `defineClass*` natives (URLClassLoader, custom loaders, hidden
+    /// classes). When a symbolic dependency is absent from the flat class
+    /// store, `load` delegates to these loaders so their `findClass` can
+    /// supply it — mirroring HotSpot's per-loader class namespaces.
+    delegate_loaders: Share<Vec<usize>>,
     module_objects: Share<HashMap<String, usize>>,
     current_thread_object: Share<Option<usize>>,
     pub(crate) call_stack: CallStack,
     pub(crate) lambda_cache: Share<HashMap<(Vec<u8>, u16), Arc<InstanceKlass<'a>>>>,
+    /// Linked `java.lang.invoke.MethodHandle` targets for generic
+    /// invokedynamic call sites serviced by real bootstrap methods
+    /// (non-LambdaMetafactory/non-StringConcatFactory). Keyed by
+    /// (caller class internal name, BootstrapMethods attribute index).
+    /// Values are `Value::Object` handles kept alive via `gc_extra_roots`.
+    pub(crate) indy_targets: Share<HashMap<(Vec<u8>, u16), Value<'a>>>,
+    /// Resolved values for `condy` (ConstantDynamic) call sites, keyed by
+    /// (caller class internal name, constant-pool index of the Dynamic
+    /// constant). Values are pinned via `gc_extra_roots`.
+    pub(crate) condy_values: Share<HashMap<(Vec<u8>, u32), Value<'a>>>,
     /// Cooperative Java thread registry (see runtime::threading).
     pub(crate) java_threads: Share<HashMap<usize, crate::share::runtime::threading::JavaThreadInfo>>,
     /// FIFO of thread object handles ready to run.
@@ -297,14 +320,6 @@ pub struct ClassLoader<'a> {
 pub enum ClassOrigin {
     Jar(PathBuf),
     Directory(PathBuf),
-}
-
-/// Extracts the resource name (path inside the module) from a jimage
-/// resource path of the form "/module/rest/of/path".
-fn jimage_resource_name(path: &str) -> Option<String> {
-    let rest = path.strip_prefix('/')?;
-    let (_, name) = rest.split_once('/')?;
-    Some(name.to_owned())
 }
 
 impl<'a> ClassLoader<'a> {
@@ -567,10 +582,13 @@ impl<'a> ClassLoader<'a> {
             synchronizer: Share::new(Synchronizer::new()),
             class_loader_object: Share::new(None),
             unnamed_module_object: Share::new(None),
+            delegate_loaders: Share::new(Vec::new()),
             module_objects: Share::new(HashMap::new()),
             current_thread_object: Share::new(None),
             call_stack: CallStack,
             lambda_cache: Share::new(HashMap::new()),
+            indy_targets: Share::new(HashMap::new()),
+            condy_values: Share::new(HashMap::new()),
             java_threads: Share::new(HashMap::new()),
             thread_ready: Share::new(VecDeque::new()),
             current_java_thread: Share::new(None),
@@ -655,10 +673,13 @@ impl<'a> ClassLoader<'a> {
             synchronizer: Share::new(Synchronizer::new()),
             class_loader_object: Share::new(None),
             unnamed_module_object: Share::new(None),
+            delegate_loaders: Share::new(Vec::new()),
             module_objects: Share::new(HashMap::new()),
             current_thread_object: Share::new(None),
             call_stack: CallStack,
             lambda_cache: Share::new(HashMap::new()),
+            indy_targets: Share::new(HashMap::new()),
+            condy_values: Share::new(HashMap::new()),
             java_threads: Share::new(HashMap::new()),
             thread_ready: Share::new(VecDeque::new()),
             current_java_thread: Share::new(None),
@@ -804,49 +825,6 @@ impl<'a> ClassLoader<'a> {
         Ok(self)
     }
 
-    /// Locates all resources (non-class entries) with the given path across
-    /// the boot image and the class path, in loader delegation order.
-    pub fn resource_locations(&self, name: &[u8]) -> io::Result<Vec<PathBuf>> {
-        let name = super::classFileParser::decodeString(name)?;
-        let mut locations = Vec::new();
-        if let Some(image) = &self.bootImage {
-            let image = image.borrow();
-            let mut matches: Vec<String> = image
-                .resource_paths()
-                .filter(|path| jimage_resource_name(path).as_deref() == Some(name.as_str()))
-                .map(str::to_owned)
-                .collect();
-            matches.sort_by(|a, b| {
-                let a_base = a.starts_with("/java.base/");
-                let b_base = b.starts_with("/java.base/");
-                b_base.cmp(&a_base).then_with(|| a.cmp(b))
-            });
-            locations.extend(matches.into_iter().map(PathBuf::from));
-        }
-        let mut sources = self.sources.borrow_mut();
-        for source in sources.iter_mut() {
-            match source {
-                ClassSource::Jar { archive: zip, path } => {
-                    let entry_name = name.clone();
-                    for index in 0..zip.len() {
-                        if let Ok(entry) = zip.by_index(index)
-                            && entry.name().ok().is_some_and(|entry| entry == entry_name)
-                        {
-                            locations.push(path.join(format!("!/{entry_name}")));
-                        }
-                    }
-                }
-                ClassSource::Directory(dir) => {
-                    let path = dir.join(&name);
-                    if path.is_file() {
-                        locations.push(path);
-                    }
-                }
-            }
-        }
-        Ok(locations)
-    }
-
     pub fn open_stream(&self, name: &[u8]) -> io::Result<Vec<u8>> {
         self.open_stream_with_origin(name).map(|(bytes, _)| bytes)
     }
@@ -907,17 +885,8 @@ impl<'a> ClassLoader<'a> {
         }
         if let Some(image) = &self.bootImage {
             let mut image = image.borrow_mut();
-            let mut matches: Vec<String> = image
-                .resource_paths()
-                .filter(|path| jimage_resource_name(path).as_deref() == Some(rel_path.as_str()))
-                .map(str::to_owned)
-                .collect();
-            matches.sort_by(|a, b| {
-                let a_base = a.starts_with("/java.base/");
-                let b_base = b.starts_with("/java.base/");
-                b_base.cmp(&a_base).then_with(|| a.cmp(b))
-            });
-            if let Some(path) = matches.into_iter().next() {
+            let path = image.matchingResources(&rel_path).next();
+            if let Some(path) = path {
                 return image.read_resource(&path).map(Some);
             }
         }
@@ -981,7 +950,10 @@ impl<'a> ClassLoader<'a> {
     }
 
     pub fn load(&self, name: &[u8]) -> io::Result<Arc<InstanceKlass<'a>>> {
-        if name.starts_with(b"[") || name.starts_with(b":") {
+        if name.starts_with(b"[") {
+            return self.load_array_class(name);
+        }
+        if name.starts_with(b":") {
             return Err(Error::other(format!(
                 "Array or primitive class cannot be loaded by name: {}",
                 String::from_utf8_lossy(name)
@@ -989,6 +961,13 @@ impl<'a> ClassLoader<'a> {
         }
         if let Some(klass) = self.classes.borrow().get(name) {
             return Ok(Arc::clone(klass));
+        }
+        // A Java loader is currently resolving this name on our behalf
+        // (delegate_load below). Report "not found" so the Java
+        // parent-first delegation proceeds to `findClass` instead of
+        // failing with a spurious circularity error.
+        if DELEGATING.with(|d| d.borrow().contains(name)) {
+            return Err(super::linkageError::LinkageError::class_not_found(name).io());
         }
         // Serialize class definition across Java OS threads; recursive
         // loads on this thread re-enter freely.
@@ -1003,9 +982,123 @@ impl<'a> ClassLoader<'a> {
             )
             .io());
         }
-        let result = self.loadClass(name);
+        let result = match self.loadClass(name) {
+            Ok(klass) => Ok(klass),
+            Err(error) => {
+                let not_found = matches!(
+                    super::linkageError::linkage_kind(&error),
+                    Some(super::linkageError::LinkageErrorKind::ClassNotFound)
+                        | Some(super::linkageError::LinkageErrorKind::NoClassDefFound)
+                );
+                if not_found
+                    && let Some(klass) = self.delegate_load(name)
+                {
+                    Ok(klass)
+                } else {
+                    Err(error)
+                }
+            }
+        };
         self.loading.borrow_mut().remove(name);
         result
+    }
+
+    /// Registers a Java `ClassLoader` object (by instance handle) that has
+    /// defined classes through the `defineClass*` natives. Called from the
+    /// native entry points; idempotent.
+    pub(crate) fn register_delegate_loader(&self, handle: usize) {
+        let mut loaders = self.delegate_loaders.borrow_mut();
+        if !loaders.contains(&handle) {
+            loaders.push(handle);
+        }
+    }
+
+    /// Resolves a missing class by invoking `loadClass` on each registered
+    /// Java loader. The loader's own parent-first delegation runs; when its
+    /// `findClass` defines the class through our `defineClass*` natives it
+    /// lands in `classes` and is picked up here. Returns `None` when no
+    /// delegate can supply the class (the original load error then stands).
+    fn delegate_load(&self, name: &[u8]) -> Option<Arc<InstanceKlass<'a>>> {
+        let loaders = self.delegate_loaders.borrow().clone();
+        if loaders.is_empty() {
+            return None;
+        }
+        let dot_name = String::from_utf8_lossy(name).replace('/', ".");
+        DELEGATING.with(|d| {
+            d.borrow_mut().insert(name.to_vec());
+        });
+        let result = (|| {
+            for handle in loaders {
+                if self.delegate_load_class(handle, &dot_name)
+                    && let Some(klass) = self.classes.borrow().get(name)
+                {
+                    return Some(Arc::clone(klass));
+                }
+            }
+            None
+        })();
+        DELEGATING.with(|d| {
+            d.borrow_mut().remove(name);
+        });
+        result
+    }
+
+    /// `loader.loadClass(dotted_name)` on a Java loader object. Returns true
+    /// when the call produced a `java.lang.Class` (the class itself is then
+    /// expected in `classes`).
+    fn delegate_load_class(&self, handle: usize, class_name: &str) -> bool {
+        let klass = {
+            let objects = self.borrow_objects();
+            let Some(object) = objects.get(handle) else {
+                return false;
+            };
+            Arc::clone(&object.klass)
+        };
+        let name = self.storage.alloc_str(class_name);
+        let mut call = JavaCallArguments::with_receiver(Value::Object(handle));
+        call.push_oop(Value::HostString(name));
+        matches!(
+            JavaCalls::call_virtual(
+                self,
+                &klass,
+                b"loadClass",
+                b"(Ljava/lang/String;)Ljava/lang/Class;",
+                &call,
+                &mut io::sink(),
+            ),
+            Ok(Some(Value::ClassMirror(_)))
+        )
+    }
+
+    /// Defines the VM-internal class for an array type descriptor
+    /// (`[I`, `[Ljava/lang/String;`, `[[I`, ...). HotSpot represents these
+    /// as `ArrayKlass` whose superclass is `java.lang.Object` and which
+    /// implements `Cloneable`/`Serializable`; array classes declare no
+    /// fields or methods of their own (`length`, `clone`, etc. are handled
+    /// by dedicated VM paths).
+    fn load_array_class(&self, name: &[u8]) -> io::Result<Arc<InstanceKlass<'a>>> {
+        if let Some(klass) = self.classes.borrow().get(name) {
+            return Ok(Arc::clone(klass));
+        }
+        let _load_guard = self.load_lock.lock();
+        if let Some(klass) = self.classes.borrow().get(name) {
+            return Ok(Arc::clone(klass));
+        }
+        let name = self.storage.alloc_slice_copy(name);
+        let class = ClassFile {
+            majorVersion: 65,
+            minorVersion: 0,
+            // ACC_PUBLIC | ACC_FINAL | ACC_ABSTRACT
+            accessFlags: 0x0411,
+            name,
+            superName: Some(b"java/lang/Object"),
+            interfaces: vec![b"java/lang/Cloneable", b"java/io/Serializable"],
+            constants: Vec::new(),
+            fields: Vec::new(),
+            methods: Vec::new(),
+            attributes: Vec::new(),
+        };
+        self.defineParsed(class)
     }
 
     fn loadClass(&self, name: &[u8]) -> io::Result<Arc<InstanceKlass<'a>>> {
@@ -1031,6 +1124,10 @@ impl<'a> ClassLoader<'a> {
         }
 
         let (bytes, origin) = self.open_stream_with_origin(name)?;
+        // HotSpot verifies classes loaded outside the boot image; the
+        // boot class path trusts the JDK's own classes.
+        let verify_class = origin.is_some()
+            && std::env::var_os("JVM25_NO_VERIFY").is_none();
         if let Some(origin) = origin {
             self.class_origins
                 .borrow_mut()
@@ -1055,6 +1152,15 @@ impl<'a> ClassLoader<'a> {
         })?;
         if class.name != name {
             return Err(super::linkageError::LinkageError::no_class_def_found(name).io());
+        }
+        if verify_class {
+            super::verifier::Verifier::verify(&class, true).map_err(|error| {
+                super::linkageError::LinkageError::new(
+                    super::linkageError::LinkageErrorKind::Verify,
+                    error.to_string(),
+                )
+                .io()
+            })?;
         }
         self.defineParsed(class)
     }
@@ -1183,6 +1289,39 @@ impl<'a> ClassLoader<'a> {
         self.lambda_cache
             .borrow_mut()
             .insert((caller.to_vec(), bsm_index), klass);
+    }
+
+    /// Cached linked target for a generic invokedynamic call site.
+    pub(crate) fn indy_target(&self, caller: &[u8], bsm_index: u16) -> Option<Value<'a>> {
+        self.indy_targets
+            .borrow()
+            .get(&(caller.to_vec(), bsm_index))
+            .copied()
+    }
+
+    /// Caches the linked target MethodHandle for a generic invokedynamic
+    /// call site and pins it as a GC root.
+    pub(crate) fn cache_indy_target(&self, caller: &[u8], bsm_index: u16, target: Value<'a>) {
+        self.indy_targets
+            .borrow_mut()
+            .insert((caller.to_vec(), bsm_index), target);
+        self.gc_extra_roots.borrow_mut().push(target);
+    }
+
+    /// Cached resolved value for a `condy` constant.
+    pub(crate) fn condy_value(&self, caller: &[u8], cp_index: u32) -> Option<Value<'a>> {
+        self.condy_values
+            .borrow()
+            .get(&(caller.to_vec(), cp_index))
+            .copied()
+    }
+
+    /// Caches a resolved `condy` value and pins it as a GC root.
+    pub(crate) fn cache_condy_value(&self, caller: &[u8], cp_index: u32, value: Value<'a>) {
+        self.condy_values
+            .borrow_mut()
+            .insert((caller.to_vec(), cp_index), value);
+        self.gc_extra_roots.borrow_mut().push(value);
     }
 
     pub fn systemClassLoaderObject(&self) -> io::Result<usize> {

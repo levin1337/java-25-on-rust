@@ -63,14 +63,17 @@ impl LinkResolver {
             }
         }
 
-        // 2. Fallback to direct hierarchical resolution
+        // 2. Fallback to direct hierarchical resolution. Private methods
+        // are never overrides (JLS 8.4.8.1), so they are skipped here; a
+        // private resolved method is selected earlier by
+        // `resolve_virtual_call_scoped`.
         let mut current = Some(receiver_klass);
         let mut interfaces = Vec::new();
         while let Some(k) = current {
             if let Some(method) = k.class.methods.iter().find(|method| {
                 method.name == name
                     && method.descriptor == descriptor
-                    && method.accessFlags & 8 == 0
+                    && method.accessFlags & 0x000A == 0
             }) {
                 if method.accessFlags & 0x0400 != 0 {
                     return Err(Error::other(format!(
@@ -168,6 +171,45 @@ impl LinkResolver {
             String::from_utf8_lossy(name),
             String::from_utf8_lossy(descriptor)
         )))
+    }
+
+    /// JVMS 5.4.3.3 + 5.4.5 dispatch for `invokevirtual`: first resolve the
+    /// method in the *symbolic* class named by the constant pool. A private
+    /// resolved method is selected directly — private methods are never
+    /// overridden, so a subclass method with the same name/descriptor must
+    /// not shadow it (e.g. `Handler.setEncoding` calling its private
+    /// `setEncoding0` while the receiver is a `StreamHandler`).
+    /// Non-private resolutions fall through to receiver-class selection.
+    pub fn resolve_virtual_call_scoped<'a>(
+        receiver_klass: &Arc<InstanceKlass<'a>>,
+        owner_klass: &Arc<InstanceKlass<'a>>,
+        name: &[u8],
+        descriptor: &[u8],
+    ) -> io::Result<(Arc<InstanceKlass<'a>>, Code<'a>)> {
+        let mut current = Some(owner_klass);
+        while let Some(k) = current {
+            if let Some(method) = k.class.methods.iter().find(|method| {
+                method.name == name
+                    && method.descriptor == descriptor
+                    && method.accessFlags & 0x0008 == 0
+            }) {
+                if method.accessFlags & 0x0002 != 0 {
+                    // ACC_PRIVATE: select the resolved method itself.
+                    if method.accessFlags & 0x0400 != 0 {
+                        return Err(Error::other(format!(
+                            "AbstractMethodError: {}.{}{}",
+                            String::from_utf8_lossy(k.class.name),
+                            String::from_utf8_lossy(name),
+                            String::from_utf8_lossy(descriptor)
+                        )));
+                    }
+                    return Ok((Arc::clone(k), Code::parse(method)?));
+                }
+                break;
+            }
+            current = k.super_klass.as_ref();
+        }
+        Self::resolve_virtual_call(receiver_klass, name, descriptor)
     }
 
     /// Resolves invokeinterface dispatch using receiver klass's itable and vtable.

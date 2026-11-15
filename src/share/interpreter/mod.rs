@@ -6,6 +6,7 @@ pub mod bytecodeInterpreter;
 pub mod bytecodeStream;
 pub mod bytecodeTracer;
 pub mod bytecodes;
+pub mod genericBootstrap;
 pub mod invocationCounter;
 pub mod lambdaMetafactory;
 pub mod linkResolver;

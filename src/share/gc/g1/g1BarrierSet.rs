@@ -1,30 +1,39 @@
-/*
- * Port of OpenJDK 25 HotSpot G1BarrierSet (share/gc/g1/g1BarrierSet.hpp)
- *
- * Implements SATB (Snapshot At The Beginning) pre-write barriers
- * and Card Table post-write barriers for G1 concurrent marking and remset maintenance.
- */
-
+use super::rememberedSet::G1RememberedSet;
+use super::heapRegion::HeapRegion;
 use crate::share::gc::shared::barrierSet::BarrierSet;
 use crate::share::oops::oop::Oop;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+/// G1 barrier set: SATB pre-write barrier (snapshot-at-the-beginning
+/// for concurrent marking) plus the post-write barrier that dirties
+/// cards in the remembered set for old→young reference tracking.
 pub struct G1BarrierSet {
     satb_buffer: Mutex<Vec<usize>>,
-    dirty_cards: Mutex<Vec<usize>>,
+    remembered: G1RememberedSet,
+    region_size: usize,
     satb_mark_count: AtomicUsize,
     post_barrier_count: AtomicUsize,
 }
 
 impl G1BarrierSet {
     pub fn new() -> Self {
+        Self::with_region_size(HeapRegion::DEFAULT_REGION_SIZE)
+    }
+
+    pub fn with_region_size(region_size: usize) -> Self {
         Self {
             satb_buffer: Mutex::new(Vec::new()),
-            dirty_cards: Mutex::new(Vec::new()),
+            remembered: G1RememberedSet::new(9),
+            region_size: region_size.max(1),
             satb_mark_count: AtomicUsize::new(0),
             post_barrier_count: AtomicUsize::new(0),
         }
+    }
+
+    #[inline]
+    pub fn remembered(&self) -> &G1RememberedSet {
+        &self.remembered
     }
 
     #[inline]
@@ -39,7 +48,7 @@ impl G1BarrierSet {
 
     pub fn clear_buffers(&self) {
         self.satb_buffer.lock().unwrap().clear();
-        self.dirty_cards.lock().unwrap().clear();
+        self.remembered.clear();
     }
 }
 
@@ -60,10 +69,7 @@ impl BarrierSet for G1BarrierSet {
 
     fn write_ref_field_post(&self, field_addr: usize, _new_val: Oop) {
         self.post_barrier_count.fetch_add(1, Ordering::Relaxed);
-        let card_index = field_addr >> 9; // 512 bytes per card
-        let mut cards = self.dirty_cards.lock().unwrap();
-        if cards.len() < 1024 {
-            cards.push(card_index);
-        }
+        let region = self.remembered.region_index(field_addr, self.region_size);
+        self.remembered.record(region, field_addr);
     }
 }

@@ -46,7 +46,7 @@ pub enum CodeBlobKind {
     UpcallStub,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CodeBlob {
     name: String,
     blob_type: CodeBlobType,
@@ -65,6 +65,7 @@ pub struct CodeBlob {
     data_begin: usize,
     data_end: usize,
     code_bytes: Vec<u8>,
+    oop_maps: crate::share::compiler::oopMap::OopMapSet,
 }
 
 impl CodeBlob {
@@ -97,6 +98,7 @@ impl CodeBlob {
             data_begin: code_end,
             data_end: code_end,
             code_bytes: Vec::new(),
+            oop_maps: crate::share::compiler::oopMap::OopMapSet::new(),
         }
     }
 
@@ -150,6 +152,7 @@ impl CodeBlob {
             data_begin,
             data_end,
             code_bytes: Vec::new(),
+            oop_maps: crate::share::compiler::oopMap::OopMapSet::new(),
         }
     }
 
@@ -313,6 +316,44 @@ impl CodeBlob {
         self.frame_complete_offset != Self::FRAME_NEVER_SAFE
             && self.code_contains(addr)
             && addr >= self.code_begin + (self.frame_complete_offset.max(0) as usize)
+    }
+
+    /// Attach a safepoint oop map at `pc_offset` (relative to code_begin).
+    pub fn add_oop_map(&mut self, pc_offset: i32, map: crate::share::compiler::oopMap::OopMap) {
+        self.oop_maps.add_gc_map(pc_offset, map);
+    }
+
+    #[inline]
+    pub fn oop_maps(&self) -> &crate::share::compiler::oopMap::OopMapSet {
+        &self.oop_maps
+    }
+
+    #[inline]
+    pub fn set_oop_maps(&mut self, maps: crate::share::compiler::oopMap::OopMapSet) {
+        self.oop_maps = maps;
+    }
+
+    /// `CodeBlob::oop_map_for_return_address`: exact-offset oop map lookup
+    /// for a return address inside this blob.
+    pub fn oop_map_for_return_address(
+        &self,
+        return_address: usize,
+    ) -> Option<crate::share::compiler::oopMap::OopMap> {
+        if !self.code_contains(return_address) {
+            return None;
+        }
+        let pc_offset = (return_address - self.code_begin) as i32;
+        self.oop_maps.find_map_at_offset(pc_offset).cloned()
+    }
+
+    /// Greatest-lower-bound oop map lookup (used by stack walking at
+    /// safepoint poll returns).
+    pub fn oop_map_for_pc(&self, pc: usize) -> Option<crate::share::compiler::oopMap::OopMap> {
+        if !self.code_contains(pc) {
+            return None;
+        }
+        let pc_offset = (pc - self.code_begin) as i32;
+        self.oop_maps.map_for_pc(pc_offset).cloned()
     }
 
     pub fn adjust_size(&mut self, used: usize) {

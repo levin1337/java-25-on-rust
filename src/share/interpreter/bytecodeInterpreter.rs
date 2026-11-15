@@ -24,7 +24,7 @@ use crate::{
         method::Code,
     },
 };
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::io::{self, Error, Write};
 use std::sync::Arc;
 
@@ -53,6 +53,7 @@ fn env_flag(name: &str) -> bool {
                 "JVM25_TRACE_EXC",
                 "JVM25_BLOCKTRACE",
                 "JVM25_TRACE_CALLS",
+                "JVM25_TRACE_COMPILE",
             ]
             .into_iter()
             .map(|key| (key.to_string(), std::env::var_os(key).is_some()))
@@ -61,6 +62,30 @@ fn env_flag(name: &str) -> bool {
         .get(name)
         .copied()
         .unwrap_or(false)
+}
+
+fn sampleThreadFrames(bytecodeCount: u64) {
+    thread_local! {
+        static lastSample: Cell<Option<std::time::Instant>> = const { Cell::new(None) };
+    }
+    let now = std::time::Instant::now();
+    if !lastSample.with(|sample| {
+        if sample.get().is_some_and(|last| now.duration_since(last).as_secs() == 0) {
+            return false;
+        }
+        sample.set(Some(now));
+        true
+    }) {
+        return;
+    }
+    let mut frames = Vec::new();
+    for_each_active_frame(&mut |frame| frames.push(frame.site()));
+    eprintln!(
+        "[dump @{bytecodeCount} tid={:?} native={}] {frames:?}",
+        std::thread::current().id(),
+        crate::share::prims::nativeLookup::current_native(),
+    );
+    crate::share::runtime::threading::debug_frames(frames);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -346,10 +371,26 @@ impl<'a> Frame<'a> {
     }
 
     fn jump(&mut self, pc: usize, offset: i32) -> io::Result<()> {
-        self.pc = pc
+        let target = pc
             .checked_add_signed(offset as isize)
             .filter(|target| *target < self.code.bytes.len())
             .ok_or_else(|| Error::other("Invalid branch target"))?;
+        // Backward branch = loop backedge; feed the tiered-compilation
+        // counters exactly like HotSpot's backward-branch dispatch does.
+        if target < self.pc {
+            let key = self.code.bytes.as_ptr() as usize;
+            if crate::share::oops::methodCounters::backedge_tick(key)
+                && env_flag("JVM25_TRACE_COMPILE")
+            {
+                eprintln!(
+                    "[compile-request:backedge] {}.{}{}",
+                    String::from_utf8_lossy(self.owner),
+                    String::from_utf8_lossy(self.code.name),
+                    String::from_utf8_lossy(self.code.descriptor),
+                );
+            }
+        }
+        self.pc = target;
         Ok(())
     }
 
@@ -758,6 +799,19 @@ pub fn execute_labeled<'a>(
     // relies on `owner` being a real class name.
     let owner = klass.class.name;
     let _ = method;
+    // Tiered compilation: every interpreted entry bumps the method's
+    // invocation counter; crossing the threshold flags it for the JIT.
+    let code_key = code.bytes.as_ptr() as usize;
+    if crate::share::oops::methodCounters::invocation_tick(code_key)
+        && env_flag("JVM25_TRACE_COMPILE")
+    {
+        eprintln!(
+            "[compile-request:invoke] {}.{}{}",
+            String::from_utf8_lossy(owner),
+            String::from_utf8_lossy(code.name),
+            String::from_utf8_lossy(code.descriptor),
+        );
+    }
     loader.call_stack.push(klass.class.name);
     let monitor = if access_flags & 0x0020 != 0 {
         let target = if access_flags & 0x0008 != 0 {
@@ -872,35 +926,16 @@ fn executeFrame<'a>(
     };
     let _registration = FrameRegistration::new(&frame);
     let mut safepoint_tick = 0u32;
+    let dumpEnabled = env_flag("JVM25_DUMP");
     loop {
         safepoint_tick = safepoint_tick.wrapping_add(1);
-        BYTECODE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let bytecodeCount = BYTECODE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if safepoint_tick & 0x3ff == 0 {
             crate::share::runtime::threading::schedule(loader, output, depth)?;
             crate::share::memory::heap::safepoint();
         }
-        if env_flag("JVM25_DUMP") {
-            static LAST_DUMP: std::sync::Mutex<Option<std::time::Instant>> =
-                std::sync::Mutex::new(None);
-            let dump_now = safepoint_tick & 0x3fff == 0
-                || LAST_DUMP
-                    .lock()
-                    .map(|mut last| {
-                        let due = last.map_or(true, |t| t.elapsed() > std::time::Duration::from_secs(1));
-                        if due {
-                            *last = Some(std::time::Instant::now());
-                        }
-                        due
-                    })
-                    .unwrap_or(false);
-            if dump_now {
-                let mut frames = Vec::new();
-                for_each_active_frame(&mut |f| frames.push(f.site()));
-                crate::share::runtime::threading::debug_frames(
-                    frames.iter().map(|s| s.to_string()).collect(),
-                );
-                eprintln!("[dump @{safepoint_tick} tid={:?} native={}] {frames:?}", std::thread::current().id(), crate::share::prims::nativeLookup::current_native());
-            }
+        if dumpEnabled && bytecodeCount & 0x3ff == 0 {
+            sampleThreadFrames(bytecodeCount);
         }
         if loader.gc_due() {
             loader.reset_allocations();
@@ -1369,6 +1404,25 @@ fn step<'a>(
                 (_, Constant::Class(c_idx)) => {
                     let name = klass.utf8(*c_idx)?;
                     Value::ClassMirror(name)
+                }
+                (_, Constant::Dynamic(bsm_attr_idx, nat_idx)) => {
+                    // condy: resolve through the real bootstrap method.
+                    let Constant::NameAndType(name_idx, desc_idx) = klass.constant(*nat_idx)?
+                    else {
+                        return Err(Error::other("Expected NameAndType constant"));
+                    };
+                    let name = klass.utf8(*name_idx)?;
+                    let desc = klass.utf8(*desc_idx)?;
+                    super::genericBootstrap::resolve_condy(
+                        loader,
+                        klass,
+                        u32::from(index),
+                        *bsm_attr_idx,
+                        name,
+                        desc,
+                        output,
+                        depth + 1,
+                    )?
                 }
                 _ => {
                     return Err(jex(
@@ -1899,16 +1953,7 @@ fn step<'a>(
         0xb2 | 0xb3 => {
             let [owner, name, descriptor] =
                 klass.memberRef(u16::from_be_bytes(frame.read()?), true)?;
-            if opcode == 0xb2
-                && [owner, name, descriptor]
-                    == [
-                        b"java/lang/System".as_slice(),
-                        b"out",
-                        b"Ljava/io/PrintStream;",
-                    ]
             {
-                Value::Output
-            } else {
                 if opcode == 0xb2
                     && owner == b"jdk/internal/misc/UnsafeConstants"
                     && let Some(value) =
@@ -2065,180 +2110,6 @@ fn step<'a>(
                 frame.push(value)?;
                 return Ok(Step::Continue);
             }
-            if opcode == 0xb6
-                && owner == b"java/io/PrintStream"
-                && (name == b"println"
-                    || name == b"print"
-                    || name == b"flush"
-                    || name == b"close")
-                && frame
-                    .stack
-                    .len()
-                    .checked_sub(1 + usize::from(descriptor != b"()V"))
-                    .and_then(|index| frame.stack.get(index))
-                    .is_some_and(|value| is_print_stream(loader, *value))
-            {
-                let is_println = name == b"println";
-                let value = if descriptor == b"()V" {
-                    Value::Empty
-                } else {
-                    frame.pop()?
-                };
-                let receiver = frame.pop()?;
-                let is_output = match receiver {
-                    Value::Output => true,
-                    Value::Object(handle) => {
-                        let objects = loader.borrow_objects();
-                        objects.get(handle).is_some_and(|object| {
-                            let mut current = Some(object.klass.as_ref());
-                            while let Some(klass) = current {
-                                if klass.class.name == b"java/io/PrintStream" {
-                                    return true;
-                                }
-                                current = klass.super_klass.as_deref();
-                            }
-                            false
-                        })
-                    }
-                    _ => false,
-                };
-                if !is_output {
-                    if env_flag("JVM25_TRACE") {
-                        eprintln!("[print-receiver] {receiver:?}");
-                    }
-                    return Err(Error::other("Invalid print receiver"));
-                }
-                match (descriptor, value) {
-                    (b"()V", _) => {
-                        if is_println {
-                            writeln!(output)?;
-                        }
-                    }
-                    (b"(I)V", Value::Int(v))
-                    | (b"(B)V", Value::Int(v))
-                    | (b"(S)V", Value::Int(v)) => {
-                        if is_println {
-                            writeln!(output, "{v}")?;
-                        } else {
-                            write!(output, "{v}")?;
-                        }
-                    }
-                    (b"(Z)V", Value::Int(v)) => {
-                        let text = if v != 0 { "true" } else { "false" };
-                        if is_println {
-                            writeln!(output, "{text}")?;
-                        } else {
-                            write!(output, "{text}")?;
-                        }
-                    }
-                    (b"(C)V", Value::Int(v)) => {
-                        let ch = char::from_u32(v as u32).unwrap_or('?');
-                        if is_println {
-                            writeln!(output, "{ch}")?;
-                        } else {
-                            write!(output, "{ch}")?;
-                        }
-                    }
-                    (b"(J)V", Value::Long(v)) => {
-                        if is_println {
-                            writeln!(output, "{v}")?;
-                        } else {
-                            write!(output, "{v}")?;
-                        }
-                    }
-                    (b"(F)V", Value::Float(v)) => {
-                        if is_println {
-                            writeln!(output, "{v}")?;
-                        } else {
-                            write!(output, "{v}")?;
-                        }
-                    }
-                    (b"(D)V", Value::Double(v)) => {
-                        if is_println {
-                            writeln!(output, "{v}")?;
-                        } else {
-                            write!(output, "{v}")?;
-                        }
-                    }
-                    (b"(Ljava/lang/String;)V", Value::HostString(v)) => {
-                        if is_println {
-                            writeln!(output, "{v}")?;
-                        } else {
-                            write!(output, "{v}")?;
-                        }
-                    }
-                    (b"(Ljava/lang/String;)V", Value::String(v)) => {
-                        let text = decodeString(v)?;
-                        if is_println {
-                            writeln!(output, "{text}")?;
-                        } else {
-                            write!(output, "{text}")?;
-                        }
-                    }
-                    (b"(Ljava/lang/Object;)V", Value::Null)
-                    | (b"(Ljava/lang/String;)V", Value::Null) => {
-                        if is_println {
-                            writeln!(output, "null")?;
-                        } else {
-                            write!(output, "null")?;
-                        }
-                    }
-                    (
-                        b"(Ljava/lang/Object;)V" | b"(Ljava/lang/String;)V",
-                        Value::Object(handle),
-                    ) => {
-                        let value = Value::Object(handle);
-                        match crate::share::prims::stringNatives::string(loader, value)? {
-                            Some(text) => {
-                                if is_println {
-                                    writeln!(output, "{text}")?;
-                                } else {
-                                    write!(output, "{text}")?;
-                                }
-                            }
-                            None => {
-                                let text = describeValue(loader, value, output, depth + 1)?;
-                                if is_println {
-                                    writeln!(output, "{text}")?;
-                                } else {
-                                    write!(output, "{text}")?;
-                                }
-                            }
-                        }
-                    }
-                    (b"(Ljava/lang/Object;)V", Value::HostString(v)) => {
-                        if is_println {
-                            writeln!(output, "{v}")?;
-                        } else {
-                            write!(output, "{v}")?;
-                        }
-                    }
-                    (b"(Ljava/lang/Object;)V", Value::String(v)) => {
-                        let text = decodeString(v)?;
-                        if is_println {
-                            writeln!(output, "{text}")?;
-                        } else {
-                            write!(output, "{text}")?;
-                        }
-                    }
-                    _ => return Err(Error::other("Unsupported println/print signature")),
-                }
-                return Ok(Step::Continue);
-            }
-            if opcode == 0xb6
-                && owner == b"java/io/PrintStream"
-                && name == b"checkError"
-                && descriptor == b"()Z"
-                && frame
-                    .stack
-                    .last()
-                    .is_some_and(|value| is_print_stream(loader, *value))
-            {
-                frame.pop()?;
-                frame.push(Value::Int(0))?;
-                return Ok(Step::Continue);
-            }
-
             let (parameters, result) = signature::method(descriptor)?;
             let count = parameters.count();
             let receiverSlots = usize::from(opcode != 0xb8);
@@ -2895,7 +2766,19 @@ fn step<'a>(
                 } else {
                     let key = CallSiteKey::new(0, &object_klass, owner, name, descriptor);
                     cached_call(loader, key, name, descriptor, || {
-                        LinkResolver::resolve_virtual_call(&object_klass, name, descriptor)
+                        // JVMS 5.4.5: private methods resolved in the symbolic
+                        // class are selected without override lookup.
+                        match loader.load(owner) {
+                            Ok(owner_klass) => LinkResolver::resolve_virtual_call_scoped(
+                                &object_klass,
+                                &owner_klass,
+                                name,
+                                descriptor,
+                            ),
+                            Err(_) => {
+                                LinkResolver::resolve_virtual_call(&object_klass, name, descriptor)
+                            }
+                        }
                     })
                     .map_err(methodError)
                     .map_err(|error| linkageExc(loader, output, depth, error))?
@@ -2919,16 +2802,39 @@ fn step<'a>(
                     depth
                 );
             }
-            let ret_val = execute_labeled(
-                loader,
-                &target,
-                code,
-                &frame.stack[start..],
-                output,
-                depth + 1,
-                flags,
-                Some((name, descriptor)),
-            )?;
+            let ret_val = if opcode != 0xb8
+                && result.is_none()
+                && crate::share::prims::jdkIntrinsics::invokeVoidInstance(
+                    loader,
+                    target.class.name,
+                    name,
+                    descriptor,
+                    &frame.stack[start..],
+                )
+            {
+                None
+            } else if opcode != 0xb8
+                && let Some(value) = crate::share::prims::jdkIntrinsics::invokeInstance(
+                    loader,
+                    &target,
+                    name,
+                    descriptor,
+                    &frame.stack[start..],
+                )
+            {
+                Some(value)
+            } else {
+                execute_labeled(
+                    loader,
+                    &target,
+                    code,
+                    &frame.stack[start..],
+                    output,
+                    depth + 1,
+                    flags,
+                    Some((name, descriptor)),
+                )?
+            };
 
             frame.stack.truncate(start);
             frame.stackSlots -= slots;
@@ -3077,13 +2983,15 @@ fn step<'a>(
                         return Ok(Step::Continue);
                     }
                     None => {
-                        return Err(jex(
-                            loader,
-                            output,
-                            depth,
-                            b"java/lang/BootstrapMethodError",
-                            Some("invokedynamic bootstrap method is not supported"),
-                        ));
+                        // Generic JVMS linkage: run the real bootstrap
+                        // method, link the CallSite, and invoke its target.
+                        if let Some(value) = super::genericBootstrap::invoke(
+                            loader, klass, &bs_info, name, descriptor, &captured,
+                            output, depth,
+                        )? {
+                            frame.push(value)?;
+                        }
+                        return Ok(Step::Continue);
                     }
                 }
             }

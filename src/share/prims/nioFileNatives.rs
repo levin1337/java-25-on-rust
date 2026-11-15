@@ -1523,6 +1523,14 @@ pub(crate) fn file_key_init<'a>(
     Ok(())
 }
 
+fn nioReadStatus(bytesRead: usize, requestedData: bool) -> i64 {
+    if bytesRead == 0 && requestedData {
+        -1
+    } else {
+        bytesRead as i64
+    }
+}
+
 /// `sun.nio.ch.FileDispatcherImpl` static natives.
 pub(crate) fn dispatcher_impl<'a>(
     loader: &ClassLoader<'a>,
@@ -1555,8 +1563,10 @@ pub(crate) fn dispatcher_impl<'a>(
                 entry.pos = pos + n as u64;
                 Ok(buf)
             })?;
-            write_buffer(address, &read)?;
-            Value::Int(read.len() as i32)
+            if !read.is_empty() {
+                write_buffer(address, &read)?;
+            }
+            Value::Int(nioReadStatus(read.len(), len != 0) as i32)
         }
         (b"pread0", b"(Ljava/io/FileDescriptor;JIJ)I") => {
             let handle = file_descriptor_handle(loader, arguments.first().copied().unwrap_or(Value::Null))?;
@@ -1571,8 +1581,10 @@ pub(crate) fn dispatcher_impl<'a>(
                 buf.truncate(n);
                 Ok(buf)
             })?;
-            write_buffer(address, &data)?;
-            Value::Int(data.len() as i32)
+            if !data.is_empty() {
+                write_buffer(address, &data)?;
+            }
+            Value::Int(nioReadStatus(data.len(), len != 0) as i32)
         }
         (b"write0", b"(Ljava/io/FileDescriptor;JIZ)I") => {
             let handle = file_descriptor_handle(loader, arguments.first().copied().unwrap_or(Value::Null))?;
@@ -1637,7 +1649,9 @@ pub(crate) fn dispatcher_impl<'a>(
                 for (ptr, len) in &buffers {
                     let mut buf = vec![0u8; *len];
                     let n = file.read(&mut buf)?;
-                    write_buffer(*ptr as i64, &buf[..n])?;
+                    if n != 0 {
+                        write_buffer(*ptr as i64, &buf[..n])?;
+                    }
                     total += n;
                     if n < *len {
                         break;
@@ -1646,7 +1660,7 @@ pub(crate) fn dispatcher_impl<'a>(
                 entry.pos = pos + total as u64;
                 Ok(())
             })?;
-            Value::Long(total as i64)
+            Value::Long(nioReadStatus(total, buffers.iter().any(|&(_, len)| len != 0)))
         }
         (b"writev0", b"(Ljava/io/FileDescriptor;JIZ)J") => {
             let handle = file_descriptor_handle(

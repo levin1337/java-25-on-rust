@@ -11,6 +11,12 @@ pub enum CompLevel {
     FullOptimization = 4, // C2 or JVMCI
 }
 
+impl Default for CompLevel {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
 impl CompLevel {
     pub const COUNT: usize = 5;
 
@@ -43,6 +49,10 @@ impl CompLevel {
             4 => Some(Self::FullOptimization),
             _ => None,
         }
+    }
+
+    pub fn as_i32(&self) -> i32 {
+        *self as i32
     }
 
     pub fn name(&self) -> &'static str {
@@ -103,6 +113,34 @@ impl MethodCompilation {
     pub const INVALID_FRAME_STATE_BCI: i32 = -6;
 }
 
+/// `CompilationModeFlag` analogue: selects which levels the tiered
+/// policy is allowed to produce (used for -Xcomp-style restricted modes).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompilationMode {
+    Normal,
+    QuickOnly,
+    HighOnly,
+    HighOnlyQuickInternal,
+}
+
+impl CompilationMode {
+    pub fn normal(&self) -> bool {
+        matches!(self, Self::Normal)
+    }
+    pub fn quick_only(&self) -> bool {
+        matches!(self, Self::QuickOnly)
+    }
+    pub fn high_only(&self) -> bool {
+        matches!(self, Self::HighOnly)
+    }
+    pub fn quick_internal(&self) -> bool {
+        matches!(self, Self::QuickOnly | Self::HighOnlyQuickInternal)
+    }
+    pub fn disable_intermediate(&self) -> bool {
+        !matches!(self, Self::Normal)
+    }
+}
+
 pub struct CompilerConfig;
 
 impl CompilerConfig {
@@ -137,5 +175,35 @@ impl CompilerConfig {
             let scaled = (freq_log as f64 * scale).round() as i32;
             scaled.max(0)
         }
+    }
+
+    /// Highest level reachable under the current compiler configuration,
+    /// before clamping by `TieredStopAtLevel` / compilation mode.
+    pub fn highest_available_level() -> CompLevel {
+        if Self::is_interpreter_only() {
+            CompLevel::None
+        } else if Self::is_c2_or_jvmci_compiler_enabled() {
+            CompLevel::FullOptimization
+        } else if Self::is_c1_enabled() {
+            CompLevel::FullProfile
+        } else {
+            CompLevel::None
+        }
+    }
+
+    pub fn is_interpreter_only() -> bool {
+        false
+    }
+
+    pub fn is_c2_or_jvmci_compiler_enabled() -> bool {
+        true
+    }
+
+    pub fn is_c1_enabled() -> bool {
+        true
+    }
+
+    pub fn is_c1_simple_only() -> bool {
+        false
     }
 }

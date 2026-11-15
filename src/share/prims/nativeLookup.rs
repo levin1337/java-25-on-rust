@@ -360,9 +360,7 @@ impl Drop for NativeGuard {
         if !self.active {
             return;
         }
-        CURRENT_NATIVE.with(|cell| {
-            *cell.borrow_mut() = std::mem::take(&mut self.previous);
-        });
+        CURRENT_NATIVE.with(|cell| *cell.borrow_mut() = self.previous.clone());
         crate::share::runtime::threading::debug_native(std::mem::take(&mut self.previous));
     }
 }
@@ -550,104 +548,6 @@ fn invokeInstanceInner<'a>(
         };
     }
 
-    if owner == b"java/lang/ClassLoader"
-        && name == b"getResources"
-        && descriptor == b"(Ljava/lang/String;)Ljava/util/Enumeration;"
-    {
-        let resource = arguments
-            .get(1)
-            .copied()
-            .and_then(|value| super::stringNatives::string(loader, value).ok().flatten());
-        let Some(resource) = resource else {
-            return Err(io::Error::other("Invalid resource name"));
-        };
-        let locations = loader.resource_locations(resource.as_bytes())?;
-        let url_klass = loader.load(b"java/net/URL")?;
-        let mut url_objects = Vec::with_capacity(locations.len());
-        for location in locations {
-            let mut object = crate::share::oops::instanceOop::InstanceOop::new(url_klass.clone())?;
-            let file = loader
-                .storage
-                .alloc_str(&format!("/{}", location.display()));
-            let protocol = url_klass.instanceField(b"protocol", b"Ljava/lang/String;")?;
-            let host = url_klass.instanceField(b"host", b"Ljava/lang/String;")?;
-            let port = url_klass.instanceField(b"port", b"I")?;
-            let file_index = url_klass.instanceField(b"file", b"Ljava/lang/String;")?;
-            object.fields[protocol] = Value::HostString("file");
-            object.fields[host] = Value::Null;
-            object.fields[port] = Value::Int(-1);
-            object.fields[file_index] = Value::HostString(file);
-            url_objects.push(object);
-        }
-        let url_count = url_objects.len() as i32;
-        let mut array = crate::share::oops::objArrayOop::ObjArrayOop::withComponent(
-            url_count,
-            b"java/net/URL",
-        )?;
-        let mut elements = url_objects.into_iter();
-        for element in array.elements.iter_mut() {
-            *element = Value::Object(loader.alloc_object(elements.next().unwrap()));
-        }
-        let list_klass = loader.load(b"java/util/ArrayList")?;
-        let list = crate::share::oops::instanceOop::InstanceOop::new(list_klass.clone())?;
-        let data_index = list_klass.instanceField(b"elementData", b"[Ljava/lang/Object;")?;
-        let size_index = list_klass.instanceField(b"size", b"I")?;
-        let list_handle = loader.alloc_object(list);
-        let array_handle = loader.alloc_obj_array(array);
-        {
-            let mut objects = loader.borrow_objects_mut();
-            let list = objects
-                .get_mut(list_handle)
-                .ok_or_else(|| io::Error::other("Invalid ArrayList object"))?;
-            list.fields[data_index] = Value::ObjectArray(array_handle);
-            list.fields[size_index] = Value::Int(url_count);
-        }
-        let enum_klass = loader.load(b"java/util/Collections$3")?;
-        let mut output = std::io::sink();
-        crate::share::interpreter::bytecodeInterpreter::initialize(
-            loader,
-            &enum_klass,
-            &mut output,
-            0,
-        )?;
-        let mut enumeration =
-            crate::share::oops::instanceOop::InstanceOop::new(enum_klass.clone())?;
-        let collection_index = enum_klass.instanceField(b"val$c", b"Ljava/util/Collection;")?;
-        enumeration.fields[collection_index] = Value::Object(list_handle);
-        let iterator_index = enum_klass.instanceField(b"i", b"Ljava/util/Iterator;")?;
-        let list_klass_for_iterator = loader.load(b"java/util/ArrayList")?;
-        let iterator_klass = loader.load(b"java/util/ArrayList$Itr")?;
-        let mut output = std::io::sink();
-        crate::share::interpreter::bytecodeInterpreter::initialize(
-            loader,
-            &iterator_klass,
-            &mut output,
-            0,
-        )?;
-        let mut iterator =
-            crate::share::oops::instanceOop::InstanceOop::new(iterator_klass.clone())?;
-        let cursor_index = iterator_klass.instanceField(b"cursor", b"I")?;
-        let last_ret_index = iterator_klass.instanceField(b"lastRet", b"I")?;
-        let expected_mod_count_index = iterator_klass.instanceField(b"expectedModCount", b"I")?;
-        let outer_class_index =
-            iterator_klass.instanceField(b"this$0", b"Ljava/util/ArrayList;")?;
-        iterator.fields[cursor_index] = Value::Int(0);
-        iterator.fields[last_ret_index] = Value::Int(-1);
-        iterator.fields[expected_mod_count_index] = Value::Int(0);
-        iterator.fields[outer_class_index] = Value::Object(list_handle);
-        let iterator_handle = loader.alloc_object(iterator);
-        let handle = loader.alloc_object(enumeration);
-        {
-            let mut objects = loader.borrow_objects_mut();
-            let enumeration = objects
-                .get_mut(handle)
-                .ok_or_else(|| io::Error::other("Invalid Enumeration object"))?;
-            enumeration.fields[iterator_index] = Value::Object(iterator_handle);
-        }
-        drop(list_klass_for_iterator);
-        return Ok(Some(Some(Value::Object(handle))));
-    }
-
     // Resolve inherited natives to their declaring class before dispatch.
     let resolved_owner;
     let owner = match native_declaring_owner(loader, owner, name, descriptor) {
@@ -657,6 +557,10 @@ fn invokeInstanceInner<'a>(
         }
         None => owner,
     };
+
+    if owner == b"java/lang/StackStreamFactory$AbstractStackWalker" {
+        return super::stackwalk::invoke(loader, name, descriptor, arguments, output);
+    }
 
     let result = match (owner, name, descriptor) {
         (b"java/lang/Runtime", b"availableProcessors", b"()I") => {
@@ -831,6 +735,15 @@ fn invokeInstanceInner<'a>(
         (b"java/lang/Thread", b"setPriority0", b"(I)V")
         | (b"java/lang/Thread", b"setNativeName", b"(Ljava/lang/String;)V")
         | (b"java/lang/Thread", b"setCurrentThread", b"(Ljava/lang/Thread;)V") => None,
+        // JVMTI-only hooks on virtual threads; no agent is attached, so
+        // these are no-ops (HotSpot also ignores them without a JVMTI env).
+        (b"java/lang/VirtualThread", b"notifyJvmtiStart", b"()V")
+        | (b"java/lang/VirtualThread", b"notifyJvmtiEnd", b"()V")
+        | (b"java/lang/VirtualThread", b"notifyJvmtiMount", b"(Z)V")
+        | (b"java/lang/VirtualThread", b"notifyJvmtiUnmount", b"(Z)V")
+        | (b"java/lang/VirtualThread", b"notifyJvmtiHideFrames", b"(Z)V") => {
+            Some(Value::Null)
+        }
         (b"java/lang/Thread", b"start0", b"()V") => {
             let receiver = arguments.first().copied().unwrap_or(Value::Null);
             if std::env::var_os("JVM25_TRACE").is_some() {
@@ -1671,10 +1584,14 @@ fn invokeStaticInner<'a>(
                 JVM_STACKWALK_GET_CALLER_CLASS, JVM_STACKWALK_SHOW_HIDDEN_FRAMES,
             };
             let klass = loader.load(owner)?;
-            let modes: [(&[u8], i32); 5] = [
+            let classMode = if klass.staticField(b"CLASS_INFO_ONLY", b"I").is_ok() {
+                b"CLASS_INFO_ONLY".as_slice()
+            } else {
+                b"FILL_CLASS_REFS_ONLY".as_slice()
+            };
+            let modes: [(&[u8], i32); 4] = [
                 (b"DEFAULT_MODE", 0),
-                (b"FILL_CLASS_REFS_ONLY", JVM_STACKWALK_FILL_CLASS_REFS_ONLY),
-                (b"GET_CALLER_CLASS", JVM_STACKWALK_GET_CALLER_CLASS),
+                (classMode, JVM_STACKWALK_FILL_CLASS_REFS_ONLY),
                 (b"SHOW_HIDDEN_FRAMES", JVM_STACKWALK_SHOW_HIDDEN_FRAMES),
                 (b"FILL_LIVE_STACK_FRAMES", JVM_STACKWALK_FILL_LIVE_STACK_FRAMES),
             ];
@@ -1682,12 +1599,23 @@ fn invokeStaticInner<'a>(
             for (field, expected) in modes {
                 compatible &= klass.staticField(field, b"I")?.get() == Value::Int(expected);
             }
+            if let Ok(field) = klass.staticField(b"GET_CALLER_CLASS", b"I") {
+                compatible &= field.get() == Value::Int(JVM_STACKWALK_GET_CALLER_CLASS);
+            }
             Some(Some(Value::Int(i32::from(compatible))))
         }
         (b"java/lang/StringUTF16", b"isBigEndian", b"()Z") => {
             Some(Some(Value::Int(i32::from(cfg!(target_endian = "big")))))
         }
         (_, b"registerNatives", b"()V") | (_, b"initIDs", b"()V") => Some(None),
+        (
+            b"java/lang/StackTraceElement",
+            b"initStackTraceElement",
+            b"(Ljava/lang/StackTraceElement;Ljava/lang/StackFrameInfo;)V",
+        ) => {
+            super::stackwalk::initTraceElement(loader, arguments)?;
+            Some(None)
+        }
         (
             b"java/lang/StackTraceElement",
             b"initStackTraceElements",
@@ -1726,7 +1654,15 @@ fn invokeStaticInner<'a>(
             }
         }
         (b"java/io/FileDescriptor", b"getHandle", b"(I)J")
-        | (b"java/io/FileDescriptor", b"getLong", b"(I)J") => Some(Some(Value::Long(0))),
+        | (b"java/io/FileDescriptor", b"getLong", b"(I)J") => {
+            // Standard descriptors map to handle = fd + 1 (see
+            // fileNatives::is_std_handle); anything else is invalid.
+            let fd = match arguments.first().copied().unwrap_or(Value::Null) {
+                Value::Int(fd) if (0..=2).contains(&fd) => fd,
+                _ => -1,
+            };
+            Some(Some(Value::Long(i64::from(fd) + 1)))
+        }
         (b"java/io/FileDescriptor", b"getInt", b"(I)I")
         | (b"java/io/FileDescriptor", b"getBoolean", b"(I)Z")
         | (b"java/io/FileDescriptor", b"getAppend", b"(I)Z") => Some(Some(Value::Int(0))),

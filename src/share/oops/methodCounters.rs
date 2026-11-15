@@ -226,3 +226,76 @@ impl Default for MethodCounters {
         Self::new()
     }
 }
+
+// ---------------------------------------------------------------------------
+// Live per-method counters keyed by the identity of the method's `Code`
+// bytes (`Code::bytes.as_ptr()`). Every interpreted call funnels through
+// `bytecodeInterpreter::execute_labeled`, so the code pointer is a stable,
+// unique key for the lifetime of the loader's bump storage.
+// ---------------------------------------------------------------------------
+
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+
+static LIVE_COUNTERS: OnceLock<Mutex<HashMap<usize, MethodCounters>>> = OnceLock::new();
+/// Methods whose counter has already triggered a compile request; prevents
+/// re-enqueueing on every subsequent tick.
+static HOT_METHODS: OnceLock<Mutex<std::collections::HashSet<usize>>> = OnceLock::new();
+
+fn counters() -> &'static Mutex<HashMap<usize, MethodCounters>> {
+    LIVE_COUNTERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn hot() -> &'static Mutex<std::collections::HashSet<usize>> {
+    HOT_METHODS.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Compile threshold for the interpreter -> JIT transition. Mirrors
+/// `Tier3InvocationThreshold`-style behaviour with a conservative default;
+/// `JVM25_C1_THRESHOLD` overrides it for tuning.
+pub fn compile_threshold() -> u32 {
+    static THRESHOLD: OnceLock<u32> = OnceLock::new();
+    *THRESHOLD.get_or_init(|| {
+        std::env::var("JVM25_C1_THRESHOLD")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1_000)
+    })
+}
+
+/// Records one method entry. Returns `true` when the invocation threshold is
+/// crossed for the first time (caller should hand the method to the compile
+/// broker).
+pub fn invocation_tick(code_key: usize) -> bool {
+    let threshold = compile_threshold();
+    let mut map = counters().lock().unwrap();
+    let counters = map.entry(code_key).or_insert_with(MethodCounters::new);
+    let count = counters.increment_invocation_counter(1);
+    if count >= threshold && hot().lock().unwrap().insert(code_key) {
+        return true;
+    }
+    false
+}
+
+/// Records one backward branch (loop backedge). Same contract as
+/// [`invocation_tick`].
+pub fn backedge_tick(code_key: usize) -> bool {
+    let threshold = compile_threshold().saturating_mul(4);
+    let mut map = counters().lock().unwrap();
+    let counters = map.entry(code_key).or_insert_with(MethodCounters::new);
+    let count = counters.increment_backedge_counter(1);
+    if count >= threshold && hot().lock().unwrap().insert(code_key) {
+        return true;
+    }
+    false
+}
+
+/// Returns the live counters for a method, if it has been ticked.
+pub fn get(code_key: usize) -> Option<MethodCounters> {
+    counters().lock().unwrap().get(&code_key).cloned()
+}
+
+/// Whether the method has already crossed a compile threshold.
+pub fn is_hot(code_key: usize) -> bool {
+    hot().lock().unwrap().contains(&code_key)
+}

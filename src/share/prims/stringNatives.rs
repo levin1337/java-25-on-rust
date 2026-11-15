@@ -45,7 +45,7 @@ pub(crate) fn string<'a>(
                         .map(|pair| u16::from_le_bytes([pair[0] as u8, pair[1] as u8]));
                     char::decode_utf16(units)
                         .collect::<Result<String, _>>()
-                        .map_err(Error::other)?
+                        .map_err(|error| Error::new(io::ErrorKind::InvalidData, error))?
                 }
                 _ => return Err(invalid()),
             };
@@ -64,47 +64,23 @@ pub(crate) fn materialize<'a>(
     output: &mut dyn Write,
     depth: usize,
 ) -> io::Result<Option<Value<'a>>> {
-    if matches!(
-        value,
-        Value::Object(_)
-            | Value::ObjectArray(_)
-            | Value::PrimitiveArray(_)
-            | Value::Arguments(_)
-            | Value::ClassMirror(_)
-            | Value::Null
-            | Value::Empty
-            | Value::Output
-            | Value::ReturnAddress(_)
-            | Value::Int(_)
-            | Value::Long(_)
-            | Value::Float(_)
-            | Value::Double(_)
-    ) {
-        return Ok(None);
-    }
-    let Some(text) = string(loader, value)? else {
-        return Ok(None);
+    let units = match value {
+        Value::String(bytes) => crate::classfile::decodeUtf16Units(bytes)?,
+        Value::HostString(text) => text.encode_utf16().collect(),
+        _ => return Ok(None),
     };
-    let text = text.into_owned();
 
     let klass = loader.load(b"java/lang/String")?;
     crate::share::interpreter::bytecodeInterpreter::initialize(loader, &klass, output, depth + 1)?;
 
-    let latin1 = text.chars().all(|c| u32::from(c) <= 0xff);
-    let bytes: Vec<u8> = if latin1 {
-        text.chars().map(|c| c as u32 as u8).collect()
+    let latin1 = units.iter().all(|&unit| unit <= 0xff);
+    let bytes = if latin1 {
+        units.into_iter().map(|unit| unit as i8).collect()
     } else {
-        let mut bytes = Vec::with_capacity(text.encode_utf16().count() * 2);
-        for unit in text.encode_utf16() {
-            bytes.push(unit as u8);
-            bytes.push((unit >> 8) as u8);
-        }
-        bytes
+        units.into_iter().flat_map(u16::to_ne_bytes).map(|byte| byte as i8).collect()
     };
 
-    let array_handle = loader.alloc_type_array(TypeArrayOop::Byte(
-        bytes.into_iter().map(|b| b as i8).collect(),
-    ));
+    let array_handle = loader.alloc_type_array(TypeArrayOop::Byte(bytes));
 
     let mut object = InstanceOop::new(klass)?;
     let value_index = object.klass.instanceField(b"value", b"[B")?;
@@ -124,11 +100,21 @@ pub(crate) fn invoke<'a>(
     descriptor: &[u8],
     args: &[Value<'a>],
 ) -> io::Result<Option<Option<Value<'a>>>> {
+    if !matches!(
+        name,
+        b"startsWith" | b"endsWith" | b"getChars" | b"length" | b"isEmpty" | b"charAt"
+            | b"hashCode" | b"equals" | b"toString" | b"intern"
+    ) {
+        return Ok(None);
+    }
     let Some((&receiver, args)) = args.split_first() else {
         return Ok(None);
     };
-    let Some(text) = string(loader, receiver)? else {
-        return Ok(None);
+    let text = match string(loader, receiver) {
+        Ok(Some(text)) => text,
+        Ok(None) => return Ok(None),
+        Err(error) if error.kind() == io::ErrorKind::InvalidData => return Ok(None),
+        Err(error) => return Err(error),
     };
     let result = match (name, descriptor, args) {
         (b"startsWith" | b"endsWith", b"(Ljava/lang/String;)Z", [needle]) => {

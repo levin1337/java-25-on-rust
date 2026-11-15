@@ -112,6 +112,7 @@ pub struct JImageReader {
     /// Absolute file offset where the data section begins.
     data_offset: u64,
     path_to_resource: HashMap<String, JImageResource>,
+    modules: Vec<String>,
     /// Internal class name (e.g. "java/lang/Object") -> resource.
     /// java.base entries take precedence over other modules.
     classes: HashMap<String, JImageResource>,
@@ -136,6 +137,7 @@ impl JImageReader {
             strings: Vec::new(),
             data_offset: 0,
             path_to_resource: HashMap::new(),
+            modules: Vec::new(),
             classes: HashMap::new(),
             module_classes: HashMap::new(),
         };
@@ -228,6 +230,16 @@ impl JImageReader {
             self.path_to_resource.insert(path, resource);
         }
 
+        self.modules = self.path_to_resource.values()
+            .map(|resource| resource.module.as_str())
+            .filter(|module| !module.is_empty())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        self.modules.sort_unstable_by(|a, b| {
+            (b == "java.base").cmp(&(a == "java.base")).then_with(|| a.cmp(b))
+        });
         Ok(())
     }
 
@@ -349,6 +361,19 @@ impl JImageReader {
     /// All indexed resource paths ("/module/path/to/resource").
     pub fn resource_paths(&self) -> impl Iterator<Item = &str> {
         self.path_to_resource.keys().map(String::as_str)
+    }
+
+    pub(crate) fn matchingResources(&self, name: &str) -> impl Iterator<Item = String> + '_ {
+        let mut path = String::with_capacity(name.len() + 32);
+        let name = name.to_owned();
+        self.modules.iter().filter_map(move |module| {
+            path.clear();
+            path.push('/');
+            path.push_str(module);
+            path.push('/');
+            path.push_str(&name);
+            self.path_to_resource.contains_key(&path).then(|| path.clone())
+        })
     }
 
     #[allow(dead_code)]

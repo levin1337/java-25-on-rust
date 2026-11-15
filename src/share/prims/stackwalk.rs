@@ -6,7 +6,332 @@
  * StackWalker options, stack frame batch fetching, and caller-sensitive method inspection.
  */
 
+use super::methodHandleNatives::{method_type_descriptor, object_field};
+use super::nativeLookup::set_instance_field;
+use crate::share::classfile::classLoader::ClassLoader;
+use crate::share::interpreter::bytecodeInterpreter::Value;
+use crate::share::oops::instanceOop::InstanceOop;
+use crate::share::oops::method::Code;
 use crate::share::oops::symbol::Symbol;
+use crate::share::runtime::javaCalls::{JavaCallArguments, JavaCalls};
+use std::cell::RefCell;
+use std::io::{self, Write};
+use std::sync::atomic::{AtomicI64, Ordering};
+
+const walkerClass: &[u8] = b"java/lang/StackStreamFactory$AbstractStackWalker";
+
+struct FrameWalk {
+    anchor: i64,
+    receiver: usize,
+    classOnly: bool,
+    frames: std::vec::IntoIter<StackFrameInfo>,
+}
+
+thread_local! {
+    static frameWalks: RefCell<Vec<FrameWalk>> = const { RefCell::new(Vec::new()) };
+}
+
+struct WalkScope;
+
+impl Drop for WalkScope {
+    fn drop(&mut self) {
+        frameWalks.with_borrow_mut(|walks| {
+            walks.pop();
+        });
+    }
+}
+
+fn fillFrames<'a>(
+    loader: &ClassLoader<'a>,
+    walk: &mut FrameWalk,
+    array: usize,
+    limit: i32,
+    start: i32,
+) -> io::Result<i32> {
+    let startIndex = usize::try_from(start).map_err(io::Error::other)?;
+    let limitIndex = usize::try_from(limit).map_err(io::Error::other)?;
+    let mut count = 0;
+    for index in startIndex..limitIndex {
+        let Some(frame) = walk.frames.next() else {
+            break;
+        };
+        let handle = match loader
+            .obj_arrays
+            .borrow()
+            .get(array)
+            .and_then(|a| a.elements.get(index))
+        {
+            Some(Value::Object(handle)) => *handle,
+            _ => return Err(io::Error::other("Invalid StackWalker frame buffer")),
+        };
+        let class = loader.load(frame.class_name.as_bytes())?;
+        let method = class
+            .class
+            .methods
+            .iter()
+            .find(|method| {
+                method.name == frame.method_name.as_bytes()
+                    && method.descriptor == frame.signature.as_bytes()
+            })
+            .ok_or_else(|| io::Error::other("StackWalker frame method is missing"))?;
+        let kind = if method.name == b"<init>" {
+            0x20000
+        } else {
+            0x10000
+        };
+        let mut flags = i32::from(method.accessFlags) | kind;
+        if frame.is_hidden_frame() {
+            flags |= 0x400000;
+        }
+        let mirror = Value::ClassMirror(class.class.name);
+        let classOrMethod = if walk.classOnly {
+            mirror
+        } else {
+            let resolved = loader.load(b"java/lang/invoke/ResolvedMethodName")?;
+            let holderSlot = resolved.instanceField(b"vmholder", b"Ljava/lang/Class;")?;
+            let mut token = InstanceOop::new(resolved)?;
+            token.fields[holderSlot] = mirror;
+            let token = loader.alloc_object(token);
+            set_instance_field(
+                loader,
+                handle,
+                b"name",
+                b"Ljava/lang/String;",
+                Value::String(method.name),
+            )?;
+            set_instance_field(
+                loader,
+                handle,
+                b"type",
+                b"Ljava/lang/Object;",
+                Value::String(method.descriptor),
+            )?;
+            set_instance_field(loader, handle, b"bci", b"I", Value::Int(frame.bci))?;
+            set_instance_field(
+                loader,
+                handle,
+                b"ste",
+                b"Ljava/lang/StackTraceElement;",
+                Value::Null,
+            )?;
+            Value::Object(token)
+        };
+        let mut objects = loader.borrow_objects_mut();
+        let object = objects
+            .get_mut(handle)
+            .ok_or_else(|| io::Error::other("Invalid StackWalker frame"))?;
+        let classSlot = object
+            .klass
+            .instanceField(b"classOrMemberName", b"Ljava/lang/Object;")?;
+        let flagsSlot = object.klass.instanceField(b"flags", b"I")?;
+        let Value::Int(previous) = object.fields[flagsSlot] else {
+            return Err(io::Error::other("Invalid StackWalker flags"));
+        };
+        object.fields[classSlot] = classOrMethod;
+        object.fields[flagsSlot] = Value::Int((previous & 0x08000000) | flags);
+        count += 1;
+    }
+    Ok(count)
+}
+
+pub(super) fn initTraceElement<'a>(
+    loader: &ClassLoader<'a>,
+    arguments: &[Value<'a>],
+) -> io::Result<()> {
+    let [Value::Object(element), Value::Object(frame)] = arguments else {
+        return Err(io::Error::other("Invalid StackWalker trace element"));
+    };
+    let Value::Object(token) =
+        object_field(loader, *frame, b"classOrMemberName", b"Ljava/lang/Object;")?
+    else {
+        return Err(io::Error::other("Missing StackWalker method"));
+    };
+    let Value::ClassMirror(name) = object_field(loader, token, b"vmholder", b"Ljava/lang/Class;")?
+    else {
+        return Err(io::Error::other("Missing StackWalker declaring class"));
+    };
+    let methodName = object_field(loader, *frame, b"name", b"Ljava/lang/String;")?;
+    let descriptor = match object_field(loader, *frame, b"type", b"Ljava/lang/Object;")? {
+        Value::String(bytes) => std::borrow::Cow::Borrowed(bytes),
+        methodType => std::borrow::Cow::Owned(method_type_descriptor(loader, methodType)?),
+    };
+    let class = loader.load(name)?;
+    let method = class
+        .class
+        .methods
+        .iter()
+        .find(|method| {
+            matches!(methodName, Value::String(bytes) if bytes == method.name)
+                && descriptor.as_ref() == method.descriptor
+        })
+        .ok_or_else(|| io::Error::other("StackWalker frame method is missing"))?;
+    let line = match object_field(loader, *frame, b"bci", b"I")? {
+        _ if method.accessFlags & 0x0100 != 0 => -2,
+        Value::Int(bci) => u16::try_from(bci)
+            .ok()
+            .and_then(|bci| {
+                Code::parse(method)
+                    .ok()?
+                    .lineNumber(&class.class.constants, bci)
+            })
+            .map_or(-1, i32::from),
+        _ => -1,
+    };
+    let dotted = crate::classfile::decodeString(name)?.replace('/', ".");
+    for (field, value) in [
+        (
+            b"declaringClass".as_slice(),
+            Value::HostString(loader.storage.alloc_str(&dotted)),
+        ),
+        (b"methodName", methodName),
+        (
+            b"fileName",
+            class.class.source_file().map_or(Value::Null, Value::String),
+        ),
+    ] {
+        set_instance_field(loader, *element, field, b"Ljava/lang/String;", value)?;
+    }
+    set_instance_field(loader, *element, b"lineNumber", b"I", Value::Int(line))?;
+    set_instance_field(
+        loader,
+        *element,
+        b"declaringClassObject",
+        b"Ljava/lang/Class;",
+        Value::ClassMirror(name),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn call_stack_walk<'a>(
+    loader: &ClassLoader<'a>,
+    receiver: usize,
+    mode: i64,
+    skip: i32,
+    buffer_size: i32,
+    start_index: i32,
+    array: usize,
+    output: &mut dyn Write,
+) -> io::Result<Option<Option<Value<'a>>>> {
+    if mode & i64::from(JVM_STACKWALK_FILL_LIVE_STACK_FRAMES) != 0 {
+        return Ok(None);
+    }
+    static nextAnchor: AtomicI64 = AtomicI64::new(1);
+    let anchor = nextAnchor.fetch_add(1, Ordering::Relaxed);
+    let frames = StackWalk::currentFrames(loader)
+        .into_iter()
+        .skip_while(|frame| {
+            frame.class_name.as_bytes() == b"java/lang/StackWalker"
+                || frame
+                    .class_name
+                    .as_bytes()
+                    .starts_with(b"java/lang/StackStreamFactory$")
+        })
+        .skip(usize::try_from(skip).map_err(io::Error::other)?)
+        .filter(|frame| {
+            mode & i64::from(JVM_STACKWALK_SHOW_HIDDEN_FRAMES) != 0
+                || !frame.is_hidden_frame()
+        })
+        .collect::<Vec<_>>();
+    let mut walk = FrameWalk {
+        anchor,
+        receiver,
+        classOnly: mode & i64::from(JVM_STACKWALK_FILL_CLASS_REFS_ONLY) != 0,
+        frames: frames.into_iter(),
+    };
+    let count = fillFrames(loader, &mut walk, array, buffer_size, start_index)?;
+    frameWalks.with_borrow_mut(|walks| walks.push(walk));
+    let _scope = WalkScope;
+    let mut call = JavaCallArguments::with_receiver(Value::Object(receiver));
+    call.push_long(anchor);
+    for value in [skip, count, start_index, start_index + count] {
+        call.push_int(value);
+    }
+    let klass = loader.load(walkerClass)?;
+    JavaCalls::call_special(
+        loader,
+        &klass,
+        b"doStackWalk",
+        b"(JIIII)Ljava/lang/Object;",
+        &call,
+        output,
+    )
+    .map(Some)
+}
+
+pub(super) fn invoke<'a>(
+    loader: &ClassLoader<'a>,
+    name: &[u8],
+    descriptor: &[u8],
+    args: &[Value<'a>],
+    output: &mut dyn Write,
+) -> io::Result<Option<Option<Value<'a>>>> {
+    match (name, descriptor, args) {
+        // JDK 21: callStackWalk(long mode, int skipframes, ...)
+        (
+            b"callStackWalk",
+            b"(JILjdk/internal/vm/ContinuationScope;Ljdk/internal/vm/Continuation;II[Ljava/lang/Object;)Ljava/lang/Object;",
+            [Value::Object(receiver), Value::Long(mode), Value::Int(skip), Value::Null, Value::Null, Value::Int(buffer), Value::Int(start), Value::ObjectArray(array)],
+        ) => call_stack_walk(
+            loader, *receiver, *mode, *skip, *buffer, *start, *array, output,
+        ),
+        // JDK 25: callStackWalk(int mode, int skipframes, ...)
+        (
+            b"callStackWalk",
+            b"(IILjdk/internal/vm/ContinuationScope;Ljdk/internal/vm/Continuation;II[Ljava/lang/Object;)Ljava/lang/Object;",
+            [Value::Object(receiver), Value::Int(mode), Value::Int(skip), Value::Null, Value::Null, Value::Int(buffer), Value::Int(start), Value::ObjectArray(array)],
+        ) => call_stack_walk(
+            loader,
+            *receiver,
+            i64::from(*mode),
+            *skip,
+            *buffer,
+            *start,
+            *array,
+            output,
+        ),
+        // JDK 25: fetchStackFrames(int mode, long anchor, int lastBatchFrameCount, int bufferSize, int startIndex, T[] frames)
+        (
+            b"fetchStackFrames",
+            b"(IJIII[Ljava/lang/Object;)I",
+            [Value::Object(receiver), Value::Int(_), Value::Long(anchor), Value::Int(_), Value::Int(limit), Value::Int(start), Value::ObjectArray(array)],
+        ) => frameWalks.with_borrow_mut(|walks| {
+            let walk = walks.last_mut().filter(|walk| walk.anchor == *anchor && walk.receiver == *receiver)
+                .ok_or_else(|| io::Error::other("Invalid StackWalker anchor"))?;
+            fillFrames(loader, walk, *array, *limit, *start).map(|count| Some(Some(Value::Int(count))))
+        }),
+        // JDK 21: fetchStackFrames(long mode, long anchor, int batchSize, int startIndex, T[] frames)
+        (
+            b"fetchStackFrames",
+            b"(JJII[Ljava/lang/Object;)I",
+            [Value::Object(receiver), Value::Long(_), Value::Long(anchor), Value::Int(batch), Value::Int(start), Value::ObjectArray(array)],
+        ) => frameWalks.with_borrow_mut(|walks| {
+            let walk = walks.last_mut().filter(|walk| walk.anchor == *anchor && walk.receiver == *receiver)
+                .ok_or_else(|| io::Error::other("Invalid StackWalker anchor"))?;
+            let end = start.saturating_add(*batch);
+            fillFrames(loader, walk, *array, end, *start).map(|count| Some(Some(Value::Int(count))))
+        }),
+        _ => {
+            if name == b"callStackWalk" || name == b"fetchStackFrames" {
+                eprintln!(
+                    "[stackwalk-miss] {}{} args={:?}",
+                    String::from_utf8_lossy(name),
+                    String::from_utf8_lossy(descriptor),
+                    args.iter()
+                        .map(|v| match v {
+                            Value::Null => "null".to_string(),
+                            Value::Int(i) => format!("int({i})"),
+                            Value::Long(l) => format!("long({l})"),
+                            Value::Object(_) => "obj".to_string(),
+                            Value::ObjectArray(_) => "objarr".to_string(),
+                            _ => format!("{v:?}"),
+                        })
+                        .collect::<Vec<_>>()
+                );
+            }
+            Ok(None)
+        }
+    }
+}
 
 pub const JVM_STACKWALK_FILL_CLASS_REFS_ONLY: i32 = 0x2;
 pub const JVM_STACKWALK_GET_CALLER_CLASS: i32 = 0x4;

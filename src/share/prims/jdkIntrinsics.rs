@@ -9,6 +9,7 @@ use std::io;
 
 use crate::share::classfile::classLoader::ClassLoader;
 use crate::share::interpreter::bytecodeInterpreter::Value;
+use crate::share::oops::instanceKlass::InstanceKlass;
 use crate::share::oops::typeArrayOop::TypeArrayOop;
 
 fn invalid(message: &str) -> io::Error {
@@ -22,49 +23,638 @@ fn int_arg(arguments: &[Value<'_>], index: usize) -> io::Result<i32> {
     }
 }
 
-/// Reads `len` bytes from a primitive byte array starting at `offset`.
-fn byte_slice<'a>(
+fn matchJarManifest<'a>(loader: &ClassLoader<'a>, arguments: &[Value<'a>]) -> Option<Value<'a>> {
+    let [
+        _,
+        Value::PrimitiveArray(pattern),
+        Value::PrimitiveArray(bytes),
+        Value::PrimitiveArray(last),
+        Value::PrimitiveArray(shift),
+    ] = arguments
+    else {
+        return None;
+    };
+    let arrays = loader.arrays.borrow();
+    let read = |handle| match arrays.get(handle)? {
+        TypeArrayOop::Byte(bytes) => Some(bytes.as_slice()),
+        _ => None,
+    };
+    let (pattern, bytes, last, shift) =
+        (read(*pattern)?, read(*bytes)?, read(*last)?, read(*shift)?);
+    let Some(limit) = bytes.len().checked_sub(pattern.len()) else {
+        return Some(Value::Int(-1));
+    };
+    let mut offset = 0;
+    'search: while offset <= limit {
+        for (index, &expected) in pattern.iter().enumerate().rev() {
+            let byte = bytes[offset + index] as u8;
+            if !(32..=122).contains(&byte) {
+                offset += pattern.len();
+                continue 'search;
+            }
+            let byte = if byte >= 97 { byte - 32 } else { byte };
+            if byte as i8 != expected {
+                let badCharacter = index as i32 + 1 - i32::from(*last.get(usize::from(byte - 32))?);
+                let advance = badCharacter.max(i32::from(*shift.get(index)?));
+                if advance <= 0 {
+                    return None;
+                }
+                offset += advance as usize;
+                continue 'search;
+            }
+        }
+        return Some(Value::Int(i32::try_from(offset).ok()?));
+    }
+    Some(Value::Int(-1))
+}
+
+fn zipName<'a>(
     loader: &ClassLoader<'a>,
     arguments: &[Value<'a>],
-    array_index: usize,
-    offset_index: usize,
-    len: usize,
-) -> io::Result<Vec<u8>> {
-    let handle = match arguments.get(array_index).copied() {
-        Some(Value::PrimitiveArray(handle)) => handle,
-        _ => return Err(invalid("Expected byte array")),
+    metadata: bool,
+) -> Option<Value<'a>> {
+    let [
+        Value::PrimitiveArray(handle),
+        Value::Int(start),
+        Value::Int(length),
+    ] = arguments
+    else {
+        return None;
     };
-    let offset = int_arg(arguments, offset_index)? as usize;
-    let arrays = loader.arrays.borrow();
-    let Some(TypeArrayOop::Byte(bytes)) = arrays.get(handle) else {
-        return Err(invalid("Expected byte array"));
-    };
-    if offset + len > bytes.len() {
-        return Err(invalid("Array index out of bounds"));
+    if metadata && *length <= 9 || !metadata && *length == 0 {
+        return Some(Value::Int(0));
     }
-    Ok(bytes[offset..offset + len].iter().map(|&b| b as u8).collect())
+    let start = usize::try_from(*start).ok()?;
+    let length = usize::try_from(*length).ok()?;
+    let arrays = loader.arrays.borrow();
+    let TypeArrayOop::Byte(bytes) = arrays.get(*handle)? else {
+        return None;
+    };
+    let name = bytes.get(start..start.checked_add(length)?)?;
+    if metadata {
+        return Some(Value::Int(i32::from(
+            name.last() != Some(&(b'/' as i8))
+                && name[..9]
+                    .iter()
+                    .zip(b"META-INF/")
+                    .all(|(&a, b)| (a as u8).eq_ignore_ascii_case(b)),
+        )));
+    }
+    let hash = |value: i32, unit: u16| value.wrapping_mul(31).wrapping_add(i32::from(unit));
+    let value = if name.iter().all(|&byte| byte >= 0) {
+        name.iter().map(|&byte| byte as u16).fold(0, hash)
+    } else {
+        let bytes: Vec<u8> = name.iter().map(|&byte| byte as u8).collect();
+        std::str::from_utf8(&bytes)
+            .ok()?
+            .encode_utf16()
+            .fold(0, hash)
+    };
+    Some(Value::Int(if name.last() == Some(&(b'/' as i8)) {
+        value
+    } else {
+        hash(value, u16::from(b'/'))
+    }))
+}
+
+fn mismatchIndex<T: Copy>(left: &[T], right: &[i8], convert: impl Fn(T) -> i8) -> Option<usize> {
+    left.iter()
+        .zip(right)
+        .position(|(&a, &b)| convert(a) != b)
+        .or_else(|| (left.len() != right.len()).then(|| left.len().min(right.len())))
+}
+
+fn compareZipName<'a>(loader: &ClassLoader<'a>, args: &[Value<'a>]) -> Option<Value<'a>> {
+    let [
+        _,
+        name,
+        Value::PrimitiveArray(handle),
+        Value::Int(start),
+        Value::Int(length),
+        Value::Int(addSlash),
+    ] = args
+    else {
+        return None;
+    };
+    let name = super::stringNatives::string(loader, *name).ok()??;
+    let end = usize::try_from(start.checked_add(*length)?).ok()?;
+    let start = usize::try_from(*start).ok()?;
+    let arrays = loader.arrays.borrow();
+    let TypeArrayOop::Byte(bytes) = arrays.get(*handle)? else {
+        return None;
+    };
+    let entry = bytes.get(start..end)?;
+    let result = match mismatchIndex(name.as_bytes(), entry, |byte| byte as i8) {
+        None => 0,
+        Some(index) if *addSlash != 0 && index + 1 == entry.len() && entry[index] == b'/' as i8 => {
+            1
+        }
+        Some(_) => 2,
+    };
+    Some(Value::Int(result))
+}
+
+fn byteRangeMismatch<'a>(loader: &ClassLoader<'a>, args: &[Value<'a>]) -> Option<Value<'a>> {
+    let [
+        Value::PrimitiveArray(a),
+        Value::Int(aFrom),
+        Value::Int(aTo),
+        Value::PrimitiveArray(b),
+        Value::Int(bFrom),
+        Value::Int(bTo),
+    ] = args
+    else {
+        return None;
+    };
+    let arrays = loader.arrays.borrow();
+    let range = |handle, from, to| {
+        let TypeArrayOop::Byte(bytes) = arrays.get(handle)? else {
+            return None;
+        };
+        bytes.get(usize::try_from(from).ok()?..usize::try_from(to).ok()?)
+    };
+    let left = range(*a, *aFrom, *aTo)?;
+    let right = range(*b, *bFrom, *bTo)?;
+    Some(Value::Int(
+        mismatchIndex(left, right, |byte| byte).map_or(-1, |index| index as i32),
+    ))
+}
+
+fn searchUnits(
+    source: &[i8],
+    target: &[i8],
+    sourceWidth: usize,
+    targetWidth: usize,
+    from: usize,
+    reverse: bool,
+) -> Option<usize> {
+    let count = target.len() / targetWidth;
+    let last = (source.len() / sourceWidth).checked_sub(count)?;
+    let matches = |index: usize| {
+        let start = index * sourceWidth;
+        let candidate = &source[start..start + count * sourceWidth];
+        if sourceWidth == targetWidth {
+            return candidate == target;
+        }
+        candidate.chunks_exact(2).zip(target).all(|(unit, &byte)| {
+            u16::from_ne_bytes([unit[0] as u8, unit[1] as u8]) == u16::from(byte as u8)
+        })
+    };
+    if reverse {
+        (0..=from.min(last)).rev().find(|&index| matches(index))
+    } else {
+        (from..=last).find(|&index| matches(index))
+    }
+}
+
+fn stringSearch<'a>(
+    loader: &ClassLoader<'a>,
+    owner: &[u8],
+    name: &[u8],
+    descriptor: &[u8],
+    args: &[Value<'a>],
+) -> Option<Value<'a>> {
+    let arrays = loader.arrays.borrow();
+    let read = |handle| match arrays.get(handle)? {
+        TypeArrayOop::Byte(bytes) => Some(bytes.as_slice()),
+        _ => None,
+    };
+    let width = if owner == b"java/lang/StringUTF16" {
+        2
+    } else {
+        1
+    };
+    let targetWidth = if name.ends_with(b"Latin1") { 1 } else { width };
+    let reverse = name.starts_with(b"last");
+    let found = match (descriptor, args) {
+        (b"([B[B)I", [Value::PrimitiveArray(source), Value::PrimitiveArray(target)])
+            if !reverse =>
+        {
+            let source = read(*source)?;
+            let target = read(*target)?;
+            if target.is_empty() {
+                return Some(Value::Int(0));
+            }
+            searchUnits(source, target, width, targetWidth, 0, false)
+        }
+        (
+            b"([BI[BII)I",
+            [
+                Value::PrimitiveArray(source),
+                Value::Int(sourceLength),
+                Value::PrimitiveArray(target),
+                Value::Int(targetLength),
+                Value::Int(from),
+            ],
+        ) => {
+            let source =
+                read(*source)?.get(..usize::try_from(*sourceLength).ok()?.checked_mul(width)?)?;
+            let target = read(*target)?.get(
+                ..usize::try_from(*targetLength)
+                    .ok()?
+                    .checked_mul(targetWidth)?,
+            )?;
+            let from = usize::try_from(*from).ok()?;
+            if target.is_empty()
+                || from > source.len() / width
+                || (reverse && from.checked_add(target.len() / targetWidth)? > source.len() / width)
+            {
+                return None;
+            }
+            searchUnits(source, target, width, targetWidth, from, reverse)
+        }
+        (
+            b"([BIII)I",
+            [
+                Value::PrimitiveArray(source),
+                Value::Int(character),
+                Value::Int(from),
+                Value::Int(end),
+            ],
+        ) if !reverse => {
+            let from = usize::try_from(*from).ok()?;
+            let end = usize::try_from(*end).ok()?;
+            if from >= end {
+                return Some(Value::Int(-1));
+            }
+            let source = read(*source)?.get(..end.checked_mul(width)?)?;
+            searchCharacter(source, width, *character, from, false)
+        }
+        (
+            b"([BII)I",
+            [
+                Value::PrimitiveArray(source),
+                Value::Int(character),
+                Value::Int(from),
+            ],
+        ) if reverse => {
+            let Ok(from) = usize::try_from(*from) else {
+                return Some(Value::Int(-1));
+            };
+            searchCharacter(read(*source)?, width, *character, from, true)
+        }
+        _ => return None,
+    };
+    Some(Value::Int(found.map_or(-1, |index| index as i32)))
+}
+
+fn searchCharacter(
+    source: &[i8],
+    width: usize,
+    character: i32,
+    from: usize,
+    reverse: bool,
+) -> Option<usize> {
+    if width == 1 {
+        let byte = u8::try_from(character).ok()? as i8;
+        return searchUnits(source, &[byte], 1, 1, from, reverse);
+    }
+    let mut units = [0; 2];
+    let units = if let Ok(unit) = u16::try_from(character) {
+        units[0] = unit;
+        &units[..1]
+    } else {
+        char::from_u32(u32::try_from(character).ok()?)?.encode_utf16(&mut units)
+    };
+    let mut encoded = [0; 4];
+    for (unit, bytes) in units.iter().zip(encoded.chunks_exact_mut(2)) {
+        let [a, b] = unit.to_ne_bytes();
+        bytes[0] = a as i8;
+        bytes[1] = b as i8;
+    }
+    searchUnits(source, &encoded[..units.len() * 2], 2, 2, from, reverse)
+}
+
+fn latin1UppercaseRange(character: i32) -> bool {
+    matches!(character, 0x41..=0x5a | 0xc0..=0xd6 | 0xd8..=0xde)
+}
+
+fn latin1Character<'a>(
+    loader: &ClassLoader<'a>,
+    klass: &InstanceKlass<'a>,
+    name: &[u8],
+    descriptor: &[u8],
+    args: &[Value<'a>],
+) -> Option<Value<'a>> {
+    if let (b"digit", b"(II)I", [_, Value::Int(character), Value::Int(radix)]) =
+        (name, descriptor, args)
+    {
+        let Value::PrimitiveArray(handle) = klass.staticField(b"DIGITS", b"[B").ok()?.get() else {
+            return None;
+        };
+        let arrays = loader.arrays.borrow();
+        let TypeArrayOop::Byte(digits) = arrays.get(handle)? else {
+            return None;
+        };
+        let digit = i32::from(*digits.get(usize::try_from(*character).ok()?)?);
+        return Some(Value::Int(
+            if (2..=36).contains(radix) && (0..*radix).contains(&digit) {
+                digit
+            } else {
+                -1
+            },
+        ));
+    }
+
+    let [_, Value::Int(character)] = args else {
+        return None;
+    };
+    let character = i32::from(u8::try_from(*character).ok()?);
+    let read = |field, signature| {
+        let Value::PrimitiveArray(handle) = klass.staticField(field, signature).ok()?.get() else {
+            return None;
+        };
+        let arrays = loader.arrays.borrow();
+        let index = character as usize;
+        match arrays.get(handle)? {
+            TypeArrayOop::Int(values) => values.get(index).copied(),
+            TypeArrayOop::Char(values) => values.get(index).copied().map(i32::from),
+            _ => None,
+        }
+    };
+    let extended = || read(b"B", b"[C");
+    let properties = || read(b"A", b"[I");
+    let value = match (name, descriptor) {
+        (b"isDigit", b"(I)Z") => i32::from((0x30..=0x39).contains(&character)),
+        (b"toLowerCase", b"(I)I") => {
+            if latin1UppercaseRange(character) {
+                character | 0x20
+            } else {
+                character
+            }
+        }
+        (b"toUpperCase" | b"toTitleCase", b"(I)I") => match character {
+            0xff => 0x178,
+            0xb5 => 0x39c,
+            value if latin1UppercaseRange(value & !0x20) => value & !0x20,
+            value => value,
+        },
+        (b"getPropertiesEx", b"(I)I") => extended()?,
+        (b"getProperties", b"(I)I") => properties()?,
+        (b"getType", b"(I)I") => properties()? & 0x1f,
+        (b"getDirectionality", b"(I)B") => (properties()? & 0x78000000) >> 27,
+        (b"isMirrored", b"(I)Z") => i32::from(properties()? < 0),
+        (b"isJavaIdentifierStart", b"(I)Z") => i32::from(properties()? & 0x7000 >= 0x5000),
+        (b"isJavaIdentifierPart", b"(I)Z") => i32::from(properties()? & 0x3000 != 0),
+        (b"isIdentifierIgnorable", b"(I)Z") => i32::from(properties()? & 0x7000 == 0x1000),
+        (b"isUnicodeIdentifierPart", b"(I)Z") => {
+            i32::from(extended()? & 32 != 0 || properties()? & 0x7000 == 0x1000)
+        }
+        (b"isWhitespace", b"(I)Z") => i32::from(properties()? & 0x7000 == 0x4000),
+        (b"getNumericValue", b"(I)I") => {
+            let value = properties()?;
+            let digit = (character + ((value & 0x03e0) >> 5)) & 31;
+            match value & 0x0c00 {
+                0x0400 => digit,
+                0x0800 => -2,
+                0x0c00 => digit + 10,
+                _ => -1,
+            }
+        }
+        (b"toUpperCaseEx", b"(I)I") => {
+            let value = properties()?;
+            if value & 0x10000 == 0 {
+                character
+            } else if value & 0x07fc0000 == 0x07fc0000 {
+                if character == 0xb5 { 0x39c } else { -1 }
+            } else {
+                character - ((value << 5) >> 23)
+            }
+        }
+        (method, b"(I)Z") => {
+            let flag = match method {
+                b"isLowerCase" => 1,
+                b"isUpperCase" => 2,
+                b"isOtherAlphabetic" => 4,
+                b"isIdeographic" => 8,
+                b"isUnicodeIdentifierStart" => 16,
+                b"isEmoji" => 64,
+                b"isEmojiPresentation" => 128,
+                b"isEmojiModifier" => 256,
+                b"isEmojiModifierBase" => 512,
+                b"isEmojiComponent" => 1024,
+                b"isExtendedPictographic" => 2048,
+                _ => return None,
+            };
+            i32::from(extended()? & flag != 0)
+        }
+        _ => return None,
+    };
+    Some(Value::Int(value))
+}
+
+pub(crate) fn invokeInstance<'a>(
+    loader: &ClassLoader<'a>,
+    klass: &InstanceKlass<'a>,
+    name: &[u8],
+    descriptor: &[u8],
+    args: &[Value<'a>],
+) -> Option<Value<'a>> {
+    match (klass.class.name, name, descriptor) {
+        (b"java/lang/CharacterDataLatin1", _, _) => {
+            latin1Character(loader, klass, name, descriptor, args)
+        }
+        (b"java/util/jar/JarFile", b"match", b"([B[B[B[B)I") => matchJarManifest(loader, args),
+        (b"java/util/zip/ZipCoder$UTF8ZipCoder", b"checkedHash", b"([BII)I") => {
+            zipName(loader, args.get(1..)?, false)
+        }
+        (b"java/util/zip/ZipCoder$UTF8ZipCoder", b"compare", b"(Ljava/lang/String;[BIIZ)B") => {
+            compareZipName(loader, args)
+        }
+        (b"java/util/zip/ZipFile$Source", b"nextEntryPos", b"(III)I") => {
+            let [
+                Value::Object(receiver),
+                Value::Int(header),
+                Value::Int(name),
+                Value::Int(length),
+            ] = args
+            else {
+                return None;
+            };
+            let Value::PrimitiveArray(handle) =
+                super::methodHandleNatives::object_field(loader, *receiver, b"cen", b"[B").ok()?
+            else {
+                return None;
+            };
+            let arrays = loader.arrays.borrow();
+            let TypeArrayOop::Byte(bytes) = arrays.get(handle)? else {
+                return None;
+            };
+            let header = bytes.get(usize::try_from(*header).ok()?..)?;
+            let extra = centralDirectoryTail(header)?;
+            Some(Value::Int(name.wrapping_add(*length).wrapping_add(extra)))
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn invokeVoidInstance(
+    loader: &ClassLoader<'_>,
+    owner: &[u8],
+    name: &[u8],
+    descriptor: &[u8],
+    args: &[Value<'_>],
+) -> bool {
+    if (owner, name, descriptor) != (b"sun/security/provider/SHA", b"implCompress0", b"([BI)V") {
+        return false;
+    }
+    compressSha1(loader, args).is_some()
+}
+
+fn compressSha1(loader: &ClassLoader<'_>, args: &[Value<'_>]) -> Option<()> {
+    let [
+        Value::Object(receiver),
+        Value::PrimitiveArray(input),
+        Value::Int(offset),
+    ] = args
+    else {
+        return None;
+    };
+    let Value::PrimitiveArray(state) =
+        super::methodHandleNatives::object_field(loader, *receiver, b"state", b"[I").ok()?
+    else {
+        return None;
+    };
+    let offset = usize::try_from(*offset).ok()?;
+    let mut arrays = loader.arrays.borrow_mut();
+    let TypeArrayOop::Byte(input) = arrays.get(*input)? else {
+        return None;
+    };
+    let block = input.get(offset..offset + 64)?;
+    let mut words = [0u32; 80];
+    for (word, bytes) in words.iter_mut().zip(block.chunks_exact(4)) {
+        *word = u32::from_be_bytes([
+            bytes[0] as u8,
+            bytes[1] as u8,
+            bytes[2] as u8,
+            bytes[3] as u8,
+        ]);
+    }
+    let TypeArrayOop::Int(state) = arrays.get_mut(state)? else {
+        return None;
+    };
+    let state = state.first_chunk_mut::<5>()?;
+    let [mut a, mut b, mut c, mut d, mut e] = state.map(|word| word as u32);
+    for round in 0..80 {
+        if round >= 16 {
+            words[round] =
+                (words[round - 3] ^ words[round - 8] ^ words[round - 14] ^ words[round - 16])
+                    .rotate_left(1);
+        }
+        let (mix, constant) = match round {
+            0..=19 => ((b & c) | (!b & d), 0x5a827999),
+            20..=39 => (b ^ c ^ d, 0x6ed9eba1),
+            40..=59 => ((b & c) | (b & d) | (c & d), 0x8f1bbcdc),
+            _ => (b ^ c ^ d, 0xca62c1d6),
+        };
+        let next = a
+            .rotate_left(5)
+            .wrapping_add(mix)
+            .wrapping_add(e)
+            .wrapping_add(constant)
+            .wrapping_add(words[round]);
+        [a, b, c, d, e] = [next, a, b.rotate_left(30), c, d];
+    }
+    for (state, word) in state.iter_mut().zip([a, b, c, d, e]) {
+        *state = state.wrapping_add(word as i32);
+    }
+    Some(())
+}
+
+const centralDirectoryHeaderSize: usize = 46;
+
+fn zipWord(bytes: &[i8], offset: usize) -> Option<i32> {
+    let [a, b] = *bytes.get(offset..offset.checked_add(2)?)? else {
+        return None;
+    };
+    Some(i32::from(u16::from_le_bytes([a as u8, b as u8])))
+}
+
+fn centralDirectoryTail(header: &[i8]) -> Option<i32> {
+    Some(zipWord(header, 30)? + zipWord(header, 32)?)
+}
+
+fn countCentralDirectoryHeaders(mut bytes: &[i8]) -> Option<i32> {
+    let mut count = 0;
+    while bytes.len() >= centralDirectoryHeaderSize {
+        let size = centralDirectoryHeaderSize
+            + (zipWord(bytes, 28)? + centralDirectoryTail(bytes)?) as usize;
+        bytes = bytes.get(size..)?;
+        count += 1;
+    }
+    Some(count)
+}
+
+fn zipField<'a>(
+    loader: &ClassLoader<'a>,
+    name: &[u8],
+    descriptor: &[u8],
+    arguments: &[Value<'a>],
+) -> Option<Value<'a>> {
+    let (offset, width) = match (name, descriptor) {
+        (b"get16", b"([BI)I") => (0, 2),
+        (b"get32" | b"CENSIG", b"([BI)J") => (0, 4),
+        (b"CENVEM", b"([BI)I") => (4, 2),
+        (b"CENVEM_FA", b"([BI)I") => (5, 1),
+        (b"CENVER", b"([BI)I") => (6, 2),
+        (b"CENFLG", b"([BI)I") => (8, 2),
+        (b"CENHOW", b"([BI)I") => (10, 2),
+        (b"CENTIM", b"([BI)J") => (12, 4),
+        (b"CENCRC", b"([BI)J") => (16, 4),
+        (b"CENSIZ", b"([BI)J") => (20, 4),
+        (b"CENLEN", b"([BI)J") => (24, 4),
+        (b"CENNAM", b"([BI)I") => (28, 2),
+        (b"CENEXT", b"([BI)I") => (30, 2),
+        (b"CENCOM", b"([BI)I") => (32, 2),
+        (b"CENDSK", b"([BI)I") => (34, 2),
+        (b"CENATT", b"([BI)I") => (36, 2),
+        (b"CENATX", b"([BI)J") => (38, 4),
+        (b"CENATX_PERMS", b"([BI)I") => (40, 2),
+        (b"CENOFF", b"([BI)J") => (42, 4),
+        _ => return None,
+    };
+    let [Value::PrimitiveArray(handle), Value::Int(base)] = arguments else {
+        return None;
+    };
+    let start = usize::try_from(base.checked_add(offset)?).ok()?;
+    let arrays = loader.arrays.borrow();
+    let TypeArrayOop::Byte(bytes) = arrays.get(*handle)? else {
+        return None;
+    };
+    if width == 2 {
+        return zipWord(bytes, start).map(Value::Int);
+    }
+    match bytes.get(start..start + width)? {
+        [a] => Some(Value::Int(i32::from(*a as u8))),
+        [a, b, c, d] => Some(Value::Long(i64::from(u32::from_le_bytes([
+            *a as u8, *b as u8, *c as u8, *d as u8,
+        ])))),
+        _ => None,
+    }
 }
 
 /// `hash = 31*hash + (a[i] & 0xff)` over `bytes[offset..offset+len]`.
-fn unsigned_byte_hash(
+fn byteHash(
     loader: &ClassLoader<'_>,
     handle: usize,
     offset: usize,
     len: usize,
     init: i32,
-) -> io::Result<i32> {
+    signed: bool,
+) -> Option<i32> {
     let arrays = loader.arrays.borrow();
     let Some(TypeArrayOop::Byte(bytes)) = arrays.get(handle) else {
-        return Err(invalid("Expected byte array"));
+        return None;
     };
-    if offset + len > bytes.len() {
-        return Err(invalid("Array index out of bounds"));
-    }
-    let mut hash = init;
-    for &b in &bytes[offset..offset + len] {
-        hash = 31 * hash + (b as u8 as i32);
-    }
-    Ok(hash)
+    let bytes = bytes.get(offset..offset.checked_add(len)?)?;
+    Some(bytes.iter().fold(init, |hash, &byte| {
+        let value = if signed {
+            i32::from(byte)
+        } else {
+            i32::from(byte as u8)
+        };
+        hash.wrapping_mul(31).wrapping_add(value)
+    }))
 }
 
 /// Handles a single static JDK helper call. Returns `Ok(None)` when the
@@ -77,10 +667,20 @@ pub(crate) fn invoke<'a>(
     arguments: &[Value<'a>],
 ) -> io::Result<Option<Value<'a>>> {
     let value = match (owner, name, descriptor) {
-        // java.lang.Byte
-        (b"java/lang/Byte", b"toUnsignedInt", b"(B)I") => {
-            Value::Int(int_arg(arguments, 0)? & 0xff)
+        (b"java/lang/CharacterDataLatin1", b"equalsIgnoreCase", b"(BB)Z") => {
+            let a = int_arg(arguments, 0)?;
+            let b = int_arg(arguments, 1)?;
+            let upper = a & 0xdf;
+            Value::Int(i32::from(
+                a == b || (latin1UppercaseRange(upper) && upper == b & 0xdf),
+            ))
         }
+        (b"java/lang/StringLatin1" | b"java/lang/StringUTF16", b"indexOf" | b"lastIndexOf", _)
+        | (b"java/lang/StringUTF16", b"indexOfLatin1" | b"lastIndexOfLatin1", _) => {
+            return Ok(stringSearch(loader, owner, name, descriptor, arguments));
+        }
+        // java.lang.Byte
+        (b"java/lang/Byte", b"toUnsignedInt", b"(B)I") => Value::Int(int_arg(arguments, 0)? & 0xff),
         (b"java/lang/Byte", b"toUnsignedLong", b"(B)J") => {
             Value::Long((int_arg(arguments, 0)? & 0xff) as i64)
         }
@@ -111,17 +711,24 @@ pub(crate) fn invoke<'a>(
             Value::Int((a % b) as i32)
         }
         // java.util.zip.ZipUtils little-endian readers
-        (b"java/util/zip/ZipUtils", b"get16", b"([BI)I") => {
-            let b = byte_slice(loader, arguments, 0, 1, 2)?;
-            Value::Int((b[0] as i32) | ((b[1] as i32) << 8))
+        (b"java/util/zip/ZipUtils", _, _) => {
+            return Ok(zipField(loader, name, descriptor, arguments));
         }
-        (b"java/util/zip/ZipUtils", b"get32", b"([BI)J") => {
-            let b = byte_slice(loader, arguments, 0, 1, 4)?;
-            let v = (b[0] as u32)
-                | ((b[1] as u32) << 8)
-                | ((b[2] as u32) << 16)
-                | ((b[3] as u32) << 24);
-            Value::Long(v as i64)
+        (b"java/util/Arrays", b"mismatch", b"([BII[BII)I") => {
+            return Ok(byteRangeMismatch(loader, arguments));
+        }
+        (b"java/util/zip/ZipFile$Source", b"isMetaName", b"([BII)Z") => {
+            return Ok(zipName(loader, arguments, true));
+        }
+        (b"java/util/zip/ZipFile$Source", b"countCENHeaders", b"([B)I") => {
+            let [Value::PrimitiveArray(handle)] = arguments else {
+                return Ok(None);
+            };
+            let arrays = loader.arrays.borrow();
+            let Some(TypeArrayOop::Byte(bytes)) = arrays.get(*handle) else {
+                return Ok(None);
+            };
+            return Ok(countCentralDirectoryHeaders(bytes).map(Value::Int));
         }
         // java.lang.Short
         (b"java/lang/Short", b"toUnsignedInt", b"(S)I") => {
@@ -130,7 +737,11 @@ pub(crate) fn invoke<'a>(
         // jdk.internal.util.Preconditions — fast path only when in bounds;
         // out-of-bounds falls through to the real implementation which
         // throws the proper IndexOutOfBoundsException via the formatter.
-        (b"jdk/internal/util/Preconditions", b"checkIndex", b"(IILjava/util/function/BiFunction;)I") => {
+        (
+            b"jdk/internal/util/Preconditions",
+            b"checkIndex",
+            b"(IILjava/util/function/BiFunction;)I",
+        ) => {
             let index = int_arg(arguments, 0)?;
             let length = int_arg(arguments, 1)?;
             if index >= 0 && index < length {
@@ -148,29 +759,25 @@ pub(crate) fn invoke<'a>(
             let offset = int_arg(arguments, 1)? as usize;
             let len = int_arg(arguments, 2)? as usize;
             let init = int_arg(arguments, 3)?;
-            return unsigned_byte_hash(loader, handle, offset, len, init).map(|h| Some(Value::Int(h)));
+            return Ok(byteHash(loader, handle, offset, len, init, false).map(Value::Int));
         }
-        // vectorizedHashCode(Object array, int off, int len, int init, int elemShift)
-        // Only the byte[]/unsigned path (elemShift == 3 → 8 bytes? JDK passes 8)
-        // is fast-pathed; other element kinds fall through.
-        (b"jdk/internal/util/ArraysSupport", b"vectorizedHashCode", b"(Ljava/lang/Object;IIII)I") => {
+        (
+            b"jdk/internal/util/ArraysSupport",
+            b"vectorizedHashCode",
+            b"(Ljava/lang/Object;IIII)I",
+        ) => {
             let handle = match arguments.first().copied() {
                 Some(Value::PrimitiveArray(handle)) => handle,
                 _ => return Ok(None),
             };
-            // Only byte[] uses the unsigned-byte hash; other element kinds
-            // have different formulas — fall through to the JDK impl.
-            {
-                let arrays = loader.arrays.borrow();
-                if !matches!(arrays.get(handle), Some(TypeArrayOop::Byte(_))) {
-                    return Ok(None);
-                }
-            }
             let offset = int_arg(arguments, 1)? as usize;
             let len = int_arg(arguments, 2)? as usize;
             let init = int_arg(arguments, 3)?;
-            let _shift = int_arg(arguments, 4)?;
-            return unsigned_byte_hash(loader, handle, offset, len, init).map(|h| Some(Value::Int(h)));
+            let kind = int_arg(arguments, 4)?;
+            if !matches!(kind, 4 | 8) {
+                return Ok(None);
+            }
+            return Ok(byteHash(loader, handle, offset, len, init, kind == 8).map(Value::Int));
         }
         _ => return Ok(None),
     };

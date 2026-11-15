@@ -173,3 +173,232 @@ impl PcDesc {
             && self.flags == other.flags
     }
 }
+
+/// LRU cache of recently found PcDescs (PcDescCache analogue, cache_size = 4).
+#[derive(Clone)]
+pub struct PcDescCache {
+    entries: Vec<Option<PcDesc>>,
+}
+
+impl PcDescCache {
+    pub const CACHE_SIZE: usize = 4;
+
+    pub fn new() -> Self {
+        Self {
+            entries: vec![None; Self::CACHE_SIZE],
+        }
+    }
+
+    pub fn init_to(&mut self, initial: PcDesc) {
+        self.entries.fill(Some(initial));
+    }
+
+    fn match_desc(pc: &PcDesc, pc_offset: i32, approximate: bool) -> bool {
+        if !approximate {
+            pc.pc_offset() == pc_offset
+        } else {
+            // Do not look before the sentinel (caller guarantees
+            // pc_offset > PcDesc::lower_offset_limit).
+            pc_offset <= pc.pc_offset()
+        }
+    }
+
+    pub fn find_pc_desc(&self, pc_offset: i32, approximate: bool) -> Option<PcDesc> {
+        // Step one: most recently added value.
+        if let Some(res) = self.entries[0] {
+            if approximate && Self::match_desc(&res, pc_offset, approximate) {
+                return Some(res);
+            }
+        }
+        // Step two: the rest of the LRU cache.
+        for entry in self.entries.iter().skip(1) {
+            match entry {
+                Some(res) => {
+                    if Self::match_desc(res, pc_offset, approximate) {
+                        return Some(*res);
+                    }
+                }
+                None => break,
+            }
+        }
+        None
+    }
+
+    pub fn add_pc_desc(&mut self, mut pc_desc: PcDesc) {
+        // Shift the cache, pushing pc_desc to the front.
+        for i in 0..Self::CACHE_SIZE {
+            let next = self.entries[i];
+            self.entries[i] = Some(pc_desc);
+            if let Some(n) = next {
+                pc_desc = n;
+            }
+        }
+    }
+
+    pub fn last_pc_desc(&self) -> Option<PcDesc> {
+        self.entries[0]
+    }
+}
+
+/// Container over a sorted PcDesc array with a leading sentinel
+/// (PcDescContainer analogue).  `descs` must be sorted by pc_offset and
+/// contain the sentinel (pc_offset == PcDesc::lower_offset_limit) at
+/// index 0 and the upper sentinel at the end.
+pub struct PcDescContainer {
+    cache: PcDescCache,
+}
+
+impl PcDescContainer {
+    pub fn new(descs: &[PcDesc]) -> Self {
+        let mut c = Self {
+            cache: PcDescCache::new(),
+        };
+        if let Some(first) = descs.first() {
+            c.cache.init_to(*first);
+        }
+        c
+    }
+
+    /// Exact-match lookup: returns the index into `descs`.
+    pub fn find_pc_desc(
+        &mut self,
+        descs: &[PcDesc],
+        pc_offset: i32,
+        approximate: bool,
+    ) -> Option<usize> {
+        if descs.is_empty() {
+            return None;
+        }
+        if pc_offset < PcDesc::LOWER_OFFSET_LIMIT
+            || pc_offset as u64 > PcDesc::UPPER_OFFSET_LIMIT as u64
+        {
+            return None;
+        }
+
+        if let Some(cached) = self.cache.find_pc_desc(pc_offset, approximate) {
+            if let Some(idx) = descs.iter().position(|d| {
+                d.pc_offset() == cached.pc_offset()
+                    && d.scope_decode_offset() == cached.scope_decode_offset()
+                    && d.obj_decode_offset() == cached.obj_decode_offset()
+            }) {
+                return Some(idx);
+            }
+        }
+
+        self.linear_or_quasi_search(descs, pc_offset, approximate)
+    }
+
+    /// Quasi-linear search ported from
+    /// PcDescContainer::find_pc_desc_internal: giant steps of
+    /// 4096 -> 256 -> 16 -> 1 then a linear pass (~16 elements).
+    fn quasi_search(&mut self, descs: &[PcDesc], pc_offset: i32, approximate: bool) -> Option<usize> {
+        if descs.len() < 2 {
+            return None;
+        }
+        // lower = index 0 (sentinel, pc_offset < target), upper = len-1
+        // (final sentinel, pc_offset >= target).
+        let mut lower = 0usize;
+        let mut upper = descs.len() - 1;
+        if lower >= upper {
+            return None;
+        }
+
+        // Use the last successful return as a split point.
+        if let Some(mid_desc) = self.cache.last_pc_desc() {
+            if let Some(mid) = descs.iter().position(|d| {
+                d.pc_offset() == mid_desc.pc_offset()
+                    && d.scope_decode_offset() == mid_desc.scope_decode_offset()
+            }) {
+                if mid_desc.pc_offset() < pc_offset {
+                    lower = mid;
+                } else {
+                    upper = mid;
+                }
+            }
+        }
+
+        // Giant steps: 4096, 256, 16, 1 (LOG2_RADIX = 4).
+        let mut step = 1usize << (4 * 3);
+        while step > 1 {
+            while lower + step < upper {
+                let mid = lower + step;
+                if descs[mid].pc_offset() < pc_offset {
+                    lower = mid;
+                } else {
+                    upper = mid;
+                    break;
+                }
+            }
+            step >>= 4;
+        }
+
+        // Sneak up linearly.
+        loop {
+            let mid = lower + 1;
+            if mid >= upper {
+                break;
+            }
+            if descs[mid].pc_offset() < pc_offset {
+                lower = mid;
+            } else {
+                upper = mid;
+                break;
+            }
+        }
+
+        // `upper` is now the first desc with pc_offset >= target.
+        let cand = upper;
+        if cand >= descs.len() {
+            return None;
+        }
+        let d = &descs[cand];
+        let ok = if approximate {
+            // approximate: pc_offset <= d.pc_offset() && previous < pc_offset
+            d.pc_offset() >= pc_offset
+                && cand > 0
+                && descs[cand - 1].pc_offset() < pc_offset
+        } else {
+            d.pc_offset() == pc_offset
+        };
+        if ok {
+            self.cache.add_pc_desc(*d);
+            Some(cand)
+        } else {
+            None
+        }
+    }
+
+    fn linear_or_quasi_search(
+        &mut self,
+        descs: &[PcDesc],
+        pc_offset: i32,
+        approximate: bool,
+    ) -> Option<usize> {
+        // For small arrays a plain binary search is equivalent and cheap.
+        if descs.len() <= 32 {
+            let idx = descs.partition_point(|d| d.pc_offset() < pc_offset);
+            if idx >= descs.len() {
+                return None;
+            }
+            let d = &descs[idx];
+            let ok = if approximate {
+                d.pc_offset() >= pc_offset
+                    && idx > 0
+                    && descs[idx - 1].pc_offset() < pc_offset
+            } else {
+                d.pc_offset() == pc_offset
+            };
+            if ok {
+                return Some(idx);
+            }
+            return None;
+        }
+        self.quasi_search(descs, pc_offset, approximate)
+    }
+}
+
+impl Default for PcDescCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}

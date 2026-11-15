@@ -213,6 +213,42 @@ fn descriptor_object<'a>(loader: &ClassLoader<'a>, value: Value<'a>) -> io::Resu
     }
 }
 
+/// Standard-stream handles produced by `FileDescriptor.getHandle`:
+/// 1 = stdin, 2 = stdout, 3 = stderr. These never enter the
+/// `nioFileNatives` handle table, so stream natives must route them
+/// to the process' real standard handles.
+fn is_std_handle(handle: u64) -> bool {
+    (1..=3).contains(&handle)
+}
+
+fn std_write(handle: u64, buf: &[u8]) -> io::Result<()> {
+    use std::io::Write;
+    if std::env::var_os("JVM25_TRACE_STD").is_some() {
+        eprintln!("[std_write] handle={handle} len={}", buf.len());
+    }
+    match handle {
+        2 => {
+            let mut out = io::stdout().lock();
+            out.write_all(buf)?;
+            out.flush()
+        }
+        3 => {
+            let mut err = io::stderr().lock();
+            err.write_all(buf)?;
+            err.flush()
+        }
+        _ => Ok(()),
+    }
+}
+
+fn std_read(handle: u64, buf: &mut [u8]) -> io::Result<usize> {
+    use std::io::Read;
+    match handle {
+        1 => io::stdin().lock().read(buf),
+        _ => Ok(0),
+    }
+}
+
 /// Reads the opaque stream handle stored in a `FileDescriptor.handle`
 /// field. Returns 0 for standard streams / unset descriptors.
 fn stream_handle<'a>(loader: &ClassLoader<'a>, value: Value<'a>) -> io::Result<u64> {
@@ -635,6 +671,11 @@ pub(crate) fn invoke<'a>(
             if handle == 0 {
                 return Err(invalid("Stream is not open"));
             }
+            if is_std_handle(handle) {
+                let mut byte = [0u8; 1];
+                let n = std_read(handle, &mut byte)?;
+                return Ok(Some(Value::Int(if n == 0 { -1 } else { i32::from(byte[0]) })));
+            }
             let mut byte = [0u8; 1];
             let count = nioFileNatives::with_file_seekable(handle, |file, pos, seekable| {
                 if seekable {
@@ -670,6 +711,14 @@ pub(crate) fn invoke<'a>(
                 ));
             }
             let mut buf = vec![0u8; len as usize];
+            if is_std_handle(handle) {
+                let n = std_read(handle, &mut buf)?;
+                buf.truncate(n);
+                for (index, &byte) in buf.iter().enumerate() {
+                    bytes[offset as usize + index] = byte as i8;
+                }
+                return Ok(Some(Value::Int(if n == 0 { -1 } else { n as i32 })));
+            }
             if std::env::var_os("JVM25_TRACE_FREAD").is_some() {
                 let path = nioFileNatives::entry_path(handle)
                     .unwrap_or_else(|| "?".to_string());
@@ -720,6 +769,9 @@ pub(crate) fn invoke<'a>(
                 Value::Long(delta) => delta,
                 _ => return Err(invalid("Invalid skip distance")),
             };
+            if is_std_handle(handle) {
+                return Ok(Some(Value::Long(0)));
+            }
             let pos = nioFileNatives::with_file(handle, |file, pos| {
                 let target = (*pos as i64 + delta).max(0) as u64;
                 file.seek(SeekFrom::Start(target))?;
@@ -767,6 +819,9 @@ pub(crate) fn invoke<'a>(
             if handle == 0 {
                 return Err(invalid("Stream is not open"));
             }
+            if is_std_handle(handle) {
+                return Ok(Some(Value::Int(0)));
+            }
             let available = nioFileNatives::with_file(handle, |file, pos| {
                 let len = file.metadata().map_err(io_error)?.len();
                 Ok(len.saturating_sub(*pos).min(i32::MAX as u64) as i32)
@@ -784,6 +839,10 @@ pub(crate) fn invoke<'a>(
             };
             let append = name == b"write"
                 && matches!(arguments.get(2).copied(), Some(Value::Int(flag)) if flag != 0);
+            if is_std_handle(handle) {
+                std_write(handle, &[byte])?;
+                return Ok(Some(Value::Null));
+            }
             nioFileNatives::with_file_seekable(handle, |file, pos, seekable| {
                 if append {
                     let len = file.metadata().map_err(io_error)?.len();
@@ -825,6 +884,10 @@ pub(crate) fn invoke<'a>(
                 .iter()
                 .map(|&b| b as u8)
                 .collect();
+            if is_std_handle(handle) {
+                std_write(handle, &buf)?;
+                return Ok(Some(Value::Null));
+            }
             nioFileNatives::with_file_seekable(handle, |file, pos, seekable| {
                 if append {
                     let end = file.metadata().map_err(io_error)?.len();
@@ -874,7 +937,11 @@ pub(crate) fn invoke_static<'a>(
         (b"getAppend", b"(I)Z") => Value::Int(0),
         (b"getHandle", b"(I)J") => {
             match arg(0) {
-                Value::Int(fd) => Value::Long(i64::from(fd)),
+                // Standard descriptors map to 1/2/3 (fd + 1) so that
+                // `FileDescriptor.handle` is nonzero for stdin and stays
+                // clear of the `nioFileNatives` handle table (0x1000+).
+                Value::Int(fd) if (0..=2).contains(&fd) => Value::Long(i64::from(fd) + 1),
+                Value::Int(_) => Value::Long(-1),
                 _ => Value::Long(-1),
             }
         }

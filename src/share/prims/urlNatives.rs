@@ -317,13 +317,26 @@ fn path_to_file_url(path: &Path) -> String {
     let mut url = text.replace('\\', "/");
     if url.starts_with("//") {
         // UNC path -> file://server/share
-        return format!("file:{url}");
+        return format!("file:{}", encodeUrlPath(&url));
     }
     if !url.starts_with('/') {
         // "C:/..." -> "/C:/..."
         url.insert(0, '/');
     }
-    format!("file:{url}")
+    format!("file:{}", encodeUrlPath(&url))
+}
+
+fn encodeUrlPath(path: &str) -> String {
+    let mut encoded = String::with_capacity(path.len());
+    for byte in path.bytes() {
+        if byte.is_ascii_alphanumeric() || b"/:-._~".contains(&byte) {
+            encoded.push(char::from(byte));
+        } else {
+            use std::fmt::Write;
+            let _ = write!(&mut encoded, "%{byte:02X}");
+        }
+    }
+    encoded
 }
 
 /// Splits a `jar:` URL file part ("file:/x.jar!/entry") into
@@ -451,46 +464,26 @@ fn byte_array_input_stream<'a>(
 // Resource enumeration (ClassLoader.getResources)
 // ---------------------------------------------------------------------------
 
-/// Extracts the resource name from a jimage path "/module/rest/of/path".
-fn jimage_resource_name(path: &str) -> Option<String> {
-    let rest = path.strip_prefix('/')?;
-    let (_, name) = rest.split_once('/')?;
-    Some(name.to_owned())
-}
-
 /// Builds the URL spec strings for every classpath/boot resource named `name`,
 /// in loader delegation order (boot image first, then classpath sources).
 fn resource_specs<'a>(loader: &ClassLoader<'a>, name: &str) -> io::Result<Vec<String>> {
     let mut specs = Vec::new();
     if let Some(image) = &loader.bootImage {
         let image = image.borrow();
-        let mut matches: Vec<String> = image
-            .resource_paths()
-            .filter(|path| jimage_resource_name(path).as_deref() == Some(name))
-            .map(str::to_owned)
-            .collect();
-        matches.sort_by(|a, b| {
-            let a_base = a.starts_with("/java.base/");
-            let b_base = b.starts_with("/java.base/");
-            b_base.cmp(&a_base).then_with(|| a.cmp(b))
-        });
-        specs.extend(matches.into_iter().map(|path| format!("jrt:{path}")));
+        specs.extend(image.matchingResources(name).map(|path| format!("jrt:{path}")));
     }
     let mut sources = loader.sources.borrow_mut();
     for source in sources.iter_mut() {
         match source {
             ClassSource::Jar { archive: zip, path } => {
-                for index in 0..zip.len() {
-                    if let Ok(entry) = zip.by_index(index)
-                        && entry.name().ok().is_some_and(|entry| entry == name)
-                    {
-                        specs.push(format!("jar:{}!/{name}", path_to_file_url(path)));
-                    }
+                if zip.by_name(name).is_ok() {
+                    specs.push(format!("jar:{}!/{}", path_to_file_url(path), encodeUrlPath(name)));
                 }
             }
             ClassSource::Directory(dir) => {
-                if dir.join(name).is_file() {
-                    specs.push(format!("{}/{name}", path_to_file_url(dir)));
+                let file = dir.join(name);
+                if file.is_file() {
+                    specs.push(path_to_file_url(&file));
                 }
             }
         }
@@ -571,6 +564,9 @@ pub(crate) fn get_resources<'a>(
         .ok_or_else(|| invalid("Invalid resource name"))?
         .into_owned();
     let specs = resource_specs(loader, &name)?;
+    if std::env::var_os("JVM25_TRACE_URL").is_some() {
+        eprintln!("[getResources] name={name} specs={}", specs.len());
+    }
 
     let url_klass = loader.load(b"java/net/URL")?;
     let _ = bytecodeInterpreter::initialize(loader, &url_klass, &mut sink(), 0);
@@ -646,6 +642,25 @@ pub(crate) fn invoke_instance<'a>(
 ) -> io::Result<Option<Option<Value<'a>>>> {
     match (owner, name, descriptor) {
         (b"java/lang/ClassLoader", b"getResources", b"(Ljava/lang/String;)Ljava/util/Enumeration;") => {
+            // Only intercept for the VM's own application/system loader,
+            // which is backed by the flat class store (jimage + classpath
+            // sources). Custom Java loaders (URLClassLoader & friends) must
+            // run their real `getResources` so their `findResources`/
+            // `URLClassPath` can supply jar resources — the symbolic owner
+            // is `java/lang/ClassLoader` for every subclass call, so the
+            // receiver must be checked explicitly.
+            let receiver = arguments.first().copied().unwrap_or(Value::Null);
+            let is_vm_loader = match receiver {
+                Value::Object(handle) => {
+                    let system = loader.systemClassLoaderObject().unwrap_or(usize::MAX);
+                    let registered = *loader.class_loader_object_handle().borrow();
+                    handle == system || Some(handle) == registered
+                }
+                _ => false,
+            };
+            if !is_vm_loader {
+                return Ok(None);
+            }
             get_resources(loader, arguments).map(|result| result.map(Some))
         }
         (b"java/net/URL", b"openConnection", b"()Ljava/net/URLConnection;")

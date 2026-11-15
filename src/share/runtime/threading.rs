@@ -129,10 +129,9 @@ pub fn debug_java_tid(tid: u64) {
 /// Spawns the watchdog thread once; it dumps every Java thread's last
 /// published frame/native state every few seconds.
 pub fn ensure_watchdog() {
-    if std::env::var_os("JVM25_DUMP").is_none() {
+    if std::env::var_os("JVM25_DUMP").is_none() || WATCHDOG.set(()).is_err() {
         return;
     }
-    let _ = WATCHDOG.set(());
     let _ = std::thread::Builder::new()
         .name("jvm-watchdog".to_string())
         .stack_size(1024 * 1024)
@@ -419,10 +418,10 @@ fn is_infra_thread(loader: &ClassLoader<'_>, handle: usize) -> bool {
         b"java/lang/management/NotificationThread",
         b"jdk/internal/misc/InnocuousThread",
         b"jdk/internal/misc/InnocuousForkJoinWorkerThread",
+        // Additional JDK infrastructure threads that loop forever:
         b"java/lang/ref/Reference$ReferenceHandler",
         b"java/lang/ref/Finalizer$FinalizerThread",
-        b"java/lang/ref/Cleaner$CleanerThread",
-        b"java/lang/ref/Finalizer$Cleaner",
+        b"java/lang/Thread$ThreadGroup",
     ];
     let objects = loader.borrow_objects();
     let Some(object) = objects.get(handle) else {

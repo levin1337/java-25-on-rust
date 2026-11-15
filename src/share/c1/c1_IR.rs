@@ -66,6 +66,8 @@ pub struct ControlFlowGraph {
     pub blocks: Vec<BasicBlock>,
     pub entry_block: usize,
     pub osr_entry_block: Option<usize>,
+    pub max_locals: usize,
+    pub max_stack_entries: usize,
 }
 
 impl ControlFlowGraph {
@@ -74,6 +76,8 @@ impl ControlFlowGraph {
             blocks: Vec::new(),
             entry_block: 0,
             osr_entry_block: None,
+            max_locals: 0,
+            max_stack_entries: 0,
         }
     }
 
@@ -224,24 +228,12 @@ impl ControlFlowGraph {
             block.begin.successors = block.successors.clone();
 
             for instr in &mut block.instructions {
-                if let Some(old_target) = match instr {
-                    HirInstruction::Goto(t) => Some(*t),
-                    _ => None,
-                } {
-                    if let Some(new_target) = new_id.get(old_target).copied().flatten() {
-                        *instr = HirInstruction::Goto(new_target);
-                    }
-                } else if let HirInstruction::If {
-                    true_block,
-                    false_block,
-                    ..
-                } = instr
-                {
-                    if let Some(nt) = new_id.get(*true_block).copied().flatten() {
-                        *true_block = nt;
-                    }
-                    if let Some(nf) = new_id.get(*false_block).copied().flatten() {
-                        *false_block = nf;
+                if instr.is_block_end() {
+                    let old_sux = instr.successors();
+                    for old_target in old_sux {
+                        if let Some(new_target) = new_id.get(old_target).copied().flatten() {
+                            instr.substitute_successor(old_target, new_target);
+                        }
                     }
                 }
             }

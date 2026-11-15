@@ -713,7 +713,11 @@ pub fn encodeModifiedUtf8(text: &str) -> Vec<u8> {
     super::symbolTable::unicode_to_modified_utf8(&units)
 }
 
-pub fn decodeString(mut bytes: &[u8]) -> std::io::Result<String> {
+pub fn decodeString(bytes: &[u8]) -> std::io::Result<String> {
+    decodeUtf16Units(bytes).map(|units| String::from_utf16_lossy(&units))
+}
+
+pub(crate) fn decodeUtf16Units(mut bytes: &[u8]) -> std::io::Result<Vec<u16>> {
     let mut units = Vec::with_capacity(bytes.len());
     while let Some((&first, rest)) = bytes.split_first() {
         let invalid = || std::io::Error::other("Invalid modified UTF-8");
@@ -737,5 +741,5 @@ pub fn decodeString(mut bytes: &[u8]) -> std::io::Result<String> {
         units.push(unit);
         bytes = remaining;
     }
-    Ok(String::from_utf16_lossy(&units))
+    Ok(units)
 }

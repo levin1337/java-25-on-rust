@@ -27,6 +27,7 @@ use crate::share::oops::instanceOop::InstanceOop;
 use crate::share::oops::objArrayOop::ObjArrayOop;
 use crate::share::oops::oop::Oop;
 use crate::share::runtime::shareCell::ShareRef;
+use crate::share::oops::typeArrayOop::TypeArrayOop;
 use parking_lot::{Condvar, Mutex};
 use std::collections::HashSet;
 use std::io;
@@ -113,6 +114,198 @@ fn drain<'a>(
                 }
             }
             Handle::TypeArray(_) => {}
+        }
+    }
+}
+
+/// ParallelGC marking: `workers` OS threads share one worklist
+/// (LIFO stack under a mutex, HotSpot `ParallelTaskTerminator`-style
+/// termination protocol). A shared claimed-set deduplicates handles so
+/// each object is scanned exactly once; `busy` counts workers holding a
+/// popped handle whose children are not yet pushed, which is what lets
+/// idle workers distinguish "empty for now" from "done".
+fn drain_parallel<'a>(
+    objects: &[InstanceOop<'a>],
+    obj_arrays: &[ObjArrayOop<'a>],
+    seeds: Vec<Handle>,
+    workers: usize,
+) -> Marks {
+    let worklist = Mutex::new(seeds);
+    let claimed = Mutex::new(HashSet::new());
+    let busy = AtomicUsize::new(0);
+    let cv = Condvar::new();
+    let workers = workers.max(1);
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| loop {
+                let handle = {
+                    let mut list = worklist.lock();
+                    loop {
+                        if let Some(handle) = list.pop() {
+                            busy.fetch_add(1, Ordering::SeqCst);
+                            break Some(handle);
+                        }
+                        if busy.load(Ordering::SeqCst) == 0 {
+                            break None;
+                        }
+                        cv.wait(&mut list);
+                    }
+                };
+                let Some(handle) = handle else {
+                    return;
+                };
+                let is_new = claimed.lock().insert(handle);
+                if is_new {
+                    let mut children = Vec::new();
+                    match handle {
+                        Handle::Object(index) => {
+                            if let Some(object) = objects.get(index) {
+                                let referent_slot = reference_referent_slot(object);
+                                for (field_index, value) in
+                                    object.fields.iter().enumerate()
+                                {
+                                    if Some(field_index) == referent_slot {
+                                        continue;
+                                    }
+                                    if let Some(child) = Handle::of(value) {
+                                        children.push(child);
+                                    }
+                                }
+                            }
+                        }
+                        Handle::ObjArray(index) => {
+                            if let Some(array) = obj_arrays.get(index) {
+                                for value in &array.elements {
+                                    if let Some(child) = Handle::of(value) {
+                                        children.push(child);
+                                    }
+                                }
+                            }
+                        }
+                        Handle::TypeArray(_) => {}
+                    }
+                    worklist.lock().extend(children);
+                }
+                busy.fetch_sub(1, Ordering::SeqCst);
+                cv.notify_all();
+            });
+        }
+    });
+    let mut marks = Marks::default();
+    for handle in claimed.into_inner() {
+        marks.insert(handle);
+    }
+    marks
+}
+
+/// Sweeps one contiguous range-partition of an arena in parallel.
+/// Each worker owns a disjoint `&mut` chunk of `items`/`live`, clears
+/// dead slots through `clear` and returns the freed indices; results
+/// are concatenated in chunk order.
+fn sweep_space<T: Send>(
+    items: &mut [T],
+    live: &mut [bool],
+    marked: &HashSet<usize>,
+    workers: usize,
+    clear: fn(&mut T),
+) -> Vec<usize> {
+    let len = items.len();
+    if len == 0 {
+        return Vec::new();
+    }
+    let parts = workers.clamp(1, len);
+    let chunk = len.div_ceil(parts);
+    let mut chunks: Vec<(usize, &mut [T], &mut [bool])> = Vec::new();
+    let mut base = 0;
+    {
+        let mut items_rest = items;
+        let mut live_rest = live;
+        while !items_rest.is_empty() {
+            let take = chunk.min(items_rest.len());
+            let (item_head, item_tail) = items_rest.split_at_mut(take);
+            let (live_head, live_tail) = live_rest.split_at_mut(take);
+            chunks.push((base, item_head, live_head));
+            items_rest = item_tail;
+            live_rest = live_tail;
+            base += take;
+        }
+    }
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = chunks
+            .into_iter()
+            .map(|(base, items, live)| {
+                scope.spawn(move || {
+                    let mut freed = Vec::new();
+                    for (offset, (item, was_live)) in
+                        items.iter_mut().zip(live.iter_mut()).enumerate()
+                    {
+                        if *was_live && !marked.contains(&(base + offset)) {
+                            *was_live = false;
+                            clear(item);
+                            freed.push(base + offset);
+                        }
+                    }
+                    freed
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|handle| handle.join().unwrap_or_default())
+            .collect()
+    })
+}
+
+/// ParallelGC sweep phase: each of the three arenas is range-partitioned
+/// across `workers` scoped threads. Arenas that cannot be exclusively
+/// borrowed are skipped for this cycle, same as the serial path.
+fn sweep_parallel(loader: &ClassLoader<'_>, marks: &Marks, workers: usize) {
+    if let (Some(mut objects), Some(mut live)) = (
+        loader.objects.try_borrow_mut(),
+        loader.objects_live.try_borrow_mut(),
+    ) {
+        live.resize(objects.len(), true);
+        if let Some(mut free) = loader.free_objects_handle().try_borrow_mut() {
+            let freed = sweep_space(
+                objects.as_mut_slice(),
+                live.as_mut_slice(),
+                &marks.objects,
+                workers,
+                |object: &mut InstanceOop<'_>| object.fields = Vec::new(),
+            );
+            free.extend(freed);
+        }
+    }
+    if let (Some(mut arrays), Some(mut live)) = (
+        loader.arrays.try_borrow_mut(),
+        loader.arrays_live.try_borrow_mut(),
+    ) {
+        live.resize(arrays.len(), true);
+        if let Some(mut free) = loader.free_type_arrays_handle().try_borrow_mut() {
+            let freed = sweep_space(
+                arrays.as_mut_slice(),
+                live.as_mut_slice(),
+                &marks.type_arrays,
+                workers,
+                |array: &mut TypeArrayOop| *array = TypeArrayOop::Byte(Vec::new()),
+            );
+            free.extend(freed);
+        }
+    }
+    if let (Some(mut arrays), Some(mut live)) = (
+        loader.obj_arrays.try_borrow_mut(),
+        loader.obj_arrays_live.try_borrow_mut(),
+    ) {
+        live.resize(arrays.len(), true);
+        if let Some(mut free) = loader.free_obj_arrays_handle().try_borrow_mut() {
+            let freed = sweep_space(
+                arrays.as_mut_slice(),
+                live.as_mut_slice(),
+                &marks.obj_arrays,
+                workers,
+                |array: &mut ObjArrayOop<'_>| array.elements = Vec::new(),
+            );
+            free.extend(freed);
         }
     }
 }
@@ -292,28 +485,109 @@ pub fn thread_finished() {
     GC_CV.notify_all();
 }
 
+/// GC execution engine backing the safepoint mark-sweep cycle.
+/// Selected once per process by `gc::shared::gcEngine` from the
+/// `-XX:+Use*GC` flags (or `JVM25_GC` for tests).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeapGcMode {
+    /// Single-threaded mark + sweep. This is also the fallback engine
+    /// for the region/concurrent collectors (G1, ZGC, Shenandoah) whose
+    /// remembered sets and barriers live in `share::gc` but are not yet
+    /// wired into the arena heap.
+    SerialMarkSweep,
+    /// Work-stealing parallel mark + range-partitioned parallel sweep
+    /// (ParallelGC semantics).
+    ParallelMarkSweep,
+    /// EpsilonGC semantics: allocation only, `collect` is a no-op.
+    NoCollect,
+}
+
+fn heap_gc_mode() -> HeapGcMode {
+    crate::share::gc::shared::gcEngine::heap_gc_mode()
+}
+
+fn gc_workers(mode: HeapGcMode) -> usize {
+    match mode {
+        HeapGcMode::ParallelMarkSweep => std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4),
+        _ => 1,
+    }
+}
+
+fn arena_total<'a>(loader: &ClassLoader<'a>) -> usize {
+    let objects = loader.objects.try_borrow();
+    let arrays = loader.arrays.try_borrow();
+    let obj_arrays = loader.obj_arrays.try_borrow();
+    match (objects, arrays, obj_arrays) {
+        (Some(objects), Some(arrays), Some(obj_arrays)) => {
+            objects.len() + arrays.len() + obj_arrays.len()
+        }
+        _ => 0,
+    }
+}
+
 /// Runs a full mark-sweep collection over the loader's object arenas.
 ///
 /// The calling thread becomes the collector: it marks the safepoint
 /// pending, parks itself like every other Java thread, waits until all
 /// registered threads are quiesced or blocked, sweeps, then releases
-/// everyone.
+/// everyone. Collection only runs once the arenas have grown by
+/// `SWEEP_THRESHOLD` slots since the last completed sweep.
 pub fn collect<'a>(loader: &ClassLoader<'a>) -> io::Result<()> {
-    let total = {
-        let objects = loader.objects.try_borrow();
-        let arrays = loader.arrays.try_borrow();
-        let obj_arrays = loader.obj_arrays.try_borrow();
-        match (objects, arrays, obj_arrays) {
-            (Some(objects), Some(arrays), Some(obj_arrays)) => {
-                objects.len() + arrays.len() + obj_arrays.len()
-            }
-            _ => return Ok(()),
-        }
-    };
+    let mode = heap_gc_mode();
+    if mode == HeapGcMode::NoCollect {
+        return Ok(());
+    }
+    let total = arena_total(loader);
+    if total == 0 {
+        return Ok(());
+    }
     let last = LAST_SWEEP_TOTAL.load(Ordering::Relaxed);
     if total.saturating_sub(last) < SWEEP_THRESHOLD {
         return Ok(());
     }
+    collect_cycle(loader, mode, total, gc_workers(mode))
+}
+
+/// Forced collection bypassing the growth threshold (System.gc,
+/// WhiteBox, explicit `CollectedHeap::collect` calls).
+pub fn collect_now<'a>(loader: &ClassLoader<'a>) -> io::Result<()> {
+    let mode = heap_gc_mode();
+    if mode == HeapGcMode::NoCollect {
+        return Ok(());
+    }
+    collect_cycle(loader, mode, arena_total(loader), gc_workers(mode))
+}
+
+/// Forced collection with an explicit engine, used by the collector
+/// objects in `share::gc` (SerialGC / ParallelGC wrappers).
+pub fn collect_with_mode<'a>(loader: &ClassLoader<'a>, mode: HeapGcMode) -> io::Result<()> {
+    if mode == HeapGcMode::NoCollect {
+        return Ok(());
+    }
+    collect_cycle(loader, mode, arena_total(loader), gc_workers(mode))
+}
+
+/// Forced collection with an explicit engine and worker count, used by
+/// `ParallelCollectedHeap` which sizes its thread team itself.
+pub fn collect_with_workers<'a>(
+    loader: &ClassLoader<'a>,
+    mode: HeapGcMode,
+    workers: usize,
+) -> io::Result<()> {
+    if mode == HeapGcMode::NoCollect {
+        return Ok(());
+    }
+    collect_cycle(loader, mode, arena_total(loader), workers.max(1))
+}
+
+fn collect_cycle<'a>(
+    loader: &ClassLoader<'a>,
+    _mode: HeapGcMode,
+    total: usize,
+    workers: usize,
+) -> io::Result<()> {
     let id = std::thread::current().id();
     {
         let mut state = GC_STATE.lock();
@@ -362,7 +636,7 @@ pub fn collect<'a>(loader: &ClassLoader<'a>) -> io::Result<()> {
             }
             roots
         };
-        let _ = collect_mark_sweep(loader, &frame_roots);
+        let _ = collect_mark_sweep(loader, &frame_roots, workers);
         let mut state = GC_STATE.lock();
         state.pending = false;
         state.collector = None;
@@ -379,10 +653,17 @@ pub fn collect<'a>(loader: &ClassLoader<'a>) -> io::Result<()> {
 }
 
 /// Mark phase over all known roots, then sweep dead arena slots.
+/// `workers > 1` selects the ParallelGC engine: work-stealing parallel
+/// marking and range-partitioned parallel sweeping; `workers == 1` is
+/// the SerialGC single-threaded path.
 /// Every arena access uses `try_borrow*`; if a quiesced thread still
 /// holds a borrow across a safepoint the collection is skipped for
 /// this cycle rather than panicking (the arenas simply keep growing).
-fn collect_mark_sweep<'a>(loader: &ClassLoader<'a>, frame_roots: &[Handle]) -> io::Result<()> {
+fn collect_mark_sweep<'a>(
+    loader: &ClassLoader<'a>,
+    frame_roots: &[Handle],
+    workers: usize,
+) -> io::Result<()> {
     let objects = match loader.objects.try_borrow() {
         Some(guard) => guard,
         None => return Ok(()),
@@ -436,7 +717,6 @@ fn collect_mark_sweep<'a>(loader: &ClassLoader<'a>, frame_roots: &[Handle]) -> i
         None => return Ok(()),
     };
 
-    let mut marks = Marks::default();
     let mut worklist = Vec::new();
 
     worklist.extend_from_slice(frame_roots);
@@ -482,7 +762,13 @@ fn collect_mark_sweep<'a>(loader: &ClassLoader<'a>, frame_roots: &[Handle]) -> i
         }
     }
 
-    drain(&objects, &obj_arrays, &mut marks, &mut worklist);
+    let mut marks = if workers > 1 {
+        drain_parallel(objects.as_slice(), obj_arrays.as_slice(), worklist, workers)
+    } else {
+        let mut marks = Marks::default();
+        drain(&objects, &obj_arrays, &mut marks, &mut worklist);
+        marks
+    };
     drop((
         objects,
         obj_arrays,
@@ -504,6 +790,10 @@ fn collect_mark_sweep<'a>(loader: &ClassLoader<'a>, frame_roots: &[Handle]) -> i
     // Sweep: free-list slots are reused by the alloc_* helpers. If any
     // arena is still borrowed (same-thread borrow across the safepoint)
     // that arena is skipped for this cycle.
+    if workers > 1 {
+        sweep_parallel(loader, &marks, workers);
+        return Ok(());
+    }
     if let (Some(mut objects), Some(mut live)) = (
         loader.objects.try_borrow_mut(),
         loader.objects_live.try_borrow_mut(),
@@ -647,10 +937,26 @@ mod tests {
         let handle = loader.alloc_type_array(TypeArrayOop::Byte(vec![1; 1_000_000]));
         // Force a collection directly (bypasses the growth threshold
         // used by the interpreter-driven `collect`).
-        let _ = collect_mark_sweep(&loader, &[]);
+        let _ = collect_mark_sweep(&loader, &[], 1);
         assert_eq!(loader.arrays.borrow()[handle].len(), 0);
         let reused = loader.alloc_type_array(TypeArrayOop::Int(vec![42]));
         assert_eq!(reused, handle);
         assert_eq!(loader.arrays.borrow()[reused].len(), 1);
+    }
+
+    #[test]
+    fn parallelSweepReclaimsUnreachableArrayStorage() {
+        let arena = crate::share::runtime::syncBump::SyncBump::new();
+        let loader = ClassLoader::open(std::path::Path::new("."), &arena).unwrap();
+        let mut handles = Vec::new();
+        for _ in 0..64 {
+            handles.push(loader.alloc_type_array(TypeArrayOop::Byte(vec![7; 4096])));
+        }
+        let _ = collect_mark_sweep(&loader, &[], 8);
+        for &handle in &handles {
+            assert_eq!(loader.arrays.borrow()[handle].len(), 0);
+        }
+        let reused = loader.alloc_type_array(TypeArrayOop::Int(vec![9]));
+        assert!(handles.contains(&reused));
     }
 }

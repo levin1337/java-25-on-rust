@@ -22,6 +22,7 @@ pub struct HeapRegion {
     end: usize,
     region_type: HeapRegionType,
     age: u32,
+    live_bytes: usize,
 }
 
 impl HeapRegion {
@@ -35,6 +36,7 @@ impl HeapRegion {
             end: bottom + size,
             region_type: HeapRegionType::Free,
             age: 0,
+            live_bytes: 0,
         }
     }
 
@@ -126,6 +128,33 @@ impl HeapRegion {
         self.age = age;
     }
 
+    #[inline]
+    pub fn live_bytes(&self) -> usize {
+        self.live_bytes
+    }
+
+    #[inline]
+    pub fn set_live_bytes(&mut self, live_bytes: usize) {
+        self.live_bytes = live_bytes.min(self.used());
+    }
+
+    #[inline]
+    pub fn garbage_bytes(&self) -> usize {
+        self.used().saturating_sub(self.live_bytes)
+    }
+
+    /// G1 collection efficiency: reclaimed bytes per allocated byte of
+    /// the region. Higher is better; regions are evacuated
+    /// garbage-first.
+    #[inline]
+    pub fn collection_efficiency(&self) -> f64 {
+        let used = self.used();
+        if used == 0 {
+            return 0.0;
+        }
+        self.garbage_bytes() as f64 / used as f64
+    }
+
     pub fn allocate(&mut self, size: usize) -> Option<usize> {
         if self.top + size <= self.end {
             let addr = self.top;
@@ -140,5 +169,6 @@ impl HeapRegion {
         self.top = self.bottom;
         self.region_type = HeapRegionType::Free;
         self.age = 0;
+        self.live_bytes = 0;
     }
 }

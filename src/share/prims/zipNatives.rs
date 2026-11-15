@@ -528,6 +528,25 @@ pub(crate) fn statik<'a>(
             }
             Value::Int(crc32c_finalize(value) as i32)
         }
+        (b"java/util/zip/Adler32", b"update", b"(II)I") => {
+            let adler = arg_i64(arguments, 0) as u32;
+            let byte = arg_i64(arguments, 1) as u8;
+            Value::Int(adler32(adler, &[byte]) as i32)
+        }
+        (b"java/util/zip/Adler32", b"updateBytes", b"(I[BII)I") => {
+            let adler = arg_i64(arguments, 0) as u32;
+            let data = collect_input(loader, arg_value(arguments, 1), arg_usize(arguments, 2), arg_usize(arguments, 3))?;
+            Value::Int(adler32(adler, &data) as i32)
+        }
+        (b"java/util/zip/Adler32", b"updateByteBuffer", b"(IJII)I") => {
+            let adler = arg_i64(arguments, 0) as u32;
+            let address = arg_i64(arguments, 1) as u64;
+            let offset = arg_usize(arguments, 2);
+            let length = arg_usize(arguments, 3);
+            let memory = OffHeapMemory::global();
+            let data = memory.read_bytes(address + offset as u64, length)?;
+            Value::Int(adler32(adler, &data) as i32)
+        }
         _ => return Ok(None),
     };
     Ok(Some(result))

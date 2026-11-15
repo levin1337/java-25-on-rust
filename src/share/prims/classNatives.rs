@@ -471,7 +471,14 @@ fn protection_domain_for_origin<'a>(
         ClassOrigin::Directory(path) => path,
     };
     let mut spec = String::from("file:///");
-    spec.push_str(&path.to_string_lossy().replace('\\', "/"));
+    for &byte in path.to_string_lossy().replace('\\', "/").as_bytes() {
+        let ch = byte as char;
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '~' | '/' | ':' | '@') {
+            spec.push(ch);
+        } else {
+            spec.push_str(&format!("%{byte:02X}"));
+        }
+    }
     if matches!(origin, ClassOrigin::Directory(_)) && !spec.ends_with('/') {
         spec.push('/');
     }

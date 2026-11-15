@@ -163,7 +163,10 @@ pub fn install_loader(loader: Arc<ClassLoader<'static>>) {
     let _ = JVM_LOADER.set(loader);
 }
 
-fn jvm_loader() -> Option<Arc<ClassLoader<'static>>> {
+/// Returns the JVM-wide `ClassLoader` installed at bootstrap, if any.
+/// Used by compiler threads and GC engines that run outside a Java call
+/// frame but still need to resolve classes / walk object graphs.
+pub fn jvm_loader() -> Option<Arc<ClassLoader<'static>>> {
     JVM_LOADER.get().cloned()
 }
 

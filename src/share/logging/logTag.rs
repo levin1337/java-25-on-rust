@@ -39,6 +39,26 @@ impl LogTag {
         }
     }
 
+    /// Prefix match for wildcard selectors like "class*" (logSelection.cpp).
+    /// Returns the tag whose name starts with `prefix`, or All for "*".
+    pub fn from_prefix(prefix: &str) -> Option<Self> {
+        let p = prefix.to_ascii_lowercase();
+        if p.is_empty() {
+            return Some(Self::All);
+        }
+        // Exact match first.
+        if let Some(t) = Self::from_str(&p) {
+            return Some(t);
+        }
+        // Otherwise match any tag whose name starts with the prefix.
+        const ALL: &[LogTag] = &[
+            LogTag::Gc, LogTag::Class, LogTag::Load, LogTag::Unload,
+            LogTag::Thread, LogTag::Jit, LogTag::Init, LogTag::Heap,
+            LogTag::Monitor, LogTag::Os, LogTag::Safepoint,
+        ];
+        ALL.iter().copied().find(|t| t.name().starts_with(p.as_str()))
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             Self::All => "all",

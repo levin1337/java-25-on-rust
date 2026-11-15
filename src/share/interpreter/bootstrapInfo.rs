@@ -169,47 +169,71 @@ impl BootstrapInfo {
                         attribute_bytes[cursor + a * 2],
                         attribute_bytes[cursor + a * 2 + 1],
                     ]);
-                    if let Some(c) = constants.get(arg_idx as usize) {
-                        let parsed_arg = match c {
-                            Constant::Integer(v) => BootstrapArg::Int(*v),
-                            Constant::Long(v) => BootstrapArg::Long(*v),
-                            Constant::Float(v) => BootstrapArg::Float(v.to_bits()),
-                            Constant::Double(v) => BootstrapArg::Double(v.to_bits()),
-                            Constant::String(s_idx) => {
-                                let s = match constants.get(*s_idx as usize) {
-                                    Some(Constant::Utf8(bytes)) => {
-                                        String::from_utf8_lossy(bytes).to_string()
-                                    }
-                                    _ => String::new(),
-                                };
-                                BootstrapArg::String(s)
+                    // JVMS §4.7.23: bootstrap argument indices are
+                    // CONSTANT_Integer, CONSTANT_Long, CONSTANT_Float,
+                    // CONSTANT_Double, CONSTANT_String, CONSTANT_Class,
+                    // CONSTANT_MethodType, or CONSTANT_MethodHandle entries.
+                    // Anything else — including index 0, out-of-range
+                    // indices, and indirect constants pointing at non-UTF8
+                    // entries — is a class-file format error.
+                    let c = constants.get(arg_idx as usize).ok_or_else(|| {
+                        Error::other(format!(
+                            "BootstrapMethods argument index {} out of bounds",
+                            arg_idx
+                        ))
+                    })?;
+                    let utf8_arg = |idx: u16| -> io::Result<String> {
+                        match constants.get(idx as usize) {
+                            Some(Constant::Utf8(bytes)) => {
+                                Ok(String::from_utf8_lossy(bytes).to_string())
                             }
-                            Constant::Class(c_idx) => {
-                                let s = match constants.get(*c_idx as usize) {
-                                    Some(Constant::Utf8(bytes)) => {
-                                        String::from_utf8_lossy(bytes).to_string()
-                                    }
-                                    _ => String::new(),
-                                };
-                                BootstrapArg::Klass(s)
-                            }
-                            Constant::MethodType(m_idx) => {
-                                let s = match constants.get(*m_idx as usize) {
-                                    Some(Constant::Utf8(bytes)) => {
-                                        String::from_utf8_lossy(bytes).to_string()
-                                    }
-                                    _ => String::new(),
-                                };
-                                BootstrapArg::MethodType(s)
-                            }
-                            Constant::MethodHandle(kind, idx) => BootstrapArg::MethodHandle {
-                                kind: *kind,
-                                index: *idx,
-                            },
-                            _ => BootstrapArg::String(String::new()),
-                        };
-                        target_args.push(parsed_arg);
-                    }
+                            _ => Err(Error::other(format!(
+                                "BootstrapMethods argument {} does not reference a CONSTANT_Utf8",
+                                arg_idx
+                            ))),
+                        }
+                    };
+                    let parsed_arg = match c {
+                        Constant::Integer(v) => BootstrapArg::Int(*v),
+                        Constant::Long(v) => BootstrapArg::Long(*v),
+                        Constant::Float(v) => BootstrapArg::Float(v.to_bits()),
+                        Constant::Double(v) => BootstrapArg::Double(v.to_bits()),
+                        Constant::String(s_idx) => BootstrapArg::String(utf8_arg(*s_idx)?),
+                        Constant::Class(c_idx) => BootstrapArg::Klass(utf8_arg(*c_idx)?),
+                        Constant::MethodType(m_idx) => {
+                            BootstrapArg::MethodType(utf8_arg(*m_idx)?)
+                        }
+                        Constant::MethodHandle(kind, idx) => BootstrapArg::MethodHandle {
+                            kind: *kind,
+                            index: *idx,
+                        },
+                        other => {
+                            return Err(Error::other(format!(
+                                "BootstrapMethods argument {} has invalid constant tag",
+                                match other {
+                                    Constant::Unusable => "Unusable",
+                                    Constant::FieldRef(..) => "FieldRef",
+                                    Constant::MethodRef(..) => "MethodRef",
+                                    Constant::InterfaceMethodRef(..) => "InterfaceMethodRef",
+                                    Constant::Class(_) => "Class",
+                                    Constant::NameAndType(..) => "NameAndType",
+                                    Constant::Utf8(_) => "Utf8",
+                                    Constant::Integer(_) => "Integer",
+                                    Constant::Float(_) => "Float",
+                                    Constant::Long(_) => "Long",
+                                    Constant::Double(_) => "Double",
+                                    Constant::String(_) => "String",
+                                    Constant::MethodHandle(..) => "MethodHandle",
+                                    Constant::MethodType(_) => "MethodType",
+                                    Constant::Dynamic(..) => "Dynamic",
+                                    Constant::InvokeDynamic(..) => "InvokeDynamic",
+                                    Constant::Module(_) => "Module",
+                                    Constant::Package(_) => "Package",
+                                }
+                            )))
+                        }
+                    };
+                    target_args.push(parsed_arg);
                 }
                 found = true;
                 break;

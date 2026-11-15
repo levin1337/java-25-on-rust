@@ -2110,3 +2110,53 @@ pub(crate) fn mapped_memory_utils<'a>(
         _ => Ok(None),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Positioned I/O and byte-range locks for `sun.nio.ch.Iocp`-based
+// asynchronous file channels (`WindowsAsynchronousFileChannelImpl`).
+// ---------------------------------------------------------------------------
+
+/// Reads up to `buf.len()` bytes at absolute `offset` without touching the
+/// handle's logical position (pread semantics).
+#[cfg(windows)]
+pub(crate) fn file_pread(handle: u64, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
+    use std::os::windows::fs::FileExt;
+    with_file(handle, |file, _pos| file.seek_read(buf, offset))
+}
+
+/// Writes `data` at absolute `offset` without touching the handle's logical
+/// position (pwrite semantics).
+#[cfg(windows)]
+pub(crate) fn file_pwrite(handle: u64, offset: u64, data: &[u8]) -> io::Result<usize> {
+    use std::os::windows::fs::FileExt;
+    with_file(handle, |file, _pos| file.seek_write(data, offset))
+}
+
+#[cfg(not(windows))]
+pub(crate) fn file_pread(handle: u64, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
+    use std::os::unix::fs::FileExt;
+    with_file(handle, |file, _pos| file.read_at(buf, offset))
+}
+
+#[cfg(not(windows))]
+pub(crate) fn file_pwrite(handle: u64, offset: u64, data: &[u8]) -> io::Result<usize> {
+    use std::os::unix::fs::FileExt;
+    with_file(handle, |file, _pos| file.write_at(data, offset))
+}
+
+/// Byte-range lock used by `WindowsAsynchronousFileChannelImpl.lockFile`.
+/// `shared=true` maps to a shared lock, `false` to an exclusive lock.
+/// Returns the `LOCK_*` status code expected by the Java side.
+pub(crate) fn file_lock_range(handle: u64, pos: u64, size: u64, shared: bool) -> io::Result<i32> {
+    with_file(handle, |file, _pos| {
+        #[cfg(windows)]
+        {
+            lock_range(file, pos as i64, size as i64, true, shared)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (file, pos, size, shared);
+            Ok(LOCK_LOCKED)
+        }
+    })
+}

@@ -390,6 +390,11 @@ static GC_STATE: Mutex<GcShared> = Mutex::new(GcShared {
     threads: Vec::new(),
 });
 static GC_CV: Condvar = Condvar::new();
+/// Serializes `#[cfg(test)]` code paths that drive `collect_cycle`:
+/// the pending-GC guard would otherwise let a concurrent test's
+/// collection return early without sweeping, making assertions flaky.
+#[cfg(test)]
+pub(crate) static GC_TEST_SERIAL: Mutex<()> = Mutex::new(());
 /// Arena slot total after the last completed sweep; collections only run
 /// once the arenas have grown by `SWEEP_THRESHOLD` slots.
 static LAST_SWEEP_TOTAL: AtomicUsize = AtomicUsize::new(0);
@@ -932,6 +937,7 @@ mod tests {
 
     #[test]
     fn releasesUnreachableArrayStorageAndReusesSlot() {
+        let _serial = GC_TEST_SERIAL.lock();
         let arena = crate::share::runtime::syncBump::SyncBump::new();
         let loader = ClassLoader::open(std::path::Path::new("."), &arena).unwrap();
         let handle = loader.alloc_type_array(TypeArrayOop::Byte(vec![1; 1_000_000]));
@@ -946,6 +952,7 @@ mod tests {
 
     #[test]
     fn parallelSweepReclaimsUnreachableArrayStorage() {
+        let _serial = GC_TEST_SERIAL.lock();
         let arena = crate::share::runtime::syncBump::SyncBump::new();
         let loader = ClassLoader::open(std::path::Path::new("."), &arena).unwrap();
         let mut handles = Vec::new();

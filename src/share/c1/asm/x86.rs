@@ -1,7 +1,7 @@
 use super::codeBuffer::{CodeBuffer, CodeBufferError};
 use super::register::{Condition as x86Condition, Register, Scale, XMMRegister};
 use crate::share::c1::c1_IR::ControlFlowGraph;
-use crate::share::c1::c1_LIR::{LirBlock, LirKind, LirOperand, LirOp, LirProgram, RuntimeStub};
+use crate::share::c1::c1_LIR::{LirKind, LirOperand, LirOp, LirProgram, RuntimeStub};
 use crate::share::c1::c1_Instruction::{ArrayElemKind, CompareKind, Condition, ConvertKind, ValueKind};
 use crate::share::oops::objLayout::ObjLayoutMode;
 use std::collections::BTreeMap;
@@ -150,20 +150,90 @@ impl<'a> X86Emitter<'a> {
     }
 
     fn emit_params(&mut self) -> Result<(), BackendError> {
-        let regs = [Register::RDI, Register::RSI, Register::RDX, Register::RCX, Register::R8, Register::R9];
+        // Windows x64: argument *position* i selects the register —
+        // xmm0-3 for float/double, rcx/rdx/r8/r9 for everything else —
+        // and positions >= 4 spill to the stack above the 32-byte
+        // shadow space at [rbp+48].  System V keeps separate gp/xmm
+        // counters (rdi/rsi/rdx/rcx/r8/r9 and xmm0-7) with stack args
+        // at [rbp+16] in declaration order.
+        let win64 = self.options.abi == Abi::WindowsX64;
+        let gp_regs: &[Register] = if win64 {
+            &[Register::RCX, Register::RDX, Register::R8, Register::R9]
+        } else {
+            &[Register::RDI, Register::RSI, Register::RDX, Register::RCX, Register::R8, Register::R9]
+        };
+        let stack_base: i32 = if win64 { 48 } else { 16 };
+        let (mut gp_idx, mut xmm_idx, mut stack_idx) = (0usize, 0usize, 0usize);
         for (i, param) in self.options.params.iter().enumerate() {
             let off = self.local_offset(param.local_slot);
-            if i < regs.len() {
-                self.mov_mem_reg(Some(Register::FP), None, Scale::S1, -(off as i32), regs[i], true)?;
+            let is_float = matches!(param.kind, LirKind::Float32 | LirKind::Float64);
+            let is_double = param.kind == LirKind::Float64;
+            if win64 {
+                if i < 4 {
+                    if is_float {
+                        let xmm = XMMRegister::from_encoding(i as u8)
+                            .ok_or(BackendError::InvalidLir)?;
+                        self.sse_store_mem(xmm, Register::FP, -(off as i32), is_double)?;
+                        if param.kind == LirKind::Float32 {
+                            self.zero_slot_upper(off)?;
+                        }
+                    } else {
+                        self.mov_mem_reg(Some(Register::FP), None, Scale::S1, -(off as i32), gp_regs[i], true)?;
+                    }
+                } else {
+                    // Stack-passed argument: raw 8-byte slot, bit pattern
+                    // preserved for both integer and floating-point args.
+                    let stack_off = stack_base + ((i - 4) * 8) as i32;
+                    self.mov_reg_mem(Register::RAX, Some(Register::FP), None, Scale::S1, stack_off, true)?;
+                    self.mov_mem_reg(Some(Register::FP), None, Scale::S1, -(off as i32), Register::RAX, true)?;
+                    if param.kind == LirKind::Float32 {
+                        self.zero_slot_upper(off)?;
+                    }
+                }
             } else {
-                let stack_off = (16 + (i - regs.len()) * 8) as i32;
-                self.mov_reg_mem(Register::RAX, Some(Register::FP), None, Scale::S1, stack_off, true)?;
-                self.mov_mem_reg(Some(Register::FP), None, Scale::S1, -(off as i32), Register::RAX, true)?;
-            }
-            if matches!(param.kind, LirKind::Float32) {
-                self.buf.write_i32(0)?;
+                if is_float {
+                    if xmm_idx < 8 {
+                        let xmm = XMMRegister::from_encoding(xmm_idx as u8)
+                            .ok_or(BackendError::InvalidLir)?;
+                        self.sse_store_mem(xmm, Register::FP, -(off as i32), is_double)?;
+                        if param.kind == LirKind::Float32 {
+                            self.zero_slot_upper(off)?;
+                        }
+                    } else {
+                        let stack_off = stack_base + (stack_idx * 8) as i32;
+                        self.mov_reg_mem(Register::RAX, Some(Register::FP), None, Scale::S1, stack_off, true)?;
+                        self.mov_mem_reg(Some(Register::FP), None, Scale::S1, -(off as i32), Register::RAX, true)?;
+                        if param.kind == LirKind::Float32 {
+                            self.zero_slot_upper(off)?;
+                        }
+                    }
+                    xmm_idx += 1;
+                } else {
+                    if gp_idx < 6 {
+                        self.mov_mem_reg(Some(Register::FP), None, Scale::S1, -(off as i32), gp_regs[gp_idx], true)?;
+                    } else {
+                        let stack_off = stack_base + (stack_idx * 8) as i32;
+                        self.mov_reg_mem(Register::RAX, Some(Register::FP), None, Scale::S1, stack_off, true)?;
+                        self.mov_mem_reg(Some(Register::FP), None, Scale::S1, -(off as i32), Register::RAX, true)?;
+                    }
+                    gp_idx += 1;
+                }
+                if (is_float && xmm_idx > 8) || (!is_float && gp_idx > 6) {
+                    stack_idx += 1;
+                }
             }
         }
+        Ok(())
+    }
+
+    /// Zeroes the upper 4 bytes of an 8-byte frame slot that holds a
+    /// Float32 value (slot layout: low 4 bytes = value, high 4 = pad).
+    fn zero_slot_upper(&mut self, off: usize) -> Result<(), BackendError> {
+        let disp = -(off as i32) + 4;
+        self.emit_rex(false, false, false, false);
+        self.buf.write(&[0xc7, 0x85])?; // mov dword [rbp+disp32], imm32
+        self.buf.write_i32(disp)?;
+        self.buf.write_i32(0)?;
         Ok(())
     }
 
@@ -331,9 +401,11 @@ impl<'a> X86Emitter<'a> {
     fn emit_convert(&mut self, kind: ConvertKind, src: &LirOperand, dst: &LirOperand) -> Result<(), BackendError> {
         let src_kind = src.kind();
         let dst_kind = dst.kind();
-        let to_xmm = matches!(dst_kind, LirKind::Float32 | LirKind::Float64);
-        let from_xmm = matches!(src_kind, LirKind::Float32 | LirKind::Float64);
-        if to_xmm {
+        // The source register file is chosen by the SOURCE kind, not the
+        // destination: float->int conversions (F2I/D2L/...) must load the
+        // operand into xmm0 even though the result goes to rax.
+        let src_is_float = matches!(src_kind, LirKind::Float32 | LirKind::Float64);
+        if src_is_float {
             self.emit_operand_to_xmm(src, XMMRegister::XMM0)?;
         } else {
             self.emit_operand_to_reg(src, Register::RAX)?;
@@ -355,7 +427,6 @@ impl<'a> X86Emitter<'a> {
             ConvertKind::I2C => { self.emit_rex(false, false, false, false); self.buf.write(&[0x0f, 0xb7, 0xc0])?; self.store_gp_result(dst, Register::RAX)?; }
             _ => { self.emit_rex(false, false, false, false); self.buf.write(&[0x0f, 0xbf, 0xc0])?; self.store_gp_result(dst, Register::RAX)?; }
         }
-        let _ = from_xmm;
         Ok(())
     }
 
@@ -370,28 +441,37 @@ impl<'a> X86Emitter<'a> {
                 let jp = self.emit_jcc_local(x86Condition::P)?;
                 let je = self.emit_jcc_local(x86Condition::E)?;
                 let jb = self.emit_jcc_local(x86Condition::B)?;
+                // Fallthrough = above: +1
                 self.mov_reg_imm(Register::RAX, 1, false)?;
-                let jmp_end = self.emit_jmp_local()?;
+                let jmp_above = self.emit_jmp_local()?;
+                // Unordered (NaN): dcmpg -> -1, dcmpl -> +1
                 let nan_pos = self.pos();
                 self.patch_local(jp, nan_pos)?;
                 self.mov_reg_imm(Register::RAX, nan as i32 as u32 as u64, false)?;
-                let jmp_end2 = self.emit_jmp_local()?;
+                let jmp_nan = self.emit_jmp_local()?;
+                // Below (CF=1, strictly less): -1
                 let less_pos = self.pos();
-                self.patch_local(je, less_pos)?;
                 self.patch_local(jb, less_pos)?;
                 self.mov_reg_imm(Register::RAX, (-1i32) as u32 as u64, false)?;
-                let jmp_end3 = self.emit_jmp_local()?;
+                let jmp_less = self.emit_jmp_local()?;
+                // Equal (ZF=1): 0
                 let equal_pos = self.pos();
-                self.patch_local(jmp_end, equal_pos)?;
-                self.patch_local(jmp_end2, equal_pos)?;
-                self.patch_local(jmp_end3, equal_pos)?;
+                self.patch_local(je, equal_pos)?;
                 self.mov_reg_imm(Register::RAX, 0, false)?;
                 let end_pos = self.pos();
-                for d in [jmp_end, jmp_end2, jmp_end3] { self.patch_local(d, end_pos)?; }
+                for d in [jmp_above, jmp_nan, jmp_less] { self.patch_local(d, end_pos)?; }
                 self.store_gp_result(dst, Register::RAX)
             }
             _ => {
                 let wide = matches!(kind, CompareKind::Int64 | CompareKind::Ref);
+                // Zero the setcc target registers BEFORE the compare:
+                // `xor` clobbers flags, so doing it after `cmp` would
+                // destroy the very condition codes setcc reads (this
+                // made every lcmp/fcmp produce 0).
+                self.emit_rex(false, false, false, false);
+                self.buf.write(&[0x45, 0x31, 0xc0])?; // xor r8d, r8d
+                self.emit_rex(false, false, false, false);
+                self.buf.write(&[0x45, 0x31, 0xc9])?; // xor r9d, r9d
                 self.emit_operand_to_reg(lhs, Register::RAX)?;
                 self.emit_operand_to_reg(rhs, Register::RCX)?;
                 self.cmp_rr(Register::RAX, Register::RCX, wide)?;
@@ -408,19 +488,15 @@ impl<'a> X86Emitter<'a> {
     }
 
     fn emit_cmp_to_int(&mut self, wide: bool, dst: &LirOperand) -> Result<(), BackendError> {
-        self.emit_rex(false, false, false, false);
-        self.buf.write(&[0x45, 0x31, 0xc0])?;
-        self.emit_rex(false, false, false, false);
-        self.buf.write(&[0x45, 0x31, 0xc9])?;
-        self.emit_setcc(x86Condition::L, Register::R8, false)?;
-        self.emit_setcc(x86Condition::G, Register::R9, false)?;
-        self.emit_rex(false, false, false, false);
-        self.buf.write(&[0x44, 0x0f, 0xb6, 0xc0])?;
-        self.emit_rex(false, false, false, false);
-        self.buf.write(&[0x44, 0x0f, 0xb6, 0xc9])?;
-        self.mov_reg_imm(Register::RAX, 0, false)?;
-        self.emit_rex(wide, false, false, false);
-        self.buf.write(&[0x44, 0x29, 0xc0])?;
+        // r8/r9 were zeroed before the cmp; setcc writes only their low
+        // bytes so the upper bits are already clear.
+        let _ = wide;
+        self.emit_setcc(x86Condition::L, Register::R8)?;
+        self.emit_setcc(x86Condition::G, Register::R9)?;
+        self.movzx_same(Register::R8)?;
+        self.movzx_same(Register::R9)?;
+        self.mov_reg_reg(Register::RAX, Register::R9, false)?;
+        self.alu_rr(Alu::Sub, Register::RAX, Register::R8, false)?;
         self.store_gp_result(dst, Register::RAX)
     }
 
@@ -532,7 +608,7 @@ impl<'a> X86Emitter<'a> {
             self.buf.write(&[0x48, 0xc1, 0xe2, 0x03])?;
         }
         self.emit_rex(true, false, false, false);
-        self.buf.write(&[0x48, 0x01, 0xd0])?;
+        self.buf.write(&[0x48, 0x01, 0xc2])?;
         self.emit_rex(true, false, false, false);
         self.buf.write(&[0x48, 0x81, 0xc2])?;
         self.buf.write_i32(self.array_base_offset(elem))?;
@@ -572,31 +648,46 @@ impl<'a> X86Emitter<'a> {
 
     fn emit_call(&mut self, dst: Option<&LirOperand>, operands: &[LirOperand], info: &crate::share::c1::c1_Instruction::CallInfo) -> Result<(), BackendError> {
         let target = info.target.ok_or(BackendError::MissingCallTarget)?;
+        let win64 = self.options.abi == Abi::WindowsX64;
         let mut gp = 0usize;
         let mut xmm = 0usize;
+        let mut slot = 0usize;
         let mut stack_args: Vec<(LirOperand, LirKind)> = Vec::new();
-        let gp_regs = [Register::RDI, Register::RSI, Register::RDX, Register::RCX, Register::R8, Register::R9];
+        // Windows x64: four unified argument slots — integer args go to
+        // rcx/rdx/r8/r9, float args to xmm0..3; slot index is shared.
+        // System V: six integer registers + eight xmm registers.
+        let gp_win64 = [Register::RCX, Register::RDX, Register::R8, Register::R9];
+        let gp_sysv = [Register::RDI, Register::RSI, Register::RDX, Register::RCX, Register::R8, Register::R9];
         let xmm_regs = [XMMRegister::XMM0, XMMRegister::XMM1, XMMRegister::XMM2, XMMRegister::XMM3, XMMRegister::XMM4, XMMRegister::XMM5, XMMRegister::XMM6, XMMRegister::XMM7];
         for op in operands {
             let kind = op.kind();
             let is_sse = matches!(kind, LirKind::Float32 | LirKind::Float64);
-            if self.options.abi == Abi::WindowsX64 {
-                let idx = gp.max(xmm);
-                if idx < 4 {
-                    if is_sse { self.emit_operand_to_xmm(op, xmm_regs[xmm])?; xmm += 1; }
-                    else { self.emit_operand_to_reg(op, gp_regs[idx])?; gp += 1; }
+            if win64 {
+                if slot < 4 {
+                    if is_sse {
+                        self.emit_operand_to_xmm(op, xmm_regs[slot])?;
+                    } else {
+                        self.emit_operand_to_reg(op, gp_win64[slot])?;
+                    }
+                    slot += 1;
                 } else {
                     stack_args.push((op.clone(), kind));
                 }
             } else if is_sse {
-                if xmm < xmm_regs.len() { self.emit_operand_to_xmm(op, xmm_regs[xmm])?; xmm += 1; } else { stack_args.push((op.clone(), kind)); }
-            } else if gp < gp_regs.len() {
-                self.emit_operand_to_reg(op, gp_regs[gp])?;
+                if xmm < xmm_regs.len() {
+                    self.emit_operand_to_xmm(op, xmm_regs[xmm])?;
+                    xmm += 1;
+                } else {
+                    stack_args.push((op.clone(), kind));
+                }
+            } else if gp < gp_sysv.len() {
+                self.emit_operand_to_reg(op, gp_sysv[gp])?;
                 gp += 1;
             } else {
                 stack_args.push((op.clone(), kind));
             }
         }
+        let _ = (gp, xmm);
         let stack_size = if stack_args.is_empty() { 0 } else { stack_args.len() * 8 };
         let frame_adj = if self.options.abi == Abi::WindowsX64 { (32 + stack_size).div_ceil(16) * 16 } else { stack_size.div_ceil(16) * 16 };
         if frame_adj > 0 {
@@ -655,14 +746,46 @@ impl<'a> X86Emitter<'a> {
 
     fn emit_call_runtime(&mut self, stub: RuntimeStub, operands: &[LirOperand], dst: Option<&LirOperand>, _bci: usize) -> Result<(), BackendError> {
         let addr = self.options.stubs.get(&stub).copied().ok_or(BackendError::MissingRuntimeStub(stub))?;
-        let regs = [Register::RDI, Register::RSI, Register::RDX, Register::RCX, Register::R8, Register::R9];
-        for (i, op) in operands.iter().take(regs.len()).enumerate() {
-            self.emit_operand_to_reg(op, regs[i])?;
+        // Runtime stubs are real `extern "C"` Rust functions: Windows x64
+        // takes args in rcx/rdx/r8/r9 with the rest on the stack above a
+        // 32-byte shadow space.  System V uses rdi/rsi/rdx/rcx/r8/r9.
+        let win64 = self.options.abi == Abi::WindowsX64;
+        let regs: &[Register] = if win64 {
+            &[Register::RCX, Register::RDX, Register::R8, Register::R9]
+        } else {
+            &[Register::RDI, Register::RSI, Register::RDX, Register::RCX, Register::R8, Register::R9]
+        };
+        let mut stack_ops: Vec<LirOperand> = Vec::new();
+        for (i, op) in operands.iter().enumerate() {
+            if i < regs.len() {
+                self.emit_operand_to_reg(op, regs[i])?;
+            } else {
+                stack_ops.push(op.clone());
+            }
         }
-        if operands.len() > regs.len() {
-            return Err(BackendError::Unsupported("runtime call with stack args".to_string()));
+        let stack_size = stack_ops.len() * 8;
+        let frame_adj = if win64 {
+            (32 + stack_size).div_ceil(16) * 16
+        } else {
+            stack_size.div_ceil(16) * 16
+        };
+        if frame_adj > 0 {
+            self.emit_rex(true, false, false, false);
+            self.buf.write(&[0x48, 0x81, 0xec])?;
+            self.buf.write_i32(frame_adj as i32)?;
+        }
+        let stack_base: i32 = if win64 { 32 } else { 0 };
+        for (i, op) in stack_ops.iter().enumerate() {
+            let off = stack_base + (i * 8) as i32;
+            self.emit_operand_to_reg(op, Register::RAX)?;
+            self.mov_mem_reg(Some(Register::SP), None, Scale::S1, off, Register::RAX, true)?;
         }
         self.emit_abs_call(addr)?;
+        if frame_adj > 0 {
+            self.emit_rex(true, false, false, false);
+            self.buf.write(&[0x48, 0x81, 0xc4])?;
+            self.buf.write_i32(frame_adj as i32)?;
+        }
         self.pc_descs.push(PcDescEntry { pc_offset: self.pos(), bci: 0, is_safepoint: stub == RuntimeStub::SafepointPoll });
         if let Some(dst) = dst {
             self.store_gp_result(dst, Register::RAX)?;
@@ -707,6 +830,9 @@ impl<'a> X86Emitter<'a> {
             self.buf.write(&[0x2d])?;
             self.buf.write_i32(low)?;
         } else {
+            self.emit_rex(false, false, false, false);
+            self.buf.write(&[0x85, 0xc0])?;
+            self.emit_jcc(x86Condition::S, default_block)?;
             self.emit_rex(false, false, false, false);
             self.buf.write(&[0x3d])?;
             self.buf.write_i32(high)?;
@@ -824,37 +950,63 @@ impl<'a> X86Emitter<'a> {
         self.buf.write(&[0x8b, 0x90])?;
         self.buf.write_i32(len_off)?;
         self.emit_rex(false, false, false, false);
-        self.buf.write(&[0x39, 0xca])?;
+        self.buf.write(&[0x3b, 0xca])?;
         let disp = self.emit_jcc_local(x86Condition::AE)?;
         Ok(Some(disp))
     }
 
+    /// Emits the `idiv` overflow guard: division overflows only for
+    /// `INT_MIN / -1`.  Jumps to `end` (skipping the stub) whenever
+    /// the operands cannot overflow; falls through to the
+    /// ArithmeticException stub otherwise.
     fn emit_div_overflow_check(&mut self, wide: bool) -> Result<(), BackendError> {
         let stub = RuntimeStub::ArithmeticException;
         if !self.options.stubs.contains_key(&stub) {
             return Err(BackendError::MissingRuntimeStub(stub));
         }
-        self.emit_rex(wide, false, false, false);
-        self.buf.write(&[0x48, 0x85, 0xc9])?;
-        let jz = self.emit_jcc_local(x86Condition::E)?;
+        let mut skips: Vec<usize> = Vec::new();
+        if wide {
+            // dividend (rax) == i64::MIN ?
+            self.mov_reg_imm(Register::RDX, 0x8000_0000_0000_0000, true)?;
+            self.cmp_rr(Register::RAX, Register::RDX, true)?;
+            skips.push(self.emit_jcc_local(x86Condition::NE)?);
+            // divisor (rcx) == -1 ?  -> cmp rcx, imm8(-1)
+            self.emit_rex(true, false, false, false);
+            self.buf.write(&[0x83, 0xf9, 0xff])?;
+            skips.push(self.emit_jcc_local(x86Condition::NE)?);
+        } else {
+            // dividend (eax) == i32::MIN ? -> cmp eax, imm32
+            self.emit_rex(false, false, false, false);
+            self.buf.write(&[0x3d])?;
+            self.buf.write_i32(i32::MIN)?;
+            skips.push(self.emit_jcc_local(x86Condition::NE)?);
+            // divisor (ecx) == -1 ? -> cmp ecx, imm8(-1)
+            self.emit_rex(false, false, false, false);
+            self.buf.write(&[0x83, 0xf9, 0xff])?;
+            skips.push(self.emit_jcc_local(x86Condition::NE)?);
+        }
         self.emit_runtime_call_addr(stub)?;
         self.buf.write(&[0x0f, 0x0b])?;
         let end = self.pos();
-        self.patch_local(jz, end)?;
+        for d in skips {
+            self.patch_local(d, end)?;
+        }
         Ok(())
     }
 
+    /// Emits the divide-by-zero guard: a zero divisor falls through to
+    /// the ArithmeticException stub; a nonzero divisor jumps over it.
     fn emit_runtime_check_zero(&mut self, reg: Register) -> Result<(), BackendError> {
         let stub = RuntimeStub::ArithmeticException;
         if !self.options.stubs.contains_key(&stub) {
             return Err(BackendError::MissingRuntimeStub(stub));
         }
         self.test_rr(reg, reg, reg == Register::RCX || reg == Register::RAX)?;
-        let jz = self.emit_jcc_local(x86Condition::E)?;
+        let jnz = self.emit_jcc_local(x86Condition::NE)?;
         self.emit_runtime_call_addr(stub)?;
         self.buf.write(&[0x0f, 0x0b])?;
         let end = self.pos();
-        self.patch_local(jz, end)?;
+        self.patch_local(jnz, end)?;
         Ok(())
     }
 
@@ -876,9 +1028,6 @@ impl<'a> X86Emitter<'a> {
 
     fn store_gp_at(&mut self, off: usize, kind: LirKind, reg: Register) -> Result<(), BackendError> {
         let wide = kind == LirKind::Int64 || kind == LirKind::Ref;
-        if kind == LirKind::Float32 {
-            self.buf.write_i32(0)?;
-        }
         self.mov_mem_reg(Some(Register::FP), None, Scale::S1, -(off as i32), reg, wide)
     }
 
@@ -887,10 +1036,7 @@ impl<'a> X86Emitter<'a> {
         let disp = -(off as i32);
         if kind == LirKind::Float32 {
             self.sse_store_mem(xmm, Register::FP, disp, false)?;
-            self.emit_rex(false, false, false, false);
-            self.buf.write(&[0xc7, 0x45])?;
-            self.buf.write_i32(disp + 4)?;
-            self.buf.write_i32(0)?;
+            self.zero_slot_upper(off)?;
         } else {
             self.sse_store_mem(xmm, Register::FP, disp, true)?;
         }
@@ -905,10 +1051,7 @@ impl<'a> X86Emitter<'a> {
                 let disp = -(off as i32);
                 self.sse_store_mem(XMMRegister::XMM0, Register::FP, disp, kind == LirKind::Float64)?;
                 if kind == LirKind::Float32 {
-                    self.emit_rex(false, false, false, false);
-                    self.buf.write(&[0xc7, 0x45])?;
-                    self.buf.write_i32(disp + 4)?;
-                    self.buf.write_i32(0)?;
+                    self.zero_slot_upper(off)?;
                 }
             }
             _ => {
@@ -1083,70 +1226,89 @@ impl<'a> X86Emitter<'a> {
         Ok(())
     }
 
-    fn emit_setcc(&mut self, cond: x86Condition, reg: Register, wide: bool) -> Result<(), BackendError> {
-        let _ = wide;
-        self.emit_rex(false, reg.needs_rex(), false, false);
+    fn emit_setcc(&mut self, cond: x86Condition, reg: Register) -> Result<(), BackendError> {
+        self.emit_rex(false, false, false, reg.needs_rex());
         self.buf.write(&[0x0f, 0x90 | cond as u8, 0xc0 | (reg.encoding() & 7)])?;
         Ok(())
     }
 
+    fn movzx_same(&mut self, reg: Register) -> Result<(), BackendError> {
+        // movzx r32, r8 of the same register — the destination is the
+        // modrm.reg field, which must encode `reg` too (a hardcoded 0
+        // silently wrote every result into r8d).
+        let enc = reg.encoding() & 7;
+        self.emit_rex(false, reg.needs_rex(), false, reg.needs_rex());
+        self.buf.write(&[0x0f, 0xb6, 0xc0 | (enc << 3) | enc])?;
+        Ok(())
+    }
+
+    /// SSE ops need the legacy prefix (0x66/0xF2/0xF3) emitted BEFORE
+    /// the REX byte — the canonical order is `66 F2 F3 REX opcode`.
+    /// Emitting REX first produces encodings some cores decode as a
+    /// different instruction (this silently zeroed xmm results).
+    fn emit_sse_rex(&mut self, prefix: u8, w: bool, r: bool, x: bool, b: bool) -> Result<(), BackendError> {
+        self.buf.write(&[prefix])?;
+        self.emit_rex(w, r, x, b);
+        Ok(())
+    }
+
     fn sse_load_mem(&mut self, xmm: XMMRegister, base: Register, disp: i32, double: bool) -> Result<(), BackendError> {
-        self.emit_rex(double, xmm.needs_rex(), false, base.needs_rex());
-        self.buf.write(&[if double { 0xf2 } else { 0xf3 }, 0x0f, 0x10])?;
+        self.emit_sse_rex(if double { 0xf2 } else { 0xf3 }, double, xmm.needs_rex(), false, base.needs_rex())?;
+        self.buf.write(&[0x0f, 0x10])?;
         self.emit_modrm_sib(xmm.encoding() & 7, Some(base), None, Scale::S1, disp)
     }
 
     fn sse_store_mem(&mut self, xmm: XMMRegister, base: Register, disp: i32, double: bool) -> Result<(), BackendError> {
-        self.emit_rex(double, xmm.needs_rex(), false, base.needs_rex());
-        self.buf.write(&[if double { 0xf2 } else { 0xf3 }, 0x0f, 0x11])?;
+        self.emit_sse_rex(if double { 0xf2 } else { 0xf3 }, double, xmm.needs_rex(), false, base.needs_rex())?;
+        self.buf.write(&[0x0f, 0x11])?;
         self.emit_modrm_sib(xmm.encoding() & 7, Some(base), None, Scale::S1, disp)
     }
 
     fn movd_xmm_from_gp(&mut self, xmm: XMMRegister, gp: Register, _wide: bool) -> Result<(), BackendError> {
-        self.emit_rex(false, xmm.needs_rex(), false, gp.needs_rex());
-        self.buf.write(&[0x66, 0x0f, 0x6e, 0xc0 | ((xmm.encoding() & 7) << 3) | (gp.encoding() & 7)])?;
+        self.emit_sse_rex(0x66, false, xmm.needs_rex(), false, gp.needs_rex())?;
+        self.buf.write(&[0x0f, 0x6e, 0xc0 | ((xmm.encoding() & 7) << 3) | (gp.encoding() & 7)])?;
         Ok(())
     }
 
     fn movq_xmm_from_gp(&mut self, xmm: XMMRegister, gp: Register) -> Result<(), BackendError> {
-        self.emit_rex(true, xmm.needs_rex(), false, gp.needs_rex());
-        self.buf.write(&[0x66, 0x0f, 0x6e, 0xc0 | ((xmm.encoding() & 7) << 3) | (gp.encoding() & 7)])?;
+        self.emit_sse_rex(0x66, true, xmm.needs_rex(), false, gp.needs_rex())?;
+        self.buf.write(&[0x0f, 0x6e, 0xc0 | ((xmm.encoding() & 7) << 3) | (gp.encoding() & 7)])?;
         Ok(())
     }
 
     fn cvtsi2ss(&mut self, xmm: XMMRegister, gp: Register, wide: bool) -> Result<(), BackendError> {
-        self.emit_rex(wide, xmm.needs_rex(), false, gp.needs_rex());
-        self.buf.write(&[0xf3, 0x0f, 0x2a, 0xc0 | ((xmm.encoding() & 7) << 3) | (gp.encoding() & 7)])?;
+        self.emit_sse_rex(0xf3, wide, xmm.needs_rex(), false, gp.needs_rex())?;
+        self.buf.write(&[0x0f, 0x2a, 0xc0 | ((xmm.encoding() & 7) << 3) | (gp.encoding() & 7)])?;
         Ok(())
     }
 
     fn cvtsi2sd(&mut self, xmm: XMMRegister, gp: Register, wide: bool) -> Result<(), BackendError> {
-        self.emit_rex(wide, xmm.needs_rex(), false, gp.needs_rex());
-        self.buf.write(&[0xf2, 0x0f, 0x2a, 0xc0 | ((xmm.encoding() & 7) << 3) | (gp.encoding() & 7)])?;
+        self.emit_sse_rex(0xf2, wide, xmm.needs_rex(), false, gp.needs_rex())?;
+        self.buf.write(&[0x0f, 0x2a, 0xc0 | ((xmm.encoding() & 7) << 3) | (gp.encoding() & 7)])?;
         Ok(())
     }
 
     fn cvttss2si(&mut self, gp: Register, xmm: XMMRegister, wide: bool) -> Result<(), BackendError> {
-        self.emit_rex(wide, gp.needs_rex(), false, xmm.needs_rex());
-        self.buf.write(&[0xf3, 0x0f, 0x2c, 0xc0 | ((gp.encoding() & 7) << 3) | (xmm.encoding() & 7)])?;
+        self.emit_sse_rex(0xf3, wide, gp.needs_rex(), false, xmm.needs_rex())?;
+        self.buf.write(&[0x0f, 0x2c, 0xc0 | ((gp.encoding() & 7) << 3) | (xmm.encoding() & 7)])?;
         Ok(())
     }
 
     fn cvttsd2si(&mut self, gp: Register, xmm: XMMRegister, wide: bool) -> Result<(), BackendError> {
-        self.emit_rex(wide, gp.needs_rex(), false, xmm.needs_rex());
-        self.buf.write(&[0xf2, 0x0f, 0x2c, 0xc0 | ((gp.encoding() & 7) << 3) | (xmm.encoding() & 7)])?;
+        self.emit_sse_rex(0xf2, wide, gp.needs_rex(), false, xmm.needs_rex())?;
+        self.buf.write(&[0x0f, 0x2c, 0xc0 | ((gp.encoding() & 7) << 3) | (xmm.encoding() & 7)])?;
         Ok(())
     }
 
     fn cvtss2sd(&mut self, dst: XMMRegister, src: XMMRegister) -> Result<(), BackendError> {
-        self.emit_rex(false, dst.needs_rex(), false, src.needs_rex());
-        self.buf.write(&[0xf3, 0x0f, 0x5a, 0xc0 | ((dst.encoding() & 7) << 3) | (src.encoding() & 7)])?;
+        self.emit_sse_rex(0xf3, false, dst.needs_rex(), false, src.needs_rex())?;
+        self.buf.write(&[0x0f, 0x5a, 0xc0 | ((dst.encoding() & 7) << 3) | (src.encoding() & 7)])?;
         Ok(())
     }
 
     fn cvtsd2ss(&mut self, dst: XMMRegister, src: XMMRegister) -> Result<(), BackendError> {
-        self.emit_rex(false, dst.needs_rex(), false, src.needs_rex());
-        self.buf.write(&[0xf2, 0x0f, 0x5a, 0xc0 | ((dst.encoding() & 7) << 3) | (src.encoding() & 7)])?;
+        self.emit_sse_rex(0xf2, false, dst.needs_rex(), false, src.needs_rex())?;
+        self.buf.write(&[0x0f, 0x5a, 0xc0 | ((dst.encoding() & 7) << 3) | (src.encoding() & 7)])?;
         Ok(())
     }
 
@@ -1162,8 +1324,8 @@ impl<'a> X86Emitter<'a> {
             (Alu::Div, true) => (0xf2, 0x5e),
             _ => return Err(BackendError::Unsupported("sse arith".to_string())),
         };
-        self.emit_rex(double, false, false, XMMRegister::XMM1.needs_rex());
-        self.buf.write(&[prefix, 0x0f, op, 0xc1])?;
+        self.emit_sse_rex(prefix, double, false, false, XMMRegister::XMM1.needs_rex())?;
+        self.buf.write(&[0x0f, op, 0xc1])?;
         Ok(())
     }
 }
@@ -1194,5 +1356,8 @@ pub fn emit_program(buf: &CodeBuffer, program: &LirProgram, options: &BackendOpt
 }
 
 pub fn compile_cfg_to_lir(cfg: &ControlFlowGraph) -> LirProgram {
-    crate::share::c1::c1_LIR::LirGenerator::generate(cfg)
+    crate::share::c1::c1_LIR::LirGenerator::generate(
+        cfg,
+        &crate::share::c1::c1_GraphBuilder::MethodMetadata::default(),
+    )
 }

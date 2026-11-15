@@ -175,6 +175,10 @@ pub struct CompileTask {
     /// Optional live `Method` handle when the caller has one; lets the
     /// compiler/policy read invocation and backedge counters.
     pub method_obj: Option<Arc<crate::share::oops::method::Method>>,
+    /// Optional pre-resolved graph metadata (ldc constants, field and
+    /// call-site info, exception handlers) collected by the broker from
+    /// the owning `InstanceKlass`; `None` falls back to `Default`.
+    pub jit_metadata: Option<crate::share::c1::c1_GraphBuilder::MethodMetadata>,
     /// Key into the interpreter's live counters (`methodCounters::get`).
     pub profile_key: Option<usize>,
     pub hot_count: u32,
@@ -202,6 +206,7 @@ impl CompileTask {
             compile_id,
             method: MethodIdentity::new(class_name, method_name, descriptor),
             method_obj: None,
+            jit_metadata: None,
             profile_key: None,
             hot_count,
             reason,

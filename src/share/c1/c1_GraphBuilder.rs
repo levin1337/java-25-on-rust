@@ -54,6 +54,22 @@ pub struct MethodMetadata {
     pub call_sites: BTreeMap<u32, CallSiteInfo>,
     pub ldc_constants: BTreeMap<u32, HirInstruction>,
     pub exception_handlers: Vec<ExceptionHandler>,
+    /// Constant-pool index -> resolved site description for every
+    /// heap-touching instruction (field get/put, static get/put,
+    /// new/checkcast/instanceof/anewarray).  The LIR lowers these to
+    /// `CallRuntime` stubs that receive a leaked `StubSite` pointer.
+    pub sites: BTreeMap<u32, SiteInfo>,
+}
+
+/// Resolved constant-pool reference passed to JIT runtime stubs.
+/// `class` is the internal (slash-separated) class name; `name`/`desc`
+/// are empty for pure class references (new/checkcast/instanceof/
+/// anewarray), which only need `class`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SiteInfo {
+    pub class: String,
+    pub name: String,
+    pub desc: String,
 }
 
 #[derive(Clone, Debug)]
@@ -83,6 +99,47 @@ impl AbsValue {
     fn new(kind: ValueKind) -> Self {
         Self { kind, slots: kind.stack_slots() }
     }
+}
+
+/// Scans raw bytecode for `ldc`/`ldc_w`/`ldc2_w` constant-pool indices.
+/// Used by the compile broker to pre-resolve numeric constants into
+/// `MethodMetadata::ldc_constants` before graph building.
+pub fn ldc_cp_indices(code: &[u8]) -> Vec<u32> {
+    let gb = GraphBuilder::new(code, 0);
+    let mut out = Vec::new();
+    let mut bci = 0usize;
+    while bci < code.len() {
+        match code[bci] {
+            0x12 => {
+                if bci + 1 < code.len() {
+                    out.push(code[bci + 1] as u32);
+                }
+            }
+            0x13 | 0x14 => {
+                if bci + 2 < code.len() {
+                    out.push(u16::from_be_bytes([code[bci + 1], code[bci + 2]]) as u32);
+                }
+            }
+            _ => {}
+        }
+        bci = gb.next_bci(bci);
+    }
+    out
+}
+
+/// Maps a resolved class-file `Constant` to the HIR constant node used
+/// for `ldc`/`ldc2_w`.  Returns `None` for reference constants
+/// (String/Class/MethodType/condy...) which cannot live in the
+/// primitive executable subset anyway.
+pub fn constant_to_hir(c: &crate::share::classfile::classFileParser::Constant<'_>) -> Option<HirInstruction> {
+    use crate::share::classfile::classFileParser::Constant;
+    Some(match c {
+        Constant::Integer(v) => HirInstruction::ConstantInt(*v),
+        Constant::Long(v) => HirInstruction::ConstantLong(*v),
+        Constant::Float(v) => HirInstruction::ConstantFloat(v.to_bits()),
+        Constant::Double(v) => HirInstruction::ConstantDouble(v.to_bits()),
+        _ => return None,
+    })
 }
 
 pub struct GraphBuilder<'a> {
@@ -400,7 +457,8 @@ impl<'a> GraphBuilder<'a> {
                     return result;
                 }
                 0x9f..=0xa6 => {
-                    self.abs_binary(&mut stack, ValueKind::Int32);
+                    self.abs_pop(&mut stack);
+                    self.abs_pop(&mut stack);
                     for tb in self.branch_successor_bcis(bci, op) {
                         if let Some(&succ) = bci_to_block_id.get(&tb) { result.push((succ, stack.clone())); }
                     }
@@ -692,8 +750,19 @@ impl<'a> GraphBuilder<'a> {
                 }
                 0xac..=0xb0 => { let val = self.pop(&mut stack).map(|x| x.expr); cfg.blocks[block_id].push(HirInstruction::Return(val.map(Box::new))); terminated = true; }
                 0xb1 => { cfg.blocks[block_id].push(HirInstruction::Return(None)); terminated = true; }
-                0xb2 => { let kind = self.static_kind(bci, true); let idx = self.cp_index(bci); stack.push(StackValue::new(self.unsupported(bci, op, &format!("getstatic cp#{}", idx)), kind)); }
-                0xb3 => { let val = self.pop(&mut stack).map(|x| x.expr).unwrap_or_else(|| self.default_for(ValueKind::Int32)); cfg.blocks[block_id].push(HirInstruction::Unsupported { opcode: op, bci, reason: "putstatic".to_string() }); let _ = val; }
+                0xb2 => {
+                    let idx = self.cp_index(bci);
+                    let kind = self.static_kind(bci, true);
+                    let name = self.metadata.fields.get(&idx).map(|f| f.name.clone()).unwrap_or_else(|| format!("cp#{}", idx));
+                    stack.push(StackValue::new(HirInstruction::GetStatic { cp_index: idx, offset: None, kind, name }, kind));
+                }
+                0xb3 => {
+                    let idx = self.cp_index(bci);
+                    let kind = self.static_kind(bci, false);
+                    let name = self.metadata.fields.get(&idx).map(|f| f.name.clone()).unwrap_or_else(|| format!("cp#{}", idx));
+                    let val = self.pop(&mut stack).map(|x| x.expr).unwrap_or_else(|| self.default_for(kind));
+                    cfg.blocks[block_id].push(HirInstruction::PutStatic { cp_index: idx, offset: None, value: Box::new(val), kind, name });
+                }
                 0xb4 | 0xb5 => {
                     let idx = self.cp_index(bci);
                     let f = self.metadata.fields.get(&idx);
@@ -712,7 +781,8 @@ impl<'a> GraphBuilder<'a> {
                 }
                 0xb6..=0xba => self.build_invoke(cfg, block_id, &mut stack, bci, op),
                 0xbb => { let idx = self.cp_index(bci); stack.push(StackValue::new(HirInstruction::NewObject { cp_index: idx, name: format!("cp#{}", idx) }, ValueKind::Ref)); }
-                0xbc | 0xbd => { let len = self.pop(&mut stack).map(|x| x.expr).unwrap_or_else(|| HirInstruction::ConstantInt(0)); let elem = if op == 0xbc { newarray_elem(self.code.get(bci + 1).copied().unwrap_or(4)) } else { ArrayElemKind::Ref }; stack.push(StackValue::new(HirInstruction::NewArray { elem, length: Box::new(len) }, ValueKind::Ref)); }
+                0xbc => { let len = self.pop(&mut stack).map(|x| x.expr).unwrap_or_else(|| HirInstruction::ConstantInt(0)); let elem = newarray_elem(self.code.get(bci + 1).copied().unwrap_or(4)); stack.push(StackValue::new(HirInstruction::NewArray { elem, length: Box::new(len) }, ValueKind::Ref)); }
+                0xbd => { let len = self.pop(&mut stack).map(|x| x.expr).unwrap_or_else(|| HirInstruction::ConstantInt(0)); let idx = self.cp_index(bci); stack.push(StackValue::new(HirInstruction::AnewArray { cp_index: idx, length: Box::new(len) }, ValueKind::Ref)); }
                 0xbe => { let arr = self.pop(&mut stack).map(|x| x.expr).unwrap_or_else(|| HirInstruction::ConstantNull); stack.push(StackValue::new(HirInstruction::ArrayLength(Box::new(arr)), ValueKind::Int32)); }
                 0xbf => { let val = self.pop(&mut stack).map(|x| x.expr).unwrap_or_else(|| HirInstruction::ConstantNull); cfg.blocks[block_id].push(HirInstruction::Throw(Box::new(val))); terminated = true; }
                 0xc0 => { let val = self.pop(&mut stack).map(|x| x.expr).unwrap_or_else(|| HirInstruction::ConstantNull); let idx = self.cp_index(bci); stack.push(StackValue::new(HirInstruction::CheckCast { value: Box::new(val), cp_index: idx, name: format!("cp#{}", idx) }, ValueKind::Ref)); }

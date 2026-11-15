@@ -3,6 +3,7 @@ pub(crate) mod classNatives;
 pub(crate) mod fileNatives;
 pub mod jni;
 pub mod jniInvocation;
+pub mod jvmExports;
 pub mod jniReferences;
 pub mod jniTrampoline;
 pub mod jvm;

@@ -1,3 +1,4 @@
+pub mod bytecodeVerifier;
 pub mod classFileParser;
 pub mod classFileStream;
 pub mod classLoader;

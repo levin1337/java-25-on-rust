@@ -105,8 +105,8 @@ pub struct BuildResult {
 
 #[derive(Clone, Copy, Debug)]
 enum PredRef {
-    Normal(usize),
-    Exc(usize),
+    Normal,
+    Exc,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -121,7 +121,6 @@ enum SuccKind {
 struct Succ {
     target: usize,
     slot: usize,
-    kind: SuccKind,
 }
 
 #[derive(Clone, Debug)]
@@ -137,8 +136,6 @@ struct OpenInfo {
     region: NodeId,
     phis: Vec<(NodeId, usize)>,
     mem_merge: NodeId,
-    zero: NodeId,
-    frame_len: usize,
     stack_base: usize,
 }
 
@@ -155,7 +152,6 @@ struct Block {
 struct ExcEdge {
     handler_block: usize,
     slot: usize,
-    bci: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -376,6 +372,7 @@ impl<'a> BytecodeGraphBuilder<'a> {
         for i in 0..n {
             let (s, e) = (self.blocks[i].start, self.blocks[i].end);
             let mut bci = s;
+            let mut term = false;
             while bci < e && bci < code_len {
                 let len = self.instr_len(bci).max(1);
                 if let Some(bc) = Bytecode::new(self.code, bci) {
@@ -466,22 +463,25 @@ impl<'a> BytecodeGraphBuilder<'a> {
                                     }
                                 }
                             }
+                            Code::Ireturn | Code::Lreturn | Code::Freturn | Code::Dreturn
+                            | Code::Areturn | Code::Return | Code::Athrow | Code::Ret => {
+                                term = true;
+                            }
                             _ => {}
                         }
                     }
                 }
                 bci += len;
             }
+            if succs[i].is_empty() && !term && i + 1 < n {
+                succs[i].push((i + 1, SuccKind::Fall));
+            }
         }
         for i in 0..n {
-            for (tb, kind) in succs[i].drain(..) {
+            for (tb, _kind) in succs[i].drain(..) {
                 let slot = self.blocks[tb].preds.len();
-                self.blocks[tb].preds.push(PredRef::Normal(i));
-                self.blocks[i].succs.push(Succ {
-                    target: tb,
-                    slot,
-                    kind,
-                });
+                self.blocks[tb].preds.push(PredRef::Normal);
+                self.blocks[i].succs.push(Succ { target: tb, slot });
             }
         }
     }
@@ -497,11 +497,10 @@ impl<'a> BytecodeGraphBuilder<'a> {
             for bci in self.throwing_bcis(s, e) {
                 let edge_id = self.exc_edges.len();
                 let slot = self.blocks[hb].preds.len();
-                self.blocks[hb].preds.push(PredRef::Exc(edge_id));
+                self.blocks[hb].preds.push(PredRef::Exc);
                 self.exc_edges.push(ExcEdge {
                     handler_block: hb,
                     slot,
-                    bci,
                 });
                 self.exc_at.entry(bci).or_default().push(edge_id);
             }
@@ -639,8 +638,6 @@ impl<'a> BytecodeGraphBuilder<'a> {
             region,
             phis,
             mem_merge,
-            zero: self.zero,
-            frame_len,
             stack_base: nlocals,
         });
         let mut locals = merged[..nlocals].to_vec();

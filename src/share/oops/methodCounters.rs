@@ -299,3 +299,39 @@ pub fn get(code_key: usize) -> Option<MethodCounters> {
 pub fn is_hot(code_key: usize) -> bool {
     hot().lock().unwrap().contains(&code_key)
 }
+
+// ---------------------------------------------------------------------------
+// Installed compiled code, keyed the same way as the counters. The value is
+// the entry-point address of the nmethod's code blob; 0/absent means the
+// method still runs in the interpreter.
+// ---------------------------------------------------------------------------
+
+static COMPILED: OnceLock<Mutex<HashMap<usize, usize>>> = OnceLock::new();
+
+fn compiled_map() -> &'static Mutex<HashMap<usize, usize>> {
+    COMPILED.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Records that `code_key`'s method now has executable code at `addr`.
+/// Called by the compile broker when an nmethod is installed.
+pub fn mark_compiled(code_key: usize, addr: usize) {
+    if addr != 0 {
+        if std::env::var_os("JVM25_TRACE_COMPILE").is_some() {
+            eprintln!("[jit-installed] code_key={code_key:#x} entry={addr:#x}");
+        }
+        compiled_map().lock().unwrap().insert(code_key, addr);
+    }
+}
+
+/// Entry-point address of the installed nmethod for `code_key`, or 0.
+/// The interpreter checks this once per method entry; a hit replaces
+/// interpretation with a direct call into the compiled code.
+#[inline]
+pub fn compiled_addr(code_key: usize) -> usize {
+    *compiled_map().lock().unwrap().get(&code_key).unwrap_or(&0)
+}
+
+/// Drops the compiled-code binding (class unloading / deoptimization).
+pub fn clear_compiled(code_key: usize) {
+    compiled_map().lock().unwrap().remove(&code_key);
+}

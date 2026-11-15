@@ -2051,6 +2051,14 @@ pub(crate) fn method_handle_invoke<'a>(
     if name != b"invoke" {
         let mh_type = object_field(loader, mh, b"type", b"Ljava/lang/invoke/MethodType;")?;
         let expected = method_type_descriptor(loader, mh_type)?;
+        if std::env::var_os("JVM25_TRACE").is_some() {
+            eprintln!(
+                "[mh-invoke] name={} desc={} expected={}",
+                String::from_utf8_lossy(name),
+                String::from_utf8_lossy(descriptor),
+                String::from_utf8_lossy(&expected)
+            );
+        }
         if expected != descriptor {
             return Err(wrong_method_type(loader));
         }
@@ -2211,6 +2219,173 @@ pub(crate) fn method_handle_invoke<'a>(
     }
 }
 
+/// `MethodHandle.linkTo{Static,Virtual,Special,Interface,Native}`: the
+/// signature-polymorphic linkers used by `java.lang.invoke` internals
+/// (DirectMethodHandle, VarHandleGuards, LambdaForm stubs). The first
+/// argument is the target `MemberName`; for receiver kinds the receiver
+/// follows it, then the call arguments.
+fn link_to<'a>(
+    loader: &ClassLoader<'a>,
+    link: &[u8],
+    arguments: &[Value<'a>],
+) -> io::Result<Option<Value<'a>>> {
+    let Some(&Value::Object(member_handle)) = arguments.first() else {
+        return Err(invalid("linkTo requires a MemberName"));
+    };
+    let state = read_member_state(loader, member_handle)?;
+    if member_is_field(&state) {
+        return Err(invalid("linkTo requires a method MemberName"));
+    }
+    let Some(clazz_name) = state.clazz.clone() else {
+        return Err(no_such_method(loader, &state.name, b""));
+    };
+    let member_descriptor = member_descriptor(loader, &state)?;
+    let has_receiver = link != b"linkToStatic";
+    let (receiver, call_args) = if has_receiver {
+        let Some(&receiver) = arguments.get(1) else {
+            return Err(invalid("linkTo receiver"));
+        };
+        if matches!(receiver, Value::Null) {
+            return Err(null_pointer(loader));
+        }
+        (Some(receiver), &arguments[2..])
+    } else {
+        (None, &arguments[1..])
+    };
+
+    if link == b"linkToNative" {
+        // Route to the native dispatch tables; the MemberName's declaring
+        // class is the native owner.
+        let klass = loader
+            .load(&clazz_name)
+            .map_err(|_| class_not_found(loader, &clazz_name))?;
+        let is_static = (member_ref_kind(state.flags) == REF_INVOKE_STATIC)
+            || (klass
+                .class
+                .methods
+                .iter()
+                .find(|m| m.name == state.name && m.descriptor == member_descriptor)
+                .is_some_and(|m| m.accessFlags & ACC_STATIC != 0));
+        let owner = target_owner_name(&klass, &state.name, &member_descriptor);
+        let mut native_args = Vec::with_capacity(call_args.len() + 1);
+        if !is_static {
+            native_args.push(receiver.unwrap_or(Value::Null));
+        }
+        native_args.extend_from_slice(call_args);
+        let result = if is_static {
+            crate::share::prims::nativeLookup::invokeStatic(
+                loader,
+                &owner,
+                &state.name,
+                &member_descriptor,
+                &native_args,
+                &mut io::sink(),
+                0,
+            )?
+        } else {
+            crate::share::prims::nativeLookup::invokeInstance(
+                loader,
+                &owner,
+                &state.name,
+                &member_descriptor,
+                &native_args,
+                &mut io::sink(),
+                0,
+            )?
+        };
+        return match result {
+            Some(Some(value)) => Ok(Some(value)),
+            Some(None) => Ok(None),
+            None => Err(invalid("linkToNative target is not a native method")),
+        };
+    }
+
+    let result = match link {
+        b"linkToStatic" => {
+            let klass = loader
+                .load(&clazz_name)
+                .map_err(|_| class_not_found(loader, &clazz_name))?;
+            let found = find_method_member(&klass, &state.name, &member_descriptor, true)
+                .or_else(|| find_method_member(&klass, &state.name, &member_descriptor, false));
+            let Some((target_klass, index)) = found else {
+                return Err(no_such_method(loader, &state.name, &member_descriptor));
+            };
+            execute_member(
+                loader,
+                &target_klass,
+                index,
+                call_args,
+                true,
+                target_klass.class.name,
+            )?
+        }
+        b"linkToVirtual" | b"linkToInterface" => {
+            let receiver = receiver.unwrap_or(Value::Null);
+            let receiver_klass = receiver_klass(loader, receiver)?;
+            let found = find_method_member(&receiver_klass, &state.name, &member_descriptor, false)
+                .or_else(|| find_interface_method(&receiver_klass, &state.name, &member_descriptor));
+            let Some((target_klass, index)) = found else {
+                return Err(no_such_method(loader, &state.name, &member_descriptor));
+            };
+            let mut full_args = Vec::with_capacity(call_args.len() + 1);
+            full_args.push(receiver);
+            full_args.extend_from_slice(call_args);
+            execute_member(
+                loader,
+                &target_klass,
+                index,
+                &full_args,
+                false,
+                target_klass.class.name,
+            )?
+        }
+        b"linkToSpecial" => {
+            let klass = loader
+                .load(&clazz_name)
+                .map_err(|_| class_not_found(loader, &clazz_name))?;
+            let found = find_method_member(&klass, &state.name, &member_descriptor, false);
+            let Some((target_klass, index)) = found else {
+                return Err(no_such_method(loader, &state.name, &member_descriptor));
+            };
+            let mut full_args = Vec::with_capacity(call_args.len() + 1);
+            full_args.push(receiver.unwrap_or(Value::Null));
+            full_args.extend_from_slice(call_args);
+            execute_member(
+                loader,
+                &target_klass,
+                index,
+                &full_args,
+                false,
+                target_klass.class.name,
+            )?
+        }
+        _ => return Err(invalid("Unsupported linkTo variant")),
+    };
+    Ok(result)
+}
+
+/// Declaring class name for a member resolved on `klass` (walks
+/// superclasses so inherited natives dispatch under the right owner).
+fn target_owner_name<'a>(
+    klass: &Arc<InstanceKlass<'a>>,
+    name: &[u8],
+    descriptor: &[u8],
+) -> Vec<u8> {
+    let mut current = Some(Arc::clone(klass));
+    while let Some(k) = current {
+        if k
+            .class
+            .methods
+            .iter()
+            .any(|m| m.name == name && m.descriptor == descriptor)
+        {
+            return k.class.name.to_vec();
+        }
+        current = k.super_klass();
+    }
+    klass.class.name.to_vec()
+}
+
 pub(crate) fn invoke_static<'a>(
     loader: &ClassLoader<'a>,
     owner: &[u8],
@@ -2218,6 +2393,15 @@ pub(crate) fn invoke_static<'a>(
     descriptor: &[u8],
     arguments: &[Value<'a>],
 ) -> io::Result<Option<Option<Value<'a>>>> {
+    if owner == b"java/lang/invoke/MethodHandle"
+        && matches!(
+            name,
+            b"linkToStatic" | b"linkToVirtual" | b"linkToSpecial" | b"linkToInterface" | b"linkToNative"
+        )
+    {
+        let _ = descriptor;
+        return link_to(loader, name, arguments).map(|result| Some(result));
+    }
     if owner != b"java/lang/invoke/MethodHandleNatives" {
         return Ok(None);
     }

@@ -438,6 +438,7 @@ pub enum HirInstruction {
         elem: ArrayElemKind,
     },
     NewArray { elem: ArrayElemKind, length: Box<HirInstruction> },
+    AnewArray { cp_index: u32, length: Box<HirInstruction> },
     NewObject { cp_index: u32, name: String },
 
     LoadField {
@@ -493,7 +494,7 @@ impl HirInstruction {
             | Self::LoadStack { kind, .. }
             | Self::LoadField { kind, .. }
             | Self::GetStatic { kind, .. } => *kind,
-            Self::NewArray { .. } | Self::NewObject { .. } | Self::CheckCast { .. } => ValueKind::Ref,
+            Self::NewArray { .. } | Self::AnewArray { .. } | Self::NewObject { .. } | Self::CheckCast { .. } => ValueKind::Ref,
             Self::Call { info, .. } => info.return_kind,
             Self::ArrayLength(_) | Self::InstanceOf { .. } | Self::Compare { .. } => ValueKind::Int32,
             Self::LoadIndexed { elem, .. } => elem.value_kind(),

@@ -3,6 +3,10 @@ name = "jvm25-rust"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+# rlib feeds the jvm25-rust binary; cdylib produces jvm.dll for java.exe.
+crate-type = ["rlib", "cdylib"]
+
 [lints.rust]
 non_snake_case = "allow"
 non_camel_case_types = "allow"

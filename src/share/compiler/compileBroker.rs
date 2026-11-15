@@ -10,17 +10,20 @@
  */
 
 use super::abstractCompiler::{AbstractCompiler, CompileError};
-use super::compileTask::{CompileOutcome, CompileReason, CompileTask, FailureReason};
+use super::compileTask::{CompileOutcome, CompileReason, CompileTask, FailureReason, MethodIdentity};
 use super::compilationPolicy::{CompilationPolicy, MethodProfile, PolicyActions};
 use super::compilerDefinitions::CompLevel;
 use super::compilerOracle::CompilerOracle;
+use crate::share::c1::c1_GraphBuilder::MethodMetadata;
 use crate::share::code::codeCache::CodeCache;
 use crate::share::code::nmethod::NMethod;
+use crate::share::oops::constMethod::ConstMethod;
+use crate::share::oops::method::{Code, Method};
 use crate::share::oops::methodCounters;
 use crate::share::oops::symbol::Symbol;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Condvar, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::time::Duration;
 
 /// Per-method compilability flags consulted by `compilation_is_prohibited`
@@ -60,6 +63,68 @@ impl MethodCompileFlags {
     pub fn is_not_osr_compilable(&self, level: CompLevel) -> bool {
         self.not_osr_compilable_mask & Self::mask_bit(level) != 0
     }
+}
+
+/// Resolves a `MethodIdentity` to a live `Method`/`ConstMethod` using the
+/// JVM-wide `ClassLoader`.  The interpreter executes `Code` parsed from
+/// `Member`s; the JIT task model expects HotSpot-style `Method` metadata.
+/// This bridge rebuilds `ConstMethod` (bytecodes, max_stack/locals,
+/// exception table) and `Method` (access flags) from the same `Member` so
+/// C1/C2 can compile exactly the code the interpreter runs.  Returns `None`
+/// when the class or method cannot be resolved (native/abstract/missing).
+fn resolve_method_obj(identity: &MethodIdentity) -> Option<Arc<Method>> {
+    let loader = crate::share::runtime::threading::jvm_loader()?;
+    let klass = loader
+        .classes
+        .borrow()
+        .get(identity.class_name.as_bytes())
+        .cloned()?;
+    let member = klass.class.methods.iter().find(|m| {
+        m.name == identity.method_name.as_bytes()
+            && m.descriptor == identity.descriptor.as_bytes()
+    })?;
+    // Skip members with no Code attribute (native/abstract) — nothing to JIT.
+    if member.code_attribute().is_none() {
+        return None;
+    }
+    let code = Code::parse(member).ok()?;
+    let const_method = ConstMethod::new(
+        0,
+        0,
+        code.maxStack.min(u16::MAX as usize) as u16,
+        code.maxLocals.min(u16::MAX as usize) as u16,
+        0,
+        code.bytes.to_vec(),
+        code.exception_table,
+        Vec::new(),
+        Vec::new(),
+    );
+    Some(Arc::new(Method::new(
+        Arc::new(const_method),
+        member.accessFlags,
+    )))
+}
+
+/// Builds `MethodMetadata` for JIT graph building: resolves every
+/// `ldc`/`ldc2_w` constant-pool index used by the method's bytecode to
+/// its numeric HIR constant.  Reference constants are skipped — they
+/// cannot appear in the primitive executable subset anyway, and their
+/// `ldc` sites degrade to `Unsupported` during graph building.
+fn resolve_jit_metadata(identity: &MethodIdentity, bytecode: &[u8]) -> Option<MethodMetadata> {
+    let loader = crate::share::runtime::threading::jvm_loader()?;
+    let klass = loader
+        .classes
+        .borrow()
+        .get(identity.class_name.as_bytes())
+        .cloned()?;
+    let mut metadata = MethodMetadata::default();
+    for idx in crate::share::c1::c1_GraphBuilder::ldc_cp_indices(bytecode) {
+        let Ok(c) = klass.constant(idx as u16) else { continue };
+        if let Some(hir) = crate::share::c1::c1_GraphBuilder::constant_to_hir(c) {
+            metadata.ldc_constants.insert(idx, hir);
+        }
+    }
+    Some(metadata)
 }
 
 /// A compile queue: FIFO of CompileTasks plus statistics
@@ -325,6 +390,26 @@ impl CompileBroker {
 
     pub fn is_initialized(&self) -> bool {
         self.initialized.load(Ordering::Acquire)
+    }
+
+    /// Lazily registers the C1 backend and spawns the compiler thread that
+    /// drains the C1 queue.  C2 has no code-generation backend yet, so only
+    /// the C1 queue is serviced.  Idempotent and cheap (one atomic swap) —
+    /// safe to call from the interpreter's hot path.
+    pub fn ensure_compiler_threads_started() {
+        static STARTED: AtomicBool = AtomicBool::new(false);
+        if STARTED.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let broker = Self::global();
+        let c1: Arc<Mutex<dyn AbstractCompiler>> =
+            Arc::new(Mutex::new(crate::share::c1::c1_Compiler::C1Compiler::new()));
+        broker.register_compiler(c1);
+        let _ = std::thread::Builder::new()
+            .name("C1 CompilerThread0".to_string())
+            .spawn(move || {
+                broker.compiler_thread_loop(CompLevel::Simple, None);
+            });
     }
 
     // ---- queues ---------------------------------------------------------
@@ -848,6 +933,16 @@ impl CompileBroker {
                     continue;
                 }
             };
+            if std::env::var_os("JVM25_TRACE_COMPILE").is_some() {
+                eprintln!(
+                    "[jit-task] level={:?} {}.{}{} osr_bci={}",
+                    task.comp_level(),
+                    task.method.class_name.as_str(),
+                    task.method.method_name.as_str(),
+                    task.method.descriptor.as_str(),
+                    task.osr_bci()
+                );
+            }
 
             self.invoke_compiler_on_method(&task);
         }
@@ -855,6 +950,32 @@ impl CompileBroker {
 
     /// Execute one task through its compiler and install the nmethod.
     pub fn invoke_compiler_on_method(&self, task: &CompileTask) {
+        // Bridge: populate `method_obj` from the live ClassLoader so the
+        // compiler backend can read bytecode/locals/flags.  Tasks created
+        // by the broker carry only `MethodIdentity` (Symbols); resolve the
+        // real `Method` here on the compiler thread.
+        let resolved_storage;
+        let task = if task.method_obj.is_none() {
+            let mut t = task.clone();
+            t.method_obj = resolve_method_obj(&t.method);
+            resolved_storage = t;
+            &resolved_storage
+        } else {
+            task
+        };
+        // Populate graph metadata (ldc constants etc.) once per task;
+        // bytecode comes from the resolved Method when available.
+        let meta_storage;
+        let task = if task.jit_metadata.is_none() {
+            let mut t = task.clone();
+            if let Some(m) = t.method_obj.as_ref() {
+                t.jit_metadata = resolve_jit_metadata(&t.method, m.bytecodes());
+            }
+            meta_storage = t;
+            &meta_storage
+        } else {
+            task
+        };
         task.mark_started();
         let level = task.comp_level();
         let compiler = match self.compiler_for_level(level) {
@@ -959,6 +1080,17 @@ impl CompileBroker {
                     task.set_nm_insts_size(code_size);
                     task.mark_success();
 
+                    // Publish the entry point to the interpreter's
+                    // per-method dispatch: the next invocation of this
+                    // method calls the compiled code directly. OSR
+                    // tasks also produce full-method code (the C1
+                    // backend has no separate OSR entry sequence), so
+                    // they publish the same way; repeated OSR installs
+                    // simply overwrite with an equivalent blob.
+                    if let Some(key) = task.profile_key {
+                        methodCounters::mark_compiled(key, addr);
+                    }
+
                     let mut inner = self.inner.lock().unwrap();
                     inner.total_compile_count += 1;
                     if is_osr {
@@ -988,8 +1120,42 @@ impl CompileBroker {
 
     /// `handle_compile_error`: record failure on the task.
     fn handle_compile_error(&self, task: &CompileTask, err: Option<&CompileError>, msg: &str) {
+        if std::env::var_os("JVM25_TRACE_COMPILE").is_some() {
+            eprintln!(
+                "[jit-fail] {}.{}{} level={:?}: {}",
+                task.method.class_name.as_str(),
+                task.method.method_name.as_str(),
+                task.method.descriptor.as_str(),
+                task.comp_level(),
+                msg
+            );
+        }
         let reason = err.map(|e| e.reason).unwrap_or(FailureReason::InternalError);
         task.set_failure_reason_at(&format!("{}: {}", reason.as_str(), msg), task.comp_level());
+        // Permanent, method-specific failures must not be retried — otherwise
+        // every invocation re-queues the same doomed task (HotSpot marks the
+        // method not-compilable for these).  Systemic reasons (internal error,
+        // OOM, timeout, disabled) stay retryable.
+        let permanent = matches!(
+            reason,
+            FailureReason::MethodNotCompilable
+                | FailureReason::MethodTooBig
+                | FailureReason::ParseError
+                | FailureReason::Unresolved
+                | FailureReason::Unsupported
+                | FailureReason::ConstraintViolation
+                | FailureReason::ForwardReference
+                | FailureReason::CompilerOracleExcluded
+                | FailureReason::StackOverflow
+        );
+        if permanent {
+            let method_key = CodeCache::method_key(
+                task.method.class_name.as_str(),
+                task.method.method_name.as_str(),
+                task.method.descriptor.as_str(),
+            );
+            self.mark_not_compilable(&method_key, task.comp_level(), task.is_osr);
+        }
         let mut inner = self.inner.lock().unwrap();
         inner.total_bailout_count += 1;
     }
@@ -1031,6 +1197,7 @@ impl CompileBroker {
         flags: MethodCompileFlags,
         blocking: bool,
     ) -> Option<CompileTask> {
+        Self::ensure_compiler_threads_started();
         let method_key = CodeCache::method_key(
             class_name.as_str(),
             method_name.as_str(),
@@ -1089,6 +1256,7 @@ impl CompileBroker {
         enclosing: Option<(String, CompLevel, bool)>, // (key, level, is_osr)
         max_osr_level: CompLevel,
     ) -> Option<CompileTask> {
+        Self::ensure_compiler_threads_started();
         let method_key = CodeCache::method_key(
             class_name.as_str(),
             method_name.as_str(),
@@ -1136,6 +1304,17 @@ impl CompileBroker {
         actions: PolicyActions,
         osr_bci_hint: Option<i32>,
     ) -> Option<CompileTask> {
+        if std::env::var_os("JVM25_TRACE_COMPILE").is_some() {
+            eprintln!(
+                "[jit-actions] {}.{}{} call={:?} osr={:?} not_entrant={}",
+                class_name.as_str(),
+                method_name.as_str(),
+                descriptor.as_str(),
+                actions.call_compile_level,
+                actions.osr_compile,
+                actions.make_not_entrant
+            );
+        }
         let mut first_task = None;
         let hot_count = profile_key
             .and_then(methodCounters::get)

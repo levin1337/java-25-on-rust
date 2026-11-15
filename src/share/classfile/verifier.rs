@@ -5,6 +5,7 @@
  * stack map frame analysis, and conformance checks.
  */
 
+use super::classLoader::ClassLoader;
 use crate::classfile::{ClassFile, Constant, Member};
 use std::io::{self, Error};
 
@@ -597,6 +598,117 @@ impl ClassVerifier {
     }
 }
 
+/// Class-level structural checks from HotSpot's `ClassVerifier::
+/// verify_class` / `classFileParser`: access-flag legality, `<init>` /
+/// `<clinit>` shape, constant-pool tag version gates and class-kind
+/// consistency.
+fn verify_class_structure(class: &ClassFile<'_>) -> io::Result<()> {
+    const ACC_PUBLIC: u16 = 0x0001;
+    const ACC_FINAL: u16 = 0x0010;
+    const ACC_SUPER: u16 = 0x0020;
+    const ACC_INTERFACE: u16 = 0x0200;
+    const ACC_ABSTRACT: u16 = 0x0400;
+    const ACC_SYNTHETIC: u16 = 0x1000;
+    const ACC_ANNOTATION: u16 = 0x2000;
+    const ACC_ENUM: u16 = 0x4000;
+    const ACC_MODULE: u16 = 0x8000;
+    const ALLOWED_CLASS_FLAGS: u16 = ACC_PUBLIC
+        | ACC_FINAL
+        | ACC_SUPER
+        | ACC_INTERFACE
+        | ACC_ABSTRACT
+        | ACC_SYNTHETIC
+        | ACC_ANNOTATION
+        | ACC_ENUM
+        | ACC_MODULE;
+
+    let flags = class.accessFlags;
+    if flags & !ALLOWED_CLASS_FLAGS != 0 {
+        return Err(Error::other(format!(
+            "ClassFormatError: Illegal class access flags {flags:#06x}"
+        )));
+    }
+    let is_interface = (flags & ACC_INTERFACE) != 0;
+    let is_annotation = (flags & ACC_ANNOTATION) != 0;
+    let is_enum = (flags & ACC_ENUM) != 0;
+    let is_module = (flags & ACC_MODULE) != 0;
+
+    if is_annotation && !is_interface {
+        return Err(Error::other(
+            "ClassFormatError: ACC_ANNOTATION requires ACC_INTERFACE",
+        ));
+    }
+    if is_module {
+        if class.name != b"module-info" {
+            return Err(Error::other(
+                "ClassFormatError: ACC_MODULE only allowed on module-info",
+            ));
+        }
+        if class.superName.is_some() || !class.interfaces.is_empty() {
+            return Err(Error::other(
+                "ClassFormatError: module-info must not have superclass or interfaces",
+            ));
+        }
+    }
+    if is_enum && !is_module {
+        // Enum classes must extend java.lang.Enum (checked at link time in
+        // HotSpot; the superclass name is available here).
+        if class.superName != Some(b"java/lang/Enum".as_slice()) {
+            return Err(Error::other(format!(
+                "ClassFormatError: enum class {} must extend java.lang.Enum (super={})",
+                String::from_utf8_lossy(class.name),
+                class
+                    .superName
+                    .map(|name| String::from_utf8_lossy(name).into_owned())
+                    .unwrap_or_else(|| "none".to_string()),
+            )));
+        }
+    }
+
+    // <init> / <clinit> shape rules (JVMS 4.6 / 5.5).
+    for method in &class.methods {
+        let is_static = (method.accessFlags & 0x0008) != 0;
+        if method.name == b"<init>" {
+            if is_static {
+                return Err(Error::other(
+                    "ClassFormatError: <init> must not be static",
+                ));
+            }
+            if !method.descriptor.starts_with(b"(")
+                || !method.descriptor.ends_with(b")V")
+            {
+                return Err(Error::other(
+                    "ClassFormatError: <init> must have descriptor ([params])V",
+                ));
+            }
+        } else if method.name == b"<clinit>" {
+            if !is_static || method.descriptor != b"()V" {
+                return Err(Error::other(
+                    "ClassFormatError: <clinit> must be static void ()V",
+                ));
+            }
+        }
+    }
+
+    // Constant-pool tag version gates (JVMS 4.4): tags introduced after
+    // the baseline class file format require the matching class version.
+    for c in &class.constants {
+        let required = match c {
+            Constant::MethodHandle(_, _) | Constant::MethodType(_) => 51,
+            Constant::InvokeDynamic(_, _) => 51,
+            Constant::Dynamic(_, _) => 55,
+            Constant::Module(_) | Constant::Package(_) => 53,
+            _ => 0,
+        };
+        if required != 0 && class.majorVersion < required {
+            return Err(Error::other(format!(
+                "UnsupportedClassVersionError: constant pool tag requires class file version {required}.0"
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub struct Verifier;
 
 impl Verifier {
@@ -606,6 +718,19 @@ impl Verifier {
     pub const DYNAMICCONSTANT_MAJOR_VERSION: u16 = 55;
 
     pub fn verify_class(class: &ClassFile<'_>) -> io::Result<()> {
+        Self::verify_class_with_loader(class, None)
+    }
+
+    /// Full verification: class structure, per-method `Code` attribute
+    /// shape and bytecode-level dataflow verification. `loader` supplies
+    /// the already-loaded class hierarchy for precise reference-type
+    /// assignability checks (JVMS 4.10 verification by type checking).
+    pub fn verify_class_with_loader<'a>(
+        class: &ClassFile<'a>,
+        loader: Option<&ClassLoader<'a>>,
+    ) -> io::Result<()> {
+        verify_class_structure(class)?;
+
         let is_interface = (class.accessFlags & 0x0200) != 0;
         let is_abstract = (class.accessFlags & 0x0400) != 0;
         let is_final = (class.accessFlags & 0x0010) != 0;
@@ -618,16 +743,21 @@ impl Verifier {
 
         for method in &class.methods {
             ClassVerifier::verify_method(method, &class.constants, class.majorVersion)?;
+            super::bytecodeVerifier::verify_method_code(class, method, loader)?;
         }
 
         Ok(())
     }
 
-    pub fn verify(class: &ClassFile<'_>, should_verify_class: bool) -> io::Result<bool> {
+    pub fn verify<'a>(
+        class: &ClassFile<'a>,
+        loader: Option<&ClassLoader<'a>>,
+        should_verify_class: bool,
+    ) -> io::Result<bool> {
         if !should_verify_class {
             return Ok(true);
         }
-        Self::verify_class(class)?;
+        Self::verify_class_with_loader(class, loader)?;
         Ok(true)
     }
 

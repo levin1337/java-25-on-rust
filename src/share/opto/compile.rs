@@ -9,9 +9,12 @@
  */
 
 use super::builder::{BytecodeGraphBuilder, BuildResult, BuilderContext, MethodCode};
+use super::codegen::{compile_schedule, BackendOptions, BackendError};
 use super::gvn::PhaseGVN;
 use super::node::{NodeId, Opcode};
 use super::phase::{Phase, PhaseCCP, PhaseIterGVN, PhaseNumber, PhaseRemoveUselessAndRenumber};
+use super::regalloc::RegisterAllocator;
+use super::scheduler::Scheduler;
 
 pub struct Compile {
     pub method_name: String,
@@ -96,5 +99,92 @@ impl Compile {
 
     pub fn has_pending_merges(&self) -> bool {
         self.gvn.has_pending_inputs() > 0
+    }
+
+    /// Runs the ported C2 backend: schedule the optimized ideal graph into
+    /// blocks, allocate registers/stack slots with the linear-scan allocator,
+    /// and emit x86-64 machine code plus frame/pc metadata.
+    ///
+    /// Returns the emitter result; unsupported graph features surface as
+    /// `BackendError::Unsupported` instead of incorrect code.
+    pub fn backend(
+        &mut self,
+        method: &MethodCode,
+        _ctx: &BuilderContext,
+        options: &BackendOptions,
+    ) -> Result<super::codegen::EmitResult, BackendError> {
+        self.optimize();
+        let schedule = Scheduler::new(&self.gvn).schedule();
+        if !schedule.unsupported.is_empty() {
+            return Err(BackendError::Unsupported(format!(
+                "scheduler rejected graph: {}",
+                schedule.unsupported.join("; ")
+            )));
+        }
+        let alloc = RegisterAllocator::new(&self.gvn, &schedule)
+            .allocate(method.param_slots)
+            .map_err(BackendError::InvalidGraph)?;
+        let buf = super::codegen::default_buffer()?;
+        compile_schedule(&buf, &self.gvn, &schedule, &alloc, options)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn method(code: &'static [u8], param_slots: usize) -> MethodCode<'static> {
+        MethodCode {
+            name: "test",
+            max_locals: param_slots.max(1),
+            max_stack: 8,
+            param_slots,
+            code,
+            handlers: &[],
+        }
+    }
+
+    #[test]
+    fn compiles_iconst_ireturn() {
+        // iconst_5 ; ireturn
+        let code: &[u8] = &[0x08, 0xac];
+        let mut c = Compile::compile(&method(code, 0), &BuilderContext::empty());
+        let emitted = c
+            .backend(&method(code, 0), &BuilderContext::empty(), &BackendOptions::default())
+            .expect("backend should emit code");
+        assert!(!emitted.code.is_empty());
+        assert!(emitted.code.iter().any(|&b| b == 0xc3)); // ret
+        assert_eq!(emitted.code[emitted.code.len() - 2..], [0x0f, 0x0b]);
+    }
+
+    #[test]
+    fn compiles_add_and_return() {
+        // iconst_2 ; iconst_3 ; iadd ; ireturn
+        let code: &[u8] = &[0x05, 0x06, 0x60, 0xac];
+        let mut c = Compile::compile(&method(code, 0), &BuilderContext::empty());
+        let emitted = c
+            .backend(&method(code, 0), &BuilderContext::empty(), &BackendOptions::default())
+            .expect("backend should emit code");
+        assert!(emitted.code.iter().any(|&b| b == 0x03)); // add r,r/m
+        assert!(emitted.code.iter().any(|&b| b == 0xc3));
+    }
+
+    #[test]
+    fn compiles_param_add() {
+        // iload_0 ; iconst_1 ; iadd ; ireturn   (static (I)I, param slot 0)
+        let code: &[u8] = &[0x1a, 0x04, 0x60, 0xac];
+        let params = vec![super::super::codegen::ParamSlot {
+            local_slot: 0,
+            kind: super::super::codegen::ParamKind::I32,
+        }];
+        let options = BackendOptions {
+            params,
+            ..BackendOptions::default()
+        };
+        let mut c = Compile::compile(&method(code, 1), &BuilderContext::empty());
+        let emitted = c
+            .backend(&method(code, 1), &BuilderContext::empty(), &options)
+            .expect("backend should emit code");
+        assert!(emitted.code.iter().any(|&b| b == 0xc3));
     }
 }

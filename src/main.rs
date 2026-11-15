@@ -14,19 +14,32 @@ fn inspect() -> Result<(), Box<dyn Error>> {
         None
     };
     let mut properties = Vec::new();
-    while arguments
-        .peek()
-        .is_some_and(|arg| arg.to_str().is_some_and(|arg| arg.starts_with("-D")))
-    {
-        let option = arguments.next().unwrap();
-        let option = option
-            .to_str()
-            .ok_or_else(|| io::Error::other("Invalid system property"))?;
-        let (key, value) = option[2..].split_once('=').unwrap_or((&option[2..], ""));
-        if key.is_empty() {
-            return Err(io::Error::other("Empty system property name").into());
+    loop {
+        let Some(peek) = arguments.peek() else { break };
+        let Some(text) = peek.to_str() else { break };
+        if text.starts_with("-D") {
+            let option = arguments.next().unwrap();
+            let option = option
+                .to_str()
+                .ok_or_else(|| io::Error::other("Invalid system property"))?;
+            let (key, value) = option[2..].split_once('=').unwrap_or((&option[2..], ""));
+            if key.is_empty() {
+                return Err(io::Error::other("Empty system property name").into());
+            }
+            properties.push((key.to_owned(), value.to_owned()));
+        } else if (text.starts_with("-X") || text.starts_with("--"))
+            && text != "--class-path"
+        {
+            let option = arguments.next().unwrap();
+            if option
+                .to_str()
+                .is_some_and(|arg| arg == "--add-exports" || arg == "--add-opens" || arg == "--patch-module")
+            {
+                let _ = arguments.next();
+            }
+        } else {
+            break;
         }
-        properties.push((key.to_owned(), value.to_owned()));
     }
     let target = arguments.next().ok_or_else(|| io::Error::other(
         "Usage: jvm25-rust [--modules <image>] [-cp <path>] <main-class> [args...] | -jar <file> [args...] | <class-file>",

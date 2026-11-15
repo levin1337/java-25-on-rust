@@ -355,6 +355,28 @@ fn member_int<'a>(
     }
 }
 
+fn set_member_field<'a>(
+    loader: &ClassLoader<'a>,
+    handle: usize,
+    klass: &InstanceKlass<'a>,
+    name: &[u8],
+    descriptor: &[u8],
+    value: Value<'a>,
+) -> io::Result<()> {
+    let slot = klass
+        .instanceField(name, descriptor)
+        .map_err(|_| invalid("Missing member field"))?;
+    let mut objects = loader.borrow_objects_mut();
+    let object = objects
+        .get_mut(handle)
+        .ok_or_else(|| invalid("Invalid object"))?;
+    if slot >= object.fields.len() {
+        return Err(invalid("Member field slot out of range"));
+    }
+    object.fields[slot] = value;
+    Ok(())
+}
+
 fn member_string<'a>(loader: &ClassLoader<'a>, value: Value<'a>) -> io::Result<Vec<u8>> {
     Ok(java_string(loader, value)?.into_bytes())
 }
@@ -424,12 +446,15 @@ fn executable_info<'a>(
     let parameters = class_array_field(loader, handle, &klass, b"parameterTypes")?;
     let result_mirror = member_field(loader, handle, &klass, b"returnType", b"Ljava/lang/Class;");
     let modifiers = member_int(loader, handle, &klass, b"modifiers", b"I")?;
-    let name_value = member_field(loader, handle, &klass, b"name", b"Ljava/lang/String;")
-        .ok_or_else(|| invalid("Missing member name"))?;
-    let name = member_string(loader, name_value)?;
+    // `java.lang.reflect.Constructor` has no `name` field; its name is the
+    // constant "<init>".
+    let name = match member_field(loader, handle, &klass, b"name", b"Ljava/lang/String;") {
+        Some(value) => member_string(loader, value)?,
+        None => Vec::new(),
+    };
     let result = match result_mirror {
         Some(Value::ClassMirror(mirror)) => descriptor_mirror(mirror),
-        _ => b"V".as_slice(),
+        _ => b":V".as_slice(),
     };
     Ok(ExecutableInfo {
         declaring,
@@ -1785,7 +1810,71 @@ fn class_java_method<'a>(
         (b"isUnnamedClass", b"()Z") => Some(Value::Int(0)),
         (b"desiredAssertionStatus", b"()Z") => Some(Value::Int(0)),
         (b"getModule", b"()Ljava/lang/Module;") => class_module_object(loader, class),
-        (b"getPackage", b"()Ljava/lang/Package;") => Some(Value::Null),
+        (b"getPackage", b"()Ljava/lang/Package;") => {
+            // Same package-name derivation as `getPackageName` above.
+            let package = if is_array {
+                let element = array_element(class);
+                if element.starts_with(b":") || element.len() == 1 {
+                    "java.lang".to_owned()
+                } else {
+                    let dotted = dotted_name(element);
+                    match dotted.rfind('.') {
+                        Some(dot) => dotted[..dot].to_owned(),
+                        None => String::new(),
+                    }
+                }
+            } else if is_primitive {
+                "java.lang".to_owned()
+            } else {
+                let dotted = dotted_name(class);
+                match dotted.rfind('.') {
+                    Some(dot) => dotted[..dot].to_owned(),
+                    None => String::new(),
+                }
+            };
+            if package.is_empty() {
+                Some(Value::Null)
+            } else if let Some(handle) = loader.package_object(&package) {
+                Some(Value::Object(handle))
+            } else {
+                // Lazily create the `java.lang.Package` object: `name` must
+                // be a real String (Package.getName() returns it to Java).
+                let name_value = string_value(loader, &package);
+                let mut sink = io::sink();
+                let real_name = match stringNatives::materialize(loader, name_value, &mut sink, 0) {
+                    Ok(Some(value)) => value,
+                    _ => name_value,
+                };
+                // `Package.versionInfo` must be a real `Package$VersionInfo`
+                // object — getters dereference it unconditionally.
+                let version_info = new_member_object(
+                    loader,
+                    b"java/lang/Package$VersionInfo",
+                    &[],
+                )
+                .ok();
+                let mut fields: Vec<(&[u8], &[u8], Value<'a>)> = vec![
+                    (b"name", b"Ljava/lang/String;", real_name),
+                ];
+                if let Some(vi) = version_info {
+                    fields.push((
+                        b"versionInfo",
+                        b"Ljava/lang/Package$VersionInfo;",
+                        Value::Object(vi),
+                    ));
+                }
+                if let Some(module) = class_module_object(loader, class) {
+                    fields.push((b"module", b"Ljava/lang/Module;", module));
+                }
+                match new_member_object(loader, b"java/lang/Package", &fields) {
+                    Ok(handle) => {
+                        loader.register_package_object(&package, handle);
+                        Some(Value::Object(handle))
+                    }
+                    Err(_) => Some(Value::Null),
+                }
+            }
+        }
         (b"getNestHost", b"()Ljava/lang/Class;") => {
             let host = if !is_array
                 && !is_primitive
@@ -2792,6 +2881,157 @@ fn dims_values<'a>(loader: &ClassLoader<'a>, value: Value<'a>) -> io::Result<Vec
 }
 
 /// Static native methods used by reflection and class lookup.
+/// `Executable.getParameters0()`: builds the real `Parameter[]` from the
+/// method's `MethodParameters` attribute (JVMS §4.7.18) and descriptor,
+/// stores `Executable$ParameterData` on the executable, and returns the
+/// array. Parameter names absent from the attribute are synthesized as
+/// `argN`, matching HotSpot.
+fn executable_parameters0<'a>(
+    loader: &ClassLoader<'a>,
+    arguments: &[Value<'a>],
+) -> io::Result<Value<'a>> {
+    let exec = arguments.first().copied().unwrap_or(Value::Null);
+    let Value::Object(handle) = exec else {
+        return Err(iae(loader, "Expected executable member object"));
+    };
+    let exec_klass = klass_of(loader, handle)?;
+    let expected: &[u8] = match exec_klass.class.name {
+        b"java/lang/reflect/Method" => b"java/lang/reflect/Method",
+        b"java/lang/reflect/Constructor" => b"java/lang/reflect/Constructor",
+        _ => return Err(iae(loader, "Expected executable member object")),
+    };
+    let info = executable_info(loader, exec, expected)?;
+    let descriptor = executable_descriptor(&info);
+    let declaring = loader.load(info.declaring)?;
+    let member_name: &[u8] = if expected == b"java/lang/reflect/Constructor" {
+        b"<init>"
+    } else {
+        info.name.as_slice()
+    };
+    let member = declaring
+        .class
+        .methods
+        .iter()
+        .find(|member| member.name == member_name && member.descriptor == descriptor.as_slice());
+
+    // MethodParameters attribute: u1 count, then {u2 name_index, u2 flags}.
+    let mut entries: Vec<(Option<Vec<u8>>, u16)> = Vec::new();
+    let mut is_real = false;
+    if let Some(member) = member
+        && let Some(attribute) = member
+            .attributes
+            .iter()
+            .find(|attribute| attribute.name == b"MethodParameters")
+    {
+        let bytes = attribute.bytes;
+        if let Some(&count) = bytes.first() {
+            let mut offset = 1;
+            for _ in 0..count {
+                let Some(slice) = bytes.get(offset..offset + 4) else {
+                    break;
+                };
+                let name_index = u16::from_be_bytes([slice[0], slice[1]]);
+                let flags = u16::from_be_bytes([slice[2], slice[3]]);
+                offset += 4;
+                let name = if name_index == 0 {
+                    None
+                } else {
+                    utf8_at(&declaring, name_index).map(<[u8]>::to_vec)
+                };
+                entries.push((name, flags));
+            }
+            is_real = true;
+        }
+    }
+
+    if std::env::var_os("JVM25_TRACE").is_some() {
+        eprintln!(
+            "[params0] member={:?} desc={} entries={} real={}",
+            member.map(|m| m.name),
+            String::from_utf8_lossy(&descriptor),
+            entries.len(),
+            is_real
+        );
+    }
+    let count = info.parameters.len();
+    let mut handles = Vec::with_capacity(count);
+    for index in 0..count {
+        let (name_bytes, flags) = entries.get(index).cloned().unwrap_or((None, 0));
+        let name_bytes = name_bytes.unwrap_or_else(|| format!("arg{index}").into_bytes());
+        let name_text = String::from_utf8_lossy(&name_bytes);
+        let name_value = string_value(loader, &name_text);
+        // JVMS parameter access flags: FINAL(0x0010) | SYNTHETIC(0x1000) |
+        // MANDATED(0x8000).
+        let modifiers = (flags & 0x9010) as i32;
+        let parameter = new_member_object(
+            loader,
+            b"java/lang/reflect/Parameter",
+            &[
+                (b"name", b"Ljava/lang/String;", name_value),
+                (b"modifiers", b"I", Value::Int(modifiers)),
+                (
+                    b"executable",
+                    b"Ljava/lang/reflect/Executable;",
+                    exec,
+                ),
+                (b"index", b"I", Value::Int(index as i32)),
+            ],
+        )?;
+        handles.push(parameter);
+    }
+    let parameters = member_array(loader, b"java/lang/reflect/Parameter", handles)?;
+
+    // `parameterData` = new ParameterData(parameters, isReal).
+    let parameter_data = new_member_object(
+        loader,
+        b"java/lang/reflect/Executable$ParameterData",
+        &[
+            (
+                b"parameters",
+                b"[Ljava/lang/reflect/Parameter;",
+                parameters,
+            ),
+            (b"isReal", b"Z", Value::Int(is_real as i32)),
+        ],
+    )?;
+    set_member_field(
+        loader,
+        handle,
+        &exec_klass,
+        b"parameterData",
+        b"Ljava/lang/reflect/Executable$ParameterData;",
+        Value::Object(parameter_data),
+    )?;
+    Ok(parameters)
+}
+
+/// Instance-side natives declared on `java.lang.reflect.Executable` and
+/// `java.lang.reflect.Field` (resolved to their declaring class by
+/// `native_declaring_owner`).
+pub(crate) fn member_invoke<'a>(
+    loader: &ClassLoader<'a>,
+    owner: &[u8],
+    name: &[u8],
+    descriptor: &[u8],
+    arguments: &[Value<'a>],
+) -> io::Result<Option<Option<Value<'a>>>> {
+    match (owner, name, descriptor) {
+        (
+            b"java/lang/reflect/Executable",
+            b"getParameters0",
+            b"()[Ljava/lang/reflect/Parameter;",
+        ) => Ok(Some(Some(executable_parameters0(loader, arguments)?))),
+        // Type-use annotation bytes are not parsed by this VM yet; the JDK
+        // treats a null result as "no annotations", consistent with
+        // Class.getRawAnnotations/getRawTypeAnnotations.
+        (b"java/lang/reflect/Executable", b"getTypeAnnotationBytes0", b"()[B")
+        | (b"java/lang/reflect/Field", b"getTypeAnnotationBytes0", b"()[B") => {
+            Ok(Some(Some(Value::Null)))
+        }
+        _ => Ok(None),
+    }
+}
+
 pub(crate) fn invoke_static<'a>(
     loader: &ClassLoader<'a>,
     owner: &[u8],
@@ -2809,6 +3049,13 @@ pub(crate) fn invoke_static<'a>(
                 java_string(loader, arguments.first().copied().unwrap_or(Value::Null))?;
             let initialize = matches!(arguments.get(1), Some(Value::Int(flags)) if *flags != 0);
             let internal = class_name.replace('.', "/");
+            if class_name.contains('=') || class_name.contains(':') {
+                eprintln!(
+                    "[forName0-suspect] name={:?} site={}",
+                    class_name,
+                    bytecodeInterpreter::current_frame_site()
+                );
+            }
             if internal.starts_with('[') {
                 let mirror = loader.storage.alloc_slice_copy(internal.as_bytes());
                 return Ok(Some(Some(Value::ClassMirror(mirror))));

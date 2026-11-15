@@ -6,8 +6,6 @@
  * protection, and lifetime management.
  */
 
-use std::alloc::{alloc, dealloc, Layout};
-use std::mem;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -17,8 +15,13 @@ mod win32 {
     pub const PAGE_EXECUTE_READWRITE: u32 = 0x40;
     pub const PAGE_EXECUTE_READ: u32 = 0x20;
     pub const PAGE_READWRITE: u32 = 0x04;
+    pub const MEM_COMMIT: u32 = 0x1000;
+    pub const MEM_RESERVE: u32 = 0x2000;
+    pub const MEM_RELEASE: u32 = 0x8000;
     #[link(name = "kernel32")]
     unsafe extern "system" {
+        pub fn VirtualAlloc(lp_address: *mut c_void, dw_size: usize, fl_allocation_type: u32, fl_protect: u32) -> *mut c_void;
+        pub fn VirtualFree(lp_address: *mut c_void, dw_size: usize, dw_free_type: u32) -> i32;
         pub fn VirtualProtect(
             lp_address: *mut c_void,
             dw_size: usize,
@@ -75,39 +78,8 @@ impl CodeBuffer {
         let page_size = page_size();
         let aligned_size = (size + page_size - 1) & !(page_size - 1);
 
-        // Allocate memory with RW permissions initially
-        let layout = Layout::from_size_align(aligned_size, CODE_BUFFER_ALIGNMENT)
-            .map_err(|_| CodeBufferError::LayoutError)?;
-
-        let ptr = unsafe { alloc(layout) };
-        if ptr.is_null() {
-            return Err(CodeBufferError::AllocationFailed(aligned_size));
-        }
-
-        let base = NonNull::new(ptr).unwrap();
-
-        // Make it executable
-        #[cfg(unix)]
-        {
-            use libc::{mprotect, PROT_READ, PROT_WRITE, PROT_EXEC};
-            let result = unsafe { mprotect(base.as_ptr() as *mut _, aligned_size, PROT_READ | PROT_WRITE | PROT_EXEC) };
-            if result != 0 {
-                unsafe { dealloc(base.as_ptr(), layout) };
-                return Err(CodeBufferError::ProtectionFailed);
-            }
-        }
-
-        #[cfg(windows)]
-        {
-            let mut old_protect: u32 = 0;
-            let result = unsafe {
-                win32::VirtualProtect(base.as_ptr() as *mut _, aligned_size, win32::PAGE_EXECUTE_READWRITE, &mut old_protect)
-            };
-            if result == 0 {
-                unsafe { dealloc(base.as_ptr(), layout) };
-                return Err(CodeBufferError::ProtectionFailed);
-            }
-        }
+        let ptr = allocate_executable(aligned_size)?;
+        let base = NonNull::new(ptr).ok_or(CodeBufferError::AllocationFailed(aligned_size))?;
 
         Ok(Self {
             base,
@@ -419,9 +391,34 @@ impl CodeBuffer {
 
 impl Drop for CodeBuffer {
     fn drop(&mut self) {
-        let layout = Layout::from_size_align(self.size, CODE_BUFFER_ALIGNMENT).unwrap();
-        unsafe { dealloc(self.base.as_ptr(), layout) };
+        free_executable(self.base.as_ptr(), self.size);
     }
+}
+
+#[cfg(windows)]
+fn allocate_executable(size: usize) -> Result<*mut u8, CodeBufferError> {
+    let ptr = unsafe {
+        win32::VirtualAlloc(std::ptr::null_mut(), size, win32::MEM_COMMIT | win32::MEM_RESERVE, win32::PAGE_EXECUTE_READWRITE)
+    };
+    if ptr.is_null() { Err(CodeBufferError::AllocationFailed(size)) } else { Ok(ptr as *mut u8) }
+}
+
+#[cfg(windows)]
+fn free_executable(ptr: *mut u8, _size: usize) {
+    unsafe { win32::VirtualFree(ptr as *mut _, 0, win32::MEM_RELEASE); }
+}
+
+#[cfg(unix)]
+fn allocate_executable(size: usize) -> Result<*mut u8, CodeBufferError> {
+    let ptr = unsafe {
+        libc::mmap(std::ptr::null_mut(), size, libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0)
+    };
+    if ptr == libc::MAP_FAILED { Err(CodeBufferError::AllocationFailed(size)) } else { Ok(ptr as *mut u8) }
+}
+
+#[cfg(unix)]
+fn free_executable(ptr: *mut u8, size: usize) {
+    unsafe { libc::munmap(ptr as *mut _, size); }
 }
 
 // SAFETY: CodeBuffer manages its own memory and provides safe access
@@ -525,7 +522,7 @@ impl GrowingCodeBuffer {
         }
 
         // Need to grow
-        drop(current); // Release borrow
+        let _ = current;
         self.grow()?;
         self.buffers[self.current].advance(bytes)
     }

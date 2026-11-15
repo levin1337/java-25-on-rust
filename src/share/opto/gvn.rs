@@ -7,7 +7,7 @@
  * graph compaction (Compile::renumber_live analog).
  */
 
-use super::node::{CmpCondition, Node, NodeId, Opcode, Type, NONE};
+use super::node::{CmpCondition, Node, NodeId, Opcode, NONE};
 use std::collections::HashMap;
 
 pub struct PhaseGVN {
@@ -149,12 +149,17 @@ impl PhaseGVN {
 
     pub fn iter_gvn(&mut self) -> usize {
         let mut rounds = 0;
+        let mut done: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
         loop {
             let mut replacements: HashMap<NodeId, NodeId> = HashMap::new();
             for id in 0..self.nodes.len() {
+                if done.contains(&id) {
+                    continue;
+                }
                 if let Some(rep) = self.optimize_node(id) {
                     if rep != id {
                         replacements.insert(id, rep);
+                        done.insert(id);
                     }
                 }
             }

@@ -1240,6 +1240,20 @@ fn net_channel<'a>(
                 None => Ok(None),
             };
         }
+        b"sun/nio/ch/Iocp" => {
+            return match iocp_dispatch(loader, name, descriptor, arguments)? {
+                Some(v) => Ok(Some(Some(v))),
+                None => Ok(None),
+            };
+        }
+        b"sun/nio/ch/WindowsAsynchronousSocketChannelImpl"
+        | b"sun/nio/ch/WindowsAsynchronousServerSocketChannelImpl"
+        | b"sun/nio/ch/WindowsAsynchronousFileChannelImpl" => {
+            return match async_dispatch(loader, owner, name, descriptor, arguments)? {
+                Some(v) => Ok(Some(Some(v))),
+                None => Ok(None),
+            };
+        }
         b"sun/nio/ch/DatagramDispatcher" => {
             let handled = matches!(
                 (name, descriptor),
@@ -1503,12 +1517,11 @@ fn net_channel<'a>(
             with_sock(id, |s| {
                 match s {
                     Sock::Fresh { stream: true, bound } => {
-                        // std has no bind-without-listen; create the listener
-                        // now so the OS assigns the port immediately.
-                        let listener = TcpListener::bind(addr)
-                            .map_err(|e| sock_io_err(loader, e))?;
-                        listener.set_nonblocking(true).ok();
-                        *s = Sock::Listener { listener, pending: None };
+                        // JDK separates bind() from listen(): a bound stream
+                        // socket is NOT yet a listener (async channels bind
+                        // before connect). Record the address; `listen`
+                        // materializes the TcpListener on demand.
+                        *bound = Some(addr);
                         Ok(())
                     }
                     Sock::Fresh { stream: false, .. } => {
@@ -1782,4 +1795,629 @@ fn net_channel<'a>(
         _ => {}
     }
     Ok(None)
+}
+
+// ---------------------------------------------------------------------------
+// IOCP (`sun.nio.ch.Iocp`) and Windows asynchronous channels
+// (`WindowsAsynchronous{Socket,ServerSocket,File}ChannelImpl`).
+//
+// The JDK drives these through an I/O completion port: channel ops return
+// IOStatus.UNAVAILABLE (-2) and the outcome arrives later through
+// `getQueuedCompletionStatus`, which maps a completion key back to the
+// channel's PendingFuture via the `overlapped` pointer.
+//
+// We perform the I/O synchronously on the calling handler-pool thread and
+// immediately enqueue the completion, preserving the exact Java-visible
+// protocol (UNAVAILABLE + later completion callback). Socket/file handles
+// are associated to (port, key) pairs by `createIoCompletionPort`, mirroring
+// `Iocp.associate`.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+struct IocpCompletion {
+    key: i64,
+    overlapped: i64,
+    bytes: i32,
+    error: i32,
+}
+
+struct IocpPort {
+    queue: std::collections::VecDeque<IocpCompletion>,
+    closed: bool,
+}
+
+struct IocpTable {
+    ports: std::collections::HashMap<u64, IocpPort>,
+    /// file/socket handle -> (port, completion key)
+    assoc: std::collections::HashMap<u64, (u64, i64)>,
+}
+
+static IOCP_SYNC: (Mutex<Option<IocpTable>>, std::sync::Condvar) =
+    (Mutex::new(None), std::sync::Condvar::new());
+static NEXT_IOCP_PORT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0x6000_0000);
+
+fn iocp_table() -> std::sync::MutexGuard<'static, Option<IocpTable>> {
+    let mut guard = IOCP_SYNC.0.lock().unwrap();
+    if guard.is_none() {
+        *guard = Some(IocpTable {
+            ports: std::collections::HashMap::new(),
+            assoc: std::collections::HashMap::new(),
+        });
+    }
+    guard
+}
+
+/// Enqueues a completion for `handle`'s associated (port, key). No-op when
+/// the handle was never associated (channel created while its group was
+/// shut down — such channels fail earlier anyway).
+fn iocp_post(handle: u64, overlapped: i64, bytes: i32, error: i32) {
+    let (lock, cvar) = &IOCP_SYNC;
+    let mut guard = lock.lock().unwrap();
+    let Some(state) = guard.as_mut() else {
+        return;
+    };
+    let Some(&(port, key)) = state.assoc.get(&handle) else {
+        return;
+    };
+    if let Some(p) = state.ports.get_mut(&port)
+        && !p.closed
+    {
+        p.queue.push_back(IocpCompletion {
+            key,
+            overlapped,
+            bytes,
+            error,
+        });
+        cvar.notify_one();
+    }
+}
+
+/// Fills `error`, `bytesTransferred`, `completionKey` (int) and `overlapped`
+/// on an `Iocp.CompletionStatus` object.
+fn set_iocp_status<'a>(
+    loader: &ClassLoader<'a>,
+    value: Value<'a>,
+    error: i32,
+    bytes: i32,
+    key: i64,
+    overlapped: i64,
+) -> io::Result<()> {
+    let Value::Object(object_handle) = value else {
+        return Err(io::Error::other("Expected CompletionStatus object"));
+    };
+    let updates = {
+        let objects = loader.borrow_objects();
+        let object = objects
+            .get(object_handle)
+            .ok_or_else(|| io::Error::other("Invalid CompletionStatus object"))?;
+        let klass = &object.klass;
+        let mut updates = vec![
+            (klass.instanceField(b"error", b"I")?, Value::Int(error)),
+            (
+                klass.instanceField(b"bytesTransferred", b"I")?,
+                Value::Int(bytes),
+            ),
+            (klass.instanceField(b"overlapped", b"J")?, Value::Long(overlapped)),
+        ];
+        // completionKey is `int` in sun.nio.ch.Iocp.CompletionStatus
+        if let Ok(slot) = klass.instanceField(b"completionKey", b"I") {
+            updates.push((slot, Value::Int(key as i32)));
+        } else if let Ok(slot) = klass.instanceField(b"completionKey", b"J") {
+            updates.push((slot, Value::Long(key)));
+        }
+        updates
+    };
+    let mut objects = loader.borrow_objects_mut();
+    let object = objects
+        .get_mut(object_handle)
+        .ok_or_else(|| io::Error::other("Invalid CompletionStatus object"))?;
+    for (slot, value) in updates {
+        if slot < object.fields.len() {
+            object.fields[slot] = value;
+        }
+    }
+    Ok(())
+}
+
+/// Parses `count` WSABUF entries at `address` (x64: `{u32 len, u32 pad,
+/// u64 buf}` — 16 bytes stride).
+fn read_wsabufs(address: i64, count: i32) -> io::Result<Vec<(u64, usize)>> {
+    let base = u64::try_from(address).map_err(|_| io::Error::other("Invalid address"))?;
+    let count = count.max(0).min(1024) as usize;
+    let mem = OffHeapMemory::global();
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        let entry = base + i as u64 * 16;
+        let len = mem.get_int(entry)?.max(0) as usize;
+        let buf = mem.get_long(entry + 8)? as u64;
+        out.push((buf, len));
+    }
+    Ok(out)
+}
+
+/// Performs a blocking read across the WSABUF array, returning bytes read
+/// (0 on EOF). The stream is temporarily switched to blocking mode.
+fn wsabuf_read(mut stream: &TcpStream, address: i64, count: i32) -> io::Result<i64> {
+    let bufs = read_wsabufs(address, count)?;
+    let mut total = 0i64;
+    stream.set_nonblocking(false)?;
+    let result = (|| {
+        for (base, len) in &bufs {
+            if *len == 0 {
+                continue;
+            }
+            let mut buf = vec![0u8; *len];
+            match stream.read(&mut buf) {
+                Ok(0) => return Ok(total),
+                Ok(n) => {
+                    write_addr(*base as i64, &buf[..n])?;
+                    total += n as i64;
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(total)
+    })();
+    stream.set_nonblocking(true).ok();
+    result
+}
+
+/// Performs a blocking gather-write across the WSABUF array.
+fn wsabuf_write(mut stream: &TcpStream, address: i64, count: i32) -> io::Result<i64> {
+    let bufs = read_wsabufs(address, count)?;
+    let mut total = 0i64;
+    stream.set_nonblocking(false)?;
+    let result = (|| {
+        for (base, len) in &bufs {
+            if *len == 0 {
+                continue;
+            }
+            let data = read_addr(*base as i64, *len)?;
+            match stream.write(&data) {
+                Ok(n) => {
+                    total += n as i64;
+                    if n < data.len() {
+                        break;
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(total)
+    })();
+    stream.set_nonblocking(true).ok();
+    result
+}
+
+fn iocp_dispatch<'a>(
+    loader: &ClassLoader<'a>,
+    name: &[u8],
+    descriptor: &[u8],
+    arguments: &[Value<'a>],
+) -> io::Result<Option<Value<'a>>> {
+    let arg = |i: usize| arguments.get(i).copied().unwrap_or(Value::Null);
+    match (name, descriptor) {
+        (b"initIDs", b"()V") => Ok(Some(Value::Null)),
+        (b"createIoCompletionPort", b"(JJII)J") => {
+            let handle = match arg(0) {
+                Value::Long(v) => v as u64,
+                Value::Int(v) => v as u32 as u64,
+                _ => 0,
+            };
+            let existing = match arg(1) {
+                Value::Long(v) => v as u64,
+                Value::Int(v) => v as u32 as u64,
+                _ => 0,
+            };
+            let key = match arg(2) {
+                Value::Int(v) => i64::from(v),
+                Value::Long(v) => v,
+                _ => 0,
+            };
+            let _concurrency = arg(3);
+            // INVALID_HANDLE_VALUE (-1) means "no file handle".
+            let file = if handle == 0 || handle == u64::MAX {
+                0
+            } else {
+                handle
+            };
+            let mut guard = iocp_table();
+            let state = guard.as_mut().unwrap();
+            if existing != 0 {
+                if !state.ports.contains_key(&existing) {
+                    return Err(io::Error::other("The handle is invalid"));
+                }
+                if file != 0 {
+                    state.assoc.insert(file, (existing, key));
+                }
+                Ok(Some(Value::Long(existing as i64)))
+            } else {
+                let port = NEXT_IOCP_PORT.fetch_add(0x10, std::sync::atomic::Ordering::Relaxed);
+                state.ports.insert(
+                    port,
+                    IocpPort {
+                        queue: std::collections::VecDeque::new(),
+                        closed: false,
+                    },
+                );
+                if file != 0 {
+                    state.assoc.insert(file, (port, key));
+                }
+                Ok(Some(Value::Long(port as i64)))
+            }
+        }
+        (b"close0", b"(J)V") => {
+            let port = match arg(0) {
+                Value::Long(v) => v as u64,
+                Value::Int(v) => v as u32 as u64,
+                _ => 0,
+            };
+            let (lock, cvar) = &IOCP_SYNC;
+            let mut guard = lock.lock().unwrap();
+            if let Some(state) = guard.as_mut()
+                && let Some(p) = state.ports.get_mut(&port)
+            {
+                p.closed = true;
+                drop(guard);
+                cvar.notify_all();
+            }
+            Ok(Some(Value::Null))
+        }
+        (b"getQueuedCompletionStatus", b"(JLsun/nio/ch/Iocp$CompletionStatus;)V") => {
+            let port = match arg(0) {
+                Value::Long(v) => v as u64,
+                Value::Int(v) => v as u32 as u64,
+                _ => 0,
+            };
+            let status = arguments.get(1).copied().unwrap_or(Value::Null);
+            let (lock, cvar) = &IOCP_SYNC;
+            let mut guard = lock.lock().unwrap();
+            let completion = loop {
+                let state = guard
+                    .as_mut()
+                    .ok_or_else(|| io::Error::other("IOCP table missing"))?;
+                match state.ports.get_mut(&port) {
+                    None => return Err(io::Error::other("The handle is invalid")),
+                    Some(p) => {
+                        if let Some(c) = p.queue.pop_front() {
+                            break c;
+                        }
+                        if p.closed {
+                            return Err(io::Error::other("The handle is invalid"));
+                        }
+                    }
+                }
+                guard = cvar.wait(guard).map_err(|_| io::Error::other("IOCP wait failed"))?;
+            };
+            drop(guard);
+            set_iocp_status(
+                loader,
+                status,
+                completion.error,
+                completion.bytes,
+                completion.key,
+                completion.overlapped,
+            )?;
+            Ok(Some(Value::Null))
+        }
+        (b"postQueuedCompletionStatus", b"(JI)V") => {
+            let port = match arg(0) {
+                Value::Long(v) => v as u64,
+                Value::Int(v) => v as u32 as u64,
+                _ => 0,
+            };
+            let key = match arg(1) {
+                Value::Int(v) => i64::from(v),
+                Value::Long(v) => v,
+                _ => 0,
+            };
+            let (lock, cvar) = &IOCP_SYNC;
+            let mut guard = lock.lock().unwrap();
+            let state = guard
+                .as_mut()
+                .ok_or_else(|| io::Error::other("IOCP table missing"))?;
+            let p = state
+                .ports
+                .get_mut(&port)
+                .ok_or_else(|| io::Error::other("The handle is invalid"))?;
+            if p.closed {
+                return Err(io::Error::other("The handle is invalid"));
+            }
+            p.queue.push_back(IocpCompletion {
+                key,
+                overlapped: 0,
+                bytes: 0,
+                error: 0,
+            });
+            drop(guard);
+            cvar.notify_one();
+            Ok(Some(Value::Null))
+        }
+        (b"getErrorMessage", b"(I)Ljava/lang/String;") => {
+            let error = match arg(0) {
+                Value::Int(v) => v,
+                _ => 0,
+            };
+            let text = if error == 0 {
+                "The operation completed successfully".to_string()
+            } else {
+                format!("The I/O operation has been aborted (error {error})")
+            };
+            Ok(Some(host_string(loader, &text)))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// `long` handle argument used by the async channel natives: fdVal-style
+/// small ints arrive as `Long`, file-table handles likewise.
+fn long_arg(value: Value<'_>) -> u64 {
+    match value {
+        Value::Long(v) => v as u64,
+        Value::Int(v) => v as u32 as u64,
+        _ => 0,
+    }
+}
+
+fn close_sock_id(id: u64) {
+    if id >= 0x4000_0100 {
+        sockets().as_mut().unwrap().remove(&id);
+    }
+}
+
+fn async_dispatch<'a>(
+    loader: &ClassLoader<'a>,
+    owner: &[u8],
+    name: &[u8],
+    descriptor: &[u8],
+    arguments: &[Value<'a>],
+) -> io::Result<Option<Value<'a>>> {
+    const UNAVAILABLE: i32 = -2;
+    let arg = |i: usize| arguments.get(i).copied().unwrap_or(Value::Null);
+    match owner {
+        b"sun/nio/ch/WindowsAsynchronousSocketChannelImpl" => {
+            match (name, descriptor) {
+                (b"initIDs", b"()V") | (b"updateConnectContext", b"(J)V") => {
+                    Ok(Some(Value::Null))
+                }
+                (b"connect0", b"(JZLjava/net/InetAddress;IJ)I") => {
+                    let handle = long_arg(arg(0));
+                    let addr_val = arg(2);
+                    let port = match arg(3) {
+                        Value::Int(p) => p as u16,
+                        _ => 0,
+                    };
+                    let overlapped = match arg(4) {
+                        Value::Long(v) => v,
+                        _ => 0,
+                    };
+                    let base = inet_addr(loader, addr_val)?;
+                    let addr = SocketAddr::new(base.ip(), port);
+                    with_sock(handle, |s| {
+                        match s {
+                            Sock::Fresh { stream: true, .. } => {
+                                let stream = TcpStream::connect(addr)
+                                    .map_err(|e| sock_io_err(loader, e))?;
+                                stream.set_nonblocking(true).ok();
+                                let local = stream.local_addr().unwrap_or(addr);
+                                *s = Sock::Connected {
+                                    stream,
+                                    local,
+                                    remote: addr,
+                                };
+                                Ok(())
+                            }
+                            _ => Err(io::Error::other("Socket is not connected")),
+                        }
+                    })?;
+                    iocp_post(handle, overlapped, 0, 0);
+                    Ok(Some(Value::Int(UNAVAILABLE)))
+                }
+                (b"read0", b"(JIJJ)I") | (b"write0", b"(JIJJ)I") => {
+                    let handle = long_arg(arg(0));
+                    let count = match arg(1) {
+                        Value::Int(v) => v,
+                        _ => 0,
+                    };
+                    let address = match arg(2) {
+                        Value::Long(v) => v,
+                        _ => 0,
+                    };
+                    let overlapped = match arg(3) {
+                        Value::Long(v) => v,
+                        _ => 0,
+                    };
+                    let is_read = name == b"read0";
+                    let n = with_sock(handle, |s| match s {
+                        Sock::Connected { stream, .. } => {
+                            if is_read {
+                                wsabuf_read(stream, address, count)
+                            } else {
+                                wsabuf_write(stream, address, count)
+                            }
+                        }
+                        _ => Err(io::Error::other("Not a connected socket")),
+                    })?;
+                    let bytes = n.max(0) as i32;
+                    iocp_post(handle, overlapped, bytes, 0);
+                    Ok(Some(Value::Int(UNAVAILABLE)))
+                }
+                (b"shutdown0", b"(JI)V") => {
+                    let handle = long_arg(arg(0));
+                    let how = match arg(1) {
+                        Value::Int(v) => v,
+                        _ => 2,
+                    };
+                    with_sock(handle, |s| {
+                        if let Sock::Connected { stream, .. } = s {
+                            let sd = match how {
+                                0 => Shutdown::Read,
+                                1 => Shutdown::Write,
+                                _ => Shutdown::Both,
+                            };
+                            stream.shutdown(sd).ok();
+                        }
+                        Ok(())
+                    })?;
+                    Ok(Some(Value::Null))
+                }
+                (b"closesocket0", b"(J)V") => {
+                    close_sock_id(long_arg(arg(0)));
+                    Ok(Some(Value::Null))
+                }
+                _ => Ok(None),
+            }
+        }
+        b"sun/nio/ch/WindowsAsynchronousServerSocketChannelImpl" => {
+            match (name, descriptor) {
+                (b"initIDs", b"()V") | (b"updateAcceptContext", b"(JJ)V") => {
+                    Ok(Some(Value::Null))
+                }
+                (b"accept0", b"(JJJJ)I") => {
+                    let listen = long_arg(arg(0));
+                    let accept = long_arg(arg(1));
+                    let overlapped = match arg(2) {
+                        Value::Long(v) => v,
+                        _ => 0,
+                    };
+                    // Probe for an immediately-available connection; when the
+                    // listener would block, hand the accept to a helper thread
+                    // so the initiator returns UNAVAILABLE right away (the
+                    // AcceptEx contract — never block the caller).
+                    enum Probe {
+                        Ready(Option<(TcpStream, SocketAddr, SocketAddr)>),
+                        Pending(TcpListener),
+                    }
+                    let probe = with_sock(listen, |s| match s {
+                        Sock::Listener { listener, pending } => {
+                            if let Some((stream, remote)) = pending.take() {
+                                stream.set_nonblocking(true).ok();
+                                let local = stream.local_addr().unwrap_or(remote);
+                                return Ok(Probe::Ready(Some((stream, local, remote))));
+                            }
+                            match listener.accept() {
+                                Ok((stream, remote)) => {
+                                    stream.set_nonblocking(true).ok();
+                                    let local = stream.local_addr().unwrap_or(remote);
+                                    Ok(Probe::Ready(Some((stream, local, remote))))
+                                }
+                                Err(e)
+                                    if e.kind() == io::ErrorKind::WouldBlock =>
+                                {
+                                    let cloned = listener
+                                        .try_clone()
+                                        .map_err(|e| sock_io_err(loader, e))?;
+                                    cloned.set_nonblocking(false).ok();
+                                    Ok(Probe::Pending(cloned))
+                                }
+                                Err(e) => Err(sock_io_err(loader, e)),
+                            }
+                        }
+                        _ => Err(io::Error::other("Not a server socket")),
+                    })?;
+                    match probe {
+                        Probe::Ready(Some((stream, local, remote))) => {
+                            with_sock(accept, |s| {
+                                *s = Sock::Connected {
+                                    stream,
+                                    local,
+                                    remote,
+                                };
+                                Ok(())
+                            })?;
+                            iocp_post(listen, overlapped, 0, 0);
+                        }
+                        Probe::Ready(None) => {}
+                        Probe::Pending(listener) => {
+                            std::thread::spawn(move || {
+                                if let Ok((stream, remote)) = listener.accept() {
+                                    stream.set_nonblocking(true).ok();
+                                    let local =
+                                        stream.local_addr().unwrap_or(remote);
+                                    let installed = with_sock(accept, |s| {
+                                        *s = Sock::Connected {
+                                            stream,
+                                            local,
+                                            remote,
+                                        };
+                                        Ok(())
+                                    });
+                                    if installed.is_ok() {
+                                        iocp_post(listen, overlapped, 0, 0);
+                                    }
+                                }
+                            });
+                        }
+                    }
+                    Ok(Some(Value::Int(UNAVAILABLE)))
+                }
+                (b"closesocket0", b"(J)V") => {
+                    close_sock_id(long_arg(arg(0)));
+                    Ok(Some(Value::Null))
+                }
+                _ => Ok(None),
+            }
+        }
+        b"sun/nio/ch/WindowsAsynchronousFileChannelImpl" => {
+            match (name, descriptor) {
+                (b"initIDs", b"()V") => Ok(Some(Value::Null)),
+                (b"readFile", b"(JIJJ)I") | (b"writeFile", b"(JIJJ)I") => {
+                    let handle = long_arg(arg(0));
+                    let address = match arg(1) {
+                        Value::Long(v) => v,
+                        _ => 0,
+                    };
+                    let len = match arg(2) {
+                        Value::Int(v) => v.max(0) as usize,
+                        _ => 0,
+                    };
+                    let offset = match arg(3) {
+                        Value::Long(v) => v as u64,
+                        _ => 0,
+                    };
+                    let overlapped = match arg(4) {
+                        Value::Long(v) => v,
+                        _ => 0,
+                    };
+                    let is_read = name == b"readFile";
+                    let n = if is_read {
+                        let mut buf = vec![0u8; len];
+                        let n = super::nioFileNatives::file_pread(handle, offset, &mut buf)?;
+                        write_addr(address, &buf[..n])?;
+                        n
+                    } else {
+                        let data = read_addr(address, len)?;
+                        super::nioFileNatives::file_pwrite(handle, offset, &data)?
+                    };
+                    iocp_post(handle, overlapped, n as i32, 0);
+                    Ok(Some(Value::Int(UNAVAILABLE)))
+                }
+                (b"lockFile", b"(JJJZJ)I") => {
+                    let handle = long_arg(arg(0));
+                    let position = match arg(1) {
+                        Value::Long(v) => v as u64,
+                        _ => 0,
+                    };
+                    let size = match arg(2) {
+                        Value::Long(v) => v as u64,
+                        _ => 0,
+                    };
+                    let shared = matches!(arg(3), Value::Int(v) if v != 0);
+                    let overlapped = match arg(4) {
+                        Value::Long(v) => v,
+                        _ => 0,
+                    };
+                    let status =
+                        super::nioFileNatives::file_lock_range(handle, position, size, shared)?;
+                    iocp_post(handle, overlapped, status, 0);
+                    Ok(Some(Value::Int(UNAVAILABLE)))
+                }
+                _ => Ok(None),
+            }
+        }
+        _ => Ok(None),
+    }
 }

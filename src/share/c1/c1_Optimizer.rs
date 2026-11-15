@@ -1,6 +1,6 @@
 use super::c1_IR::ControlFlowGraph;
 use super::c1_Instruction::{
-    ArrayElemKind, CallInfo, CompareKind, Condition, ConvertKind, HirInstruction, ValueKind,
+    CallInfo, CompareKind, Condition, ConvertKind, HirInstruction, ValueKind,
 };
 use std::collections::HashMap;
 

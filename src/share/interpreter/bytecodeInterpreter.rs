@@ -41,6 +41,28 @@ pub fn frame_count() -> u64 {
     FRAME_COUNT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+fn jit_skip(owner: &[u8], code: &crate::share::oops::method::Code<'_>) -> bool {
+    static SKIP: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let skip = SKIP.get_or_init(|| {
+        std::env::var("JVM25_JIT_SKIP")
+            .unwrap_or_default()
+            .split(',')
+            .map(|part| part.trim().to_string())
+            .filter(|part| !part.is_empty())
+            .collect()
+    });
+    if skip.is_empty() {
+        return false;
+    }
+    let key = format!(
+        "{}.{}{}",
+        String::from_utf8_lossy(owner),
+        String::from_utf8_lossy(code.name),
+        String::from_utf8_lossy(code.descriptor)
+    );
+    skip.iter().any(|part| key.contains(part.as_str()))
+}
+
 fn env_flag(name: &str) -> bool {
     static FLAGS: std::sync::OnceLock<std::collections::HashMap<String, bool>> =
         std::sync::OnceLock::new();
@@ -54,6 +76,7 @@ fn env_flag(name: &str) -> bool {
                 "JVM25_BLOCKTRACE",
                 "JVM25_TRACE_CALLS",
                 "JVM25_TRACE_COMPILE",
+                "JVM25_NO_JIT",
             ]
             .into_iter()
             .map(|key| (key.to_string(), std::env::var_os(key).is_some()))
@@ -221,8 +244,7 @@ pub(crate) fn for_each_active_frame(f: &mut impl FnMut(&Frame<'static>)) {
     });
 }
 
-#[allow(dead_code)]
-fn current_frame_site() -> String {
+pub fn current_frame_site() -> String {
     ACTIVE_FRAMES.with(|frames| {
         let frames = frames.borrow();
         frames
@@ -267,6 +289,13 @@ pub(crate) struct Frame<'a> {
     stackSlots: usize,
     owner: &'a [u8],
     monitors: Vec<u64>,
+    /// Raw pointer/length to the declaring class's constant pool, used by
+    /// `stackWalkInfo` to resolve LineNumberTable entries. The `InstanceKlass`
+    /// `Arc` owning the `ClassFile` (and thus this `Vec`'s buffer) is kept
+    /// alive by the `execute*` call chain for the entire lifetime of every
+    /// active interpreter frame; the buffer never reallocates after parse.
+    constants_ptr: *const Constant<'a>,
+    constants_len: usize,
 }
 
 impl<'a> Frame<'a> {
@@ -280,12 +309,21 @@ impl<'a> Frame<'a> {
 
     pub(crate) fn stackWalkInfo(&self) -> crate::share::prims::stackwalk::StackFrameInfo {
         use crate::share::oops::symbol::Symbol;
+        // SAFETY: see `constants_ptr` field docs — the owning InstanceKlass
+        // Arc outlives every active interpreter frame.
+        let constants = unsafe {
+            std::slice::from_raw_parts(self.constants_ptr, self.constants_len)
+        };
+        let line_number = u16::try_from(self.instructionPc)
+            .ok()
+            .and_then(|bci| self.code.lineNumber(constants, bci))
+            .map_or(-1, i32::from);
         crate::share::prims::stackwalk::StackFrameInfo::new(
             Symbol::new(self.owner),
             Symbol::new(self.code.name),
             Symbol::new(self.code.descriptor),
             self.instructionPc as i32,
-            -1,
+            line_number,
             false,
         )
     }
@@ -377,17 +415,37 @@ impl<'a> Frame<'a> {
             .ok_or_else(|| Error::other("Invalid branch target"))?;
         // Backward branch = loop backedge; feed the tiered-compilation
         // counters exactly like HotSpot's backward-branch dispatch does.
-        if target < self.pc {
+        if target < self.pc && !env_flag("JVM25_NO_JIT") && !jit_skip(self.owner, &self.code)
+        {
             let key = self.code.bytes.as_ptr() as usize;
-            if crate::share::oops::methodCounters::backedge_tick(key)
-                && env_flag("JVM25_TRACE_COMPILE")
-            {
-                eprintln!(
-                    "[compile-request:backedge] {}.{}{}",
-                    String::from_utf8_lossy(self.owner),
-                    String::from_utf8_lossy(self.code.name),
-                    String::from_utf8_lossy(self.code.descriptor),
-                );
+            if crate::share::oops::methodCounters::backedge_tick(key) {
+                if env_flag("JVM25_TRACE_COMPILE") {
+                    eprintln!(
+                        "[compile-request:backedge] {}.{}{}",
+                        String::from_utf8_lossy(self.owner),
+                        String::from_utf8_lossy(self.code.name),
+                        String::from_utf8_lossy(self.code.descriptor),
+                    );
+                }
+                // Hot loop backedge: request an OSR compile (and possibly a
+                // regular recompile) through the broker.  `enclosing` is
+                // None — we do not yet track the innermost compiled frame.
+                let flags = crate::share::compiler::compileBroker::MethodCompileFlags {
+                    is_static_initializer: self.code.name == b"<clinit>",
+                    ..Default::default()
+                };
+                crate::share::compiler::compileBroker::CompileBroker::global()
+                    .backedge_event(
+                        crate::share::oops::symbol::Symbol::new(self.owner),
+                        crate::share::oops::symbol::Symbol::new(self.code.name),
+                        crate::share::oops::symbol::Symbol::new(self.code.descriptor),
+                        target as i32,
+                        Some(key),
+                        flags,
+                        false,
+                        None,
+                        crate::share::compiler::compilerDefinitions::CompLevel::Simple,
+                    );
             }
         }
         self.pc = target;
@@ -802,15 +860,99 @@ pub fn execute_labeled<'a>(
     // Tiered compilation: every interpreted entry bumps the method's
     // invocation counter; crossing the threshold flags it for the JIT.
     let code_key = code.bytes.as_ptr() as usize;
-    if crate::share::oops::methodCounters::invocation_tick(code_key)
-        && env_flag("JVM25_TRACE_COMPILE")
+    // Executable tier: once the broker has installed an nmethod for
+    // this method, subsequent invocations run the compiled code
+    // directly.  The entry point is published two ways: the
+    // method-counters dispatch key (set by the broker at install) and
+    // the CodeCache method index itself.  `try_invoke` returns None
+    // for anything outside the executable subset (unsupported
+    // signature, arity mismatch), in which case we fall through to
+    // the interpreter unchanged; `Deoptimize` retires the nmethod and
+    // resumes interpretation, and `Thrown` propagates a Java
+    // throwable raised inside compiled code.
+    let no_jit = env_flag("JVM25_NO_JIT");
+    let mut compiled_addr = if no_jit {
+        0
+    } else {
+        crate::share::oops::methodCounters::compiled_addr(code_key)
+    };
+    if compiled_addr == 0 && crate::share::oops::methodCounters::is_hot(code_key) {
+        // Hot method without a published dispatch entry: consult the
+        // CodeCache nmethod index by method key (HotSpot's
+        // `nmethod::entry_point` lookup on the Method).
+        let holder = String::from_utf8_lossy(owner);
+        let name = String::from_utf8_lossy(code.name);
+        let sig = String::from_utf8_lossy(code.descriptor);
+        if let Some(nm) = crate::share::code::codeCache::CodeCache::global()
+            .find_nmethod(holder.as_ref(), name.as_ref(), sig.as_ref())
+            && nm.is_in_use()
+            && !nm.is_osr_method()
+            && nm.entry_point() != 0
+        {
+            compiled_addr = nm.entry_point();
+        }
+    }
+    if compiled_addr != 0
+        && access_flags & (0x0100 | 0x0400 | 0x0020) == 0
     {
-        eprintln!(
-            "[compile-request:invoke] {}.{}{}",
-            String::from_utf8_lossy(owner),
-            String::from_utf8_lossy(code.name),
-            String::from_utf8_lossy(code.descriptor),
-        );
+        match crate::share::jitruntime::try_invoke(
+            compiled_addr,
+            code.descriptor,
+            access_flags & 0x0008 != 0,
+            arguments,
+            depth,
+        ) {
+            Some(crate::share::jitruntime::CompiledResult::Value(value)) => {
+                return Ok(value);
+            }
+            Some(crate::share::jitruntime::CompiledResult::Thrown(handle)) => {
+                return Err(Error::other(JavaThrowable(handle)));
+            }
+            Some(crate::share::jitruntime::CompiledResult::Deoptimize) => {
+                // Uncommon trap / unsupported stub: retire the
+                // nmethod (HotSpot `make_not_entrant`) and resume in
+                // the interpreter with intact state.
+                if let Some(nm) = crate::share::code::codeCache::CodeCache::global()
+                    .find_nmethod_at_address(compiled_addr)
+                {
+                    nm.make_not_entrant();
+                }
+                crate::share::oops::methodCounters::clear_compiled(code_key);
+            }
+            None => {}
+        }
+    }
+    if !no_jit
+        && !jit_skip(owner, &code)
+        && crate::share::oops::methodCounters::invocation_tick(code_key)
+    {
+        if env_flag("JVM25_TRACE_COMPILE") {
+            eprintln!(
+                "[compile-request:invoke] {}.{}{}",
+                String::from_utf8_lossy(owner),
+                String::from_utf8_lossy(code.name),
+                String::from_utf8_lossy(code.descriptor),
+            );
+        }
+        // Tiered compilation: feed the invocation event to the broker so a
+        // hot method is queued for C1/C2.  Compilation itself runs on a
+        // compiler thread; the interpreter keeps executing until an
+        // nmethod is installed.
+        let flags = crate::share::compiler::compileBroker::MethodCompileFlags {
+            is_native: access_flags & 0x0100 != 0,
+            is_abstract: access_flags & 0x0400 != 0,
+            is_static_initializer: code.name == b"<clinit>",
+            ..Default::default()
+        };
+        crate::share::compiler::compileBroker::CompileBroker::global()
+            .compile_if_required(
+                crate::share::oops::symbol::Symbol::new(owner),
+                crate::share::oops::symbol::Symbol::new(code.name),
+                crate::share::oops::symbol::Symbol::new(code.descriptor),
+                Some(code_key),
+                flags,
+                false,
+            );
     }
     loader.call_stack.push(klass.class.name);
     let monitor = if access_flags & 0x0020 != 0 {
@@ -923,6 +1065,8 @@ fn executeFrame<'a>(
         locals,
         owner,
         monitors: Vec::new(),
+        constants_ptr: klass.class.constants.as_ptr(),
+        constants_len: klass.class.constants.len(),
     };
     let _registration = FrameRegistration::new(&frame);
     let mut safepoint_tick = 0u32;
@@ -964,7 +1108,9 @@ fn executeFrame<'a>(
                 }
             }
             Ok(Step::Continue) => {}
-            Ok(Step::Return(value)) => return Ok(value),
+            Ok(Step::Return(value)) => {
+                return Ok(value);
+            }
             Err(error) => match throwable_of(&error) {
                 Some(handle) => {
                     let exc = Value::Object(handle);
@@ -2394,7 +2540,7 @@ fn step<'a>(
                 {
                     match frame.pop()? {
                         Value::ClassMirror(_) => {
-                            crate::share::cds::cdsConfig::CDSConfig::initializeFromArchive()?
+                            crate::share::cds::cdsConfig::CDSConfig::initialize_from_archive()?
                         }
                         Value::Null => {
                             return Err(jex(
@@ -2791,16 +2937,75 @@ fn step<'a>(
                     || owner == b"net/fabricmc/loader/impl/launch/knot/FabricGlobalPropertyService"
                     || owner == b"org/spongepowered/asm/mixin/MixinEnvironment"
                     || owner == b"org/spongepowered/asm/mixin/MixinEnvironment$Phase"
-                    || owner == b"org/spongepowered/asm/launch/GlobalProperties")
+                    || owner == b"org/spongepowered/asm/launch/GlobalProperties"
+                    || (std::env::var_os("JVM25_TRACE_PARSER").is_some()
+                        && owner == b"sun/nio/fs/WindowsPathParser"))
             {
+                let parser_trace = std::env::var_os("JVM25_TRACE_PARSER").is_some()
+                    && owner == b"sun/nio/fs/WindowsPathParser";
                 eprintln!(
-                    "[call] {}.{}{} op={:#x} depth={}",
+                    "[call] {}.{}{} op={:#x} depth={}{}",
                     String::from_utf8_lossy(owner),
                     String::from_utf8_lossy(name),
                     String::from_utf8_lossy(descriptor),
                     opcode,
-                    depth
+                    depth,
+                    if parser_trace {
+                        format!(" args={:?}", &frame.stack[start..])
+                    } else {
+                        String::new()
+                    }
                 );
+            }
+            if opcode == 0xb7
+                && owner == b"java/nio/file/InvalidPathException"
+                && name == b"<init>"
+            {
+                match frame.stack.get(start + 1) {
+                    Some(Value::HostString(s)) => {
+                        let bytes = s.as_bytes();
+                        let head: Vec<u8> = bytes.iter().take(16).copied().collect();
+                        eprintln!(
+                            "[ipe] host len={} head={:02x?} text={:?}",
+                            bytes.len(),
+                            head,
+                            s
+                        );
+                    }
+                    Some(Value::String(b)) => {
+                        let head: Vec<u8> = b.iter().take(16).copied().collect();
+                        eprintln!("[ipe] str len={} head={:02x?}", b.len(), head);
+                    }
+                    Some(other) => {
+                        if let Some(text) =
+                            crate::share::prims::stringNatives::string(loader, *other)?
+                        {
+                            let bytes = text.as_bytes();
+                            let head: Vec<u8> = bytes.iter().take(16).copied().collect();
+                            eprintln!(
+                                "[ipe] obj len={} head={:02x?} text={:?}",
+                                bytes.len(),
+                                head,
+                                text
+                            );
+                        } else {
+                            let klass_name = if let Value::Object(handle) = *other {
+                                loader
+                                    .borrow_objects()
+                                    .get(handle)
+                                    .map(|object| {
+                                        String::from_utf8_lossy(&object.klass.class.name)
+                                            .into_owned()
+                                    })
+                                    .unwrap_or_else(|| "?".to_string())
+                            } else {
+                                "?".to_string()
+                            };
+                            eprintln!("[ipe] input other: {:?} klass={}", other, klass_name);
+                        }
+                    }
+                    None => eprintln!("[ipe] no arg"),
+                }
             }
             let ret_val = if opcode != 0xb8
                 && result.is_none()

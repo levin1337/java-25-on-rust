@@ -45,6 +45,14 @@ pub struct Arguments {
     pub execution_mode: ExecutionMode,
     pub tiered_compilation: bool,
     pub tiered_stop_at_level: u8,
+
+    // Diagnostics / platform flags
+    /// -Xlog:<selectors>[:<output options>]
+    pub xlog: Option<String>,
+    /// -XX:NativeMemoryTracking={off,summary,detail}
+    pub native_memory_tracking: Option<String>,
+    /// -Xshare:{off,on,dump,auto,aot}
+    pub share_mode: Option<String>,
 }
 
 impl Default for Arguments {
@@ -65,6 +73,10 @@ impl Default for Arguments {
             execution_mode: ExecutionMode::Mixed,
             tiered_compilation: true,
             tiered_stop_at_level: 4,
+
+            xlog: None,
+            native_memory_tracking: None,
+            share_mode: None,
         }
     }
 }
@@ -131,6 +143,16 @@ impl Arguments {
                 if let Ok(lvl) = lvl_str.parse::<u8>() {
                     parsed.tiered_stop_at_level = lvl.clamp(1, 4);
                 }
+            } else if let Some(xlog) = arg.strip_prefix("-Xlog:") {
+                parsed.xlog = Some(xlog.to_string());
+            } else if let Some(xlog) = arg.strip_prefix("-Xlog") {
+                // Bare "-Xlog" enables default info logging.
+                let _ = xlog;
+                parsed.xlog = Some(String::new());
+            } else if let Some(nmt) = arg.strip_prefix("-XX:NativeMemoryTracking=") {
+                parsed.native_memory_tracking = Some(nmt.to_string());
+            } else if let Some(share) = arg.strip_prefix("-Xshare:") {
+                parsed.share_mode = Some(share.to_string());
             } else if let Some(prop) = arg.strip_prefix("-D") {
                 if let Some((k, v)) = prop.split_once('=') {
                     parsed.properties.insert(k.to_string(), v.to_string());
@@ -147,7 +169,46 @@ impl Arguments {
         }
 
         parsed.apply_ergo();
+        parsed.apply_diagnostic_flags();
         parsed
+    }
+
+    /// Applies diagnostics/platform flags to the corresponding subsystems
+    /// (unified logging, NMT, CDS) — mirrors the flag application phase of
+    /// Arguments::parse / os::init in HotSpot.
+    pub fn apply_diagnostic_flags(&self) {
+        use crate::share::cds::cdsConfig::{CDSConfig, CdsMode};
+        use crate::share::logging::log::Log;
+        use crate::share::logging::logConfiguration::LogConfiguration;
+        use crate::share::nmt::memTracker::MemTracker;
+
+        if let Some(xlog) = &self.xlog {
+            let cfg = LogConfiguration::global();
+            if xlog.is_empty() {
+                cfg.parse_log_argument("all=info").ok();
+            } else if let Err(e) = cfg.parse_xlog(xlog) {
+                // HotSpot prints a warning and continues.
+                eprintln!("Warning: Invalid -Xlog option '{}': {}", xlog, e);
+            }
+            Log::reset_outputs();
+        }
+
+        if let Some(nmt) = &self.native_memory_tracking {
+            MemTracker::initialize_from_flag(Some(nmt));
+        }
+
+        if let Some(share) = &self.share_mode {
+            let mode = match share.to_ascii_lowercase().as_str() {
+                "off" => Some(CdsMode::Off),
+                "on" | "auto" => Some(CdsMode::UseStatic),
+                "dump" => Some(CdsMode::DumpStatic),
+                "aot" => Some(CdsMode::DumpAot),
+                _ => None,
+            };
+            if let Some(m) = mode {
+                CDSConfig::set_mode(m);
+            }
+        }
     }
 
     /// Parses human-readable memory size string (e.g. "512m", "2g", "128k")

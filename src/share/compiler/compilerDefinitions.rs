@@ -196,7 +196,13 @@ impl CompilerConfig {
     }
 
     pub fn is_c2_or_jvmci_compiler_enabled() -> bool {
-        true
+        // C2 (opto) currently builds and optimizes ideal graphs but has
+        // no instruction selection, register allocation or code
+        // emission, so it cannot produce runnable nmethods. Reporting
+        // it as enabled would park hot methods in the C2 queue forever;
+        // the tiered policy therefore tops out at C1 until the C2
+        // backend lands.
+        false
     }
 
     pub fn is_c1_enabled() -> bool {

@@ -556,13 +556,19 @@ impl CodeCache {
             nm.method_name(),
             nm.method_signature()
         );
-        let addr = self.allocate_nmethod_blob(name, blob_type, total, code_bytes)?;
+        let addr = self.allocate_nmethod_blob(name, blob_type, total, code_bytes.clone())?;
         let method_key = Self::method_key(nm.method_holder(), nm.method_name(), nm.method_signature());
         self.register_nmethod_blob(&method_key, addr);
-        nm.set_code_location(addr, total);
-        nm.set_code_bytes(Vec::new()); // bytes live in the heap blob
+        // The heap address is only a bookkeeping key: CodeHeap does not
+        // reserve real memory.  Materialize the code bytes into an RWW
+        // region so `entry_point` is actually callable, and relocate
+        // the nmethod there (HotSpot's code-cache allocation analogue).
+        let exec_addr = crate::share::jitruntime::publish_executable(&code_bytes, total)
+            .ok_or_else(|| "executable memory allocation failed".to_string())?;
+        nm.set_code_location(exec_addr, total);
+        nm.set_code_bytes(Vec::new()); // bytes live in the exec arena
         self.add_nmethod(nm);
-        Ok(addr)
+        Ok(exec_addr)
     }
 
     pub fn nmethods_count(&self) -> usize {

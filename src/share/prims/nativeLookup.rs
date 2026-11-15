@@ -562,6 +562,14 @@ fn invokeInstanceInner<'a>(
         return super::stackwalk::invoke(loader, name, descriptor, arguments, output);
     }
 
+    if owner == b"java/lang/reflect/Executable" || owner == b"java/lang/reflect/Field" {
+        if let Some(result) = super::reflectionNatives::member_invoke(
+            loader, owner, name, descriptor, arguments,
+        )? {
+            return Ok(Some(result));
+        }
+    }
+
     let result = match (owner, name, descriptor) {
         (b"java/lang/Runtime", b"availableProcessors", b"()I") => {
             let cpus = std::thread::available_parallelism()
@@ -1669,6 +1677,74 @@ fn invokeStaticInner<'a>(
         (b"java/io/FileDescriptor", b"setInt", b"(II)V")
         | (b"java/io/FileDescriptor", b"setLong", b"(IJ)V")
         | (b"java/io/FileDescriptor", b"setHandle", b"(IJ)V") => Some(None),
+        (b"java/io/FileCleanable", b"cleanupClose0", b"(IJ)V") => {
+            // args: (int fd, long handle). Releases the tracked file-table
+            // entry; pseudo-handles for standard streams (<= 3) are never
+            // closed.
+            if let Some(Value::Long(handle)) = arguments.get(1) {
+                let handle = *handle as u64;
+                if handle > 3 {
+                    let _ = super::nioFileNatives::free_handle(handle);
+                }
+            }
+            Some(None)
+        }
+        (b"jdk/internal/misc/PreviewFeatures", b"isPreviewEnabled", b"()Z") => {
+            Some(Some(Value::Int(0)))
+        }
+        (
+            b"jdk/internal/util/EnvUtils",
+            b"getEnvVar",
+            b"(Ljava/lang/String;)Ljava/lang/String;",
+        ) => {
+            let name = arguments
+                .first()
+                .and_then(|value| super::stringNatives::string(loader, *value).ok().flatten());
+            let value = name.and_then(|name| std::env::var(name.as_ref()).ok());
+            Some(Some(match value {
+                Some(text) => Value::HostString(loader.storage.alloc_str(&text)),
+                None => Value::Null,
+            }))
+        }
+        (
+            b"jdk/internal/vm/VMSupport",
+            b"getVMTemporaryDirectory",
+            b"()Ljava/lang/String;",
+        ) => {
+            let dir = loader
+                .systemProperties
+                .borrow()
+                .get("java.io.tmpdir")
+                .map(|text| text.to_string())
+                .or_else(|| std::env::var("TEMP").ok())
+                .or_else(|| std::env::var("TMP").ok())
+                .unwrap_or_else(|| ".".to_string());
+            Some(Some(Value::HostString(loader.storage.alloc_str(&dir))))
+        }
+        (
+            b"jdk/internal/vm/VMSupport",
+            b"initAgentProperties",
+            b"(Ljava/util/Properties;)Ljava/util/Properties;",
+        ) => {
+            // No javaagent/instrumentation is attached, so the property set
+            // is returned unchanged.
+            Some(Some(
+                arguments.first().copied().unwrap_or(Value::Null),
+            ))
+        }
+        (b"java/io/Console", b"istty", b"()Z") => {
+            Some(Some(Value::Int(console_is_tty() as i32)))
+        }
+        (b"jdk/internal/io/JdkConsoleImpl", b"echo", b"(Z)Z") => {
+            Some(Some(Value::Int(0)))
+        }
+        (b"sun/io/Win32ErrorMode", b"setErrorMode", b"(J)J") => {
+            let mode = arguments.first().copied().unwrap_or(Value::Null);
+            let Value::Long(mode) = mode else {
+                return Err(io::Error::other("Invalid error mode"));
+            };
+            Some(Some(Value::Long(win32_set_error_mode(mode as u64) as i64)))
+        }
         (b"jdk/internal/misc/Signal", b"findSignal0", b"(Ljava/lang/String;)I") => {
             // Standard signal numbers (Linux/POSIX numbering, same table
             // HotSpot uses on Windows for the Signal API).
@@ -2428,7 +2504,9 @@ fn invokeStaticInner<'a>(
         }
         _ if owner == b"java/util/zip/Inflater"
             || owner == b"java/util/zip/Deflater"
-            || owner == b"java/util/zip/CRC32" =>
+            || owner == b"java/util/zip/CRC32"
+            || owner == b"java/util/zip/CRC32C"
+            || owner == b"java/util/zip/Adler32" =>
         {
             match super::zipNatives::statik(loader, owner, name, descriptor, arguments)? {
                 Some(_value) if descriptor.ends_with(b")V") => Some(None),
@@ -2626,4 +2704,42 @@ fn os_random(bytes: &mut [u8]) -> bool {
         chunk.copy_from_slice(&buffer[..chunk.len()]);
     }
     true
+}
+
+/// `java.io.Console.isatty`: whether stdout is attached to a real console.
+#[cfg(windows)]
+fn console_is_tty() -> bool {
+    const STD_OUTPUT_HANDLE: u32 = 0xFFFF_FFF5;
+    const ENABLE_PROCESSED_INPUT: u32 = 0x0001;
+    unsafe extern "system" {
+        fn GetStdHandle(which: u32) -> *mut core::ffi::c_void;
+        fn GetConsoleMode(handle: *mut core::ffi::c_void, mode: *mut u32) -> i32;
+    }
+    let handle = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+    if handle.is_null() {
+        return false;
+    }
+    let mut mode = 0u32;
+    unsafe { GetConsoleMode(handle, &mut mode) != 0 }
+}
+
+#[cfg(not(windows))]
+fn console_is_tty() -> bool {
+    use std::io::IsTerminal;
+    std::io::stdout().is_terminal()
+}
+
+/// `sun.io.Win32ErrorMode.setErrorMode`: forwards to kernel32
+/// `SetErrorMode`, which returns the previous mode.
+#[cfg(windows)]
+fn win32_set_error_mode(mode: u64) -> u64 {
+    unsafe extern "system" {
+        fn SetErrorMode(mode: u32) -> u32;
+    }
+    u64::from(unsafe { SetErrorMode(mode as u32) })
+}
+
+#[cfg(not(windows))]
+fn win32_set_error_mode(mode: u64) -> u64 {
+    mode
 }

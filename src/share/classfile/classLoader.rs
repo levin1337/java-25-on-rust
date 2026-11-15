@@ -269,6 +269,8 @@ pub struct ClassLoader<'a> {
     /// supply it — mirroring HotSpot's per-loader class namespaces.
     delegate_loaders: Share<Vec<usize>>,
     module_objects: Share<HashMap<String, usize>>,
+    /// Lazily created `java.lang.Package` objects keyed by package name.
+    package_objects: Share<HashMap<String, usize>>,
     current_thread_object: Share<Option<usize>>,
     pub(crate) call_stack: CallStack,
     pub(crate) lambda_cache: Share<HashMap<(Vec<u8>, u16), Arc<InstanceKlass<'a>>>>,
@@ -390,6 +392,16 @@ impl<'a> ClassLoader<'a> {
     /// GC root access: all materialized `java.lang.Module` objects.
     pub(crate) fn module_objects_handle(&self) -> &Share<HashMap<String, usize>> {
         &self.module_objects
+    }
+
+    pub(crate) fn package_object(&self, name: &str) -> Option<usize> {
+        self.package_objects.borrow().get(name).copied()
+    }
+
+    pub(crate) fn register_package_object(&self, name: &str, handle: usize) {
+        self.package_objects
+            .borrow_mut()
+            .insert(name.to_owned(), handle);
     }
 
     /// GC sweep access: dead arena slots awaiting reuse, per arena.
@@ -584,6 +596,7 @@ impl<'a> ClassLoader<'a> {
             unnamed_module_object: Share::new(None),
             delegate_loaders: Share::new(Vec::new()),
             module_objects: Share::new(HashMap::new()),
+            package_objects: Share::new(HashMap::new()),
             current_thread_object: Share::new(None),
             call_stack: CallStack,
             lambda_cache: Share::new(HashMap::new()),
@@ -675,6 +688,7 @@ impl<'a> ClassLoader<'a> {
             unnamed_module_object: Share::new(None),
             delegate_loaders: Share::new(Vec::new()),
             module_objects: Share::new(HashMap::new()),
+            package_objects: Share::new(HashMap::new()),
             current_thread_object: Share::new(None),
             call_stack: CallStack,
             lambda_cache: Share::new(HashMap::new()),
@@ -950,6 +964,13 @@ impl<'a> ClassLoader<'a> {
     }
 
     pub fn load(&self, name: &[u8]) -> io::Result<Arc<InstanceKlass<'a>>> {
+        if name.contains(&b'=') {
+            eprintln!(
+                "[load-suspect] name={:?}\n{}",
+                String::from_utf8_lossy(name),
+                std::backtrace::Backtrace::force_capture()
+            );
+        }
         if name.starts_with(b"[") {
             return self.load_array_class(name);
         }
@@ -1154,7 +1175,7 @@ impl<'a> ClassLoader<'a> {
             return Err(super::linkageError::LinkageError::no_class_def_found(name).io());
         }
         if verify_class {
-            super::verifier::Verifier::verify(&class, true).map_err(|error| {
+            super::verifier::Verifier::verify(&class, Some(self), true).map_err(|error| {
                 super::linkageError::LinkageError::new(
                     super::linkageError::LinkageErrorKind::Verify,
                     error.to_string(),

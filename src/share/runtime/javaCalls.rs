@@ -275,6 +275,15 @@ pub fn mainClass<'a>(
         let args = JavaCallArguments::new();
         eprintln!("[phase] 1");
         let _ = JavaCalls::call_static(loader, &system, b"initPhase1", b"()V", &args, output);
+        for name in [
+            b"java/lang/invoke/MethodHandle".as_slice(),
+            b"java/lang/invoke/ResolvedMethodName",
+            b"java/lang/invoke/MemberName",
+            b"java/lang/invoke/MethodHandleNatives",
+        ] {
+            let klass = loader.load(name)?;
+            bytecodeInterpreter::initialize(loader, &klass, output, 0)?;
+        }
         eprintln!("[phase] 2 {:?}", t0.elapsed());
         let mut args = JavaCallArguments::new();
         args.push_int(0);

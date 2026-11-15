@@ -121,6 +121,38 @@ fn native_declaring_owner<'a>(
     name: &[u8],
     descriptor: &[u8],
 ) -> Option<Vec<u8>> {
+    let key = (
+        owner.as_ptr() as usize,
+        owner.len(),
+        name.as_ptr() as usize,
+        name.len(),
+        descriptor.as_ptr() as usize,
+        descriptor.len(),
+    );
+    if let Some(cached) = loader.native_declaring_cache.borrow().get(&key) {
+        return cached.clone();
+    }
+    let (cacheable, result) = native_declaring_owner_uncached(loader, owner, name, descriptor);
+    // Only memoize resolutions that saw a successfully loaded owner class;
+        // a transient load failure (e.g. circularity during clinit) must not
+        // poison the cache for later calls.
+    if cacheable {
+        loader
+            .native_declaring_cache
+            .borrow_mut()
+            .insert(key, result.clone());
+    }
+    result
+}
+
+/// Returns `(cacheable, declaring_class_name)`. `cacheable` is false when
+/// the owner class could not be loaded at all.
+fn native_declaring_owner_uncached<'a>(
+    loader: &crate::share::classfile::classLoader::ClassLoader<'a>,
+    owner: &[u8],
+    name: &[u8],
+    descriptor: &[u8],
+) -> (bool, Option<Vec<u8>>) {
     let declares = |klass: &crate::share::oops::instanceKlass::InstanceKlass<'a>| {
         klass
             .class
@@ -128,19 +160,21 @@ fn native_declaring_owner<'a>(
             .iter()
             .any(|method| method.name == name && method.descriptor == descriptor)
     };
-    let first = loader.load(owner).ok()?;
+    let Ok(first) = loader.load(owner) else {
+        return (false, None);
+    };
     if declares(&first) {
         // Common case: the constant-pool owner declares the method itself.
-        return None;
+        return (true, None);
     }
     let mut current = first.super_klass.clone();
     while let Some(klass) = current {
         if declares(&klass) {
-            return Some(klass.class.name.to_vec());
+            return (true, Some(klass.class.name.to_vec()));
         }
         current = klass.super_klass.clone();
     }
-    None
+    (true, None)
 }
 
 pub static NATIVE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

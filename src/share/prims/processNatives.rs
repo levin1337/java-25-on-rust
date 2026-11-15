@@ -12,7 +12,7 @@
 use crate::share::classfile::classLoader::ClassLoader;
 use crate::share::interpreter::bytecodeInterpreter::Value;
 use crate::share::oops::typeArrayOop::TypeArrayOop;
-use crate::share::prims::nioFileNatives::{alloc_handle, EntryKind};
+use crate::share::prims::nioFileNatives::{alloc_handle, alloc_handle_unseekable, EntryKind};
 use std::ffi::c_void;
 use std::io;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
@@ -552,7 +552,7 @@ fn create_process<'a>(
             if requested.get(i).copied().unwrap_or(-1) == -1 {
                 if let Some(parent) = pipe_parents.get(index) {
                     let file = unsafe { std::fs::File::from_raw_handle(*parent as RawHandle) };
-                    let id = alloc_handle(EntryKind::File(file), String::new());
+                    let id = alloc_handle_unseekable(EntryKind::File(file), String::new());
                     if i < values.len() {
                         values[i] = id as i64;
                     }

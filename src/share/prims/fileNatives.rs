@@ -636,8 +636,10 @@ pub(crate) fn invoke<'a>(
                 return Err(invalid("Stream is not open"));
             }
             let mut byte = [0u8; 1];
-            let count = nioFileNatives::with_file(handle, |file, pos| {
-                file.seek(SeekFrom::Start(*pos))?;
+            let count = nioFileNatives::with_file_seekable(handle, |file, pos, seekable| {
+                if seekable {
+                    file.seek(SeekFrom::Start(*pos))?;
+                }
                 let n = file.read(&mut byte)?;
                 *pos += n as u64;
                 Ok(n)
@@ -673,8 +675,10 @@ pub(crate) fn invoke<'a>(
                     .unwrap_or_else(|| "?".to_string());
                 eprintln!("[fread] {path} handle={handle} off={offset} len={len}");
             }
-            let count = nioFileNatives::with_file(handle, |file, pos| {
-                file.seek(SeekFrom::Start(*pos))?;
+            let count = nioFileNatives::with_file_seekable(handle, |file, pos, seekable| {
+                if seekable {
+                    file.seek(SeekFrom::Start(*pos))?;
+                }
                 let n = file.read(&mut buf)?;
                 buf.truncate(n);
                 *pos += n as u64;
@@ -780,13 +784,17 @@ pub(crate) fn invoke<'a>(
             };
             let append = name == b"write"
                 && matches!(arguments.get(2).copied(), Some(Value::Int(flag)) if flag != 0);
-            nioFileNatives::with_file(handle, |file, pos| {
+            nioFileNatives::with_file_seekable(handle, |file, pos, seekable| {
                 if append {
                     let len = file.metadata().map_err(io_error)?.len();
                     file.seek(SeekFrom::Start(len))?;
                 }
                 file.write_all(&[byte]).map_err(io_error)?;
-                *pos = file.stream_position().map_err(io_error)?;
+                if seekable {
+                    *pos = file.stream_position().map_err(io_error)?;
+                } else {
+                    *pos += 1;
+                }
                 Ok(())
             })?;
             return Ok(Some(Value::Null));
@@ -817,13 +825,17 @@ pub(crate) fn invoke<'a>(
                 .iter()
                 .map(|&b| b as u8)
                 .collect();
-            nioFileNatives::with_file(handle, |file, pos| {
+            nioFileNatives::with_file_seekable(handle, |file, pos, seekable| {
                 if append {
                     let end = file.metadata().map_err(io_error)?.len();
                     file.seek(SeekFrom::Start(end))?;
                 }
                 file.write_all(&buf).map_err(io_error)?;
-                *pos = file.stream_position().map_err(io_error)?;
+                if seekable {
+                    *pos = file.stream_position().map_err(io_error)?;
+                } else {
+                    *pos += buf.len() as u64;
+                }
                 Ok(())
             })?;
             return Ok(Some(Value::Null));

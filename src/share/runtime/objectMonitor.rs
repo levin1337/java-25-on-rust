@@ -174,7 +174,14 @@ impl ObjectMonitor {
                 let remaining = d - now;
                 let _ = self.cond.wait_for(&mut state, remaining);
             } else {
-                self.cond.wait(&mut state);
+                // JLS permits spurious wakeups from Object.wait. Return to
+                // Java at least every 100ms so conditions checked there
+                // (e.g. Thread.join's isAlive loop) are re-evaluated even
+                // when a notify fired between the check and the wait.
+                let _ = self
+                    .cond
+                    .wait_for(&mut state, std::time::Duration::from_millis(100));
+                break;
             }
         }
         state.waiting.retain(|w| w.tid != thread_id);

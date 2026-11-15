@@ -216,6 +216,11 @@ impl CallSiteKey {
             desc_len: descriptor.len(),
         }
     }
+
+    /// `true` for invokestatic sites (kind 2).
+    pub(crate) fn is_static(&self) -> bool {
+        self.kind == 2
+    }
 }
 
 pub struct ClassLoader<'a> {
@@ -277,7 +282,12 @@ pub struct ClassLoader<'a> {
     /// Resolved invoke* targets (klass + parsed Code) keyed by call site.
     /// Method resolution is deterministic per receiver class, so hits skip
     /// the vtable scan and `Code::parse` on every call.
-    pub(crate) invoke_cache: Share<HashMap<CallSiteKey, (Arc<InstanceKlass<'a>>, Code<'a>)>>,
+    pub(crate) invoke_cache: Share<HashMap<CallSiteKey, (Arc<InstanceKlass<'a>>, Code<'a>, u16)>>,
+    /// Memoized `native_declaring_owner` results: (owner,name,descriptor)
+    /// slice pointers -> declaring class name or None. Class hierarchy is
+    /// immutable after load, so results never change.
+    pub(crate) native_declaring_cache:
+        Share<HashMap<(usize, usize, usize, usize, usize, usize), Option<Vec<u8>>>>,
     loader_type: ClassLoaderType,
 }
 
@@ -571,6 +581,7 @@ impl<'a> ClassLoader<'a> {
             class_object_names: Share::new(HashMap::new()),
             class_origins: Share::new(HashMap::new()),
             invoke_cache: Share::new(HashMap::new()),
+            native_declaring_cache: Share::new(HashMap::new()),
             loader_type: ClassLoaderType::AppLoader,
         })
     }
@@ -658,6 +669,7 @@ impl<'a> ClassLoader<'a> {
             class_object_names: Share::new(HashMap::new()),
             class_origins: Share::new(HashMap::new()),
             invoke_cache: Share::new(HashMap::new()),
+            native_declaring_cache: Share::new(HashMap::new()),
             loader_type: ClassLoaderType::AppLoader,
         })
     }

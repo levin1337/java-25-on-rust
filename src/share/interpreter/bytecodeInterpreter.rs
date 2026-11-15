@@ -1310,18 +1310,26 @@ fn methodAccessFlags<'a>(
 
 /// Returns the cached resolution for an invoke* call site or resolves,
 /// caches, and returns it. Only successful resolutions are cached;
-/// failures re-resolve every time (matching uncached semantics).
+/// failures re-resolve every time (matching uncached semantics). The
+/// resolved method's access flags are cached alongside so callers skip
+/// the `methodAccessFlags` hierarchy scan too.
 fn cached_call<'a>(
     loader: &ClassLoader<'a>,
     key: CallSiteKey,
+    name: &[u8],
+    descriptor: &[u8],
     resolve: impl FnOnce() -> io::Result<(Arc<InstanceKlass<'a>>, Code<'a>)>,
-) -> io::Result<(Arc<InstanceKlass<'a>>, Code<'a>)> {
-    if let Some(hit) = loader.invoke_cache.borrow().get(&key) {
-        return Ok(hit.clone());
+) -> io::Result<(Arc<InstanceKlass<'a>>, Code<'a>, u16)> {
+    if let Some((klass, code, flags)) = loader.invoke_cache.borrow().get(&key) {
+        return Ok((Arc::clone(klass), code.clone(), *flags));
     }
-    let resolved = resolve()?;
-    loader.invoke_cache.borrow_mut().insert(key, resolved.clone());
-    Ok(resolved)
+    let (klass, code) = resolve()?;
+    let flags = methodAccessFlags(&klass, name, descriptor, key.is_static());
+    loader
+        .invoke_cache
+        .borrow_mut()
+        .insert(key, (Arc::clone(&klass), code.clone(), flags));
+    Ok((klass, code, flags))
 }
 
 fn step<'a>(
@@ -2628,18 +2636,18 @@ fn step<'a>(
                     ))
                 }
             };
-            let (target, code) = if opcode == 0xb8 {
+            let (target, code, flags) = if opcode == 0xb8 {
                 let target = loader
                     .load(owner)
                     .map_err(|error| linkageExc(loader, output, depth, error))?;
                 let key = CallSiteKey::new(2, &target, owner, name, descriptor);
-                let (target, code) = cached_call(loader, key, || {
+                let (target, code, flags) = cached_call(loader, key, name, descriptor, || {
                     LinkResolver::resolve_static_call(&target, name, descriptor)
                 })
                 .map_err(methodError)
                 .map_err(|error| linkageExc(loader, output, depth, error))?;
                 initialize(loader, &target, output, depth + 1)?;
-                (target, code)
+                (target, code, flags)
             } else {
                 if let Value::ClassMirror(class_name) = frame.stack[start] {
                     match (name, descriptor) {
@@ -2860,21 +2868,21 @@ fn step<'a>(
                         .load(owner)
                         .map_err(|error| linkageExc(loader, output, depth, error))?;
                     let key = CallSiteKey::new(1, &target, owner, name, descriptor);
-                    cached_call(loader, key, || {
+                    cached_call(loader, key, name, descriptor, || {
                         LinkResolver::resolve_special_call(&target, name, descriptor)
                     })
                     .map_err(methodError)
                     .map_err(|error| linkageExc(loader, output, depth, error))?
                 } else if opcode == 0xb9 {
                     let key = CallSiteKey::new(3, &object_klass, owner, name, descriptor);
-                    cached_call(loader, key, || {
+                    cached_call(loader, key, name, descriptor, || {
                         LinkResolver::resolve_interface_call(&object_klass, owner, name, descriptor)
                     })
                     .map_err(methodError)
                     .map_err(|error| linkageExc(loader, output, depth, error))?
                 } else {
                     let key = CallSiteKey::new(0, &object_klass, owner, name, descriptor);
-                    cached_call(loader, key, || {
+                    cached_call(loader, key, name, descriptor, || {
                         LinkResolver::resolve_virtual_call(&object_klass, name, descriptor)
                     })
                     .map_err(methodError)
@@ -2882,7 +2890,7 @@ fn step<'a>(
                 }
             };
 
-            let flags = methodAccessFlags(&target, name, descriptor, opcode == 0xb8);
+
             if env_flag("JVM25_TRACE_CALLS")
                 && (owner == b"net/fabricmc/loader/impl/launch/FabricLauncherBase"
                     || owner == b"net/fabricmc/loader/impl/launch/knot/FabricGlobalPropertyService"

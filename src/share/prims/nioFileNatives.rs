@@ -117,6 +117,7 @@ pub(crate) struct Entry {
     pub(crate) kind: EntryKind,
     pub(crate) pos: u64,
     pub(crate) path: String,
+    pub(crate) seekable: bool,
 }
 
 #[allow(dead_code)]
@@ -146,7 +147,17 @@ pub(crate) fn alloc_handle(kind: EntryKind, path: String) -> u64 {
     let mut table = table().lock().unwrap();
     let handle = table.next;
     table.next += 0x10;
-    table.entries.insert(handle, Entry { kind, pos: 0, path });
+    table.entries.insert(handle, Entry { kind, pos: 0, path, seekable: true });
+    handle
+}
+
+/// Registers a handle whose underlying object does not support seeking
+/// (anonymous pipes, sockets). Sequential reads skip the position restore.
+pub(crate) fn alloc_handle_unseekable(kind: EntryKind, path: String) -> u64 {
+    let mut table = table().lock().unwrap();
+    let handle = table.next;
+    table.next += 0x10;
+    table.entries.insert(handle, Entry { kind, pos: 0, path, seekable: false });
     handle
 }
 
@@ -1533,8 +1544,11 @@ pub(crate) fn dispatcher_impl<'a>(
             let len = arg(2) as usize;
             let read = with_entry(handle, |entry| {
                 let pos = entry.pos;
+                let seekable = entry.seekable;
                 let file = file_of(entry)?;
-                file.seek(SeekFrom::Start(pos))?;
+                if seekable {
+                    file.seek(SeekFrom::Start(pos))?;
+                }
                 let mut buf = vec![0u8; len];
                 let n = file.read(&mut buf)?;
                 buf.truncate(n);
@@ -1567,13 +1581,16 @@ pub(crate) fn dispatcher_impl<'a>(
             let append = arg(3) != 0;
             let data = read_buffer(address, len)?;
             let written = with_entry(handle, |entry| {
+                let seekable = entry.seekable;
                 let start = if append {
                     file_of(entry)?.seek(SeekFrom::End(0))?
                 } else {
                     entry.pos
                 };
                 let file = file_of(entry)?;
-                file.seek(SeekFrom::Start(start))?;
+                if seekable {
+                    file.seek(SeekFrom::Start(start))?;
+                }
                 let n = file.write(&data)?;
                 entry.pos = start + n as u64;
                 Ok(n)
@@ -1612,8 +1629,11 @@ pub(crate) fn dispatcher_impl<'a>(
             let mut total = 0usize;
             with_entry(handle, |entry| {
                 let pos = entry.pos;
+                let seekable = entry.seekable;
                 let file = file_of(entry)?;
-                file.seek(SeekFrom::Start(pos))?;
+                if seekable {
+                    file.seek(SeekFrom::Start(pos))?;
+                }
                 for (ptr, len) in &buffers {
                     let mut buf = vec![0u8; *len];
                     let n = file.read(&mut buf)?;
@@ -1735,7 +1755,7 @@ pub(crate) fn dispatcher_impl<'a>(
         (b"duplicateHandle", b"(J)J") => {
             let source = arg(0) as u64;
             let mut table = table().lock().unwrap();
-            let (kind, pos, path) = {
+            let (kind, pos, path, seekable) = {
                 let entry = table
                     .entries
                     .get(&source)
@@ -1745,11 +1765,11 @@ pub(crate) fn dispatcher_impl<'a>(
                     EntryKind::Other => EntryKind::Other,
                     _ => return Err(invalid("Cannot duplicate handle")),
                 };
-                (kind, entry.pos, entry.path.clone())
+                (kind, entry.pos, entry.path.clone(), entry.seekable)
             };
             let handle = table.next;
             table.next += 0x10;
-            table.entries.insert(handle, Entry { kind, pos, path });
+            table.entries.insert(handle, Entry { kind, pos, path, seekable });
             Value::Long(handle as i64)
         }
         (b"allocationGranularity0", b"()J") => Value::Long(65_536),
@@ -2024,6 +2044,21 @@ pub(crate) fn with_file<R>(
             _ => return Err(invalid("Handle is not a file")),
         };
         f(file, &mut entry.pos)
+    })
+}
+
+/// Like `with_file` but also exposes whether the handle supports seeking.
+pub(crate) fn with_file_seekable<R>(
+    handle: u64,
+    f: impl FnOnce(&mut std::fs::File, &mut u64, bool) -> io::Result<R>,
+) -> io::Result<R> {
+    with_entry(handle, |entry| {
+        let seekable = entry.seekable;
+        let file = match &mut entry.kind {
+            EntryKind::File(file) => file,
+            _ => return Err(invalid("Handle is not a file")),
+        };
+        f(file, &mut entry.pos, seekable)
     })
 }
 

@@ -349,8 +349,15 @@ pub fn finish(loader: &ClassLoader<'_>, handle: usize) {
         if let Some(object) = objects.get_mut(handle)
             && slot < object.fields.len()
         {
+            if std::env::var_os("JVM25_BLOCKTRACE").is_some() {
+                eprintln!("[finish] clear eetop handle={handle} slot={slot} fields={}", object.fields.len());
+            }
             object.fields[slot] = Value::Long(0);
+        } else if std::env::var_os("JVM25_BLOCKTRACE").is_some() {
+            eprintln!("[finish] eetop slot={slot} out of range handle={handle}");
         }
+    } else if std::env::var_os("JVM25_BLOCKTRACE").is_some() {
+        eprintln!("[finish] no eetop field handle={handle}");
     }
     let holder = {
         let objects = loader.borrow_objects();
@@ -432,6 +439,18 @@ pub fn wait_object(
 ) -> io::Result<()> {
     let tid = current_tid(loader);
     let monitor = { loader.synchronizer.borrow_mut().monitor(monitor_key) };
+    if std::env::var_os("JVM25_BLOCKTRACE").is_some() {
+        let site = {
+            let mut top = String::new();
+            crate::share::interpreter::bytecodeInterpreter::for_each_active_frame(&mut |f| {
+                if top.is_empty() {
+                    top = f.site().to_string();
+                }
+            });
+            top
+        };
+        eprintln!("[block] wait_object tid={tid} key={monitor_key} timeout={timeout_millis} at {site}");
+    }
     crate::share::memory::heap::quiesce();
     let result = monitor.wait_blocking(tid, timeout_millis);
     crate::share::memory::heap::unquiesce();

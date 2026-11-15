@@ -800,12 +800,16 @@ impl<'m, 'a> BytecodeVerifier<'m, 'a> {
                     st.extend(second);
                     (d, prev_locals.clone(), st)
                 } else if (248..=250).contains(&frame_type) {
-                    // chop_frame
+                    // chop_frame: k counts logical locals, while the
+                    // expanded representation gives category-2 values two
+                    // slots (primary + 2nd marker).
                     let d = read_u2(bytes, &mut pos)? as usize;
                     let k = (251 - frame_type) as usize;
                     let mut locals = prev_locals.clone();
                     for _ in 0..k {
-                        locals.pop();
+                        if matches!(locals.pop(), Some(vt) if vt.is_category2_2nd()) {
+                            locals.pop();
+                        }
                     }
                     (d, locals, Vec::new())
                 } else if frame_type == 251 {

@@ -602,7 +602,10 @@ impl ClassVerifier {
 /// verify_class` / `classFileParser`: access-flag legality, `<init>` /
 /// `<clinit>` shape, constant-pool tag version gates and class-kind
 /// consistency.
-fn verify_class_structure(class: &ClassFile<'_>) -> io::Result<()> {
+fn verify_class_structure<'a>(
+    class: &ClassFile<'a>,
+    loader: Option<&ClassLoader<'a>>,
+) -> io::Result<()> {
     const ACC_PUBLIC: u16 = 0x0001;
     const ACC_FINAL: u16 = 0x0010;
     const ACC_SUPER: u16 = 0x0020;
@@ -713,7 +716,7 @@ impl Verifier {
         class: &ClassFile<'a>,
         loader: Option<&ClassLoader<'a>>,
     ) -> io::Result<()> {
-        verify_class_structure(class)?;
+        verify_class_structure(class, loader)?;
 
         let is_enum = (class.accessFlags & 0x4000) != 0;
         let is_module = (class.accessFlags & 0x8000) != 0;

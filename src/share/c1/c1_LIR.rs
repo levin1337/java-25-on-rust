@@ -259,7 +259,8 @@ impl LirGenerator {
                     let dst = self.alloc_temp(LirKind::from_value_kind(*kind));
                     out.push(LirOp::LoadField { dst, obj, offset: *offset, kind: LirKind::from_value_kind(*kind) });
                 } else {
-                    out.push(LirOp::CallRuntime { stub: RuntimeStub::UnresolvedField, operands: vec![self.emit_expr(out, obj)], dst: None, bci: 0 });
+                    let obj_op = self.emit_expr(out, obj);
+                    out.push(LirOp::CallRuntime { stub: RuntimeStub::UnresolvedField, operands: vec![obj_op], dst: None, bci: 0 });
                 }
             }
             HirInstruction::StoreField { obj, offset, value, kind, .. } => {
@@ -399,7 +400,8 @@ impl LirGenerator {
                     out.push(LirOp::LoadField { dst: dst.clone(), obj, offset: *offset, kind: LirKind::from_value_kind(*kind) });
                     dst
                 } else {
-                    out.push(LirOp::CallRuntime { stub: RuntimeStub::UnresolvedField, operands: vec![self.emit_expr(out, obj)], dst: None, bci: 0 });
+                    let obj_op = self.emit_expr(out, obj);
+                    out.push(LirOp::CallRuntime { stub: RuntimeStub::UnresolvedField, operands: vec![obj_op], dst: None, bci: 0 });
                     LirOperand::ConstI32(0)
                 }
             }

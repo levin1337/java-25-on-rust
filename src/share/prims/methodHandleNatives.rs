@@ -2055,7 +2055,27 @@ pub(crate) fn method_handle_invoke<'a>(
             return Err(wrong_method_type(loader));
         }
     }
-    let member_value = object_field(loader, mh, b"member", b"Ljava/lang/invoke/MemberName;")?;
+    let member_value = match object_field(loader, mh, b"member", b"Ljava/lang/invoke/MemberName;") {
+        Ok(value) => value,
+        Err(error) => {
+            if std::env::var_os("JVM25_TRACE").is_some() {
+                let mut chain = Vec::new();
+                if let Ok(k) = object_klass(loader, mh) {
+                    let mut cur = Some(k);
+                    while let Some(klass) = cur {
+                        chain.push(String::from_utf8_lossy(&klass.class.name).replace('/', "."));
+                        cur = klass.super_klass();
+                    }
+                }
+                eprintln!(
+                    "[mh-invoke] member lookup failed chain={chain:?} name={} desc={}",
+                    String::from_utf8_lossy(name),
+                    String::from_utf8_lossy(descriptor)
+                );
+            }
+            return Err(error);
+        }
+    };
     let Value::Object(member_handle) = member_value else {
         return Err(invalid("MethodHandle without MemberName"));
     };

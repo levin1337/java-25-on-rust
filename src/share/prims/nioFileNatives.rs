@@ -54,7 +54,11 @@ fn throwable<'a>(
     Ok(handle)
 }
 
-fn throw_java<'a>(loader: &ClassLoader<'a>, class_name: &[u8], message: &str) -> io::Error {
+pub(crate) fn throw_java<'a>(
+    loader: &ClassLoader<'a>,
+    class_name: &[u8],
+    message: &str,
+) -> io::Error {
     match throwable(loader, class_name, message) {
         Ok(handle) => io::Error::other(JavaThrowable(handle)),
         Err(_) => io::Error::other(format!(
@@ -489,6 +493,52 @@ fn java_path(path: &str) -> String {
     } else {
         path.replace('\\', "/")
     }
+}
+
+/// Queries free/total bytes for the volume containing `path`
+/// (`GetDiskFreeSpaceExW` on Windows).
+#[cfg(windows)]
+fn disk_free_space(path: &str) -> Option<(u64, u64, u64)> {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetDiskFreeSpaceExW(
+            path: *const u16,
+            free_available: *mut u64,
+            total: *mut u64,
+            total_free: *mut u64,
+        ) -> i32;
+    }
+    let wide: Vec<u16> = java_path(path).encode_utf16().chain(std::iter::once(0)).collect();
+    let (mut free_available, mut total, mut total_free) = (0u64, 0u64, 0u64);
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(wide.as_ptr(), &mut free_available, &mut total, &mut total_free)
+    };
+    (ok != 0).then_some((free_available, total, total_free))
+}
+
+#[cfg(not(windows))]
+fn disk_free_space(_path: &str) -> Option<(u64, u64, u64)> {
+    None
+}
+
+/// Volume root of a canonical Windows path: `C:\` for drive paths,
+/// `\\server\share\` for UNC paths.
+fn volume_root(path: &str) -> String {
+    let path = path.strip_prefix("\\\\?\\").unwrap_or(path);
+    if path.starts_with("\\\\") {
+        let mut parts = path[2..].split('\\').filter(|s| !s.is_empty());
+        return match (parts.next(), parts.next()) {
+            (Some(server), Some(share)) => format!("\\\\{server}\\{share}\\"),
+            _ => path[..path.len().min(2)].to_owned(),
+        };
+    }
+    let bytes = path.as_bytes();
+    if bytes.len() >= 2 && bytes[1] == b':' {
+        let mut root = path[..2].to_owned();
+        root.push('\\');
+        return root;
+    }
+    path.to_owned()
 }
 
 /// Fills `bytes` with operating-system entropy (BCryptGenRandom on Windows,
@@ -1092,6 +1142,82 @@ pub(crate) fn dispatcher<'a>(
                 }
                 Err(_) => Value::HostString(loader.storage.alloc_str(&path)),
             }
+        }
+        (b"GetVolumePathName0", b"(J)Ljava/lang/String;") => {
+            let path = read_wide_path(arg(0))?;
+            let canonical = std::fs::canonicalize(java_path(&path))
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| java_path(&path));
+            let text = canonical
+                .strip_prefix("\\\\?\\")
+                .unwrap_or(&canonical)
+                .to_owned();
+            Value::HostString(loader.storage.alloc_str(&volume_root(&text)))
+        }
+        (b"GetVolumeInformation0", b"(JLsun/nio/fs/WindowsNativeDispatcher$VolumeInformation;)V") => {
+            let _path = read_wide_path(arg(0))?;
+            let receiver = match arguments.get(1).copied().unwrap_or(Value::Null) {
+                Value::Object(handle) => handle,
+                _ => return Err(invalid("Expected VolumeInformation")),
+            };
+            let file_system_name = loader.storage.alloc_str("NTFS");
+            let volume_name = loader.storage.alloc_str("");
+            let klass = {
+                let objects = loader.borrow_objects();
+                objects
+                    .get(receiver)
+                    .map(|o| o.klass.clone())
+                    .ok_or_else(|| invalid("Invalid VolumeInformation"))?
+            };
+            let mut objects = loader.borrow_objects_mut();
+            if let Some(object) = objects.get_mut(receiver) {
+                for (name, desc, value) in [
+                    (b"fileSystemName".as_slice(), b"Ljava/lang/String;".as_slice(), Value::HostString(file_system_name)),
+                    (b"volumeName".as_slice(), b"Ljava/lang/String;".as_slice(), Value::HostString(volume_name)),
+                    (b"volumeSerialNumber".as_slice(), b"I".as_slice(), Value::Int(0)),
+                    (b"flags".as_slice(), b"I".as_slice(), Value::Int(0)),
+                ] {
+                    if let Ok(slot) = klass.instanceField(name, desc)
+                        && slot < object.fields.len()
+                    {
+                        object.fields[slot] = value;
+                    }
+                }
+            }
+            return Ok(Some(Value::Null));
+        }
+        (b"GetDiskFreeSpaceEx0", b"(JLsun/nio/fs/WindowsNativeDispatcher$DiskFreeSpace;)V")
+        | (b"GetDiskFreeSpace0", b"(JLsun/nio/fs/WindowsNativeDispatcher$DiskFreeSpace;)V") => {
+            let path = read_wide_path(arg(0))?;
+            let receiver = match arguments.get(1).copied().unwrap_or(Value::Null) {
+                Value::Object(handle) => handle,
+                _ => return Err(invalid("Expected DiskFreeSpace")),
+            };
+            let (free_available, total, total_free) = disk_free_space(&path)
+                .ok_or_else(|| invalid("GetDiskFreeSpace failed"))?;
+            let klass = {
+                let objects = loader.borrow_objects();
+                objects
+                    .get(receiver)
+                    .map(|o| o.klass.clone())
+                    .ok_or_else(|| invalid("Invalid DiskFreeSpace"))?
+            };
+            let mut objects = loader.borrow_objects_mut();
+            if let Some(object) = objects.get_mut(receiver) {
+                for (name, value) in [
+                    (b"freeBytesAvailable".as_slice(), free_available as i64),
+                    (b"totalNumberOfBytes".as_slice(), total as i64),
+                    (b"totalNumberOfFreeBytes".as_slice(), total_free as i64),
+                    (b"bytesPerSector".as_slice(), 4096i64),
+                ] {
+                    if let Ok(slot) = klass.instanceField(name, b"J")
+                        && slot < object.fields.len()
+                    {
+                        object.fields[slot] = Value::Long(value);
+                    }
+                }
+            }
+            return Ok(Some(Value::Null));
         }
         (b"GetLogicalDrives", b"()I") => {
             let mut mask = 0i32;
@@ -2042,7 +2168,15 @@ pub(crate) fn open_file(
         .create(write)
         .append(append)
         .truncate(truncate && !append);
-    let file = options.open(java_path(path)).map_err(io_error)?;
+    let file = match options.open(java_path(path)) {
+        Ok(file) => file,
+        Err(error) => {
+            if std::env::var_os("JVM25_TRACE").is_some() {
+                eprintln!("[open_file] FAILED path={path:?} error={error}");
+            }
+            return Err(error);
+        }
+    };
     Ok(alloc_handle(EntryKind::File(file), path.to_string()))
 }
 

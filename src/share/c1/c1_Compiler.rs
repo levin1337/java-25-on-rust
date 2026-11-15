@@ -106,7 +106,8 @@ fn parse_descriptor_params(descriptor: &str, is_static: bool) -> Vec<ParamInfo> 
 impl AbstractCompiler for C1Compiler {
     fn compiler_type(&self) -> CompilerType { CompilerType::C1 }
 
-    fn compile_task(&mut self, task: &CompileTask) -> Result<CompileOutcome, CompileError> {
+    fn compile_method(&mut self, task: &CompileTask) -> Result<CompileOutcome, CompileError> {
+        self.compiled_methods += 1;
         let method = task.method_obj.as_ref().ok_or_else(|| CompileError::new(FailureReason::Unresolved, "missing Method handle", CompLevel::Simple))?;
         let bytecode = method.bytecodes();
         if bytecode.is_empty() {
@@ -120,11 +121,6 @@ impl AbstractCompiler for C1Compiler {
             other => CompileError::new(FailureReason::InternalError, other.to_string(), CompLevel::Simple),
         })?;
         Ok(CompileOutcome { code_bytes: code, frame_size, pc_descs, ..CompileOutcome::default() })
-    }
-
-    fn compile_method(&mut self, _task: &CompileTask) -> io::Result<()> {
-        self.compiled_methods += 1;
-        Ok(())
     }
 
     fn supports_level(&self, level: CompLevel) -> bool { level.is_c1() }

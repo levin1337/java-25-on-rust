@@ -554,6 +554,11 @@ fn natives_init<'a>(loader: &ClassLoader<'a>, arguments: &[Value<'a>]) -> io::Re
     let mut flags = modifiers & 0xFFFF;
     if is_field {
         flags |= IS_FIELD;
+        flags |= (if modifiers & u32::from(ACC_STATIC) != 0 {
+            REF_GET_STATIC
+        } else {
+            REF_GET_FIELD
+        }) << REF_KIND_SHIFT;
         if let Ok(trusted) = object_field(loader, handle, b"trustedFinal", b"Z") {
             if trusted.int()? != 0 {
                 flags |= TRUSTED_FINAL;
@@ -573,6 +578,13 @@ fn natives_init<'a>(loader: &ClassLoader<'a>, arguments: &[Value<'a>]) -> io::Re
         } else {
             IS_METHOD
         };
+        flags |= (if reflect_name == b"java/lang/reflect/Constructor" {
+            REF_NEW_INVOKE_SPECIAL
+        } else if modifiers & u32::from(ACC_STATIC) != 0 {
+            REF_INVOKE_STATIC
+        } else {
+            REF_INVOKE_VIRTUAL
+        }) << REF_KIND_SHIFT;
         // Build the MethodType via MethodType.methodType(rtype, ptypes).
         let rtype = if reflect_name == b"java/lang/reflect/Constructor" {
             clazz_value

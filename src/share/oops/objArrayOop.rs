@@ -75,6 +75,17 @@ impl<'a> ObjArrayOop<'a> {
         Ok(old)
     }
 
+    /// Element (compressed-oop) size in bytes for the given layout mode.
+    pub fn element_size_in_bytes(mode: ObjLayoutMode) -> usize {
+        mode.narrow_oop_size()
+    }
+
+    /// Byte offset of element 0 — identical to `base_offset_in_bytes`,
+    /// named for symmetry with `TypeArrayOop`/`ArrayLayout`.
+    pub fn data_offset_in_bytes(mode: ObjLayoutMode) -> usize {
+        Self::base_offset_in_bytes(mode)
+    }
+
     pub fn base_offset_in_bytes(mode: ObjLayoutMode) -> usize {
         let oop_size = mode.narrow_oop_size();
         mode.array_base_offset(oop_size, oop_size)

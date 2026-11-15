@@ -114,6 +114,11 @@ impl TaskState {
 struct TaskShared {
     state: Mutex<TaskState>,
     done: Condvar,
+    /// Per-bci live-reference maps for deoptimization, filled in by the
+    /// compiler backend during `compile_method` (`&CompileTask` is
+    /// shared, so the data lives here rather than in CompileOutcome
+    /// which is produced by value).
+    live_maps: Mutex<Vec<crate::share::code::nmethod::DeoptLiveMap>>,
 }
 
 impl TaskShared {
@@ -121,6 +126,7 @@ impl TaskShared {
         Self {
             state: Mutex::new(TaskState::new(comp_level, is_blocking, time_queued)),
             done: Condvar::new(),
+            live_maps: Mutex::new(Vec::new()),
         }
     }
 }
@@ -181,6 +187,10 @@ pub struct CompileTask {
     pub jit_metadata: Option<crate::share::c1::c1_GraphBuilder::MethodMetadata>,
     /// Key into the interpreter's live counters (`methodCounters::get`).
     pub profile_key: Option<usize>,
+    /// Broker deinstall epoch captured when the task was queued; the
+    /// broker refuses to install a task whose epoch went stale (the
+    /// method was deinstalled while the task was in flight).
+    pub submit_epoch: u64,
     pub hot_count: u32,
     pub reason: CompileReason,
     pub is_osr: bool,
@@ -208,6 +218,7 @@ impl CompileTask {
             method_obj: None,
             jit_metadata: None,
             profile_key: None,
+            submit_epoch: 0,
             hot_count,
             reason,
             is_osr: false,
@@ -438,6 +449,30 @@ impl CompileTask {
 
     pub fn waiting_for_completion_count(&self) -> u32 {
         self.shared.state.lock().unwrap().waiting_count
+    }
+
+    // ---- deopt live maps ------------------------------------------------
+
+    /// Record the per-bci live-reference maps produced by the compiler
+    /// (sorted by bci, deduplicated).
+    pub fn set_live_maps(&self, mut maps: Vec<crate::share::code::nmethod::DeoptLiveMap>) {
+        maps.sort_by_key(|m| m.bci());
+        maps.dedup_by_key(|m| m.bci());
+        *self.shared.live_maps.lock().unwrap() = maps;
+    }
+
+    /// Add or replace the live map for one bci.
+    pub fn add_live_map(&self, map: crate::share::code::nmethod::DeoptLiveMap) {
+        let mut maps = self.shared.live_maps.lock().unwrap();
+        match maps.binary_search_by_key(&map.bci(), |m| m.bci()) {
+            Ok(idx) => maps[idx] = map,
+            Err(idx) => maps.insert(idx, map),
+        }
+    }
+
+    /// All live maps recorded so far (compiler thread or broker).
+    pub fn live_maps(&self) -> Vec<crate::share::code::nmethod::DeoptLiveMap> {
+        self.shared.live_maps.lock().unwrap().clone()
     }
 
     // ---- code size stats ----------------------------------------------

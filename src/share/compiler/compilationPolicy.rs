@@ -209,8 +209,10 @@ impl CompilationPolicy {
     pub fn new() -> Self {
         let mut state = PolicyState::default();
         state.start_time_ms = now_ms();
-        state.increase_threshold_at_ratio =
-            100.0 / (100.0 - state_increase_pct_placeholder());
+        // Code-cache pressure threshold (percent used) above which C1
+        // thresholds are inflated exponentially — HotSpot
+        // `increase_first_tier_compile_threshold_at` (default 50%).
+        state.increase_threshold_at_ratio = INCREASE_FIRST_TIER_COMPILE_THRESHOLD_AT;
         Self {
             thresholds: PolicyThresholds::default(),
             mode: CompilationMode::Normal,
@@ -469,13 +471,20 @@ impl CompilationPolicy {
 
         // Apply predicate (delay_profiling uses Tier0ProfileDelayFactor=1.0
         // scaled path in HotSpot; here delay_profiling lowers thresholds).
-        let scale = if delay_profiling { 1.0 } else { 1.0 };
-        let mut hit = self.call_predicate_scaled(CompLevel::None, i, b, scale * oracle_scale.unwrap_or(1.0))
-            || self.loop_predicate_scaled(CompLevel::None, i, b, scale * oracle_scale.unwrap_or(1.0));
+        // `CompileThresholdScaling` multiplies every tier threshold, on
+        // both the delay path and the queue-feedback path.
+        let oracle = oracle_scale.unwrap_or(1.0);
+        let mut hit = self.call_predicate_scaled(CompLevel::None, i, b, oracle)
+            || self.loop_predicate_scaled(CompLevel::None, i, b, oracle);
         // With load feedback when not delaying:
         if !delay_profiling {
-            hit = self.call_predicate(CompLevel::None, i, b, queue_size_c1, queue_size_c2)
-                || self.loop_predicate(CompLevel::None, i, b, queue_size_c1, queue_size_c2);
+            let k = self.threshold_scale(
+                CompLevel::FullProfile,
+                self.thresholds.tier3_load_feedback,
+                queue_size_c1,
+            ) * oracle;
+            hit = self.call_predicate_scaled(CompLevel::None, i, b, k)
+                || self.loop_predicate_scaled(CompLevel::None, i, b, k);
         }
 
         if !self.mode.disable_intermediate() && hit {
@@ -502,16 +511,31 @@ impl CompilationPolicy {
         b: u32,
         _queue_size_c1: usize,
         queue_size_c2: usize,
-        _oracle_scale: Option<f64>,
+        oracle_scale: Option<f64>,
     ) -> CompLevel {
+        // HotSpot `transition_from_full_profile`: `mdo == nullptr`
+        // keeps the method at full_profile — without profiling data
+        // there is no evidence it is C2-worthy, so it must NOT jump
+        // straight to full optimization.
+        let has_mdo = profile.mdo_invocation_delta.is_some()
+            || profile.mdo_backedge_delta.is_some()
+            || profile.mdo_would_profile;
+        if !has_mdo {
+            return CompLevel::FullProfile;
+        }
         // MDO deltas when present; otherwise raw counters.
         let (mi, mb) = match (profile.mdo_invocation_delta, profile.mdo_backedge_delta) {
             (Some(di), Some(db)) => (di, db),
             _ => (i, b),
         };
         if profile.mdo_would_profile || self.mode.disable_intermediate() {
-            if self.call_predicate(CompLevel::FullProfile, mi, mb, 0, queue_size_c2)
-                || self.loop_predicate(CompLevel::FullProfile, mi, mb, 0, queue_size_c2)
+            let k = self.threshold_scale(
+                CompLevel::FullOptimization,
+                self.thresholds.tier4_load_feedback,
+                queue_size_c2,
+            ) * oracle_scale.unwrap_or(1.0);
+            if self.call_predicate_scaled(CompLevel::FullProfile, mi, mb, k)
+                || self.loop_predicate_scaled(CompLevel::FullProfile, mi, mb, k)
             {
                 CompLevel::FullOptimization
             } else {
@@ -523,14 +547,20 @@ impl CompilationPolicy {
     }
 
     /// `transition_from_full_profile` (3 -> 4).
-    fn transition_from_full_profile(&self, profile: &MethodProfile, queue_size_c1: usize, queue_size_c2: usize) -> CompLevel {
+    fn transition_from_full_profile(
+        &self,
+        profile: &MethodProfile,
+        queue_size_c1: usize,
+        queue_size_c2: usize,
+        oracle_scale: Option<f64>,
+    ) -> CompLevel {
         self.transition_from_full_profile_inner(
             profile,
             profile.invocation_count,
             profile.backedge_count,
             queue_size_c1,
             queue_size_c2,
-            None,
+            oracle_scale,
         )
     }
 
@@ -538,10 +568,11 @@ impl CompilationPolicy {
     fn transition_from_limited_profile(
         &self,
         profile: &MethodProfile,
-        delay_profiling: bool,
+        _delay_profiling: bool,
         disable_feedback: bool,
         queue_size_c1: usize,
         queue_size_c2: usize,
+        oracle_scale: Option<f64>,
     ) -> CompLevel {
         let i = profile.invocation_count;
         let b = profile.backedge_count;
@@ -553,10 +584,11 @@ impl CompilationPolicy {
         // C++: mdo && would_profile -> maybe full_profile;
         //      mdo && !would_profile -> full_optimization;
         //      no mdo -> must profile first (full_profile) when queue allows.
+        let oracle = oracle_scale.unwrap_or(1.0);
         let profile_cond = disable_feedback
             || (c2_queue_ok
-                && (self.call_predicate_scaled(CompLevel::LimitedProfile, i, b, 1.0)
-                    || self.loop_predicate_scaled(CompLevel::LimitedProfile, i, b, 1.0)));
+                && (self.call_predicate_scaled(CompLevel::LimitedProfile, i, b, oracle)
+                    || self.loop_predicate_scaled(CompLevel::LimitedProfile, i, b, oracle)));
 
         if profile.mdo_would_profile {
             if profile_cond {
@@ -604,8 +636,14 @@ impl CompilationPolicy {
                 disable_feedback,
                 queue_size_c1,
                 queue_size_c2,
+                oracle_scale,
             ),
-            CompLevel::FullProfile => self.transition_from_full_profile(profile, queue_size_c1, queue_size_c2),
+            CompLevel::FullProfile => self.transition_from_full_profile(
+                profile,
+                queue_size_c1,
+                queue_size_c2,
+                oracle_scale,
+            ),
             _ => cur_level,
         }
     }
@@ -703,6 +741,7 @@ impl CompilationPolicy {
         cur_level: CompLevel,
         queue_size_c1: usize,
         queue_size_c2: usize,
+        oracle_scale: Option<f64>,
     ) -> CompLevel {
         let mut next_level = self.common(
             profile,
@@ -711,7 +750,7 @@ impl CompilationPolicy {
             false,
             queue_size_c1,
             queue_size_c2,
-            None,
+            oracle_scale,
             true,
         );
         if cur_level == CompLevel::None {
@@ -735,6 +774,18 @@ impl CompilationPolicy {
         oracle_scale: Option<f64>,
         is_trivial: bool,
     ) -> PolicyActions {
+        // Honour the caller-supplied trivial flag even when the profile
+        // snapshot does not carry it (accessor / constant getter).
+        let profile_storage;
+        let profile = if is_trivial && !profile.is_trivial {
+            profile_storage = MethodProfile {
+                is_trivial: true,
+                ..profile.clone()
+            };
+            &profile_storage
+        } else {
+            profile
+        };
         let mut actions = PolicyActions {
             next_level: cur_level,
             create_mdo: self.should_create_mdo(profile, cur_level, queue_size_c2),
@@ -764,6 +815,7 @@ impl CompilationPolicy {
         is_trivial: bool,
         enclosing: Option<(&str, CompLevel, bool)>, // (key, level, is_osr_nmethod)
         max_osr_level: CompLevel,
+        oracle_scale: Option<f64>,
     ) -> PolicyActions {
         let mut actions = PolicyActions {
             next_level: cur_level,
@@ -771,7 +823,14 @@ impl CompilationPolicy {
             ..Default::default()
         };
 
-        let next_osr_level = self.loop_event(key, profile, cur_level, queue_size_c1, queue_size_c2);
+        let next_osr_level = self.loop_event(
+            key,
+            profile,
+            cur_level,
+            queue_size_c1,
+            queue_size_c2,
+            oracle_scale,
+        );
         // At the very least compile the OSR version.
         if next_osr_level != cur_level && next_osr_level.is_compile() {
             actions.osr_compile = Some((next_osr_level, bci));
@@ -789,7 +848,7 @@ impl CompilationPolicy {
                     elevel,
                     queue_size_c1,
                     queue_size_c2,
-                    None,
+                    oracle_scale,
                 );
                 let mut make_not_entrant = false;
                 if max_osr_level == CompLevel::FullOptimization {
@@ -810,7 +869,7 @@ impl CompilationPolicy {
                 actions.next_level = fixed;
             }
             None => {
-                let next_level = self.call_event(key, profile, cur_level, queue_size_c1, queue_size_c2, None);
+                let next_level = self.call_event(key, profile, cur_level, queue_size_c1, queue_size_c2, oracle_scale);
                 if next_level != cur_level && next_level.is_compile() {
                     actions.call_compile_level = Some(next_level);
                 }
@@ -854,24 +913,14 @@ impl CompilationPolicy {
     }
 
     /// `is_method_profiled`: level-3 code already collected enough profile
-    /// to justify skipping straight to C2.
+    /// (MDO deltas vs tier-4 predicates) to justify skipping straight to
+    /// C2.  HotSpot returns false when no MDO exists.
     pub fn is_method_profiled(&self, profile: &MethodProfile, _q1: usize, _q2: usize) -> bool {
         if let (Some(i), Some(b)) = (profile.mdo_invocation_delta, profile.mdo_backedge_delta) {
             return self.call_predicate_scaled(CompLevel::FullProfile, i, b, 1.0)
                 || self.loop_predicate_scaled(CompLevel::FullProfile, i, b, 1.0);
         }
-        // Without MDO deltas, use the raw counters vs tier-4 thresholds.
-        self.call_predicate_scaled(
-            CompLevel::FullProfile,
-            profile.invocation_count,
-            profile.backedge_count,
-            1.0,
-        ) || self.loop_predicate_scaled(
-            CompLevel::FullProfile,
-            profile.invocation_count,
-            profile.backedge_count,
-            1.0,
-        )
+        false
     }
 
     // ---- compilability -----------------------------------------------------
@@ -1128,10 +1177,6 @@ impl Default for CompilationPolicy {
     }
 }
 
-fn state_increase_pct_placeholder() -> f64 {
-    INCREASE_FIRST_TIER_COMPILE_THRESHOLD_AT
-}
-
 /// `CodeCache::reverse_free_ratio` analogue: used by threshold_scale to
 /// inflate C1 thresholds under code-cache pressure.  Reads the global
 /// code cache if present.
@@ -1151,4 +1196,212 @@ pub fn code_cache_reverse_free_ratio() -> f64 {
 pub trait QueueSizes {
     fn c1_size(&self) -> usize;
     fn c2_size(&self) -> usize;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::share::compiler::compileTask::CompileReason;
+
+    fn policy() -> CompilationPolicy {
+        let p = CompilationPolicy::new();
+        p.set_c1_count(1);
+        p.set_c2_count(1);
+        p
+    }
+
+    #[test]
+    fn call_predicate_tier3_thresholds() {
+        let p = policy();
+        // Tier3 invocation threshold = 200.
+        assert!(p.call_predicate(CompLevel::None, 200, 0, 0, 0));
+        assert!(!p.call_predicate(CompLevel::None, 199, 0, 0, 0));
+        // Combined threshold: i >= 100 && i+b >= 2000.
+        assert!(p.call_predicate(CompLevel::None, 100, 1900, 0, 0));
+        assert!(!p.call_predicate(CompLevel::None, 100, 1899, 0, 0));
+        assert!(!p.call_predicate(CompLevel::None, 99, 5000, 0, 0));
+    }
+
+    #[test]
+    fn call_predicate_tier4_thresholds() {
+        let p = policy();
+        assert!(p.call_predicate(CompLevel::FullProfile, 2000, 0, 0, 0));
+        assert!(!p.call_predicate(CompLevel::FullProfile, 1999, 0, 0, 0));
+        assert!(p.call_predicate(CompLevel::FullProfile, 600, 14400, 0, 0));
+        assert!(!p.call_predicate(CompLevel::FullProfile, 599, 20000, 0, 0));
+        // Already-compiled levels always satisfy the predicate.
+        assert!(p.call_predicate(CompLevel::FullOptimization, 0, 0, 0, 0));
+        assert!(p.call_predicate(CompLevel::Simple, 0, 0, 0, 0));
+    }
+
+    #[test]
+    fn loop_predicate_backedge_thresholds() {
+        let p = policy();
+        assert!(p.loop_predicate(CompLevel::None, 0, 60_000, 0, 0));
+        assert!(!p.loop_predicate(CompLevel::None, 0, 59_999, 0, 0));
+        assert!(p.loop_predicate(CompLevel::FullProfile, 0, 40_000, 0, 0));
+        assert!(!p.loop_predicate(CompLevel::FullProfile, 0, 39_999, 0, 0));
+    }
+
+    #[test]
+    fn queue_size_scales_thresholds() {
+        let p = policy();
+        // k = queue/(feedback_k*compilers)+1 ; with 1 C1 compiler and
+        // feedback_k=5, 45 queued tasks -> k=10 -> tier3 threshold 2000.
+        assert!(!p.call_predicate(CompLevel::None, 500, 0, 45, 0));
+        assert!(p.call_predicate(CompLevel::None, 2000, 0, 45, 0));
+    }
+
+    #[test]
+    fn invocation_event_transitions_none_to_profile() {
+        let p = policy();
+        let hot = MethodProfile {
+            invocation_count: TIER3_INVOCATION_THRESHOLD,
+            ..Default::default()
+        };
+        let actions = p.method_invocation_event("k.m()V", &hot, CompLevel::None, 0, 0, None, false);
+        // C2 is disabled in this port, so the top reachable level is C1
+        // full profile (level 3).
+        assert_eq!(actions.call_compile_level, Some(CompLevel::FullProfile));
+
+        let cold = MethodProfile {
+            invocation_count: TIER3_INVOCATION_THRESHOLD - 1,
+            ..Default::default()
+        };
+        let actions = p.method_invocation_event("k.cold()V", &cold, CompLevel::None, 0, 0, None, false);
+        assert_eq!(actions.call_compile_level, None);
+    }
+
+    #[test]
+    fn invocation_event_trivial_method_goes_simple() {
+        let p = policy();
+        let prof = MethodProfile {
+            invocation_count: 1,
+            is_trivial: true,
+            ..Default::default()
+        };
+        let actions = p.method_invocation_event("k.get()I", &prof, CompLevel::None, 0, 0, None, true);
+        assert_eq!(actions.call_compile_level, Some(CompLevel::Simple));
+    }
+
+    #[test]
+    fn backedge_event_requests_osr() {
+        let p = policy();
+        let prof = MethodProfile {
+            backedge_count: TIER3_BACKEDGE_THRESHOLD,
+            ..Default::default()
+        };
+        let actions = p.method_back_branch_event(
+            "k.loop()V",
+            &prof,
+            7,
+            CompLevel::None,
+            0,
+            0,
+            false,
+            None,
+            CompLevel::Simple,
+            None,
+        );
+        assert!(actions.osr_compile.is_some());
+        assert_eq!(actions.osr_compile.unwrap().1, 7);
+    }
+
+    #[test]
+    fn level_tracking_and_limits() {
+        let p = policy();
+        assert_eq!(p.level_of("k.x()V"), CompLevel::None);
+        p.note_level("k.x()V", CompLevel::FullProfile, false);
+        p.note_level("k.x()V", CompLevel::Simple, true);
+        assert_eq!(p.level_of("k.x()V"), CompLevel::FullProfile);
+        assert_eq!(p.osr_level_of("k.x()V"), CompLevel::Simple);
+        // C2 disabled -> highest available is C1 full profile.
+        assert_eq!(p.highest_compile_level(), CompLevel::FullProfile);
+        assert_eq!(p.limit_level(CompLevel::FullOptimization), CompLevel::FullProfile);
+        assert_eq!(p.limit_level(CompLevel::Simple), CompLevel::Simple);
+        assert!(p.verify_level(CompLevel::FullProfile));
+        assert!(!p.verify_level(CompLevel::Any));
+    }
+
+    #[test]
+    fn select_task_prefers_whitebox_then_rate() {
+        let p = policy();
+        let q = CompileQueue::new("sel");
+        let normal = CompileTask::new(1, Symbol::new(b"A"), Symbol::new(b"m"), Symbol::new(b"()V"), CompLevel::Simple, 1, CompileReason::ReasonInvocationCount, false);
+        let wb = CompileTask::new(2, Symbol::new(b"A"), Symbol::new(b"w"), Symbol::new(b"()V"), CompLevel::Simple, 1, CompileReason::ReasonWhitebox, true);
+        q.add(normal.clone());
+        q.add(wb.clone());
+        let sel = p.select_task(&q).unwrap();
+        assert_eq!(sel.compile_id(), 2);
+        // Drain; next selection returns the remaining task.
+        q.remove(2);
+        let sel2 = p.select_task(&q).unwrap();
+        assert_eq!(sel2.compile_id(), 1);
+    }
+
+    #[test]
+    fn rate_update_and_weight() {
+        let p = policy();
+        p.update_rate("k.hot()V", 100);
+        // Second update with a later timestamp produces a rate.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        p.update_rate("k.hot()V", 200);
+        assert!(p.weight("k.hot()V") >= 0.0);
+        assert!(!p.is_stale("k.hot()V"));
+    }
+
+    #[test]
+    fn oracle_scaling_shrinks_and_grows_tier3_threshold() {
+        let p = policy();
+        // i=150 sits between 0.5x (100) and 2.0x (400) of the 200
+        // tier-3 invocation threshold.
+        let prof = MethodProfile {
+            invocation_count: 150,
+            ..Default::default()
+        };
+        let actions = p.method_invocation_event("k.s()V", &prof, CompLevel::None, 0, 0, Some(0.5), false);
+        assert!(actions.call_compile_level.is_some());
+        let actions = p.method_invocation_event("k.s()V", &prof, CompLevel::None, 0, 0, Some(2.0), false);
+        assert_eq!(actions.call_compile_level, None);
+        // No oracle rule -> unchanged behaviour.
+        let actions = p.method_invocation_event("k.s()V", &prof, CompLevel::None, 0, 0, None, false);
+        assert_eq!(actions.call_compile_level, None);
+    }
+
+    #[test]
+    fn oracle_scaling_affects_osr_backedge_decision() {
+        let p = policy();
+        let prof = MethodProfile {
+            backedge_count: TIER3_BACKEDGE_THRESHOLD,
+            ..Default::default()
+        };
+        // 2.0x pushes the 60k backedge threshold to 120k: no OSR.
+        let actions = p.method_back_branch_event(
+            "k.loop()V",
+            &prof,
+            7,
+            CompLevel::None,
+            0,
+            0,
+            false,
+            None,
+            CompLevel::Simple,
+            Some(2.0),
+        );
+        assert!(actions.osr_compile.is_none());
+        // 0.5x drops it to 30k: OSR requested.
+        let actions = p.method_back_branch_event(
+            "k.loop()V",
+            &prof,
+            7,
+            CompLevel::None,
+            0,
+            0,
+            false,
+            None,
+            CompLevel::Simple,
+            Some(0.5),
+        );
+        assert!(actions.osr_compile.is_some());
+    }
 }

@@ -82,6 +82,32 @@ impl FieldFlags {
     }
 }
 
+/// Machine-level kind of a field or method signature for JIT code
+/// generation.  Mirrors the categories JIT frontends need for
+/// getfield/putfield/getstatic/putstatic lowering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldKind {
+    Int32,
+    Int64,
+    Float32,
+    Float64,
+    /// Reference type (`L...;` or array `[...`).
+    Ref,
+}
+
+/// Maps a JVM field descriptor (`I`, `J`, `Ljava/lang/String;`, `[I`, ...)
+/// to its machine kind.  Returns `None` for `V` and malformed input.
+pub fn descriptor_kind(descriptor: &[u8]) -> Option<FieldKind> {
+    match descriptor.first()? {
+        b'I' | b'S' | b'C' | b'B' | b'Z' => Some(FieldKind::Int32),
+        b'J' => Some(FieldKind::Int64),
+        b'F' => Some(FieldKind::Float32),
+        b'D' => Some(FieldKind::Float64),
+        b'L' | b'[' => Some(FieldKind::Ref),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FieldInfo<'a> {
     pub access_flags: u16,
@@ -191,5 +217,18 @@ impl<'a> FieldInfo<'a> {
     /// Required memory alignment in bytes for the field.
     pub fn alignment(&self) -> usize {
         self.size_in_bytes()
+    }
+
+    /// Machine kind of this field for JIT lowering.
+    pub fn kind(&self) -> Option<FieldKind> {
+        descriptor_kind(self.descriptor)
+    }
+
+    /// Number of local/stack slots the field occupies (long/double = 2).
+    pub fn size_in_slots(&self) -> usize {
+        match self.kind() {
+            Some(FieldKind::Int64) | Some(FieldKind::Float64) => 2,
+            _ => 1,
+        }
     }
 }

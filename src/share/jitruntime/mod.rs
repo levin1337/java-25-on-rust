@@ -22,4 +22,4 @@ pub mod runtime;
 pub mod stubs;
 
 pub use runtime::{signature_supported, try_invoke, CompiledResult};
-pub use stubs::{publish_executable, stub_map};
+pub use stubs::{ExecutableMeta, publish_executable, publish_executable_meta, stub_map};

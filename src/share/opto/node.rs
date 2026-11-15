@@ -234,6 +234,64 @@ impl Opcode {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ArrayElemKind {
+    Int,
+    Long,
+    Float,
+    Double,
+    Ref,
+    Byte,
+    Char,
+    Short,
+}
+
+impl ArrayElemKind {
+    pub fn code(self) -> i32 {
+        match self {
+            Self::Int => 0,
+            Self::Long => 1,
+            Self::Float => 2,
+            Self::Double => 3,
+            Self::Ref => 12,
+            Self::Byte => 5,
+            Self::Char => 6,
+            Self::Short => 7,
+        }
+    }
+
+    pub fn from_code(code: i32) -> Option<Self> {
+        match code {
+            0 => Some(Self::Int),
+            1 => Some(Self::Long),
+            2 => Some(Self::Float),
+            3 => Some(Self::Double),
+            12 => Some(Self::Ref),
+            5 => Some(Self::Byte),
+            6 => Some(Self::Char),
+            7 => Some(Self::Short),
+            _ => None,
+        }
+    }
+
+    pub fn element_size(self) -> usize {
+        match self {
+            Self::Byte => 1,
+            Self::Char | Self::Short => 2,
+            Self::Int | Self::Float | Self::Ref => 4,
+            Self::Long | Self::Double => 8,
+        }
+    }
+
+    pub fn element_align(self) -> usize {
+        self.element_size()
+    }
+
+    pub fn is_xmm(self) -> bool {
+        matches!(self, Self::Float | Self::Double)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Node {
     pub id: NodeId,

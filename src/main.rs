@@ -3,7 +3,28 @@ use jvm25_rust::share::{classfile::classLoader::ClassLoader, runtime::javaCalls}
 use std::{env, error::Error, fs, io, path::Path, process::ExitCode};
 
 fn inspect() -> Result<(), Box<dyn Error>> {
-    let mut arguments = env::args_os().skip(1).peekable();
+    let mut raw: Vec<std::ffi::OsString> = env::args_os().skip(1).collect();
+    // Java launcher @argument files: `@file` expands to the whitespace-
+    // separated tokens inside (double quotes group, `\"`/`\\` escape).
+    // `@@` yields a literal `@` argument.
+    let mut expanded: Vec<std::ffi::OsString> = Vec::with_capacity(raw.len());
+    for arg in raw.drain(..) {
+        let text = arg.to_string_lossy();
+        if text.starts_with("@@") {
+            expanded.push(std::ffi::OsString::from(&text[1..]));
+        } else if let Some(path) = text.strip_prefix('@')
+            && !path.is_empty()
+        {
+            let contents = fs::read_to_string(path)
+                .map_err(|e| io::Error::other(format!("Cannot read argument file {path}: {e}")))?;
+            for token in parse_argfile(&contents) {
+                expanded.push(std::ffi::OsString::from(token));
+            }
+        } else {
+            expanded.push(arg);
+        }
+    }
+    let mut arguments = expanded.into_iter().peekable();
     let modules = if arguments.next_if_eq("--modules").is_some() {
         Some(
             arguments
@@ -85,6 +106,7 @@ fn inspect() -> Result<(), Box<dyn Error>> {
             .to_str()
             .filter(|name| !name.is_empty() && !name.starts_with('-'))
             .ok_or_else(|| io::Error::other("Invalid main class"))?;
+        eprintln!("[args] name={name:?} classpath={classpath:?}");
         let classpath = expand_classpath_wildcards(classpath);
         let mut loader = ClassLoader::open_classpath(&classpath, &storage)?;
         loader.setSystemProperty("java.class.path", &classpath)?;
@@ -150,6 +172,60 @@ fn expand_classpath_wildcards(classpath: &str) -> String {
         }
     }
     expanded.join(&separator.to_string())
+}
+
+/// Splits an `@argument` file into tokens. Whitespace separates tokens;
+/// `"..."` groups whitespace, `\"` and `\\` are escapes, `#` at the start
+/// of a line comments out the rest of the line.
+fn parse_argfile(contents: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut token = String::new();
+    let mut chars = contents.chars().peekable();
+    let mut quoted = false;
+    let mut token_started = false;
+    let mut line_start = true;
+    while let Some(ch) = chars.next() {
+        if line_start && ch == '#' {
+            while let Some(c) = chars.next() {
+                if c == '\n' {
+                    break;
+                }
+            }
+            line_start = true;
+            continue;
+        }
+        line_start = ch == '\n';
+        match ch {
+            '"' => {
+                quoted = !quoted;
+                token_started = true;
+            }
+            '\\' => match chars.peek().copied() {
+                Some('"') | Some('\\') => {
+                    token.push(chars.next().unwrap());
+                    token_started = true;
+                }
+                _ => {
+                    token.push('\\');
+                    token_started = true;
+                }
+            },
+            c if c.is_whitespace() && !quoted => {
+                if token_started || !token.is_empty() {
+                    tokens.push(std::mem::take(&mut token));
+                    token_started = false;
+                }
+            }
+            c => {
+                token.push(c);
+                token_started = true;
+            }
+        }
+    }
+    if token_started || !token.is_empty() {
+        tokens.push(token);
+    }
+    tokens
 }
 
 fn inspectClass(path: &Path) -> Result<(), Box<dyn Error>> {

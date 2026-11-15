@@ -4,6 +4,7 @@ pub mod classFileStream;
 pub mod classLoader;
 pub mod javaClasses;
 pub mod jimage;
+pub mod jitMetadata;
 pub mod jimageDecompressor;
 pub mod linkageError;
 pub mod modules;
@@ -32,6 +33,9 @@ pub use javaClasses::{
     java_lang_System, java_lang_Thread, java_lang_Throwable, java_lang_boxing_object,
 };
 pub use jimage::{JIMAGE_MAGIC, JImageHeader, JImageReader};
+pub use jitMetadata::{
+    JitCallSite, JitExceptionHandler, JitFieldInfo, JitMetadata, JitSite,
+};
 pub use jimageDecompressor::{StringsProvider, decompress_resource};
 pub use linkageError::{LinkageError, LinkageErrorKind, linkage_kind};
 pub use modules::{ModuleEntry, ModuleTable, Modules};

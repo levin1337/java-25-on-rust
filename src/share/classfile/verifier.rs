@@ -630,7 +630,6 @@ fn verify_class_structure(class: &ClassFile<'_>) -> io::Result<()> {
     }
     let is_interface = (flags & ACC_INTERFACE) != 0;
     let is_annotation = (flags & ACC_ANNOTATION) != 0;
-    let is_enum = (flags & ACC_ENUM) != 0;
     let is_module = (flags & ACC_MODULE) != 0;
 
     if is_annotation && !is_interface {
@@ -650,21 +649,6 @@ fn verify_class_structure(class: &ClassFile<'_>) -> io::Result<()> {
             ));
         }
     }
-    if is_enum && !is_module {
-        // Enum classes must extend java.lang.Enum (checked at link time in
-        // HotSpot; the superclass name is available here).
-        if class.superName != Some(b"java/lang/Enum".as_slice()) {
-            return Err(Error::other(format!(
-                "ClassFormatError: enum class {} must extend java.lang.Enum (super={})",
-                String::from_utf8_lossy(class.name),
-                class
-                    .superName
-                    .map(|name| String::from_utf8_lossy(name).into_owned())
-                    .unwrap_or_else(|| "none".to_string()),
-            )));
-        }
-    }
-
     // <init> / <clinit> shape rules (JVMS 4.6 / 5.5).
     for method in &class.methods {
         let is_static = (method.accessFlags & 0x0008) != 0;
@@ -730,6 +714,24 @@ impl Verifier {
         loader: Option<&ClassLoader<'a>>,
     ) -> io::Result<()> {
         verify_class_structure(class)?;
+
+        let is_enum = (class.accessFlags & 0x4000) != 0;
+        let is_module = (class.accessFlags & 0x8000) != 0;
+        if is_enum && !is_module {
+            let enum_super = match class.superName {
+                Some(b"java/lang/Enum") => true,
+                Some(super_name) => loader
+                    .and_then(|loader| loader.load(super_name).ok())
+                    .is_some_and(|klass| (klass.class.accessFlags & 0x4000) != 0),
+                None => false,
+            };
+            if !enum_super {
+                return Err(Error::other(format!(
+                    "ClassFormatError: enum class {} must extend java.lang.Enum",
+                    String::from_utf8_lossy(class.name),
+                )));
+            }
+        }
 
         let is_interface = (class.accessFlags & 0x0200) != 0;
         let is_abstract = (class.accessFlags & 0x0400) != 0;

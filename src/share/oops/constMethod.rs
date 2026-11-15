@@ -9,7 +9,79 @@
  * - Parameter and signature indices
  */
 
-use super::method::ExceptionTableEntry;
+use super::method::{Code, ExceptionTableEntry};
+use crate::classfile::Member;
+use std::io::{self, Error};
+
+/// Length in bytes of the field descriptor at the start of `bytes`
+/// (`I` -> 1, `Ljava/lang/String;` -> 18, `[I` -> 2).  Returns `None`
+/// for `V`, empty input or malformed descriptors.
+pub fn field_descriptor_len(bytes: &[u8]) -> Option<usize> {
+    let dims = bytes.iter().take_while(|b| **b == b'[').count();
+    let tag = *bytes.get(dims)?;
+    match tag {
+        b'B' | b'C' | b'D' | b'F' | b'I' | b'J' | b'S' | b'Z' => Some(dims + 1),
+        b'L' => {
+            let rest = &bytes[dims + 1..];
+            let end = rest.iter().position(|b| *b == b';')?;
+            if end == 0 {
+                return None;
+            }
+            Some(dims + 1 + end + 1)
+        }
+        _ => None,
+    }
+}
+
+/// Slot size of a field descriptor: 2 for `J`/`D`, 1 otherwise
+/// (references and arrays occupy one compressed-oop slot).
+pub fn field_descriptor_slots(descriptor: &[u8]) -> io::Result<usize> {
+    if field_descriptor_len(descriptor) != Some(descriptor.len()) {
+        return Err(Error::other("Invalid field descriptor"));
+    }
+    Ok(match descriptor.iter().position(|b| *b != b'[').map(|i| descriptor[i]) {
+        Some(b'J') | Some(b'D') => 2,
+        _ => 1,
+    })
+}
+
+/// Splits a JVM method descriptor into its parameter descriptors and
+/// the return descriptor (`None` for `V`).
+pub fn split_method_descriptor(descriptor: &[u8]) -> io::Result<(Vec<&[u8]>, Option<&[u8]>)> {
+    let invalid = || Error::other("Invalid method descriptor");
+    let params = descriptor.strip_prefix(b"(").ok_or_else(invalid)?;
+    let mut pos = 0usize;
+    let mut arguments = Vec::new();
+    while pos < params.len() && params[pos] != b')' {
+        let len = field_descriptor_len(&params[pos..]).ok_or_else(invalid)?;
+        arguments.push(&params[pos..pos + len]);
+        pos += len;
+    }
+    if pos >= params.len() || params[pos] != b')' {
+        return Err(invalid());
+    }
+    let result = &params[pos + 1..];
+    let returns = if result == b"V" {
+        None
+    } else {
+        if field_descriptor_len(result) != Some(result.len()) {
+            return Err(invalid());
+        }
+        Some(result)
+    };
+    Ok((arguments, returns))
+}
+
+/// `size_of_parameters` for a method descriptor: total local-variable
+/// slots occupied by the arguments (long/double count as 2).
+pub fn descriptor_parameter_slots(descriptor: &[u8]) -> io::Result<u16> {
+    let (arguments, _) = split_method_descriptor(descriptor)?;
+    let mut slots = 0usize;
+    for arg in arguments {
+        slots += field_descriptor_slots(arg)?;
+    }
+    u16::try_from(slots).map_err(|_| Error::other("Too many method parameters"))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LocalVariableTableElement {
@@ -80,6 +152,28 @@ impl ConstMethod {
             line_number_table,
             local_variable_table,
         }
+    }
+
+    /// Builds a `ConstMethod` directly from a parsed class-file `Member`:
+    /// bytecodes, max_stack/max_locals, exception table and
+    /// `size_of_parameters` are all recovered from the Code attribute and
+    /// the method descriptor.  Name/signature CP indices are left as 0 —
+    /// callers that need them must resolve them against the owning
+    /// constant pool separately.
+    pub fn from_member(member: &Member<'_>) -> io::Result<Self> {
+        let code = Code::parse(member)?;
+        let size_of_parameters = descriptor_parameter_slots(member.descriptor)?;
+        Ok(Self::new(
+            0,
+            0,
+            code.maxStack.min(u16::MAX as usize) as u16,
+            code.maxLocals.min(u16::MAX as usize) as u16,
+            size_of_parameters,
+            code.bytes.to_vec(),
+            code.exception_table,
+            Vec::new(),
+            Vec::new(),
+        ))
     }
 
     #[inline]

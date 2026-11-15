@@ -14,10 +14,14 @@ use super::compileTask::{CompileOutcome, CompileReason, CompileTask, FailureReas
 use super::compilationPolicy::{CompilationPolicy, MethodProfile, PolicyActions};
 use super::compilerDefinitions::CompLevel;
 use super::compilerOracle::CompilerOracle;
-use crate::share::c1::c1_GraphBuilder::MethodMetadata;
+use crate::share::c1::c1_GraphBuilder::{
+    CallSiteInfo, ExceptionHandler, FieldInfo, MethodMetadata, SiteInfo,
+};
+use crate::share::c1::c1_Instruction::ValueKind;
 use crate::share::code::codeCache::CodeCache;
 use crate::share::code::nmethod::NMethod;
 use crate::share::oops::constMethod::ConstMethod;
+use crate::share::oops::fieldInfo::FieldKind;
 use crate::share::oops::method::{Code, Method};
 use crate::share::oops::methodCounters;
 use crate::share::oops::symbol::Symbol;
@@ -79,15 +83,12 @@ fn resolve_method_obj(identity: &MethodIdentity) -> Option<Arc<Method>> {
         .borrow()
         .get(identity.class_name.as_bytes())
         .cloned()?;
-    let member = klass.class.methods.iter().find(|m| {
-        m.name == identity.method_name.as_bytes()
-            && m.descriptor == identity.descriptor.as_bytes()
-    })?;
+    let member = find_member(&klass, identity)?;
     // Skip members with no Code attribute (native/abstract) — nothing to JIT.
     if member.code_attribute().is_none() {
         return None;
     }
-    let code = Code::parse(member).ok()?;
+    let code = Code::parse(&member).ok()?;
     let const_method = ConstMethod::new(
         0,
         0,
@@ -105,12 +106,48 @@ fn resolve_method_obj(identity: &MethodIdentity) -> Option<Arc<Method>> {
     )))
 }
 
-/// Builds `MethodMetadata` for JIT graph building: resolves every
-/// `ldc`/`ldc2_w` constant-pool index used by the method's bytecode to
-/// its numeric HIR constant.  Reference constants are skipped — they
-/// cannot appear in the primitive executable subset anyway, and their
-/// `ldc` sites degrade to `Unsupported` during graph building.
-fn resolve_jit_metadata(identity: &MethodIdentity, bytecode: &[u8]) -> Option<MethodMetadata> {
+/// Finds the `Member` of `identity`'s method inside the already-loaded
+/// `klass` (name + descriptor match, mirroring `resolve_method_obj`).
+fn find_member<'a>(
+    klass: &crate::share::oops::instanceKlass::InstanceKlass<'a>,
+    identity: &MethodIdentity,
+) -> Option<crate::share::classfile::classFileParser::Member<'a>> {
+    klass
+        .class
+        .methods
+        .iter()
+        .find(|m| {
+            m.name == identity.method_name.as_bytes()
+                && m.descriptor == identity.descriptor.as_bytes()
+        })
+        .cloned()
+}
+
+/// `ClassLoader::jit_metadata` (`JitFieldInfo.kind`) -> C1 `ValueKind`.
+fn jit_field_kind(kind: FieldKind) -> ValueKind {
+    match kind {
+        FieldKind::Int32 => ValueKind::Int32,
+        FieldKind::Int64 => ValueKind::Int64,
+        FieldKind::Float32 => ValueKind::Float32,
+        FieldKind::Float64 => ValueKind::Float64,
+        FieldKind::Ref => ValueKind::Ref,
+    }
+}
+
+/// Builds `MethodMetadata` for JIT graph building.  Runs the
+/// `ClassLoader::jit_metadata` producer over the method's `Member` —
+/// resolved field offsets/kinds, invoke call-site descriptions,
+/// owner/name/descriptor triples for every heap-touching instruction
+/// (consumed by `c1_LIR` as leaked `StubSite` pointers) and the
+/// exception table — then overlays the `ldc`/`ldc2_w` constant-pool
+/// indices used by `bytecode`, resolved to numeric HIR constants.
+/// Producer failures degrade to the ldc-only metadata; `C1Compiler`
+/// additionally backfills unresolved heap sites via
+/// `resolve_heap_sites` (offset-less) before graph building.
+pub fn resolve_jit_metadata(
+    identity: &MethodIdentity,
+    bytecode: &[u8],
+) -> Option<MethodMetadata> {
     let loader = crate::share::runtime::threading::jvm_loader()?;
     let klass = loader
         .classes
@@ -118,6 +155,62 @@ fn resolve_jit_metadata(identity: &MethodIdentity, bytecode: &[u8]) -> Option<Me
         .get(identity.class_name.as_bytes())
         .cloned()?;
     let mut metadata = MethodMetadata::default();
+    if let Some(member) = find_member(&klass, identity)
+        && let Ok(jit) = loader.jit_metadata(&klass, &member)
+    {
+        for (idx, f) in jit.fields {
+            metadata.fields.insert(
+                idx,
+                FieldInfo {
+                    kind: jit_field_kind(f.kind),
+                    offset: f.offset.map(|o| o as usize),
+                    name: f.name,
+                },
+            );
+        }
+        for (idx, c) in jit.call_sites {
+            metadata.call_sites.insert(
+                idx,
+                CallSiteInfo {
+                    opcode: c.opcode,
+                    cp_index: c.cp_index,
+                    name: c.name,
+                    arg_kinds: c
+                        .arg_kinds
+                        .iter()
+                        .map(|k| jit_field_kind(*k))
+                        .collect(),
+                    return_kind: c
+                        .return_kind
+                        .map(jit_field_kind)
+                        .unwrap_or(ValueKind::Void),
+                    is_static: c.is_static,
+                    is_interface: c.is_interface,
+                    target: None,
+                },
+            );
+        }
+        for (idx, s) in jit.sites {
+            metadata.sites.insert(
+                idx,
+                SiteInfo {
+                    class: s.class,
+                    name: s.name,
+                    desc: s.desc,
+                },
+            );
+        }
+        metadata.exception_handlers = jit
+            .exception_handlers
+            .iter()
+            .map(|h| ExceptionHandler {
+                start_pc: h.start_pc,
+                end_pc: h.end_pc,
+                handler_pc: h.handler_pc,
+                catch_type: h.catch_type,
+            })
+            .collect();
+    }
     for idx in crate::share::c1::c1_GraphBuilder::ldc_cp_indices(bytecode) {
         let Ok(c) = klass.constant(idx as u16) else { continue };
         if let Some(hir) = crate::share::c1::c1_GraphBuilder::constant_to_hir(c) {
@@ -185,7 +278,7 @@ impl CompileQueue {
 
     /// `CompileQueue::remove_and_mark_stale`.
     pub fn remove_and_mark_stale(&self, compile_id: usize) {
-        if let Some(mut task) = self.remove(compile_id) {
+        if let Some(task) = self.remove(compile_id) {
             task.mark_stale();
             task.set_failure_reason("stale task");
             self.stale.lock().unwrap().push(task);
@@ -322,6 +415,11 @@ struct BrokerInner {
     completed_levels: HashMap<String, CompLevel>,
     /// method_key -> osr_bci -> completed osr level.
     completed_osr: HashMap<String, HashMap<i32, CompLevel>>,
+    /// Per-method deinstall epoch: bumped by `deinstall_method` so a
+    /// compile task submitted before the deinstall cannot resurrect
+    /// the method's code when it finishes afterwards.
+    deinstall_epoch: u64,
+    method_epoch: HashMap<String, u64>,
     /// Per-method compilability flags.
     method_flags: HashMap<String, MethodCompileFlags>,
 }
@@ -349,6 +447,8 @@ impl BrokerInner {
             queued_methods: HashSet::new(),
             completed_levels: HashMap::new(),
             completed_osr: HashMap::new(),
+            deinstall_epoch: 0,
+            method_epoch: HashMap::new(),
             method_flags: HashMap::new(),
         }
     }
@@ -384,8 +484,15 @@ impl CompileBroker {
 
     pub fn global() -> &'static CompileBroker {
         let broker = GLOBAL_BROKER.get_or_init(Self::new);
-        broker.initialized.store(true, Ordering::Release);
+        broker.initialize();
         broker
+    }
+
+    /// Mark the broker initialized (`CompileBroker::init` analogue).
+    /// The global broker is initialized lazily on first `global()`;
+    /// ad-hoc brokers (tests, embedded use) call this explicitly.
+    pub fn initialize(&self) {
+        self.initialized.store(true, Ordering::Release);
     }
 
     pub fn is_initialized(&self) -> bool {
@@ -397,19 +504,47 @@ impl CompileBroker {
     /// the C1 queue is serviced.  Idempotent and cheap (one atomic swap) —
     /// safe to call from the interpreter's hot path.
     pub fn ensure_compiler_threads_started() {
-        static STARTED: AtomicBool = AtomicBool::new(false);
-        if STARTED.swap(true, Ordering::AcqRel) {
-            return;
+        Self::ensure_compiler_thread_for_level(CompLevel::Simple);
+    }
+
+    /// Lazily spawn the compiler thread servicing `level`'s queue.
+    /// C1 levels share the C1 queue/thread; every C2 level shares the
+    /// C2 queue/thread.  Idempotent — safe on the interpreter hot path.
+    fn ensure_compiler_thread_for_level(level: CompLevel) {
+        if level.is_c2() {
+            static C2_STARTED: AtomicBool = AtomicBool::new(false);
+            if C2_STARTED.swap(true, Ordering::AcqRel) {
+                return;
+            }
+            let broker = Self::global();
+            // Only spawn when a C2-capable backend is actually
+            // registered; otherwise the queue would never drain.
+            if broker.compiler_for_level(CompLevel::FullOptimization).is_none() {
+                C2_STARTED.store(false, Ordering::Release);
+                return;
+            }
+            let _ = std::thread::Builder::new()
+                .name("C2 CompilerThread0".to_string())
+                .stack_size(16 * 1024 * 1024)
+                .spawn(move || {
+                    broker.compiler_thread_loop(CompLevel::FullOptimization, None);
+                });
+        } else {
+            static C1_STARTED: AtomicBool = AtomicBool::new(false);
+            if C1_STARTED.swap(true, Ordering::AcqRel) {
+                return;
+            }
+            let broker = Self::global();
+            let c1: Arc<Mutex<dyn AbstractCompiler>> =
+                Arc::new(Mutex::new(crate::share::c1::c1_Compiler::C1Compiler::new()));
+            broker.register_compiler(c1);
+            let _ = std::thread::Builder::new()
+                .name("C1 CompilerThread0".to_string())
+                .stack_size(16 * 1024 * 1024)
+                .spawn(move || {
+                    broker.compiler_thread_loop(CompLevel::Simple, None);
+                });
         }
-        let broker = Self::global();
-        let c1: Arc<Mutex<dyn AbstractCompiler>> =
-            Arc::new(Mutex::new(crate::share::c1::c1_Compiler::C1Compiler::new()));
-        broker.register_compiler(c1);
-        let _ = std::thread::Builder::new()
-            .name("C1 CompilerThread0".to_string())
-            .spawn(move || {
-                broker.compiler_thread_loop(CompLevel::Simple, None);
-            });
     }
 
     // ---- queues ---------------------------------------------------------
@@ -618,9 +753,19 @@ impl CompileBroker {
             if let Some(&lvl) = inner.completed_levels.get(&method_key) {
                 return lvl.as_i32() >= comp_level.as_i32();
             }
-        } else if let Some(nm) = cache.find_osr_nmethod(holder, name, sig, osr_bci) {
-            if nm.is_in_use() && nm.comp_level().as_i32() >= comp_level.as_i32() {
-                return true;
+        } else {
+            if let Some(nm) = cache.find_osr_nmethod(holder, name, sig, osr_bci) {
+                if nm.is_in_use() && nm.comp_level().as_i32() >= comp_level.as_i32() {
+                    return true;
+                }
+            }
+            // Broker-recorded OSR level (installed nmethod may sit at a
+            // lower level while the policy target is already met).
+            let inner = self.inner.lock().unwrap();
+            if let Some(levels) = inner.completed_osr.get(&method_key) {
+                if let Some(&lvl) = levels.get(&osr_bci) {
+                    return lvl.as_i32() >= comp_level.as_i32();
+                }
             }
         }
         false
@@ -633,7 +778,13 @@ impl CompileBroker {
 
     pub fn compilation_is_in_queue(&self, holder: &str, name: &str, sig: &str) -> bool {
         let key = CodeCache::method_key(holder, name, sig);
-        self.compilation_is_in_queue_key(&key)
+        // Markers are `method_key` for regular compiles and
+        // `method_key@osr_bci` for OSR ones; report either.
+        self.inner.lock().unwrap().queued_methods.iter().any(|k| {
+            k == &key
+                || k.strip_prefix(key.as_str())
+                    .map_or(false, |rest| rest.starts_with('@'))
+        })
     }
 
     // ---- prohibition -----------------------------------------------------------
@@ -668,7 +819,12 @@ impl CompileBroker {
             self.mark_not_compilable(method_key, comp_level, is_osr);
         }
 
-        if flags.is_not_compilable(comp_level) || (is_osr && flags.is_not_osr_compilable(comp_level)) {
+        // Native methods are never JIT-compiled (HotSpot
+        // `ciMethod::is_not_compilable`-equivalent).
+        if is_native
+            || flags.is_not_compilable(comp_level)
+            || (is_osr && flags.is_not_osr_compilable(comp_level))
+        {
             return true;
         }
         false
@@ -689,8 +845,9 @@ impl CompileBroker {
         reason: CompileReason,
         blocking: bool,
         profile_key: Option<usize>,
+        submit_epoch: u64,
     ) -> CompileTask {
-        let task = if osr_bci == CompileTask::INVOCATION_ENTRY_BCI {
+        let mut task = if osr_bci == CompileTask::INVOCATION_ENTRY_BCI {
             CompileTask::new(
                 compile_id,
                 class_name,
@@ -714,16 +871,12 @@ impl CompileBroker {
                 blocking,
             )
         };
+        task.submit_epoch = submit_epoch;
         if let Some(pk) = profile_key {
-            // profile_key is stored via a wrapper — CompileTask has the field.
-            let mut t = task;
-            t.profile_key = Some(pk);
-            queue.add(t.clone());
-            t
-        } else {
-            queue.add(task.clone());
-            task
+            task.profile_key = Some(pk);
         }
+        queue.add(task.clone());
+        task
     }
 
     /// `compile_method_base`: the full request path.
@@ -786,6 +939,26 @@ impl CompileBroker {
         }
 
         let queue = self.compile_queue(comp_level)?;
+        // Make sure a compiler thread is draining this level's queue
+        // before the task can be observed as queued (HotSpot starts
+        // compiler threads at broker init; here we lazily spawn the
+        // matching thread — C1 on first use, C2 when a C2-capable
+        // backend has been registered and a task arrives).  Only the
+        // process-wide broker auto-spawns; ad-hoc brokers (tests) drive
+        // `compiler_thread_loop` themselves.
+        if std::ptr::eq(self, Self::global()) {
+            Self::ensure_compiler_thread_for_level(comp_level);
+        }
+        // Reserve the dedup slot BEFORE the task becomes visible to
+        // compiler threads: a fast compile could otherwise finish and
+        // clear a marker inserted only afterwards, leaking the method
+        // as permanently "queued" (HotSpot inserts into
+        // `_compile_tasks`/`queued_methods` before queue insertion).
+        let submit_epoch = {
+            let mut inner = self.inner.lock().unwrap();
+            inner.queued_methods.insert(queue_key);
+            inner.method_epoch.get(&method_key).copied().unwrap_or(0)
+        };
         let task = self.create_compile_task(
             queue,
             compile_id,
@@ -798,10 +971,8 @@ impl CompileBroker {
             reason,
             blocking,
             profile_key,
+            submit_epoch,
         );
-
-        // Mark queued (dedup) — cleared on completion.
-        self.inner.lock().unwrap().queued_methods.insert(queue_key);
         self.policy.note_queued(&method_key);
 
         if blocking {
@@ -954,8 +1125,10 @@ impl CompileBroker {
         // compiler backend can read bytecode/locals/flags.  Tasks created
         // by the broker carry only `MethodIdentity` (Symbols); resolve the
         // real `Method` here on the compiler thread.
+        let trace = std::env::var_os("JVM25_TRACE_COMPILE").is_some();
         let resolved_storage;
         let task = if task.method_obj.is_none() {
+            if trace { eprintln!("[jit-stage] resolve_method_obj {}", task.method.method_key); }
             let mut t = task.clone();
             t.method_obj = resolve_method_obj(&t.method);
             resolved_storage = t;
@@ -967,6 +1140,7 @@ impl CompileBroker {
         // bytecode comes from the resolved Method when available.
         let meta_storage;
         let task = if task.jit_metadata.is_none() {
+            if trace { eprintln!("[jit-stage] resolve_jit_metadata {}", task.method.method_key); }
             let mut t = task.clone();
             if let Some(m) = t.method_obj.as_ref() {
                 t.jit_metadata = resolve_jit_metadata(&t.method, m.bytecodes());
@@ -977,6 +1151,7 @@ impl CompileBroker {
             task
         };
         task.mark_started();
+        if trace { eprintln!("[jit-stage] compile_method {}", task.method.method_key); }
         let level = task.comp_level();
         let compiler = match self.compiler_for_level(level) {
             Some(c) => c,
@@ -1004,12 +1179,41 @@ impl CompileBroker {
 
     /// Install a successful CompileOutcome as an nmethod in the CodeCache.
     fn install_outcome(&self, task: &CompileTask, outcome: CompileOutcome) {
+        // Stale/unloaded tasks and tasks submitted before a
+        // `deinstall_method` epoch bump must not resurrect code.
+        if task.is_stale() || task.is_unloaded() {
+            task.set_failure_reason("stale task");
+            return;
+        }
+        let install_key = CodeCache::method_key(
+            task.method.class_name.as_str(),
+            task.method.method_name.as_str(),
+            task.method.descriptor.as_str(),
+        );
+        {
+            let inner = self.inner.lock().unwrap();
+            if inner.method_epoch.get(&install_key).copied().unwrap_or(0) != task.submit_epoch {
+                task.set_failure_reason("method deinstalled while compiling");
+                return;
+            }
+        }
         let level = task.comp_level();
         // Normalize pc_descs: sorted with sentinels (HotSpot scopes_pcs
         // layout has lower/upper sentinel entries).
         let mut pc_descs = outcome.pc_descs;
         pc_descs.sort_by_key(|d| d.pc_offset());
         pc_descs.dedup_by_key(|d| d.pc_offset());
+        // C1 currently reports the deopt bci through the scope decode
+        // offset slot (it emits no scope-data blob).  Normalize it into
+        // PcDesc::bci once, here, so deopt consumers see a real bci.
+        if outcome.scope_data.is_empty() {
+            for d in &mut pc_descs {
+                if d.bci() == crate::share::code::pcDesc::PcDesc::UNKNOWN_BCI {
+                    let bci = d.scope_decode_offset();
+                    d.set_bci(if bci >= 0 { bci } else { crate::share::code::pcDesc::PcDesc::UNKNOWN_BCI });
+                }
+            }
+        }
         let sentinel_low = crate::share::code::pcDesc::PcDesc::new(
             crate::share::code::pcDesc::PcDesc::LOWER_OFFSET_LIMIT,
             0,
@@ -1025,6 +1229,33 @@ impl CompileBroker {
         full.extend(pc_descs);
         full.push(sentinel_high);
 
+        // Live-reference maps for deoptimization.  The compiler backend
+        // may not emit any yet; fall back to a conservative map per
+        // deopt bci covering every local/stack slot (HotSpot-style
+        // "all refs live" safety net) using the method's max_locals /
+        // max_stack.
+        let mut live_maps = task.live_maps();
+        if live_maps.is_empty() {
+            if let Some(m) = &task.method_obj {
+                let locals = m.max_locals() as usize;
+                let stack = m.max_stack() as usize;
+                let mut bcis: Vec<i32> =
+                    full.iter().map(|d| d.bci()).filter(|b| *b >= 0).collect();
+                bcis.sort_unstable();
+                bcis.dedup();
+                if !bcis.is_empty() {
+                    live_maps = bcis
+                        .into_iter()
+                        .map(|b| {
+                            crate::share::code::nmethod::DeoptLiveMap::conservative(
+                                b, locals, stack,
+                            )
+                        })
+                        .collect();
+                }
+            }
+        }
+
         let is_osr = task.is_osr();
         let entry_bci = if is_osr { task.osr_bci() } else { CompileTask::INVOCATION_ENTRY_BCI };
         let code_size = outcome.code_bytes.len();
@@ -1033,7 +1264,8 @@ impl CompileBroker {
             + outcome.scopes.len() * 128
             + outcome.scope_data.len()
             + outcome.exception_table.size_in_bytes()
-            + outcome.oop_maps.maps().iter().map(|m| m.data_size() + 16).sum::<usize>();
+            + outcome.oop_maps.maps().iter().map(|m| m.data_size() + 16).sum::<usize>()
+            + live_maps.iter().map(|m| m.encoded_size()).sum::<usize>();
 
         let nm = NMethod::with_entry_points(
             task.method.class_name.as_str().to_string(),
@@ -1069,6 +1301,8 @@ impl CompileBroker {
                     installed.set_scope_data(outcome.scope_data);
                     installed.set_handler_table(outcome.exception_table);
                     installed.set_pc_handlers(outcome.pc_handlers);
+                    installed.set_frame_size(outcome.frame_size);
+                    installed.set_live_maps(live_maps);
                     let mut maps: Vec<_> = outcome.oop_maps.maps().to_vec();
                     maps.sort_by_key(|m| m.offset());
                     for map in maps {
@@ -1108,6 +1342,13 @@ impl CompileBroker {
                     }
                     self.policy.note_level(&method_key, level, is_osr);
                     self.policy.note_completed(&method_key);
+                } else {
+                    // install_nmethod succeeded but the registry lookup
+                    // missed — report the failure instead of leaving the
+                    // task silently incomplete.
+                    task.set_failure_reason("installed nmethod missing from code cache");
+                    let mut inner = self.inner.lock().unwrap();
+                    inner.total_bailout_count += 1;
                 }
             }
             Err(e) => {
@@ -1170,9 +1411,11 @@ impl CompileBroker {
         );
         let qkey = Self::queue_key(&method_key, task.osr_bci());
         {
+            // Remove only this task's own marker: an OSR task finishing
+            // must not clear the dedup slot of a concurrently queued
+            // regular compile of the same method (and vice versa).
             let mut inner = self.inner.lock().unwrap();
             inner.queued_methods.remove(&qkey);
-            inner.queued_methods.remove(&method_key);
         }
         if !task.is_complete() {
             task.mark_complete();
@@ -1215,18 +1458,18 @@ impl CompileBroker {
                 is_trivial: flags.is_trivial,
                 ..Default::default()
             });
+        // Feed the event rate the queue selector uses for prioritizing
+        // hot methods over cold ones.
+        self.policy.update_rate(
+            &method_key,
+            profile.invocation_count as u64 + profile.backedge_count as u64,
+        );
 
         let oracle_scale = self
             .policy
             .oracle_threshold_scaling(&class_name, &method_name, &descriptor);
 
-        let (q1, q2) = {
-            let inner = self.inner.lock().unwrap();
-            (self.policy.compiler_count(CompLevel::FullProfile) as usize, self.policy.compiler_count(CompLevel::FullOptimization) as usize)
-        };
-        let _ = (q1, q2);
         let actions = {
-            let inner = self.inner.lock().unwrap();
             let cur = self.policy.comp_level(&method_key);
             self.policy.method_invocation_event(
                 &method_key,
@@ -1270,9 +1513,15 @@ impl CompileBroker {
                 p
             })
             .unwrap_or_default();
+        self.policy.update_rate(
+            &method_key,
+            profile.invocation_count as u64 + profile.backedge_count as u64,
+        );
 
+        let oracle_scale = self
+            .policy
+            .oracle_threshold_scaling(&class_name, &method_name, &descriptor);
         let actions = {
-            let inner = self.inner.lock().unwrap();
             let cur = self.policy.comp_level(&method_key);
             self.policy.method_back_branch_event(
                 &method_key,
@@ -1284,6 +1533,7 @@ impl CompileBroker {
                 flags.is_trivial,
                 enclosing.as_ref().map(|(k, l, o)| (k.as_str(), *l, *o)),
                 max_osr_level,
+                oracle_scale,
             )
         };
         self.execute_actions(&method_key, &class_name, &method_name, &descriptor, profile_key, flags, blocking, actions, Some(bci))
@@ -1380,6 +1630,39 @@ impl CompileBroker {
         CodeCache::global().make_not_entrant(holder, name, sig)
     }
 
+    /// `nmethod::deoptimize` + immediate code-cache reclaim for a whole
+    /// method (regular + OSR variants).  Returns the number of
+    /// nmethods deinstalled.  Also drops any queued compile task for
+    /// the method so a stale request is not re-installed afterwards.
+    pub fn deinstall_method(&self, holder: &str, name: &str, sig: &str) -> usize {
+        let key = CodeCache::method_key(holder, name, sig);
+        // Bump the method's deinstall epoch first: any compile task
+        // already in flight (popped from the queue, not visible to the
+        // snapshot below) will observe the mismatch at install time and
+        // refuse to resurrect the method's code.
+        {
+            let mut inner = self.inner.lock().unwrap();
+            inner.deinstall_epoch += 1;
+            let epoch = inner.deinstall_epoch;
+            inner.method_epoch.insert(key.clone(), epoch);
+        }
+        let count = CodeCache::global().deinstall_nmethod(&key);
+        // Fail pending compile tasks for this method: their results
+        // would resurrect code we just invalidated.
+        for task in self.c1_queue.snapshot().into_iter().chain(self.c2_queue.snapshot()) {
+            if task.method_key() == key {
+                let qkey = Self::queue_key(&key, task.osr_bci());
+                let _ = self.c1_queue.remove(task.compile_id());
+                let _ = self.c2_queue.remove(task.compile_id());
+                task.mark_stale();
+                task.set_failure_reason("method deinstalled");
+                self.inner.lock().unwrap().queued_methods.remove(&qkey);
+                self.inner.lock().unwrap().queued_methods.remove(&key);
+            }
+        }
+        count
+    }
+
     // ---- sweeper / deopt ---------------------------------------------------------
 
     /// `deoptimize_all` / `deoptimize_invalidated`.
@@ -1459,25 +1742,229 @@ impl Default for CompileBroker {
 }
 
 fn split_method_key(key: &str) -> (String, String, String) {
-    // key = "holder.name+descriptor" where descriptor starts at first '('
-    // after the last '.'.  We stored "class.name sig" as class.name<sig>.
-    if let Some(dot) = key.rfind('.') {
-        let holder_name = &key[..dot];
-        let rest = &key[dot + 1..];
-        // rest = "methodName(sig)ret" — split name/sig at first '('
-        if let Some(paren) = rest.find('(') {
-            let name = rest[..paren].to_string();
-            let sig = rest[paren..].to_string();
-            // holder_name = "holder.method"? No: key = holder.name sig?
-            // Our method_key = "{class}.{name}{sig}", so holder+name are
-            // ambiguous; recover: holder = up to last '.' before name.
-            if let Some(d2) = holder_name.rfind('.') {
-                let holder = holder_name[..d2].to_string();
-                let mname = format!("{}{}", &holder_name[d2 + 1..], name);
-                return (holder, mname, sig);
-            }
-            return (holder_name.to_string(), name, sig);
+    // key = "{holder}.{name}{sig}" where sig starts at the first '('.
+    // Neither holder (internal class name, may contain '/' and '.')
+    // nor the signature contains a '.' before the method-name split
+    // point, so the holder is everything before the LAST '.' preceding
+    // the signature.
+    if let Some(paren) = key.find('(') {
+        let sig = &key[paren..];
+        let head = &key[..paren];
+        if let Some(dot) = head.rfind('.') {
+            return (
+                head[..dot].to_string(),
+                head[dot + 1..].to_string(),
+                sig.to_string(),
+            );
         }
     }
     (key.to_string(), String::new(), String::new())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::share::compiler::abstractCompiler::CompilerType;
+
+    fn sym(s: &str) -> Symbol {
+        Symbol::new(s.as_bytes())
+    }
+
+    struct MockCompiler {
+        fail: bool,
+        calls: usize,
+    }
+
+    impl MockCompiler {
+        fn ok() -> Self {
+            Self { fail: false, calls: 0 }
+        }
+        fn failing() -> Self {
+            Self { fail: true, calls: 0 }
+        }
+    }
+
+    impl AbstractCompiler for MockCompiler {
+        fn compiler_type(&self) -> CompilerType {
+            CompilerType::C1
+        }
+        fn supports_level(&self, level: CompLevel) -> bool {
+            level.is_c1()
+        }
+        fn compile_method(&mut self, task: &CompileTask) -> Result<CompileOutcome, CompileError> {
+            self.calls += 1;
+            if self.fail {
+                return Err(CompileError::unsupported("mock failure", task.comp_level()));
+            }
+            Ok(CompileOutcome {
+                code_bytes: vec![0x90, 0xc3],
+                frame_size: 32,
+                ..CompileOutcome::default()
+            })
+        }
+    }
+
+    #[test]
+    fn compile_queue_add_remove_stale() {
+        let q = CompileQueue::new("test");
+        let t1 = CompileTask::new(1, sym("A"), sym("m"), sym("()V"), CompLevel::Simple, 1, CompileReason::ReasonInvocationCount, false);
+        let t2 = CompileTask::new(2, sym("A"), sym("n"), sym("()V"), CompLevel::Simple, 1, CompileReason::ReasonInvocationCount, false);
+        q.add(t1.clone());
+        q.add(t2.clone());
+        assert_eq!(q.size(), 2);
+        assert_eq!(q.total_added(), 2);
+        assert_eq!(q.remove(1).unwrap().compile_id(), 1);
+        assert!(q.remove(1).is_none());
+        assert_eq!(q.size(), 1);
+        q.remove_and_mark_stale(2);
+        assert!(q.is_empty());
+        q.purge_stale_tasks();
+        assert!(t2.is_complete());
+        assert!(t2.is_stale());
+    }
+
+    #[test]
+    fn compile_queue_free_all_fails_tasks() {
+        let q = CompileQueue::new("test");
+        let t = CompileTask::new(7, sym("A"), sym("m"), sym("()V"), CompLevel::Simple, 1, CompileReason::ReasonTiered, true);
+        q.add(t.clone());
+        q.free_all();
+        assert!(t.is_complete());
+        assert!(!t.is_success());
+        assert!(t.failure_reason().is_some());
+    }
+
+    #[test]
+    fn task_blocking_wait_and_live_maps() {
+        let t = CompileTask::new(3, sym("A"), sym("m"), sym("()V"), CompLevel::FullProfile, 1, CompileReason::ReasonWhitebox, true);
+        assert!(t.is_blocking());
+        t.add_live_map(crate::share::code::nmethod::DeoptLiveMap::from_ref_slots(4, vec![0], vec![]));
+        t.add_live_map(crate::share::code::nmethod::DeoptLiveMap::from_ref_slots(2, vec![1], vec![0]));
+        let maps = t.live_maps();
+        assert_eq!(maps.len(), 2);
+        assert_eq!(maps[0].bci(), 2);
+        // complete from another "thread" (same thread is fine for the test)
+        let t2 = t.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            t2.mark_success();
+            t2.mark_complete();
+        });
+        assert!(t.wait_for_completion(Some(Duration::from_secs(5))));
+        assert!(t.is_success());
+    }
+
+    #[test]
+    fn method_compile_flags_masks() {
+        let mut f = MethodCompileFlags::default();
+        f.set_not_compilable(CompLevel::Simple);
+        f.set_not_osr_compilable(CompLevel::FullProfile);
+        assert!(f.is_not_compilable(CompLevel::Simple));
+        assert!(!f.is_not_compilable(CompLevel::FullProfile));
+        assert!(f.is_not_osr_compilable(CompLevel::FullProfile));
+        assert!(!f.is_not_osr_compilable(CompLevel::Simple));
+    }
+
+    #[test]
+    fn split_method_key_recovers_parts() {
+        let (h, n, s) = split_method_key("pkg/Foo.bar(I)J");
+        assert_eq!(h, "pkg/Foo");
+        assert_eq!(n, "bar");
+        assert_eq!(s, "(I)J");
+        // Dotted class names keep all but the last component as holder.
+        let (h2, n2, s2) = split_method_key("java.lang.String.charAt()I");
+        assert_eq!(h2, "java.lang.String");
+        assert_eq!(n2, "charAt");
+        assert_eq!(s2, "()I");
+        let (h3, n3, s3) = split_method_key("weirdkey");
+        assert_eq!(h3, "weirdkey");
+        assert!(n3.is_empty());
+        assert!(s3.is_empty());
+    }
+
+    #[test]
+    fn broker_queue_dedup_and_compile() {
+        let broker = CompileBroker::new();
+        broker.initialize();
+        broker.register_compiler(Arc::new(Mutex::new(MockCompiler::ok())));
+
+        let t = broker
+            .compile_method(
+                sym("MockKlass"),
+                sym("hotMethod"),
+                sym("()V"),
+                CompLevel::Simple,
+                1,
+                CompileReason::ReasonInvocationCount,
+                false,
+            )
+            .expect("task queued");
+        // Duplicate request while queued is suppressed.
+        assert!(
+            broker
+                .compile_method(
+                    sym("MockKlass"),
+                    sym("hotMethod"),
+                    sym("()V"),
+                    CompLevel::Simple,
+                    1,
+                    CompileReason::ReasonInvocationCount,
+                    false,
+                )
+                .is_none()
+        );
+        assert_eq!(broker.c1_queue.size(), 1);
+        assert!(broker.compilation_is_in_queue("MockKlass", "hotMethod", "()V"));
+
+        // Drive the compiler thread manually (bounded).
+        broker.compiler_thread_loop(CompLevel::Simple, Some(1));
+        assert!(t.wait_for_completion(Some(Duration::from_secs(5))));
+        assert!(t.is_success(), "task failed: {:?}", t.failure_reason());
+        assert!(!broker.compilation_is_in_queue("MockKlass", "hotMethod", "()V"));
+
+        // The nmethod was installed into the global code cache.
+        let key = CodeCache::method_key("MockKlass", "hotMethod", "()V");
+        let nm = CodeCache::global().find_nmethod_by_key(&key).expect("nmethod installed");
+        assert!(nm.is_in_use());
+        assert_eq!(nm.frame_size(), 32);
+        // PcDesc bci normalization: outcome had no scope data, so the
+        // pc_desc's scope_decode_offset (0 here) maps to UNKNOWN_BCI.
+        for pd in nm.pc_descs() {
+            assert!(pd.bci() == crate::share::code::pcDesc::PcDesc::UNKNOWN_BCI || pd.bci() >= 0);
+        }
+
+        // not-entrant transition through the broker.
+        assert!(broker.make_not_entrant("MockKlass", "hotMethod", "()V"));
+        let nm2 = CodeCache::global().find_nmethod_by_key(&key).unwrap();
+        assert!(nm2.is_not_entrant());
+
+        // Deinstall reclaims it entirely.
+        assert_eq!(broker.deinstall_method("MockKlass", "hotMethod", "()V"), 1);
+        assert!(CodeCache::global().find_nmethod_by_key(&key).is_none());
+    }
+
+    #[test]
+    fn broker_compile_failure_marks_task() {
+        let broker = CompileBroker::new();
+        broker.initialize();
+        broker.register_compiler(Arc::new(Mutex::new(MockCompiler::failing())));
+        let t = broker
+            .compile_method(
+                sym("FailKlass"),
+                sym("bad"),
+                sym("()V"),
+                CompLevel::Simple,
+                1,
+                CompileReason::ReasonInvocationCount,
+                false,
+            )
+            .unwrap();
+        broker.compiler_thread_loop(CompLevel::Simple, Some(1));
+        assert!(t.wait_for_completion(Some(Duration::from_secs(5))));
+        assert!(!t.is_success());
+        assert!(t.failure_reason().unwrap().contains("unsupported"));
+        // Permanent failure marked the method not-compilable at this level.
+        let flags = broker.method_flags("FailKlass.bad()V");
+        assert!(flags.is_not_compilable(CompLevel::Simple));
+    }
 }

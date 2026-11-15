@@ -137,6 +137,12 @@ impl KlassVtable {
         self.table.get_mut(index)
     }
 
+    /// Iterates all vtable entries in slot order (HotSpot
+    /// `klassVtable::methods` traversal used by JIT dispatch).
+    pub fn entries(&self) -> impl Iterator<Item = &VtableEntry> {
+        self.table.iter()
+    }
+
     pub fn index_of_method(&self, method_name: &str, signature: &str) -> Option<usize> {
         self.table
             .iter()
@@ -290,6 +296,11 @@ impl KlassItable {
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// Iterates all itable method entries in registration order.
+    pub fn entries(&self) -> impl Iterator<Item = &ItableMethodEntry> {
+        self.entries.iter()
     }
 
     pub fn add_entry(

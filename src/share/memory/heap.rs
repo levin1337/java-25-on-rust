@@ -507,15 +507,48 @@ pub enum HeapGcMode {
     NoCollect,
 }
 
+/// Registers `value` as an extra GC root. Used by JIT-compiled frames
+/// and runtime stubs that must keep handles alive across GC-unsafe
+/// operations (allocation slow paths, safepoint polls). Returns the
+/// slot index for diagnostics; removal should go through
+/// `unregister_extra_root`, which is atomic with respect to concurrent
+/// pushes — the find-and-remove happens under a single mutable borrow,
+/// unlike the previous borrow-then-remove-position pattern that could
+/// observe a shifted index when another thread registered in between.
+///
+/// The borrow is held only for the `push` itself, so stubs must scope
+/// it tightly: never hold a `gc_extra_roots` borrow across a safepoint,
+/// or the collecting thread's `try_borrow` fails and the whole cycle is
+/// skipped until the borrow is released.
+pub fn register_extra_root<'a>(loader: &ClassLoader<'a>, value: Value<'a>) -> usize {
+    let mut roots = loader.gc_extra_roots.borrow_mut();
+    roots.push(value);
+    roots.len() - 1
+}
+
+/// Removes one occurrence of `value` from the extra-root list (the last
+/// one, matching LIFO stub push/pop order). Returns `true` when an
+/// entry was removed. Atomic under a single mutable borrow — safe for
+/// the push/pop pairs JIT allocation stubs perform around GC-unsafe
+/// sections.
+pub fn unregister_extra_root<'a>(loader: &ClassLoader<'a>, value: Value<'a>) -> bool {
+    let mut roots = loader.gc_extra_roots.borrow_mut();
+    let Some(position) = roots.iter().rposition(|entry| *entry == value) else {
+        return false;
+    };
+    roots.remove(position);
+    true
+}
+
 fn heap_gc_mode() -> HeapGcMode {
     crate::share::gc::shared::gcEngine::heap_gc_mode()
 }
 
 fn gc_workers(mode: HeapGcMode) -> usize {
     match mode {
-        HeapGcMode::ParallelMarkSweep => std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4),
+        HeapGcMode::ParallelMarkSweep => {
+            crate::share::gc::shared::gcEngine::parallel_gc_workers()
+        }
         _ => 1,
     }
 }
@@ -689,6 +722,10 @@ fn collect_mark_sweep<'a>(
         Some(guard) => guard,
         None => return Ok(()),
     };
+    let reference_pending = match loader.reference_pending.try_borrow() {
+        Some(guard) => guard,
+        None => return Ok(()),
+    };
     let loader_object = match loader.class_loader_object_handle().try_borrow() {
         Some(guard) => guard,
         None => return Ok(()),
@@ -767,6 +804,33 @@ fn collect_mark_sweep<'a>(
         }
     }
 
+    // The VM pending-reference list is a GC root: its entries have not
+    // been enqueued into their `ReferenceQueue` yet (the JDK
+    // ReferenceHandler consumes `reference_pending` asynchronously via
+    // `getAndClearReferencePendingList`), so without this they could be
+    // swept before `discovered` processing and lose their notification —
+    // including `Cleaner.clean()` runs. The chain is linked through the
+    // `discovered` field; cycle-guarded because the list is built by GC
+    // but walked here on every cycle.
+    let mut pending_cursor = *reference_pending;
+    let mut pending_seen = HashSet::new();
+    while let Some(index) = pending_cursor {
+        if !pending_seen.insert(index) {
+            break;
+        }
+        worklist.push(Handle::Object(index));
+        pending_cursor = objects.get(index).and_then(|object| {
+            let slot = object
+                .klass
+                .instanceField(b"discovered", b"Ljava/lang/ref/Reference;")
+                .ok()?;
+            match object.fields.get(slot) {
+                Some(Value::Object(next)) => Some(*next),
+                _ => None,
+            }
+        });
+    }
+
     let mut marks = if workers > 1 {
         drain_parallel(objects.as_slice(), obj_arrays.as_slice(), worklist, workers)
     } else {
@@ -780,6 +844,7 @@ fn collect_mark_sweep<'a>(
         classes,
         lambda_classes,
         extra_roots,
+        reference_pending,
         loader_object,
         current_thread,
         unnamed_module,
@@ -926,14 +991,164 @@ fn process_references(loader: &ClassLoader<'_>, marks: &mut Marks) {
             }
         }
     }
-    *loader.reference_pending.borrow_mut() = pending.first().copied();
+
+    // Publish the pending list. `getAndClearReferencePendingList` takes
+    // the whole head atomically, so a non-empty slot means the JDK
+    // ReferenceHandler has not started consuming the previous list yet:
+    // append the newly discovered references to its tail instead of
+    // dropping it (HotSpot keeps a single pending list across cycles).
+    let mut head_slot = loader.reference_pending.borrow_mut();
+    match (*head_slot, pending.first().copied()) {
+        (None, new_head) => *head_slot = new_head,
+        (Some(head), Some(new_head)) => {
+            if let Some(mut objects) = loader.objects.try_borrow_mut() {
+                // Walk to the tail of the existing chain; it ends with
+                // `discovered == null`. Bounded by the arena size so a
+                // corrupted chain cannot loop forever.
+                let mut tail = head;
+                for _ in 0..objects.len() {
+                    let Some(object) = objects.get(tail) else {
+                        break;
+                    };
+                    let Ok(slot) = object
+                        .klass
+                        .instanceField(b"discovered", b"Ljava/lang/ref/Reference;")
+                    else {
+                        break;
+                    };
+                    match object.fields.get(slot) {
+                        Some(Value::Object(next)) => tail = *next,
+                        _ => break,
+                    }
+                }
+                if let Some(object) = objects.get_mut(tail)
+                    && let Ok(slot) = object
+                        .klass
+                        .instanceField(b"discovered", b"Ljava/lang/ref/Reference;")
+                {
+                    object.fields[slot] = Value::Object(new_head);
+                }
+            }
+        }
+        (Some(_), None) => {}
+    }
+    drop(head_slot);
     crate::share::runtime::threading::wake_all(loader);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::share::classfile::{ClassFile, Member};
+    use crate::share::oops::instanceKlass::InstanceKlass;
     use crate::share::oops::typeArrayOop::TypeArrayOop;
+    use std::sync::Arc;
+
+    fn reference_klass<'a>() -> Arc<InstanceKlass<'a>> {
+        Arc::new(
+            InstanceKlass::new(
+                ClassFile {
+                    majorVersion: 65,
+                    minorVersion: 0,
+                    accessFlags: 0x0001,
+                    name: b"java/lang/ref/Reference",
+                    superName: Some(b"java/lang/Object"),
+                    interfaces: Vec::new(),
+                    constants: Vec::new(),
+                    fields: vec![
+                        Member {
+                            accessFlags: 0,
+                            name: b"referent",
+                            descriptor: b"Ljava/lang/Object;",
+                            attributes: Vec::new(),
+                        },
+                        Member {
+                            accessFlags: 0,
+                            name: b"discovered",
+                            descriptor: b"Ljava/lang/ref/Reference;",
+                            attributes: Vec::new(),
+                        },
+                    ],
+                    methods: Vec::new(),
+                    attributes: Vec::new(),
+                },
+                None,
+                Vec::new(),
+            )
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn extraRootHelpersPinAndRelease() {
+        let _serial = GC_TEST_SERIAL.lock();
+        let arena = crate::share::runtime::syncBump::SyncBump::new();
+        let loader = ClassLoader::open(std::path::Path::new("."), &arena).unwrap();
+        let handle = loader.alloc_type_array(TypeArrayOop::Byte(vec![5; 4096]));
+        let slot = register_extra_root(&loader, Value::PrimitiveArray(handle));
+        assert_eq!(loader.gc_extra_roots.borrow()[slot], Value::PrimitiveArray(handle));
+        for _ in 0..100 {
+            let _ = collect_mark_sweep(&loader, &[], 1);
+            if loader.arrays.borrow()[handle].len() == 4096 {
+                break;
+            }
+        }
+        assert_eq!(loader.arrays.borrow()[handle].len(), 4096);
+        assert!(unregister_extra_root(&loader, Value::PrimitiveArray(handle)));
+        assert!(!unregister_extra_root(&loader, Value::PrimitiveArray(handle)));
+        for _ in 0..100 {
+            let _ = collect_mark_sweep(&loader, &[], 1);
+            if loader.arrays.borrow()[handle].len() == 0 {
+                break;
+            }
+        }
+        assert_eq!(loader.arrays.borrow()[handle].len(), 0);
+    }
+
+    /// The VM pending-reference list is a GC root: a discovered
+    /// reference whose `gc_extra_roots` pin was already released must
+    /// survive subsequent collections until the JDK ReferenceHandler
+    /// consumes it via `getAndClearReferencePendingList`.
+    #[test]
+    fn pendingReferencesSurviveUntilConsumed() {
+        let _serial = GC_TEST_SERIAL.lock();
+        let arena = crate::share::runtime::syncBump::SyncBump::new();
+        let loader = ClassLoader::open(std::path::Path::new("."), &arena).unwrap();
+
+        let referent = loader.alloc_type_array(TypeArrayOop::Byte(vec![9; 2048]));
+        let reference = loader.alloc_object(InstanceOop {
+            klass: reference_klass(),
+            fields: vec![Value::PrimitiveArray(referent), Value::Null],
+        });
+        register_extra_root(&loader, Value::Object(reference));
+
+        for _ in 0..100 {
+            let _ = collect_mark_sweep(&loader, &[], 1);
+            if *loader.reference_pending.borrow() == Some(reference) {
+                break;
+            }
+        }
+        assert_eq!(*loader.reference_pending.borrow(), Some(reference));
+        assert_eq!(loader.borrow_objects()[reference].fields[0], Value::Null);
+
+        // Drop the explicit pin: the reference is now reachable only
+        // through the VM pending list. Run several cycles — if the
+        // pending chain were not a GC root the first successful sweep
+        // would clear the object's fields.
+        assert!(unregister_extra_root(&loader, Value::Object(reference)));
+        for _ in 0..100 {
+            let _ = collect_mark_sweep(&loader, &[], 1);
+            if loader.borrow_objects()[reference].fields.len() == 0 {
+                break;
+            }
+        }
+        // Referent stays swept; the reference object itself must NOT be
+        // collected — its fields (referent slot + discovered link) have
+        // to remain intact for the pending-list walk.
+        assert_eq!(loader.arrays.borrow()[referent].len(), 0);
+        assert_eq!(loader.borrow_objects()[reference].fields.len(), 2);
+        assert_eq!(*loader.reference_pending.borrow(), Some(reference));
+    }
 
     #[test]
     fn releasesUnreachableArrayStorageAndReusesSlot() {

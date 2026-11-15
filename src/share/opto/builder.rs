@@ -9,7 +9,7 @@
  */
 
 use super::gvn::PhaseGVN;
-use super::node::{CmpCondition, NodeId, Opcode, NONE};
+use super::node::{ArrayElemKind, CmpCondition, NodeId, Opcode, NONE};
 use crate::share::interpreter::bytecode::{self, Bytecode};
 use crate::share::interpreter::bytecodes::{self, Code};
 use std::collections::{BTreeSet, HashMap};
@@ -760,24 +760,51 @@ impl<'a> BytecodeGraphBuilder<'a> {
 
     fn load_op(kind: FieldKind) -> Opcode {
         match kind {
-            FieldKind::Int | FieldKind::Bool | FieldKind::Byte | FieldKind::Short
-            | FieldKind::Char => Opcode::LoadI,
+            FieldKind::Int => Opcode::LoadI,
             FieldKind::Long => Opcode::LoadL,
             FieldKind::Float => Opcode::LoadF,
             FieldKind::Double => Opcode::LoadD,
             FieldKind::Ref => Opcode::LoadP,
+            FieldKind::Byte | FieldKind::Bool => Opcode::LoadB,
+            FieldKind::Char => Opcode::LoadC,
+            FieldKind::Short => Opcode::LoadS,
         }
     }
 
     fn store_op(kind: FieldKind) -> Opcode {
         match kind {
-            FieldKind::Int | FieldKind::Bool | FieldKind::Byte | FieldKind::Short
-            | FieldKind::Char => Opcode::StoreI,
+            FieldKind::Int => Opcode::StoreI,
             FieldKind::Long => Opcode::StoreL,
             FieldKind::Float => Opcode::StoreF,
             FieldKind::Double => Opcode::StoreD,
             FieldKind::Ref => Opcode::StoreP,
+            FieldKind::Byte | FieldKind::Bool => Opcode::StoreB,
+            FieldKind::Char => Opcode::StoreC,
+            FieldKind::Short => Opcode::StoreS,
         }
+    }
+
+    fn array_elem(code: Code) -> Option<ArrayElemKind> {
+        use ArrayElemKind::*;
+        Some(match code {
+            Code::Iaload => Int,
+            Code::Laload => Long,
+            Code::Faload => Float,
+            Code::Daload => Double,
+            Code::Aaload => Ref,
+            Code::Baload => Byte,
+            Code::Caload => Char,
+            Code::Saload => Short,
+            Code::Iastore => Int,
+            Code::Lastore => Long,
+            Code::Fastore => Float,
+            Code::Dastore => Double,
+            Code::Aastore => Ref,
+            Code::Bastore => Byte,
+            Code::Castore => Char,
+            Code::Sastore => Short,
+            _ => return None,
+        })
     }
 
     fn exec_instr(&mut self, bci: usize, method: &MethodCode, frame: &mut Frame) {
@@ -971,39 +998,46 @@ impl<'a> BytecodeGraphBuilder<'a> {
                 self.local_set(idx, frame);
             }
             Iaload | Laload | Faload | Daload | Aaload | Baload | Caload | Saload => {
-                let kind = match code {
-                    Laload => FieldKind::Long,
-                    Faload => FieldKind::Float,
-                    Daload => FieldKind::Double,
-                    Aaload => FieldKind::Ref,
-                    _ => FieldKind::Int,
+                let ekind = Self::array_elem(code).unwrap();
+                let kind = match ekind {
+                    ArrayElemKind::Long => FieldKind::Long,
+                    ArrayElemKind::Float => FieldKind::Float,
+                    ArrayElemKind::Double => FieldKind::Double,
+                    ArrayElemKind::Ref => FieldKind::Ref,
+                    ArrayElemKind::Byte => FieldKind::Byte,
+                    ArrayElemKind::Char => FieldKind::Char,
+                    ArrayElemKind::Short => FieldKind::Short,
+                    ArrayElemKind::Int => FieldKind::Int,
                 };
                 let idx = self.pop(frame);
                 let arr = self.pop(frame);
                 let op = Self::load_op(kind);
-                let n = self.gvn.transform(op, vec![frame.mem, frame.ctrl, arr, idx]);
+                let ek = self.gvn.con_i(ekind.code());
+                let n = self.gvn.transform(op, vec![frame.mem, frame.ctrl, arr, idx, ek]);
                 let cat2 = matches!(kind, FieldKind::Long | FieldKind::Double);
                 self.push(frame, n, cat2);
                 self.maybe_throw(bci, n, frame);
             }
             Iastore | Lastore | Fastore | Dastore | Aastore | Bastore | Castore | Sastore => {
+                let ekind = Self::array_elem(code).unwrap();
                 let v = self.pop(frame);
                 let idx = self.pop(frame);
                 let arr = self.pop(frame);
-                let kind = match code {
-                    Iastore => FieldKind::Int,
-                    Lastore => FieldKind::Long,
-                    Fastore => FieldKind::Float,
-                    Dastore => FieldKind::Double,
-                    Aastore => FieldKind::Ref,
-                    Bastore => FieldKind::Byte,
-                    Castore => FieldKind::Char,
-                    _ => FieldKind::Short,
+                let kind = match ekind {
+                    ArrayElemKind::Long => FieldKind::Long,
+                    ArrayElemKind::Float => FieldKind::Float,
+                    ArrayElemKind::Double => FieldKind::Double,
+                    ArrayElemKind::Ref => FieldKind::Ref,
+                    ArrayElemKind::Byte => FieldKind::Byte,
+                    ArrayElemKind::Char => FieldKind::Char,
+                    ArrayElemKind::Short => FieldKind::Short,
+                    ArrayElemKind::Int => FieldKind::Int,
                 };
                 let op = Self::store_op(kind);
+                let ek = self.gvn.con_i(ekind.code());
                 let n = self
                     .gvn
-                    .alloc(op, vec![frame.mem, frame.ctrl, arr, idx, v]);
+                    .alloc(op, vec![frame.mem, frame.ctrl, arr, idx, v, ek]);
                 frame.mem = n;
                 self.maybe_throw(bci, n, frame);
             }

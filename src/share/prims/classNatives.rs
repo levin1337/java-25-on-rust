@@ -414,19 +414,25 @@ pub(crate) fn materialize_class<'a>(
         .push(Value::Object(handle));
     loader.class_object_names.borrow_mut().insert(handle, name);
     loader.class_objects.borrow_mut().insert(key, handle);
-    if let Some(origin) = loader.class_origin(name)
-        && let Ok(domain) = protection_domain_for_origin(loader, &origin)
-    {
-        if let Ok(slot) = klass.instanceField(
+    let domain = loader
+        .class_protection_domain(name)
+        .map(Value::Object)
+        .or_else(|| {
+            loader
+                .class_origin(name)
+                .and_then(|origin| protection_domain_for_origin(loader, &origin).ok())
+        });
+    if let Some(domain) = domain
+        && let Ok(slot) = klass.instanceField(
             b"protectionDomain",
             b"Ljava/security/ProtectionDomain;",
-        ) {
-            let mut objects = loader.borrow_objects_mut();
-            if let Some(object) = objects.get_mut(handle)
-                && slot < object.fields.len()
-            {
-                object.fields[slot] = domain;
-            }
+        )
+    {
+        let mut objects = loader.borrow_objects_mut();
+        if let Some(object) = objects.get_mut(handle)
+            && slot < object.fields.len()
+        {
+            object.fields[slot] = domain;
         }
     }
     Ok(Some(Value::Object(handle)))

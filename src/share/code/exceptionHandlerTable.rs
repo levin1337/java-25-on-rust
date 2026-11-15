@@ -401,3 +401,66 @@ impl PcRangeHandlerTable {
         t
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn handler_table_subtables() {
+        let mut t = ExceptionHandlerTable::new(8);
+        t.add_subtable(10, &[20, 30], Some(&[0, 1]), &[100, 200]);
+        t.add_subtable(50, &[60], None, &[300]);
+        assert_eq!(t.len(), 2 + 3);
+        assert_eq!(t.subtable_for(10), Some(0));
+        assert_eq!(t.subtable_for(50), Some(3));
+        let e = t.entry_for(10, 30, 1).unwrap();
+        assert_eq!(e.pco(), 200);
+        assert_eq!(e.bci(), 30);
+        assert_eq!(e.scope_depth(), 1);
+    }
+
+    #[test]
+    fn handler_table_serialization_round_trip() {
+        let mut t = ExceptionHandlerTable::new(8);
+        t.add_subtable(10, &[20, 30], Some(&[0, 1]), &[100, 200]);
+        let bytes = t.copy_bytes_to();
+        assert_eq!(bytes.len(), t.size_in_bytes());
+        let back = ExceptionHandlerTable::from_bytes(&bytes);
+        assert_eq!(back.entries(), t.entries());
+        let e = back.entry_for(10, 20, 0).unwrap();
+        assert_eq!(e.pco(), 100);
+    }
+
+    #[test]
+    fn pc_range_lookup_order_and_catch_all() {
+        let mut t = PcRangeHandlerTable::new();
+        let catch_all = Symbol::new(b"java/lang/Throwable");
+        let io = Symbol::new(b"java/io/IOException");
+        t.add(0, 50, 200, None);
+        t.add(60, 70, 100, Some(io.clone()));
+        // Catch-all range wins inside [0,50) for any thrown type.
+        let e = t.lookup_exact(15, &catch_all).unwrap();
+        assert_eq!(e.handler_pc, 200);
+        // The typed range only matches its catch type.
+        let e2 = t.lookup(65, &io, None).unwrap();
+        assert_eq!(e2.handler_pc, 100);
+        assert!(t.lookup_exact(65, &catch_all).is_none());
+        // Outside all ranges.
+        assert!(t.lookup_exact(55, &catch_all).is_none());
+        // covering() reports every range containing the pc.
+        assert_eq!(t.covering(15).count(), 1);
+        assert_eq!(t.covering(65).count(), 1);
+    }
+
+    #[test]
+    fn pc_range_from_bci_table() {
+        let entries: [(u16, u16, u16, Option<Symbol>); 1] =
+            [(0, 10, 20, Some(Symbol::new(b"E")))];
+        let t = PcRangeHandlerTable::from_bci_table(&entries, |bci| bci as i32 * 4);
+        assert_eq!(t.entries().len(), 1);
+        assert_eq!(t.entries()[0].start_pc, 0);
+        assert_eq!(t.entries()[0].end_pc, 40);
+        assert_eq!(t.entries()[0].handler_pc, 80);
+    }
+}

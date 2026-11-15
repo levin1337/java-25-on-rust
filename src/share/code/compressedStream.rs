@@ -73,22 +73,25 @@ pub fn write_uint(value: u32, out: &mut Vec<u8>) {
     }
 }
 
-/// Number of bytes the encoding of `value` occupies.
-pub fn encoded_length(mut value: u32) -> usize {
+/// Number of bytes the encoding of `value` occupies.  Mirrors
+/// `write_uint` exactly: one terminal byte for `value < L`, otherwise
+/// one high byte per 6-bit digit plus a final terminal byte.
+pub fn encoded_length(value: u32) -> usize {
     if value < L {
         return 1;
     }
-    let mut sum = 0u32;
-    let mut lg_h_i = 0u32;
-    for i in 1..MAX_LENGTH {
-        // value <= sum + (L-1) << lg_h_i  => fits in i+1 bytes
-        if value <= sum.saturating_add((L - 1) << lg_h_i) || i == MAX_LENGTH - 1 {
-            return i + 1;
+    let mut sum = value;
+    let mut len = 0usize;
+    let mut i = 0usize;
+    loop {
+        if sum < L || i == MAX_LENGTH - 1 {
+            return len + 1;
         }
-        sum = sum.wrapping_add((MAX_B - X) << lg_h_i);
-        lg_h_i += LG_H;
+        sum = sum.saturating_sub(L);
+        sum >>= LG_H;
+        len += 1;
+        i += 1;
     }
-    MAX_LENGTH
 }
 
 /// `UNSIGNED5::encode_sign`: zig-zag style encoding of a signed value.
@@ -236,5 +239,89 @@ impl CompressedWriteStream {
         let bits = value.to_bits();
         self.write_int((bits >> 32) as u32);
         self.write_int(bits as u32);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uint_round_trip() {
+        for v in [
+            0u32, 1, 2, 63, 64, 100, 190, 191, 192, 193, 255, 256, 1000, 4096,
+            65535, 65536, 1_000_000, 70_000, u32::MAX,
+        ] {
+            let mut buf = Vec::new();
+            write_uint(v, &mut buf);
+            assert_eq!(buf.len(), encoded_length(v), "len mismatch for {}", v);
+            let mut pos = 0usize;
+            let got = read_uint(&buf, &mut pos).unwrap();
+            assert_eq!(got, v, "round trip failed for {}", v);
+            assert_eq!(pos, buf.len());
+        }
+    }
+
+    #[test]
+    fn sign_round_trip() {
+        for v in [0i32, 1, -1, 63, -64, 1000, -1000, i32::MAX, i32::MIN, 12345, -12345] {
+            let enc = encode_sign(v);
+            assert_eq!(decode_sign(enc), v);
+        }
+    }
+
+    #[test]
+    fn stream_int_round_trip() {
+        let mut w = CompressedWriteStream::new();
+        w.write_signed_int(-5);
+        w.write_int(70000);
+        w.write_bool(true);
+        w.write_byte(-3);
+        w.write_char(0xABCD);
+        w.write_short(-1234);
+        w.write_float(1.5);
+        w.write_double(-2.25);
+        let data = w.into_buffer();
+
+        let mut r = CompressedReadStream::new(&data);
+        assert_eq!(r.read_signed_int(), Some(-5));
+        assert_eq!(r.read_int(), Some(70000));
+        assert_eq!(r.read_bool(), Some(true));
+        assert_eq!(r.read_byte(), Some(-3));
+        assert_eq!(r.read_char(), Some(0xABCD));
+        assert_eq!(r.read_short(), Some(-1234));
+        assert_eq!(r.read_int(), Some(1.5f32.to_bits().reverse_bits()));
+        // double: high word then low word
+        let hi = r.read_int().unwrap() as u64;
+        let lo = r.read_int().unwrap() as u64;
+        assert_eq!((hi << 32) | lo, (-2.25f64).to_bits());
+        assert!(r.eof());
+    }
+
+    #[test]
+    fn malformed_input_rejected() {
+        // byte 0 is excluded by UNSIGNED5
+        assert_eq!(read_uint(&[0x00], &mut 0), None);
+        // truncated multi-byte sequence
+        let mut buf = Vec::new();
+        write_uint(u32::MAX, &mut buf);
+        buf.pop();
+        assert_eq!(read_uint(&buf, &mut 0), None);
+        // empty input
+        assert_eq!(read_uint(&[], &mut 0), None);
+        let mut r = CompressedReadStream::new(&[]);
+        assert_eq!(r.read_int(), None);
+        assert_eq!(r.read(), None);
+    }
+
+    #[test]
+    fn new_at_offsets() {
+        let mut w = CompressedWriteStream::new();
+        w.write_int(11);
+        w.write_int(22);
+        let data = w.into_buffer();
+        let mut r = CompressedReadStream::new_at(&data, 1);
+        // skip first encoded int (1 -> single byte 0x02)
+        assert_eq!(r.read_int(), Some(22));
     }
 }

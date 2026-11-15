@@ -23,6 +23,7 @@ fn define_from_window<'a>(
     bytes_value: Value<'a>,
     offset: usize,
     length: usize,
+    protection_domain: Value<'a>,
 ) -> io::Result<Value<'a>> {
     let Value::PrimitiveArray(handle) = bytes_value else {
         return Err(io::Error::other("defineClass: expected byte[]"));
@@ -46,6 +47,9 @@ fn define_from_window<'a>(
     let class = ClassFile::parse(owned, false).map_err(linkage_error)?;
     let name = class.name;
     loader.define_class(class)?;
+    if let Value::Object(handle) = protection_domain {
+        loader.record_class_protection_domain(name, handle);
+    }
     Ok(Value::ClassMirror(name))
 }
 
@@ -73,7 +77,8 @@ pub(crate) fn define_class0<'a>(
         .get(5)
         .and_then(|value| value.int().ok())
         .unwrap_or(0) as usize;
-    define_from_window(loader, bytes_value, offset, length).map(Some)
+    let protection_domain = arguments.get(6).copied().unwrap_or(Value::Null);
+    define_from_window(loader, bytes_value, offset, length, protection_domain).map(Some)
 }
 
 /// Reads an instance field of a buffer object, walking the hierarchy.
@@ -142,6 +147,10 @@ pub(crate) fn define_class2<'a>(
     let class = ClassFile::parse(owned, false).map_err(linkage_error)?;
     let name = class.name;
     loader.define_class(class)?;
+    let protection_domain = arguments.get(5).copied().unwrap_or(Value::Null);
+    if let Value::Object(handle) = protection_domain {
+        loader.record_class_protection_domain(name, handle);
+    }
     Ok(Some(Value::ClassMirror(name)))
 }
 
@@ -165,5 +174,6 @@ pub(crate) fn define_class1<'a>(
         .get(4)
         .and_then(|value| value.int().ok())
         .unwrap_or(0) as usize;
-    define_from_window(loader, bytes_value, offset, length).map(Some)
+    let protection_domain = arguments.get(5).copied().unwrap_or(Value::Null);
+    define_from_window(loader, bytes_value, offset, length, protection_domain).map(Some)
 }

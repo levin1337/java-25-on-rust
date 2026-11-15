@@ -2351,6 +2351,13 @@ pub(crate) fn class_invoke<'a>(
     arguments: &[Value<'a>],
 ) -> io::Result<Option<Value<'a>>> {
     let receiver = arguments.first().copied().unwrap_or(Value::Null);
+    // Heap `java.lang.Class` objects carry a populated `protectionDomain`
+    // field; keep the handle so natives like `getProtectionDomain0` can
+    // read it back without re-materializing.
+    let receiver_object = match receiver {
+        Value::Object(handle) => Some(handle),
+        _ => None,
+    };
     // Accept materialized `java.lang.Class` objects as well as `ClassMirror`
     // literals by recovering the internal class name.
     let receiver = match receiver {
@@ -2496,7 +2503,55 @@ pub(crate) fn class_invoke<'a>(
                 }
             }
         }
-        (b"getProtectionDomain0", b"()Ljava/security/ProtectionDomain;") => Value::Null,
+        (b"getProtectionDomain0", b"()Ljava/security/ProtectionDomain;") => {
+            // `java.lang.Class.protectionDomain` is populated when the
+            // mirror object is materialized; reuse the receiver object
+            // when the caller already has one, otherwise materialize.
+            let class_object = match receiver_object {
+                Some(handle) => Value::Object(handle),
+                None => match crate::share::prims::classNatives::materialize_class(
+                    loader,
+                    receiver,
+                )? {
+                    Some(value) => value,
+                    None => Value::Null,
+                },
+            };
+            let handle = match class_object {
+                Value::Object(handle) => handle,
+                _ => return Ok(Some(Value::Null)),
+            };
+            let objects = loader.borrow_objects();
+            let field_value = match objects.get(handle) {
+                Some(object) => match object.klass.instanceField(
+                    b"protectionDomain",
+                    b"Ljava/security/ProtectionDomain;",
+                ) {
+                    Ok(slot) if slot < object.fields.len() => object.fields[slot],
+                    _ => Value::Null,
+                },
+                None => Value::Null,
+            };
+            if !matches!(field_value, Value::Null) {
+                return Ok(Some(field_value));
+            }
+            if let Some(klass) = klass.as_ref()
+                && let Some(pd) = loader.class_protection_domain(klass.class.name)
+            {
+                return Ok(Some(Value::Object(pd)));
+            }
+            if let Some(klass) = klass.as_ref() {
+                eprintln!(
+                    "[pd-null] {} recorded={} origin={}",
+                    String::from_utf8_lossy(klass.class.name),
+                    loader
+                        .class_protection_domain(klass.class.name)
+                        .is_some(),
+                    loader.class_origin(klass.class.name).is_some()
+                );
+            }
+            Value::Null
+        }
         (b"getGenericSignature0", b"()Ljava/lang/String;") => {
             if is_array || is_primitive {
                 Value::Null

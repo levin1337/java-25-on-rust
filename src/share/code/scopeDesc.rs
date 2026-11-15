@@ -538,3 +538,118 @@ pub fn encode_scope_desc(
     );
     (w.finish(), top)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scope_value_round_trip() {
+        let values = vec![
+            ScopeValue::ConstantInt(-7),
+            ScopeValue::ConstantLong(0x1234_5678_9ABC_DEF0u64 as i64),
+            ScopeValue::ConstantFloat(1.25f32.to_bits()),
+            ScopeValue::ConstantDouble((-3.5f64).to_bits()),
+            ScopeValue::ConstantOop("java/lang/Object".to_string()),
+            ScopeValue::Location { location: -2, offset_in_location: 8 },
+        ];
+        let mut w = ScopeDescWriter::new();
+        let off = w.write_scope_values(&values);
+        let data = w.finish();
+        let mut r = ScopeDescReader::new(&data);
+        let decoded = r.decode_scope_values(off).unwrap();
+        assert_eq!(decoded, values);
+    }
+
+    #[test]
+    fn encode_decode_scope_desc_round_trip() {
+        let desc = ScopeDesc::with_details(
+            "pkg/Klass".to_string(),
+            "method".to_string(),
+            "(I)J".to_string(),
+            42,
+            false,
+            NO_SENDER_DECODE_OFFSET,
+            vec![ScopeValue::ConstantInt(1), ScopeValue::Location { location: 3, offset_in_location: 0 }],
+            vec![ScopeValue::ConstantLong(99)],
+            vec![MonitorValue {
+                owner: ScopeValue::ConstantOop("mon".to_string()),
+                location: ScopeValue::Location { location: -4, offset_in_location: 0 },
+                eliminated: true,
+            }],
+            true,
+            false,
+            true,
+        );
+        let (data, top) = encode_scope_desc(&desc);
+        let chain = decode_scope_chain(&data, top);
+        assert_eq!(chain.len(), 1);
+        let d = &chain[0];
+        assert_eq!(d.method_holder(), "pkg/Klass");
+        assert_eq!(d.method_name(), "method");
+        assert_eq!(d.method_signature(), "(I)J");
+        assert_eq!(d.bci(), 42);
+        assert_eq!(d.locals().len(), 2);
+        assert_eq!(d.expressions(), &[ScopeValue::ConstantLong(99)]);
+        assert_eq!(d.monitors().len(), 1);
+        assert!(d.monitors()[0].eliminated);
+        // reexecute / return_oop / rethrow_exception are PcDesc flags in
+        // HotSpot, not ScopeDesc wire data; the in-memory fields default
+        // to false after a decode.
+        assert!(!d.should_reexecute());
+        assert!(!d.rethrow_exception());
+        assert!(!d.return_oop());
+        assert!(d.is_top());
+    }
+
+    #[test]
+    fn inline_chain_decode_order() {
+        let mut w = ScopeDescWriter::new();
+        // Inner (callee) scope first, then outer with sender -> inner.
+        let inner_locals = w.write_scope_values(&[ScopeValue::ConstantInt(42)]);
+        let inner = w.write_scope(
+            NO_SENDER_DECODE_OFFSET,
+            "Inner",
+            "in",
+            "()V",
+            5,
+            inner_locals,
+            SERIALIZED_NULL,
+            SERIALIZED_NULL,
+        );
+        let outer_locals = w.write_scope_values(&[ScopeValue::Location { location: -2, offset_in_location: 0 }]);
+        let outer = w.write_scope(
+            inner,
+            "Outer",
+            "out",
+            "()V",
+            9,
+            outer_locals,
+            SERIALIZED_NULL,
+            SERIALIZED_NULL,
+        );
+        let data = w.finish();
+        let chain = decode_scope_chain(&data, outer);
+        assert_eq!(chain.len(), 2);
+        // Top of chain first (outermost caller is the nmethod's own
+        // frame; here `outer` is the top since it points to `inner`).
+        assert_eq!(chain[0].method_name(), "out");
+        assert_eq!(chain[0].bci(), 9);
+        assert_eq!(chain[0].sender_decode_offset(), inner);
+        assert_eq!(chain[1].method_name(), "in");
+        assert_eq!(chain[1].bci(), 5);
+        assert!(chain[1].is_top());
+        assert_eq!(chain[1].locals(), &[ScopeValue::ConstantInt(42)]);
+    }
+
+    #[test]
+    fn empty_and_null_offsets() {
+        // decode offset 0 (serialized_null) yields empty chain.
+        let data = ScopeDescWriter::new().finish();
+        assert!(decode_scope_chain(&data, SERIALIZED_NULL).is_empty());
+        assert!(decode_scope_chain(&data, NO_SENDER_DECODE_OFFSET).is_empty());
+        // truncated blob must not panic.
+        let mut r = ScopeDescReader::new(&[0x01]);
+        let _ = r.decode_full();
+    }
+}

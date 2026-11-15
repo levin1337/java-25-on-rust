@@ -38,6 +38,14 @@ thread_local! {
     /// Interpreter recursion depth of the frame that entered JIT code;
     /// stubs forward it to throwable-object construction.
     static DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Number of 8-byte slots below the JIT frame's `rbp` that may hold
+    /// references; runtime stubs use it for conservative GC rooting.
+    static FRAME_QWORDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Floating-point result bits produced by a runtime stub (the stub
+    /// ABI returns integers in rax only); trampolines move this into
+    /// xmm0 on the success path so `float`/`double` stub results and
+    /// interpreted callee returns reach JIT code.
+    static XMM_RESULT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Result channel between JIT-called stubs and `try_invoke`.
@@ -70,6 +78,29 @@ pub(crate) fn set_depth(depth: usize) {
 
 pub(crate) fn current_depth() -> usize {
     DEPTH.with(|d| d.get())
+}
+
+pub(crate) fn pending_active() -> bool {
+    !matches!(PENDING.with(|p| p.get()), Pending::None)
+}
+
+pub(crate) fn set_frame_qwords(qwords: usize) {
+    FRAME_QWORDS.with(|c| c.set(qwords));
+}
+
+pub(crate) fn current_frame_qwords() -> usize {
+    FRAME_QWORDS.with(|c| c.get())
+}
+
+pub(crate) fn set_stub_xmm_result(bits: u64) {
+    XMM_RESULT.with(|c| c.set(bits));
+}
+
+/// Reads and clears the floating-point stub result channel.  Called by
+/// every trampoline right after the handler returns, before the
+/// pending-outcome check.
+pub(crate) fn take_stub_xmm_result() -> u64 {
+    XMM_RESULT.with(|c| c.replace(0))
 }
 
 /// Outcome of a compiled-code invocation.
@@ -116,7 +147,7 @@ pub enum SlotKind {
 pub const REF_TAG_OBJECT: u64 = 0;
 pub const REF_TAG_OBJECT_ARRAY: u64 = 1;
 pub const REF_TAG_PRIMITIVE_ARRAY: u64 = 2;
-const REF_HANDLE_MASK: u64 = (1u64 << 48) - 1;
+pub const REF_HANDLE_MASK: u64 = (1u64 << 48) - 1;
 
 /// Encodes an interpreter `Value` as the raw word compiled code sees.
 /// Returns `None` for variants that have no handle representation.
@@ -437,6 +468,8 @@ pub fn try_invoke<'a>(
     // unwind through the trampoline back to the post-call site.
     take_pending();
     set_depth(depth);
+    let prev_frame_qwords = current_frame_qwords();
+    set_frame_qwords(stubs::frame_qwords_for(addr));
     let call_args = CallArgs {
         regs,
         xmm,
@@ -445,6 +478,7 @@ pub fn try_invoke<'a>(
         addr,
     };
     let (raw, xmm_raw) = unsafe { invoke_raw(&call_args) };
+    set_frame_qwords(prev_frame_qwords);
     if std::env::var_os("JVM25_JIT_DEBUG").is_some() {
         eprintln!("[jit] ret={:?} raw={:016x} xmm_raw={:016x}", sig.ret, raw, xmm_raw);
     }
@@ -682,29 +716,6 @@ mod tests {
     }
 
     #[test]
-    fn dump_isslash_code() {
-        let mut compiler = crate::share::c1::c1_Compiler::C1Compiler::new();
-        let (code, frame, pcs) = compiler
-            .compile_to_code(
-                &[
-                    0x1a, 0x10, 0x5c, 0x9f, 0x00, 0x09, 0x1a, 0x10, 0x2f, 0xa0, 0x00, 0x07,
-                    0x04, 0xa7, 0x00, 0x04, 0x03, 0xac,
-                ],
-                1,
-                vec![ParamInfo { local_slot: 0, kind: LirKind::Int32 }],
-            )
-            .unwrap();
-        eprintln!("frame={} pcs={:?}", frame, pcs);
-        for (i, b) in code.iter().enumerate() {
-            eprint!("{:02x} ", b);
-            if i % 16 == 15 {
-                eprintln!();
-            }
-        }
-        eprintln!();
-    }
-
-    #[test]
     fn isslash_branch_runs_native() {
         // Mirrors sun.nio.fs.WindowsPathParser.isSlash(C)Z:
         //   0: iload_0; 1: bipush '\\'(92); 3: if_icmpeq +9 -> 12
@@ -731,22 +742,6 @@ mod tests {
     }
 
     #[test]
-    fn dump_div_code() {
-        let mut compiler = crate::share::c1::c1_Compiler::C1Compiler::new();
-        let (code, frame, pcs) = compiler
-            .compile_to_code(&[0x04, 0x03, 0x6c, 0xac], 1, Vec::new())
-            .unwrap();
-        eprintln!("frame={} pcs={:?}", frame, pcs);
-        for (i, b) in code.iter().enumerate() {
-            eprint!("{:02x} ", b);
-            if i % 16 == 15 {
-                eprintln!();
-            }
-        }
-        eprintln!();
-    }
-
-    #[test]
     fn mixed_int_float_params_use_unified_slots() {
         // iload_0 (0x1a); fload_1 (0x23); f2i (0x8b); iadd (0x60);
         // ireturn (0xac) -> (IF)I
@@ -765,5 +760,640 @@ mod tests {
             CompiledResult::Value(Some(Value::Int(v))) => assert_eq!(v, 42),
             other => panic!("unexpected result: {:?}", other),
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Heap-operation tests: real ClassLoader + hand-built klasses.
+    // -----------------------------------------------------------------
+
+    use crate::share::c1::c1_GraphBuilder::{FieldInfo, MethodMetadata, SiteInfo};
+    use crate::share::classfile::classFileParser::{ClassFile, Member};
+    use crate::share::classfile::classLoader::ClassLoader;
+    use crate::share::jitruntime::stubs;
+    use crate::share::oops::instanceKlass::InstanceKlass;
+    use crate::share::oops::instanceOop::InstanceOop;
+    use crate::share::runtime::syncBump::SyncBump;
+    use crate::share::runtime::threading;
+    use std::sync::{Arc, OnceLock};
+
+    fn test_loader() -> Arc<ClassLoader<'static>> {
+        static LOADER: OnceLock<Arc<ClassLoader<'static>>> = OnceLock::new();
+        LOADER
+            .get_or_init(|| {
+                let arena: &'static SyncBump =
+                    Box::leak(Box::new(SyncBump::new()));
+                let loader = Arc::new(ClassLoader::open(std::path::Path::new("."), arena).unwrap());
+                threading::install_loader(loader.clone());
+                loader
+            })
+            .clone()
+    }
+
+    fn register_klass(
+        loader: &ClassLoader<'static>,
+        name: &'static [u8],
+        fields: &[(&'static [u8], &'static [u8], u16)],
+    ) -> Arc<InstanceKlass<'static>> {
+        let class = ClassFile {
+            majorVersion: 65,
+            minorVersion: 0,
+            accessFlags: 0x0001,
+            name,
+            superName: Some(b"java/lang/Object"),
+            interfaces: Vec::new(),
+            constants: Vec::new(),
+            fields: fields
+                .iter()
+                .map(|&(n, d, f)| Member {
+                    accessFlags: f,
+                    name: n,
+                    descriptor: d,
+                    attributes: Vec::new(),
+                })
+                .collect(),
+            methods: Vec::new(),
+            attributes: Vec::new(),
+        };
+        let klass = Arc::new(InstanceKlass::new(class, None, Vec::new()).unwrap());
+        loader.classes.borrow_mut().insert(name, klass.clone());
+        klass
+    }
+
+    fn site(class: &str, name: &str, desc: &str) -> SiteInfo {
+        SiteInfo {
+            class: class.to_string(),
+            name: name.to_string(),
+            desc: desc.to_string(),
+        }
+    }
+
+    fn field_info(kind: crate::share::c1::c1_Instruction::ValueKind, name: &str) -> FieldInfo {
+        FieldInfo {
+            kind,
+            offset: None,
+            name: name.to_string(),
+        }
+    }
+
+    fn compile_meta(
+        bytecode: &[u8],
+        max_locals: usize,
+        params: Vec<ParamInfo>,
+        metadata: MethodMetadata,
+    ) -> usize {
+        let mut compiler = crate::share::c1::c1_Compiler::C1Compiler::new();
+        let (code, _frame, _pcs) = compiler
+            .compile_to_code_meta(bytecode, max_locals, params, metadata)
+            .unwrap();
+        stubs::publish_executable(&code, code.len()).unwrap()
+    }
+
+    fn int_result(result: CompiledResult<'_>) -> i32 {
+        match result {
+            CompiledResult::Value(Some(Value::Int(v))) => v,
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn getfield_putfield_roundtrip() {
+        let loader = test_loader();
+        let klass = register_klass(&loader, b"T", &[(b"x", b"I", 0)]);
+        let object = InstanceOop::new(klass).unwrap();
+        let handle = loader.alloc_object(object);
+
+        let mut metadata = MethodMetadata::default();
+        metadata.sites.insert(1, site("T", "x", "I"));
+        metadata
+            .fields
+            .insert(1, field_info(crate::share::c1::c1_Instruction::ValueKind::Int32, "x"));
+
+        let addr = compile_meta(
+            &[0x2a, 0xb4, 0x00, 0x01, 0xac],
+            1,
+            vec![ParamInfo { local_slot: 0, kind: LirKind::Ref }],
+            metadata.clone(),
+        );
+        let args = [Value::Object(handle)];
+        let result = try_invoke(addr, b"()I", false, &args, 0).unwrap();
+        assert_eq!(int_result(result), 0);
+
+        let addr = compile_meta(
+            &[0x2a, 0x10, 0x2a, 0xb5, 0x00, 0x01, 0xb1],
+            1,
+            vec![ParamInfo { local_slot: 0, kind: LirKind::Ref }],
+            metadata,
+        );
+        let result = try_invoke(addr, b"()V", false, &args, 0).unwrap();
+        assert!(matches!(result, CompiledResult::Value(None)));
+        assert_eq!(loader.borrow_objects()[handle].fields[0], Value::Int(42));
+    }
+
+    #[test]
+    fn getfield_null_receiver_throws_npe() {
+        let loader = test_loader();
+        register_klass(&loader, b"TN", &[(b"x", b"I", 0)]);
+        register_klass(&loader, b"java/lang/NullPointerException", &[]);
+        let mut metadata = MethodMetadata::default();
+        metadata.sites.insert(1, site("TN", "x", "I"));
+        metadata
+            .fields
+            .insert(1, field_info(crate::share::c1::c1_Instruction::ValueKind::Int32, "x"));
+        let addr = compile_meta(
+            &[0x2a, 0xb4, 0x00, 0x01, 0xac],
+            1,
+            vec![ParamInfo { local_slot: 0, kind: LirKind::Ref }],
+            metadata,
+        );
+        let args = [Value::Null];
+        let result = try_invoke(addr, b"()I", false, &args, 0).unwrap();
+        assert!(matches!(result, CompiledResult::Thrown(_)));
+    }
+
+    #[test]
+    fn getstatic_putstatic_roundtrip() {
+        let loader = test_loader();
+        register_klass(&loader, b"S", &[(b"v", b"I", 0x0008)]);
+        let mut metadata = MethodMetadata::default();
+        metadata.sites.insert(1, site("S", "v", "I"));
+        metadata
+            .fields
+            .insert(1, field_info(crate::share::c1::c1_Instruction::ValueKind::Int32, "v"));
+
+        let addr = compile_meta(&[0x08, 0xb3, 0x00, 0x01, 0xb1], 0, Vec::new(), metadata.clone());
+        let result = try_invoke(addr, b"()V", true, &[], 0).unwrap();
+        assert!(matches!(result, CompiledResult::Value(None)));
+
+        let addr = compile_meta(&[0xb2, 0x00, 0x01, 0xac], 0, Vec::new(), metadata);
+        let result = try_invoke(addr, b"()I", true, &[], 0).unwrap();
+        assert_eq!(int_result(result), 5);
+    }
+
+    #[test]
+    fn int_array_store_load() {
+        let _loader = test_loader();
+        let addr = compile_meta(
+            &[
+                0x06, 0xbc, 0x0a, 0x59, 0x03, 0x10, 0x07, 0x4f, 0x03, 0x2e, 0xac,
+            ],
+            1,
+            Vec::new(),
+            MethodMetadata::default(),
+        );
+        let result = try_invoke(addr, b"()I", true, &[], 0).unwrap();
+        assert_eq!(int_result(result), 7);
+    }
+
+    #[test]
+    fn object_array_store_load_instanceof() {
+        let loader = test_loader();
+        let klass = register_klass(&loader, b"TA", &[]);
+        let object = InstanceOop::new(klass).unwrap();
+        let handle = loader.alloc_object(object);
+
+        let mut metadata = MethodMetadata::default();
+        metadata.sites.insert(1, site("TA", "", ""));
+        metadata.sites.insert(2, site("TA", "", ""));
+        let addr = compile_meta(
+            &[
+                0x04, 0xbd, 0x00, 0x01, 0x59, 0x03, 0x2a, 0x53, 0x03, 0x32, 0xc1, 0x00,
+                0x02, 0xac,
+            ],
+            1,
+            vec![ParamInfo { local_slot: 0, kind: LirKind::Ref }],
+            metadata,
+        );
+        let args = [Value::Object(handle)];
+        let result = try_invoke(addr, b"(Ljava/lang/Object;)I", true, &args, 0).unwrap();
+        assert_eq!(int_result(result), 1);
+    }
+
+    #[test]
+    fn new_allocates_instance() {
+        let loader = test_loader();
+        register_klass(&loader, b"N", &[(b"x", b"I", 0)]);
+        let mut metadata = MethodMetadata::default();
+        metadata.sites.insert(1, site("N", "", ""));
+        let addr = compile_meta(&[0xbb, 0x00, 0x01, 0xb0], 0, Vec::new(), metadata);
+        let result = try_invoke(addr, b"()Ljava/lang/Object;", true, &[], 0).unwrap();
+        match result {
+            CompiledResult::Value(Some(Value::Object(h))) => {
+                let objects = loader.borrow_objects();
+                assert_eq!(objects[h].klass.class.name, b"N");
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn checkcast_passes_and_throws() {
+        let loader = test_loader();
+        let klass = register_klass(&loader, b"C", &[]);
+        let other = register_klass(&loader, b"C2", &[]);
+        register_klass(&loader, b"java/lang/ClassCastException", &[]);
+        let object = InstanceOop::new(klass).unwrap();
+        let handle = loader.alloc_object(object);
+        let object2 = InstanceOop::new(other).unwrap();
+        let handle2 = loader.alloc_object(object2);
+
+        let mut metadata = MethodMetadata::default();
+        metadata.sites.insert(1, site("C", "", ""));
+        metadata.sites.insert(2, site("C2", "", ""));
+        let addr = compile_meta(
+            &[0x2a, 0xc0, 0x00, 0x01, 0xb0],
+            1,
+            vec![ParamInfo { local_slot: 0, kind: LirKind::Ref }],
+            metadata.clone(),
+        );
+        let args = [Value::Object(handle)];
+        let result = try_invoke(addr, b"(Ljava/lang/Object;)Ljava/lang/Object;", true, &args, 0).unwrap();
+        assert!(matches!(result, CompiledResult::Value(Some(Value::Object(h))) if h == handle));
+
+        let addr = compile_meta(
+            &[0x2a, 0xc0, 0x00, 0x02, 0xb0],
+            1,
+            vec![ParamInfo { local_slot: 0, kind: LirKind::Ref }],
+            metadata,
+        );
+        // C instance checked against C2 must raise ClassCastException.
+        let args = [Value::Object(handle)];
+        let result = try_invoke(addr, b"(Ljava/lang/Object;)Ljava/lang/Object;", true, &args, 0).unwrap();
+        assert!(matches!(result, CompiledResult::Thrown(_)));
+        let _ = handle2;
+    }
+
+    #[test]
+    fn instanceof_reports_assignability() {
+        let loader = test_loader();
+        let klass = register_klass(&loader, b"IO", &[]);
+        let object = InstanceOop::new(klass).unwrap();
+        let handle = loader.alloc_object(object);
+
+        let mut metadata = MethodMetadata::default();
+        metadata.sites.insert(1, site("IO", "", ""));
+        let addr = compile_meta(
+            &[0x2a, 0xc1, 0x00, 0x01, 0xac],
+            1,
+            vec![ParamInfo { local_slot: 0, kind: LirKind::Ref }],
+            metadata,
+        );
+        for (arg, want) in [(Value::Object(handle), 1), (Value::Null, 0)] {
+            let result = try_invoke(addr, b"(Ljava/lang/Object;)I", true, &[arg], 0).unwrap();
+            assert_eq!(int_result(result), want);
+        }
+    }
+
+    #[test]
+    fn athrow_propagates_throwable() {
+        let loader = test_loader();
+        let klass = register_klass(&loader, b"java/lang/Throwable", &[]);
+        let object = InstanceOop::new(klass).unwrap();
+        let handle = loader.alloc_object(object);
+
+        let addr = compile_meta(
+            &[0x2a, 0xbf],
+            1,
+            vec![ParamInfo { local_slot: 0, kind: LirKind::Ref }],
+            MethodMetadata::default(),
+        );
+        let args = [Value::Object(handle)];
+        let result = try_invoke(addr, b"(Ljava/lang/Object;)V", true, &args, 0).unwrap();
+        assert!(matches!(result, CompiledResult::Thrown(h) if h == handle));
+    }
+
+    #[test]
+    fn resolve_heap_sites_fills_metadata() {
+        use crate::share::c1::c1_GraphBuilder::resolve_heap_sites;
+        let loader = test_loader();
+        let constants = vec![
+            crate::share::classfile::classFileParser::Constant::Unusable,
+            crate::share::classfile::classFileParser::Constant::Utf8(b"T"),
+            crate::share::classfile::classFileParser::Constant::Utf8(b"x"),
+            crate::share::classfile::classFileParser::Constant::Utf8(b"I"),
+            crate::share::classfile::classFileParser::Constant::Class(1),
+            crate::share::classfile::classFileParser::Constant::NameAndType(2, 3),
+            crate::share::classfile::classFileParser::Constant::FieldRef(4, 5),
+        ];
+        let class = ClassFile {
+            majorVersion: 65,
+            minorVersion: 0,
+            accessFlags: 0x0001,
+            name: b"T",
+            superName: Some(b"java/lang/Object"),
+            interfaces: Vec::new(),
+            constants,
+            fields: vec![Member {
+                accessFlags: 0,
+                name: b"x",
+                descriptor: b"I",
+                attributes: Vec::new(),
+            }],
+            methods: Vec::new(),
+            attributes: Vec::new(),
+        };
+        let klass = InstanceKlass::new(class, None, Vec::new()).unwrap();
+        let code = [0x2a, 0xb4, 0x00, 0x06, 0xac];
+        let mut metadata = MethodMetadata::default();
+        resolve_heap_sites(&klass, &code, &mut metadata);
+        let info = metadata.sites.get(&6).expect("site resolved");
+        assert_eq!(info.class, "T");
+        assert_eq!(info.name, "x");
+        assert_eq!(info.desc, "I");
+        assert_eq!(
+            metadata.fields.get(&6).map(|f| f.kind),
+            Some(crate::share::c1::c1_Instruction::ValueKind::Int32)
+        );
+        let _ = loader;
+    }
+
+    // -----------------------------------------------------------------
+    // Method-call tests: JIT -> JIT (direct target) and
+    // JIT -> UnresolvedCall stub -> interpreter / nested JIT.
+    // -----------------------------------------------------------------
+
+    use crate::share::c1::c1_GraphBuilder::CallSiteInfo;
+    use crate::share::c1::c1_Instruction::ValueKind;
+    use crate::share::classfile::classFileParser::Attribute;
+
+    fn pi(slot: usize) -> ParamInfo {
+        ParamInfo { local_slot: slot, kind: LirKind::Int32 }
+    }
+
+    fn call_site(
+        opcode: u8,
+        arg_kinds: Vec<ValueKind>,
+        return_kind: ValueKind,
+        is_static: bool,
+        target: Option<u64>,
+    ) -> CallSiteInfo {
+        CallSiteInfo {
+            opcode,
+            cp_index: 1,
+            name: String::new(),
+            arg_kinds,
+            return_kind,
+            is_static,
+            is_interface: false,
+            target,
+        }
+    }
+
+    /// Registers a klass whose `methods` carry real `Code` attributes
+    /// so `LinkResolver`/`execute_labeled` can run them interpreted.
+    fn register_method_klass(
+        loader: &ClassLoader<'static>,
+        name: &'static [u8],
+        method_name: &'static [u8],
+        descriptor: &'static [u8],
+        access_flags: u16,
+        bytecode: &'static [u8],
+        max_locals: u16,
+    ) -> Arc<InstanceKlass<'static>> {
+        register_method_klass_cp(
+            loader,
+            name,
+            method_name,
+            descriptor,
+            access_flags,
+            bytecode,
+            max_locals,
+            Vec::new(),
+        )
+    }
+
+    fn register_method_klass_cp(
+        loader: &ClassLoader<'static>,
+        name: &'static [u8],
+        method_name: &'static [u8],
+        descriptor: &'static [u8],
+        access_flags: u16,
+        bytecode: &'static [u8],
+        max_locals: u16,
+        constants: Vec<crate::share::classfile::classFileParser::Constant<'static>>,
+    ) -> Arc<InstanceKlass<'static>> {
+        let mut code_attr = Vec::with_capacity(8 + bytecode.len() + 2);
+        code_attr.extend_from_slice(&[0, 4]); // max_stack = 4
+        code_attr.extend_from_slice(&max_locals.to_be_bytes());
+        code_attr.extend_from_slice(&(bytecode.len() as u32).to_be_bytes());
+        code_attr.extend_from_slice(bytecode);
+        code_attr.extend_from_slice(&[0, 0]); // exception_table_length = 0
+        let code_attr: &'static [u8] = Box::leak(code_attr.into_boxed_slice());
+        let class = ClassFile {
+            majorVersion: 65,
+            minorVersion: 0,
+            accessFlags: 0x0001,
+            name,
+            superName: Some(b"java/lang/Object"),
+            interfaces: Vec::new(),
+            constants,
+            fields: Vec::new(),
+            methods: vec![Member {
+                accessFlags: access_flags,
+                name: method_name,
+                descriptor,
+                attributes: vec![Attribute { name: b"Code", bytes: code_attr }],
+            }],
+            attributes: Vec::new(),
+        };
+        let klass = Arc::new(InstanceKlass::new(class, None, Vec::new()).unwrap());
+        loader.classes.borrow_mut().insert(name, klass.clone());
+        klass
+    }
+
+    #[test]
+    fn jit_calls_compiled_callee_direct() {
+        // callee: iload_0; iload_1; iadd; ireturn -> (II)I
+        let callee = compile_and_publish(
+            &[0x1a, 0x1b, 0x60, 0xac],
+            2,
+            vec![pi(0), pi(1)],
+        );
+        let mut md = MethodMetadata::default();
+        md.call_sites.insert(
+            1,
+            call_site(0xb8, vec![ValueKind::Int32, ValueKind::Int32], ValueKind::Int32, true, Some(callee as u64)),
+        );
+        md.sites.insert(1, site("C", "add", "(II)I"));
+        // caller: iload_0; iload_1; invokestatic #1; ireturn
+        let caller = compile_meta(
+            &[0x1a, 0x1b, 0xb8, 0x00, 0x01, 0xac],
+            2,
+            vec![pi(0), pi(1)],
+            md,
+        );
+        let args = [Value::Int(20), Value::Int(22)];
+        let result = try_invoke(caller, b"(II)I", true, &args, 0).unwrap();
+        assert_eq!(int_result(result), 42);
+    }
+
+    #[test]
+    fn jit_calls_interpreted_callee_via_stub() {
+        let loader = test_loader();
+        // C.add(II)I interpreted: iload_0; iload_1; iadd; ireturn
+        register_method_klass(
+            &loader,
+            b"C",
+            b"add",
+            b"(II)I",
+            0x0009,
+            Box::leak(vec![0x1a, 0x1b, 0x60, 0xac].into_boxed_slice()),
+            2,
+        );
+        let mut md = MethodMetadata::default();
+        md.call_sites.insert(
+            1,
+            call_site(0xb8, vec![ValueKind::Int32, ValueKind::Int32], ValueKind::Int32, true, None),
+        );
+        md.sites.insert(1, site("C", "add", "(II)I"));
+        let caller = compile_meta(
+            &[0x1a, 0x1b, 0xb8, 0x00, 0x01, 0xac],
+            2,
+            vec![pi(0), pi(1)],
+            md,
+        );
+        let args = [Value::Int(19), Value::Int(23)];
+        let result = try_invoke(caller, b"(II)I", true, &args, 0).unwrap();
+        assert_eq!(int_result(result), 42);
+    }
+
+    #[test]
+    fn jit_call_deep_chain_jit_to_jit_to_jit() {
+        let _loader = test_loader();
+        // leaf: bipush 7; ireturn -> ()I
+        let leaf = compile_and_publish(&[0x10, 0x07, 0xac], 0, Vec::new());
+        // mid: invokestatic leaf; ireturn -> ()I  (direct target = leaf)
+        let mut mid_md = MethodMetadata::default();
+        mid_md.call_sites.insert(
+            1,
+            call_site(0xb8, vec![], ValueKind::Int32, true, Some(leaf as u64)),
+        );
+        mid_md.sites.insert(1, site("L", "v", "()I"));
+        let mid = compile_meta(&[0xb8, 0x00, 0x01, 0xac], 0, Vec::new(), mid_md);
+        // top: invokestatic mid; ireturn -> ()I  (direct target = mid)
+        let mut top_md = MethodMetadata::default();
+        top_md.call_sites.insert(
+            1,
+            call_site(0xb8, vec![], ValueKind::Int32, true, Some(mid as u64)),
+        );
+        top_md.sites.insert(1, site("M", "v", "()I"));
+        let top = compile_meta(&[0xb8, 0x00, 0x01, 0xac], 0, Vec::new(), top_md);
+        let result = try_invoke(top, b"()I", true, &[], 0).unwrap();
+        assert_eq!(int_result(result), 7);
+    }
+
+    #[test]
+    fn jit_call_throwing_callee_propagates() {
+        let _loader = test_loader();
+        // bad: iconst_1; iconst_0; idiv; ireturn -> ()I (div-by-zero stub)
+        let bad = compile_and_publish(&[0x04, 0x03, 0x6c, 0xac], 1, Vec::new());
+        let mut md = MethodMetadata::default();
+        md.call_sites.insert(
+            1,
+            call_site(0xb8, vec![], ValueKind::Int32, true, Some(bad as u64)),
+        );
+        md.sites.insert(1, site("B", "boom", "()I"));
+        let caller = compile_meta(&[0xb8, 0x00, 0x01, 0xac], 0, Vec::new(), md);
+        let result = try_invoke(caller, b"()I", true, &[], 0).unwrap();
+        assert!(
+            matches!(result, CompiledResult::Deoptimize | CompiledResult::Thrown(_)),
+            "unexpected result: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn jit_call_recursive_interpreted() {
+        let loader = test_loader();
+        // R.rec(I)I: n<=0 -> 0 else n + rec(n-1); invokestatic targets
+        // cp#6 = Methodref(R.rec(I)I) built below.
+        let rec_code: &'static [u8] = Box::leak(
+            vec![
+                0x1a, 0x9e, 0x00, 0x0c, 0x1a, 0x1a, 0x04, 0x64, 0xb8, 0x00, 0x06, 0x60, 0xac,
+                0x03, 0xac,
+            ]
+            .into_boxed_slice(),
+        );
+        use crate::share::classfile::classFileParser::Constant;
+        register_method_klass_cp(
+            &loader,
+            b"R",
+            b"rec",
+            b"(I)I",
+            0x0009,
+            rec_code,
+            1,
+            vec![
+                Constant::Unusable,
+                Constant::Utf8(b"R"),
+                Constant::Utf8(b"rec"),
+                Constant::Utf8(b"(I)I"),
+                Constant::Class(1),
+                Constant::NameAndType(2, 3),
+                Constant::MethodRef(4, 5),
+            ],
+        );
+        let mut md = MethodMetadata::default();
+        md.call_sites.insert(
+            1,
+            call_site(0xb8, vec![ValueKind::Int32], ValueKind::Int32, true, None),
+        );
+        md.sites.insert(1, site("R", "rec", "(I)I"));
+        // caller: iload_0; invokestatic #1; ireturn -> (I)I
+        let caller = compile_meta(
+            &[0x1a, 0xb8, 0x00, 0x01, 0xac],
+            1,
+            vec![pi(0)],
+            md,
+        );
+        let args = [Value::Int(4)];
+        let result = try_invoke(caller, b"(I)I", true, &args, 0).unwrap();
+        assert_eq!(int_result(result), 10);
+    }
+
+    #[test]
+    fn debug_rec_interpreted_direct() {
+        let loader = test_loader();
+        let rec_code: &'static [u8] = Box::leak(
+            vec![
+                0x1a, 0x9e, 0x00, 0x0c, 0x1a, 0x1a, 0x04, 0x64, 0xb8, 0x00, 0x06, 0x60, 0xac,
+                0x03, 0xac,
+            ]
+            .into_boxed_slice(),
+        );
+        use crate::share::classfile::classFileParser::Constant;
+        let r = register_method_klass_cp(
+            &loader,
+            b"R",
+            b"rec",
+            b"(I)I",
+            0x0009,
+            rec_code,
+            1,
+            vec![
+                Constant::Unusable,
+                Constant::Utf8(b"R"),
+                Constant::Utf8(b"rec"),
+                Constant::Utf8(b"(I)I"),
+                Constant::Class(1),
+                Constant::NameAndType(2, 3),
+                Constant::MethodRef(4, 5),
+            ],
+        );
+        let (target, code) = crate::share::interpreter::linkResolver::LinkResolver::resolve_static_call(
+            &r, b"rec", b"(I)I",
+        )
+        .unwrap();
+        let result = crate::share::interpreter::bytecodeInterpreter::execute_labeled(
+            &loader,
+            &target,
+            code,
+            &[Value::Int(4)],
+            &mut std::io::sink(),
+            0,
+            0x0009,
+            None,
+        );
+        eprintln!("direct result: {result:?}");
+        assert!(result.is_ok());
     }
 }

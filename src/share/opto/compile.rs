@@ -12,7 +12,12 @@ use super::builder::{BytecodeGraphBuilder, BuildResult, BuilderContext, MethodCo
 use super::codegen::{compile_schedule, BackendOptions, BackendError};
 use super::gvn::PhaseGVN;
 use super::node::{NodeId, Opcode};
-use super::phase::{Phase, PhaseCCP, PhaseIterGVN, PhaseNumber, PhaseRemoveUselessAndRenumber};
+use super::phase::{
+    IdealLoopResult, Phase, PhaseCCP, PhaseCanonicalizerRun, PhaseIterGVN, PhaseMacroExpandRun,
+    PhaseNumber, PhaseRemoveUselessAndRenumber, PhaseTyperRun,
+};
+use super::phase::PhaseIdealLoopRun;
+use super::r#type::Type;
 use super::regalloc::RegisterAllocator;
 use super::scheduler::Scheduler;
 
@@ -24,6 +29,8 @@ pub struct Compile {
     phases_run: Vec<Phase>,
     pub build: Option<BuildResult>,
     pub optimized: bool,
+    pub node_types: Vec<Type>,
+    pub loops: Option<IdealLoopResult>,
 }
 
 impl Compile {
@@ -39,6 +46,8 @@ impl Compile {
             phases_run: Vec::new(),
             build: None,
             optimized: false,
+            node_types: Vec::new(),
+            loops: None,
         };
         c.build_graph(method, ctx);
         c
@@ -61,6 +70,38 @@ impl Compile {
     pub fn optimize(&mut self) {
         if self.optimized {
             return;
+        }
+        {
+            let mut phase = Phase::new(PhaseNumber::GVN);
+            PhaseIterGVN::optimize(&mut self.gvn);
+            phase.complete();
+            self.phases_run.push(phase);
+        }
+        {
+            let mut phase = Phase::with_name(PhaseNumber::GVN, "typer");
+            let typer = PhaseTyperRun::optimize(&self.gvn);
+            self.node_types = typer.types;
+            phase.complete();
+            self.phases_run.push(phase);
+        }
+        {
+            let mut phase = Phase::with_name(PhaseNumber::Optimistic, "canonicalizer");
+            PhaseCanonicalizerRun::optimize(&mut self.gvn);
+            phase.complete();
+            self.phases_run.push(phase);
+        }
+        {
+            let mut phase = Phase::with_name(PhaseNumber::MacroExpand, "macroExpand");
+            let mut me = PhaseMacroExpandRun::new();
+            me.optimize(&mut self.gvn);
+            phase.complete();
+            self.phases_run.push(phase);
+        }
+        {
+            let mut phase = Phase::new(PhaseNumber::IdealLoop);
+            self.loops = Some(PhaseIdealLoopRun::optimize(&self.gvn));
+            phase.complete();
+            self.phases_run.push(phase);
         }
         {
             let mut phase = Phase::new(PhaseNumber::GVN);
@@ -159,11 +200,11 @@ mod tests {
 
     #[test]
     fn compiles_add_and_return() {
-        // iconst_2 ; iconst_3 ; iadd ; ireturn
-        let code: &[u8] = &[0x05, 0x06, 0x60, 0xac];
-        let mut c = Compile::compile(&method(code, 0), &BuilderContext::empty());
+        // iload_0 ; iload_0 ; iadd ; ireturn   (static (I)I, param slot 0)
+        let code: &[u8] = &[0x1a, 0x1a, 0x60, 0xac];
+        let mut c = Compile::compile(&method(code, 1), &BuilderContext::empty());
         let emitted = c
-            .backend(&method(code, 0), &BuilderContext::empty(), &BackendOptions::default())
+            .backend(&method(code, 1), &BuilderContext::empty(), &BackendOptions::default())
             .expect("backend should emit code");
         assert!(emitted.code.iter().any(|&b| b == 0x03)); // add r,r/m
         assert!(emitted.code.iter().any(|&b| b == 0xc3));
@@ -186,5 +227,127 @@ mod tests {
             .backend(&method(code, 1), &BuilderContext::empty(), &options)
             .expect("backend should emit code");
         assert!(emitted.code.iter().any(|&b| b == 0xc3));
+    }
+
+    fn stub_map(entries: &[(crate::share::c1::c1_LIR::RuntimeStub, u64)]) -> std::collections::BTreeMap<crate::share::c1::c1_LIR::RuntimeStub, u64> {
+        entries.iter().copied().collect()
+    }
+
+    #[test]
+    fn compiles_idiv_with_arith_stub() {
+        // iload_0 ; iload_1 ; idiv ; ireturn   (static (I,I)I)
+        let code: &[u8] = &[0x1a, 0x1b, 0x6c, 0xac];
+        let params = vec![
+            super::super::codegen::ParamSlot { local_slot: 0, kind: super::super::codegen::ParamKind::I32 },
+            super::super::codegen::ParamSlot { local_slot: 1, kind: super::super::codegen::ParamKind::I32 },
+        ];
+        let options = BackendOptions {
+            params,
+            stubs: stub_map(&[(crate::share::c1::c1_LIR::RuntimeStub::ArithmeticException, 0x1111)]),
+            ..BackendOptions::default()
+        };
+        let mut c = Compile::compile(&method(code, 2), &BuilderContext::empty());
+        let emitted = c
+            .backend(&method(code, 2), &BuilderContext::empty(), &options)
+            .expect("backend should emit idiv");
+        assert!(emitted.code.windows(2).any(|w| w == [0xf7, 0xf9]), "idiv ecx missing: {:02x?}", emitted.code);
+        assert!(emitted.code.windows(2).any(|w| w == [0xff, 0xd0]), "stub call missing");
+        assert!(emitted.code.windows(2).any(|w| w == [0x0f, 0x0b]), "ud2 trap missing");
+    }
+
+    #[test]
+    fn idiv_requires_arith_stub() {
+        let code: &[u8] = &[0x1a, 0x1b, 0x6c, 0xac];
+        let params = vec![
+            super::super::codegen::ParamSlot { local_slot: 0, kind: super::super::codegen::ParamKind::I32 },
+            super::super::codegen::ParamSlot { local_slot: 1, kind: super::super::codegen::ParamKind::I32 },
+        ];
+        let options = BackendOptions {
+            params,
+            ..BackendOptions::default()
+        };
+        let mut c = Compile::compile(&method(code, 2), &BuilderContext::empty());
+        assert!(c
+            .backend(&method(code, 2), &BuilderContext::empty(), &options)
+            .is_err());
+    }
+
+    #[test]
+    fn compiles_iaload_via_stub() {
+        // aload_0 ; iconst_0 ; iaload ; ireturn   (static ([I)I)
+        let code: &[u8] = &[0x2a, 0x03, 0x2e, 0xac];
+        let params = vec![super::super::codegen::ParamSlot {
+            local_slot: 0,
+            kind: super::super::codegen::ParamKind::Ref,
+        }];
+        let options = BackendOptions {
+            params,
+            stubs: stub_map(&[(crate::share::c1::c1_LIR::RuntimeStub::ArrayLoad, 0x2222)]),
+            ..BackendOptions::default()
+        };
+        let mut c = Compile::compile(&method(code, 1), &BuilderContext::empty());
+        let emitted = c
+            .backend(&method(code, 1), &BuilderContext::empty(), &options)
+            .expect("backend should emit array load");
+        assert!(emitted.code.windows(6).any(|w| w == [0x41, 0xb8, 0x00, 0x00, 0x00, 0x00]), "mov r8d,kind(0) missing: {:02x?}", emitted.code);
+        assert!(emitted.code.windows(2).any(|w| w == [0xff, 0xd0]), "stub call missing");
+    }
+
+    #[test]
+    fn compiles_iastore_via_stub() {
+        // aload_0 ; iconst_0 ; iconst_5 ; iastore ; return   (static ([II)V)
+        let code: &[u8] = &[0x2a, 0x03, 0x08, 0x4f, 0xb1];
+        let params = vec![super::super::codegen::ParamSlot {
+            local_slot: 0,
+            kind: super::super::codegen::ParamKind::Ref,
+        }];
+        let options = BackendOptions {
+            params,
+            stubs: stub_map(&[(crate::share::c1::c1_LIR::RuntimeStub::ArrayStore, 0x3333)]),
+            ..BackendOptions::default()
+        };
+        let mut c = Compile::compile(&method(code, 1), &BuilderContext::empty());
+        let emitted = c
+            .backend(&method(code, 1), &BuilderContext::empty(), &options)
+            .expect("backend should emit array store");
+        assert!(emitted.code.windows(6).any(|w| w == [0x41, 0xb9, 0x00, 0x00, 0x00, 0x00]), "mov r9d,kind(0) missing: {:02x?}", emitted.code);
+        assert!(emitted.code.windows(2).any(|w| w == [0xff, 0xd0]), "stub call missing");
+    }
+
+    #[test]
+    fn compiles_arraylength_via_stub() {
+        // aload_0 ; arraylength ; ireturn   (static ([I)I)
+        let code: &[u8] = &[0x2a, 0xbe, 0xac];
+        let params = vec![super::super::codegen::ParamSlot {
+            local_slot: 0,
+            kind: super::super::codegen::ParamKind::Ref,
+        }];
+        let options = BackendOptions {
+            params,
+            stubs: stub_map(&[(crate::share::c1::c1_LIR::RuntimeStub::ArrayLength, 0x4444)]),
+            ..BackendOptions::default()
+        };
+        let mut c = Compile::compile(&method(code, 1), &BuilderContext::empty());
+        let emitted = c
+            .backend(&method(code, 1), &BuilderContext::empty(), &options)
+            .expect("backend should emit arraylength");
+        assert!(emitted.code.windows(2).any(|w| w == [0xff, 0xd0]), "stub call missing");
+    }
+
+    #[test]
+    fn array_ops_require_stubs() {
+        let code: &[u8] = &[0x2a, 0xbe, 0xac];
+        let params = vec![super::super::codegen::ParamSlot {
+            local_slot: 0,
+            kind: super::super::codegen::ParamKind::Ref,
+        }];
+        let options = BackendOptions {
+            params,
+            ..BackendOptions::default()
+        };
+        let mut c = Compile::compile(&method(code, 1), &BuilderContext::empty());
+        assert!(c
+            .backend(&method(code, 1), &BuilderContext::empty(), &options)
+            .is_err());
     }
 }

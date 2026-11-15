@@ -95,6 +95,12 @@ impl<'a> Code<'a> {
         })
     }
 
+    /// Local-variable slots occupied by the method's parameters
+    /// (`ConstMethod::size_of_parameters` equivalent for a `Code`).
+    pub fn parameter_slots(&self) -> io::Result<u16> {
+        super::constMethod::descriptor_parameter_slots(self.descriptor)
+    }
+
     pub fn lineNumber(&self, constants: &[Constant<'_>], bci: u16) -> Option<u16> {
         let mut reader = Reader(self.attributes);
         let mut best = None;
@@ -146,6 +152,17 @@ impl Method {
     pub const ACC_ABSTRACT: u16 = 0x0400;
     pub const ACC_STRICT: u16 = 0x0800;
     pub const ACC_SYNTHETIC: u16 = 0x1000;
+
+    /// Builds a `Method` (with `ConstMethod`) directly from a parsed
+    /// class-file `Member`, recovering bytecodes, frame sizes, the
+    /// exception table and `size_of_parameters`.  Used by the compile
+    /// broker to bridge interpreter `Member`s into JIT metadata.
+    pub fn from_member(member: &Member<'_>) -> io::Result<Self> {
+        Ok(Self::new(
+            Arc::new(ConstMethod::from_member(member)?),
+            member.accessFlags,
+        ))
+    }
 
     pub fn new(const_method: Arc<ConstMethod>, access_flags: u16) -> Self {
         Self {

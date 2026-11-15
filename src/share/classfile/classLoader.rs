@@ -304,6 +304,10 @@ pub struct ClassLoader<'a> {
     /// Classpath origin of each loaded class, used to synthesize the
     /// `protectionDomain`/`CodeSource` a real `defineClass` would store.
     pub(crate) class_origins: Share<HashMap<Vec<u8>, Option<ClassOrigin>>>,
+    /// `ProtectionDomain` object handles supplied to `defineClass*` natives,
+    /// keyed by internal class name. Mirrors the PD a real VM attaches to
+    /// the `InstanceKlass` at definition time.
+    pub(crate) class_protection_domains: Share<HashMap<Vec<u8>, usize>>,
     /// Resolved invoke* targets (klass + parsed Code) keyed by call site.
     /// Method resolution is deterministic per receiver class, so hits skip
     /// the vtable scan and `Code::parse` on every call.
@@ -611,6 +615,7 @@ impl<'a> ClassLoader<'a> {
             class_objects: Share::new(HashMap::new()),
             class_object_names: Share::new(HashMap::new()),
             class_origins: Share::new(HashMap::new()),
+            class_protection_domains: Share::new(HashMap::new()),
             invoke_cache: Share::new(HashMap::new()),
             native_declaring_cache: Share::new(HashMap::new()),
             loader_type: ClassLoaderType::AppLoader,
@@ -703,6 +708,7 @@ impl<'a> ClassLoader<'a> {
             class_objects: Share::new(HashMap::new()),
             class_object_names: Share::new(HashMap::new()),
             class_origins: Share::new(HashMap::new()),
+            class_protection_domains: Share::new(HashMap::new()),
             invoke_cache: Share::new(HashMap::new()),
             native_declaring_cache: Share::new(HashMap::new()),
             loader_type: ClassLoaderType::AppLoader,
@@ -890,6 +896,22 @@ impl<'a> ClassLoader<'a> {
             .flatten()
     }
 
+    /// Records the `ProtectionDomain` object a `defineClass*` native was
+    /// given for `name`, keeping it alive as a GC root.
+    pub(crate) fn record_class_protection_domain(&self, name: &[u8], handle: usize) {
+        self.class_protection_domains
+            .borrow_mut()
+            .insert(name.to_vec(), handle);
+        self.gc_extra_roots
+            .borrow_mut()
+            .push(Value::Object(handle));
+    }
+
+    /// `ProtectionDomain` object handle recorded for `name`, if any.
+    pub fn class_protection_domain(&self, name: &[u8]) -> Option<usize> {
+        self.class_protection_domains.borrow().get(name).copied()
+    }
+
     /// Reads a non-class resource (properties files, data files, ...).
     /// Returns `Ok(None)` when the resource does not exist.
     pub fn open_resource(&self, name: &[u8]) -> io::Result<Option<Vec<u8>>> {
@@ -965,8 +987,20 @@ impl<'a> ClassLoader<'a> {
 
     pub fn load(&self, name: &[u8]) -> io::Result<Arc<InstanceKlass<'a>>> {
         if name.contains(&b'=') {
+            let stack: Vec<String> = self
+                .call_stack
+                .snapshot()
+                .iter()
+                .map(|name| String::from_utf8_lossy(name).into_owned())
+                .collect();
+            let loading: Vec<String> = self
+                .loading
+                .borrow()
+                .iter()
+                .map(|name| String::from_utf8_lossy(name).into_owned())
+                .collect();
             eprintln!(
-                "[load-suspect] name={:?}\n{}",
+                "[load-suspect] name={:?} loading={loading:?} jstack={stack:?}\n{}",
                 String::from_utf8_lossy(name),
                 std::backtrace::Backtrace::force_capture()
             );

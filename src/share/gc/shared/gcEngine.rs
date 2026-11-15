@@ -38,3 +38,23 @@ pub fn heap_gc_mode() -> HeapGcMode {
         mode.unwrap_or(HeapGcMode::SerialMarkSweep)
     })
 }
+
+/// Worker count for the parallel mark-sweep engine (ParallelGC
+/// `-XX:ParallelGCThreads=N`; last occurrence wins). Falls back to the
+/// hardware parallelism, then 4 — same default HotSpot uses for small
+/// heaps.
+pub fn parallel_gc_workers() -> usize {
+    let mut workers = None;
+    for arg in std::env::args_os() {
+        let Some(arg) = arg.to_str() else {
+            continue;
+        };
+        if let Some(value) = arg.strip_prefix("-XX:ParallelGCThreads=") {
+            workers = value.parse::<usize>().ok();
+        }
+    }
+    workers
+        .filter(|count| *count > 0)
+        .or_else(|| std::thread::available_parallelism().ok().map(|n| n.get()))
+        .unwrap_or(4)
+}

@@ -14,6 +14,112 @@ use crate::share::compiler::oopMap::OopMapSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+/// Per-bci live-reference map for deoptimization (`ScopeValue`-level
+/// detail lives in the scope-data blob; this is the conservative
+/// slot-level map the interpreter needs to rebuild a frame: which
+/// local-variable slots and operand-stack slots hold live references
+/// at a given bytecode index).
+///
+/// Slot numbering follows the JVM frame layout: locals are indexed
+/// 0..max_locals (long/double occupy two slots, the second marked
+/// dead), operand-stack slots follow at max_locals..max_locals+depth.
+/// A slot listed here is known to contain a reference at this bci;
+/// slots NOT listed may still hold references the compiler could not
+/// prove dead — callers that need full safety should treat the map as
+/// "at least these are live" and combine it with the oop maps.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeoptLiveMap {
+    bci: i32,
+    /// Local-variable slot indices holding live references.
+    local_ref_slots: Vec<u16>,
+    /// Operand-stack slot indices (0-based within the operand stack,
+    /// NOT including the locals base) holding live references.
+    stack_ref_slots: Vec<u16>,
+}
+
+impl DeoptLiveMap {
+    pub fn new(bci: i32) -> Self {
+        Self {
+            bci,
+            local_ref_slots: Vec::new(),
+            stack_ref_slots: Vec::new(),
+        }
+    }
+
+    /// Most conservative map: every slot of the frame is a live
+    /// reference.  Used when the compiler cannot compute precise liveness
+    /// (e.g. C1 without full dataflow) — deopt then preserves every
+    /// reference-typed slot conservatively.
+    pub fn conservative(bci: i32, local_count: usize, stack_depth: usize) -> Self {
+        let mut m = Self::new(bci);
+        m.local_ref_slots = (0..local_count.min(u16::MAX as usize) as u16).collect();
+        m.stack_ref_slots = (0..stack_depth.min(u16::MAX as usize) as u16).collect();
+        m
+    }
+
+    /// Build from explicit reference-slot sets (locals + operand stack).
+    pub fn from_ref_slots(
+        bci: i32,
+        local_ref_slots: Vec<u16>,
+        stack_ref_slots: Vec<u16>,
+    ) -> Self {
+        Self {
+            bci,
+            local_ref_slots,
+            stack_ref_slots,
+        }
+    }
+
+    #[inline]
+    pub fn bci(&self) -> i32 {
+        self.bci
+    }
+
+    pub fn add_local_ref_slot(&mut self, slot: u16) {
+        if !self.local_ref_slots.contains(&slot) {
+            self.local_ref_slots.push(slot);
+            self.local_ref_slots.sort_unstable();
+        }
+    }
+
+    pub fn add_stack_ref_slot(&mut self, slot: u16) {
+        if !self.stack_ref_slots.contains(&slot) {
+            self.stack_ref_slots.push(slot);
+            self.stack_ref_slots.sort_unstable();
+        }
+    }
+
+    #[inline]
+    pub fn local_ref_slots(&self) -> &[u16] {
+        &self.local_ref_slots
+    }
+
+    #[inline]
+    pub fn stack_ref_slots(&self) -> &[u16] {
+        &self.stack_ref_slots
+    }
+
+    /// Whether local slot `slot` is a live reference at this bci.
+    pub fn is_live_local_ref(&self, slot: u16) -> bool {
+        self.local_ref_slots.binary_search(&slot).is_ok()
+    }
+
+    /// Whether operand-stack slot `slot` (0-based) is a live reference.
+    pub fn is_live_stack_ref(&self, slot: u16) -> bool {
+        self.stack_ref_slots.binary_search(&slot).is_ok()
+    }
+
+    /// Total live references recorded.
+    pub fn live_ref_count(&self) -> usize {
+        self.local_ref_slots.len() + self.stack_ref_slots.len()
+    }
+
+    /// Serialized size estimate for code-cache metadata accounting.
+    pub fn encoded_size(&self) -> usize {
+        8 + self.local_ref_slots.len() * 2 + self.stack_ref_slots.len() * 2
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum NMethodState {
     NotInstalled,
@@ -74,6 +180,11 @@ pub struct NMethodShared {
     pub pc_handlers: std::sync::Mutex<PcRangeHandlerTable>,
     /// Safepoint oop maps.
     pub oop_maps: std::sync::Mutex<OopMapSet>,
+    /// Per-bci live-reference maps for deoptimization, sorted by bci.
+    pub live_maps: std::sync::Mutex<Vec<DeoptLiveMap>>,
+    /// Compiled frame size in bytes (needed to unwind/rebuild the
+    /// interpreter frame on deopt).
+    pub frame_size: AtomicU64,
 }
 
 impl NMethodShared {
@@ -91,6 +202,8 @@ impl NMethodShared {
             handler_table: std::sync::Mutex::new(ExceptionHandlerTable::new(8)),
             pc_handlers: std::sync::Mutex::new(PcRangeHandlerTable::new()),
             oop_maps: std::sync::Mutex::new(OopMapSet::new()),
+            live_maps: std::sync::Mutex::new(Vec::new()),
+            frame_size: AtomicU64::new(0),
         }
     }
 }
@@ -601,6 +714,92 @@ impl NMethod {
         self.shared.oop_maps.lock().unwrap().add_gc_map(pc_offset, map);
     }
 
+    // ---- deoptimization data -----------------------------------------
+
+    /// Compiled frame size in bytes (0 until the compiler reports it).
+    #[inline]
+    pub fn frame_size(&self) -> usize {
+        self.shared.frame_size.load(Ordering::Acquire) as usize
+    }
+
+    pub fn set_frame_size(&self, size: usize) {
+        self.shared.frame_size.store(size as u64, Ordering::Release);
+    }
+
+    /// Replace the per-bci live-reference maps (kept sorted by bci).
+    pub fn set_live_maps(&self, mut maps: Vec<DeoptLiveMap>) {
+        maps.sort_by_key(|m| m.bci);
+        maps.dedup_by_key(|m| m.bci);
+        *self.shared.live_maps.lock().unwrap() = maps;
+    }
+
+    /// Add or replace the live map for one bci.
+    pub fn add_live_map(&self, map: DeoptLiveMap) {
+        let mut maps = self.shared.live_maps.lock().unwrap();
+        match maps.binary_search_by_key(&map.bci, |m| m.bci) {
+            Ok(idx) => maps[idx] = map,
+            Err(idx) => maps.insert(idx, map),
+        }
+    }
+
+    /// All recorded live maps, sorted by bci.
+    pub fn live_maps(&self) -> Vec<DeoptLiveMap> {
+        self.shared.live_maps.lock().unwrap().clone()
+    }
+
+    /// Exact live-reference map for `bci`.
+    pub fn live_map_for_bci(&self, bci: i32) -> Option<DeoptLiveMap> {
+        let maps = self.shared.live_maps.lock().unwrap();
+        maps.binary_search_by_key(&bci, |m| m.bci)
+            .ok()
+            .map(|idx| maps[idx].clone())
+    }
+
+    /// Greatest live map with bci <= `bci` (safepoint granularity is
+    /// per-pc-desc; when no exact bci map exists the previous one is the
+    /// conservative over-approximation of liveness).
+    pub fn live_map_near_bci(&self, bci: i32) -> Option<DeoptLiveMap> {
+        let maps = self.shared.live_maps.lock().unwrap();
+        let idx = maps.partition_point(|m| m.bci <= bci);
+        if idx == 0 {
+            None
+        } else {
+            Some(maps[idx - 1].clone())
+        }
+    }
+
+    /// Combined deopt lookup for a native `pc`: resolves the PcDesc
+    /// (which carries the deopt bci) and returns `(pc_desc, live_map)`.
+    /// The live map is exact-bci first, then nearest-lower fallback.
+    pub fn deopt_info_at_pc(&self, pc: usize) -> Option<(PcDesc, Option<DeoptLiveMap>)> {
+        let pd = self.pc_desc_near(pc)?;
+        let bci = pd.bci();
+        let map = if bci != PcDesc::UNKNOWN_BCI {
+            self.live_map_for_bci(bci).or_else(|| self.live_map_near_bci(bci))
+        } else {
+            None
+        };
+        Some((pd, map))
+    }
+
+    /// Conservative live map covering the whole frame when the compiler
+    /// produced none: every local slot and a caller-provided operand
+    /// depth are treated as live references.
+    pub fn conservative_live_map(&self, bci: i32, local_count: usize, stack_depth: usize) -> DeoptLiveMap {
+        DeoptLiveMap::conservative(bci, local_count, stack_depth)
+    }
+
+    /// Total encoded size of the deopt live maps (metadata accounting).
+    pub fn live_maps_size(&self) -> usize {
+        self.shared
+            .live_maps
+            .lock()
+            .unwrap()
+            .iter()
+            .map(DeoptLiveMap::encoded_size)
+            .sum()
+    }
+
     pub fn print_on(&self, f: &mut dyn std::fmt::Write) {
         let _ = writeln!(
             f,
@@ -622,9 +821,106 @@ impl NMethod {
         if self.is_marked_for_deoptimization() {
             let _ = writeln!(f, "  marked for deoptimization");
         }
-        let _ = writeln!(f, "  pc_descs={} scopes={} oop_maps={}",
+        let _ = writeln!(f, "  pc_descs={} scopes={} oop_maps={} live_maps={}",
             self.pc_descs.len(),
             self.scopes.len(),
-            self.shared.oop_maps.lock().unwrap().size());
+            self.shared.oop_maps.lock().unwrap().size(),
+            self.shared.live_maps.lock().unwrap().len());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::share::compiler::compilerDefinitions::CompLevel;
+
+    fn test_nm() -> NMethod {
+        NMethod::with_entry_points(
+            "holder".to_string(),
+            "foo".to_string(),
+            "()V".to_string(),
+            CompLevel::FullProfile,
+            -1,
+            0x1000,
+            256,
+            0x1000,
+            0x1000,
+            0x1000,
+            vec![
+                PcDesc::new(PcDesc::LOWER_OFFSET_LIMIT, 0, 0),
+                PcDesc::with_bci(10, 0, 0, PcDesc::PCDESC_REEXECUTE, 4),
+                PcDesc::with_bci(20, 0, 0, 0, 8),
+                PcDesc::new(PcDesc::UPPER_OFFSET_LIMIT, 0, 0),
+            ],
+            Vec::new(),
+        )
+    }
+
+    #[test]
+    fn live_maps_sorted_and_lookup() {
+        let nm = test_nm();
+        nm.set_live_maps(vec![
+            DeoptLiveMap::from_ref_slots(8, vec![0, 2], vec![1]),
+            DeoptLiveMap::from_ref_slots(4, vec![0], vec![]),
+        ]);
+        let maps = nm.live_maps();
+        assert_eq!(maps.len(), 2);
+        assert_eq!(maps[0].bci(), 4);
+        assert_eq!(maps[1].bci(), 8);
+        let m = nm.live_map_for_bci(8).unwrap();
+        assert!(m.is_live_local_ref(2));
+        assert!(!m.is_live_local_ref(1));
+        assert!(m.is_live_stack_ref(1));
+        // near lookup falls back to greatest bci <= target
+        let near = nm.live_map_near_bci(6).unwrap();
+        assert_eq!(near.bci(), 4);
+        assert!(nm.live_map_near_bci(3).is_none());
+    }
+
+    #[test]
+    fn deopt_info_at_pc_uses_pcdesc_bci() {
+        let nm = test_nm();
+        nm.set_live_maps(vec![DeoptLiveMap::from_ref_slots(4, vec![0], vec![])]);
+        // pc 0x1000+15 -> nearest pc_desc is offset 10 -> bci 4
+        let (pd, map) = nm.deopt_info_at_pc(0x1000 + 15).unwrap();
+        assert_eq!(pd.bci(), 4);
+        assert!(map.is_some());
+        // pc before first real desc still resolves to sentinel (bci unknown)
+        let (pd2, map2) = nm.deopt_info_at_pc(0x1000).unwrap();
+        assert_eq!(pd2.bci(), PcDesc::UNKNOWN_BCI);
+        assert!(map2.is_none());
+    }
+
+    #[test]
+    fn conservative_map_covers_frame() {
+        let m = DeoptLiveMap::conservative(3, 4, 2);
+        assert_eq!(m.live_ref_count(), 6);
+        assert!(m.is_live_local_ref(3));
+        assert!(m.is_live_stack_ref(1));
+        assert!(!m.is_live_stack_ref(2));
+    }
+
+    #[test]
+    fn state_transitions() {
+        let nm = test_nm();
+        assert!(nm.is_in_use());
+        assert!(nm.make_not_entrant_with_reason(InvalidationReason::MarkedForDeoptimization));
+        assert!(nm.is_not_entrant());
+        nm.make_not_entrant(); // already not in use: no-op
+        nm.mark_for_deoptimization();
+        assert!(nm.is_marked_for_deoptimization());
+        nm.make_zombie();
+        assert!(nm.is_zombie());
+        assert!(nm.is_unloaded());
+        nm.deoptimization_done();
+        assert!(nm.is_deoptimization_done());
+    }
+
+    #[test]
+    fn frame_size_accessor() {
+        let nm = test_nm();
+        assert_eq!(nm.frame_size(), 0);
+        nm.set_frame_size(48);
+        assert_eq!(nm.frame_size(), 48);
     }
 }

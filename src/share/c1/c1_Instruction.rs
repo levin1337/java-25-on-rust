@@ -176,6 +176,9 @@ pub struct CallInfo {
     pub is_interface: bool,
     pub target: Option<u64>,
     pub resolved: bool,
+    /// Leaked `StubSite` pointer for the CallMethod stub; 0 when the
+    /// constant-pool site was not resolved (stub deopts).
+    pub site: u64,
 }
 
 impl CallInfo {
@@ -190,6 +193,7 @@ impl CallInfo {
             is_interface: opcode == 0xb9,
             target: None,
             resolved: false,
+            site: 0,
         }
     }
 

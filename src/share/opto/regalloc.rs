@@ -25,7 +25,7 @@ use super::scheduler::{
     collect_materialized, effect_value_indices, phis_of_region, region_pred_index,
     terminal_value_indices, Schedule,
 };
-use crate::share::c1::asm::register::{Register, XMMRegister};
+use super::asm::register::{Register, XMMRegister};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

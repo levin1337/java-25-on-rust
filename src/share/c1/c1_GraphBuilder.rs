@@ -3,6 +3,7 @@ use super::c1_Instruction::{
     ArrayElemKind, BlockBegin, CallInfo, CompareKind, Condition, ConvertKind, HirInstruction,
     ValueKind,
 };
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -44,6 +45,7 @@ impl CallSiteInfo {
             is_interface: self.is_interface,
             target: self.target,
             resolved: true,
+            site: 0,
         }
     }
 }
@@ -89,6 +91,41 @@ impl StackValue {
     }
 }
 
+/// `true` when re-emitting `expr` is not semantics-preserving: the
+/// node allocates, calls into the runtime, reads mutable heap state
+/// or can throw.  `dup*` handlers spill such expressions to a frame
+/// slot so the lowered code evaluates them once; pure trees (constants,
+/// local/stack loads, arithmetic, conversions, comparisons) may be
+/// shared freely because re-emission is side-effect free.
+fn expr_needs_spill(expr: &HirInstruction) -> bool {
+    match expr {
+        HirInstruction::ConstantInt(_)
+        | HirInstruction::ConstantLong(_)
+        | HirInstruction::ConstantFloat(_)
+        | HirInstruction::ConstantDouble(_)
+        | HirInstruction::ConstantNull
+        | HirInstruction::LoadLocal { .. }
+        | HirInstruction::LoadStack { .. } => false,
+        HirInstruction::Add(l, r)
+        | HirInstruction::Sub(l, r)
+        | HirInstruction::Mul(l, r)
+        | HirInstruction::Div(l, r)
+        | HirInstruction::Rem(l, r)
+        | HirInstruction::And(l, r)
+        | HirInstruction::Or(l, r)
+        | HirInstruction::Xor(l, r)
+        | HirInstruction::Shl(l, r)
+        | HirInstruction::Shr(l, r)
+        | HirInstruction::Ushr(l, r) => expr_needs_spill(l) || expr_needs_spill(r),
+        HirInstruction::Neg(v) => expr_needs_spill(v),
+        HirInstruction::Convert { value, .. } => expr_needs_spill(value),
+        HirInstruction::Compare { left, right, .. } => {
+            expr_needs_spill(left) || expr_needs_spill(right)
+        }
+        _ => true,
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct AbsValue {
     kind: ValueKind,
@@ -127,6 +164,81 @@ pub fn ldc_cp_indices(code: &[u8]) -> Vec<u32> {
     out
 }
 
+/// Resolves every heap-touching constant-pool index in `code`
+/// (field get/put, static get/put, new/checkcast/instanceof/
+/// anewarray) against `klass` and merges the results into
+/// `metadata.sites`/`metadata.fields`.  Entries already present are
+/// kept so broker-supplied metadata wins.  This is what lets the
+/// executable tier lower heap ops to `CallRuntime` stubs with real
+/// `StubSite` pointers instead of deoptimizing unconditionally.
+pub fn resolve_heap_sites(
+    klass: &crate::share::oops::instanceKlass::InstanceKlass<'_>,
+    code: &[u8],
+    metadata: &mut MethodMetadata,
+) {
+    let gb = GraphBuilder::new(code, 0);
+    let mut bci = 0usize;
+    while bci < code.len() {
+        let op = code[bci];
+        let cp_ops = matches!(
+            op,
+            0xb2 | 0xb3 | 0xb4 | 0xb5 | 0xb6..=0xba | 0xbb | 0xbd | 0xc0 | 0xc1
+        );
+        if cp_ops && bci + 2 < code.len() {
+            let idx = u16::from_be_bytes([code[bci + 1], code[bci + 2]]) as u32;
+            if idx != 0 && !metadata.sites.contains_key(&idx) {
+                match op {
+                    // Invoke instructions: the site triple feeds the
+                    // CallMethod stub (owner/name/descriptor), exactly
+                    // like the heap-op sites feed the field stubs.
+                    0xb6..=0xba => {
+                        if let Ok([owner, name, desc]) = klass.memberRef(idx as u16, false) {
+                            metadata.sites.insert(
+                                idx,
+                                SiteInfo {
+                                    class: String::from_utf8_lossy(owner).into_owned(),
+                                    name: String::from_utf8_lossy(name).into_owned(),
+                                    desc: String::from_utf8_lossy(desc).into_owned(),
+                                },
+                            );
+                        }
+                    }
+                    0xb2 | 0xb3 | 0xb4 | 0xb5 => {
+                        if let Ok([owner, name, desc]) = klass.memberRef(idx as u16, true) {
+                            metadata.fields.entry(idx).or_insert_with(|| FieldInfo {
+                                kind: ValueKind::from_descriptor(desc),
+                                offset: None,
+                                name: String::from_utf8_lossy(name).into_owned(),
+                            });
+                            metadata.sites.insert(
+                                idx,
+                                SiteInfo {
+                                    class: String::from_utf8_lossy(owner).into_owned(),
+                                    name: String::from_utf8_lossy(name).into_owned(),
+                                    desc: String::from_utf8_lossy(desc).into_owned(),
+                                },
+                            );
+                        }
+                    }
+                    _ => {
+                        if let Ok(class) = klass.className(idx as u16) {
+                            metadata.sites.insert(
+                                idx,
+                                SiteInfo {
+                                    class: String::from_utf8_lossy(class).into_owned(),
+                                    name: String::new(),
+                                    desc: String::new(),
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        bci = gb.next_bci(bci);
+    }
+}
+
 /// Maps a resolved class-file `Constant` to the HIR constant node used
 /// for `ldc`/`ldc2_w`.  Returns `None` for reference constants
 /// (String/Class/MethodType/condy...) which cannot live in the
@@ -146,15 +258,19 @@ pub struct GraphBuilder<'a> {
     pub code: &'a [u8],
     pub max_locals: usize,
     pub metadata: MethodMetadata,
+    /// Spill slots handed out to duplicated non-trivial expressions
+    /// (see `spill_value`); `build_cfg` folds the final count into
+    /// `ControlFlowGraph::max_stack_entries`.
+    spill_count: Cell<usize>,
 }
 
 impl<'a> GraphBuilder<'a> {
     pub fn new(code: &'a [u8], max_locals: usize) -> Self {
-        Self { code, max_locals, metadata: MethodMetadata::default() }
+        Self { code, max_locals, metadata: MethodMetadata::default(), spill_count: Cell::new(0) }
     }
 
     pub fn with_metadata(code: &'a [u8], max_locals: usize, metadata: MethodMetadata) -> Self {
-        Self { code, max_locals, metadata }
+        Self { code, max_locals, metadata, spill_count: Cell::new(0) }
     }
 
     pub fn max_locals(&self) -> usize {
@@ -193,6 +309,10 @@ impl<'a> GraphBuilder<'a> {
             let (start, end) = self.block_range(&leaders, i);
             self.build_block(&mut cfg, i, start, end, &bci_to_block_id, states.get(i).and_then(|s| s.as_ref()));
         }
+        // Spill slots live above the operand-stack region; grow it so
+        // `stack_count` covers every `LoadStack`/`StoreStack` index the
+        // dup handlers may have emitted.
+        cfg.max_stack_entries += self.spill_count.get();
         cfg.compute_predecessors();
         cfg
     }
@@ -664,12 +784,12 @@ impl<'a> GraphBuilder<'a> {
                 0x4f..=0x56 => self.array_store(cfg, block_id, &mut stack, op),
                 0x57 => { self.pop(&mut stack); }
                 0x58 => { self.pop2(&mut stack); }
-                0x59 => { if let Some(v) = stack.last().cloned() { stack.push(v); } }
-                0x5a => { self.dup_x(&mut stack, 1, false); }
-                0x5b => { self.dup_x(&mut stack, 2, false); }
-                0x5c => { self.dup2(&mut stack); }
-                0x5d => { self.dup2_x(&mut stack, 1); }
-                0x5e => { self.dup2_x(&mut stack, 2); }
+                0x59 => { self.dup_top(cfg, block_id, &mut stack); }
+                0x5a => { self.dup_x(cfg, block_id, &mut stack, 1, false); }
+                0x5b => { self.dup_x(cfg, block_id, &mut stack, 2, false); }
+                0x5c => { self.dup2(cfg, block_id, &mut stack); }
+                0x5d => { self.dup2_x(cfg, block_id, &mut stack, 1); }
+                0x5e => { self.dup2_x(cfg, block_id, &mut stack, 2); }
                 0x5f => { if stack.len() >= 2 { let n = stack.len(); stack.swap(n - 1, n - 2); } }
                 0x60..=0x83 => {
                     let kind = self.arith_kind(op);
@@ -869,40 +989,118 @@ impl<'a> GraphBuilder<'a> {
         if stack.last().map(|v| v.slots) == Some(2) { stack.pop(); } else { stack.pop(); stack.pop(); }
     }
 
-    fn dup_x(&self, stack: &mut Vec<StackValue>, below: usize, _wide: bool) {
+    /// `dup`: duplicates the top stack value.  Trivial expressions
+    /// (constants, local/stack loads, pure arithmetic) may share the
+    /// tree — re-emission is side-effect free — but anything that can
+    /// allocate, call, throw or observe mutable heap state is spilled
+    /// to a dedicated stack slot first so it is evaluated exactly
+    /// once, like the JVM's operand-stack value.
+    fn dup_top(&self, cfg: &mut ControlFlowGraph, block_id: usize, stack: &mut Vec<StackValue>) {
+        let Some(v) = stack.last_mut() else { return };
+        let kind = v.kind;
+        if !expr_needs_spill(&v.expr) {
+            if let Some(top) = stack.last().cloned() {
+                stack.push(top);
+            }
+            return;
+        }
+        let expr = std::mem::replace(&mut v.expr, HirInstruction::ConstantInt(0));
+        let spilled = self.spill_value(cfg, block_id, expr, kind);
+        v.expr = spilled.clone();
+        stack.push(StackValue::new(spilled, kind));
+    }
+
+    /// Emits `StoreStack{spill_slot} = expr` into the current block
+    /// and returns the `LoadStack` that reads it back.  Spill slots
+    /// are allocated above `max_stack_entries` (the operand-stack
+    /// region) and never reused within the method, so a spilled value
+    /// stays valid in its frame slot even when the `LoadStack` is
+    /// consumed by a successor block.
+    fn spill_value(
+        &self,
+        cfg: &mut ControlFlowGraph,
+        block_id: usize,
+        expr: HirInstruction,
+        kind: ValueKind,
+    ) -> HirInstruction {
+        let slot = cfg.max_stack_entries + self.spill_count.get();
+        self.spill_count.set(self.spill_count.get() + 1);
+        cfg.blocks[block_id].push(HirInstruction::StoreStack {
+            slot,
+            kind,
+            value: Box::new(expr),
+        });
+        HirInstruction::LoadStack { slot, kind }
+    }
+
+    /// Replaces `value.expr` with a spill `LoadStack` when the
+    /// expression must be evaluated once; returns the operand both
+    /// duplicated stack entries should carry.
+    fn dup_operand(
+        &self,
+        cfg: &mut ControlFlowGraph,
+        block_id: usize,
+        value: &mut StackValue,
+    ) -> HirInstruction {
+        let kind = value.kind;
+        if !expr_needs_spill(&value.expr) {
+            return value.expr.clone();
+        }
+        let expr = std::mem::replace(&mut value.expr, HirInstruction::ConstantInt(0));
+        self.spill_value(cfg, block_id, expr, kind)
+    }
+
+    fn dup_x(&self, cfg: &mut ControlFlowGraph, block_id: usize, stack: &mut Vec<StackValue>, below: usize, _wide: bool) {
         if stack.len() <= below { return; }
-        let top = stack.pop().unwrap();
+        let mut top = stack.pop().unwrap();
         let split = stack.len().saturating_sub(below);
+        let operand = self.dup_operand(cfg, block_id, &mut top);
         let mut tail = Vec::with_capacity(stack.len() + below + 1);
         tail.extend(stack.drain(..split));
-        tail.push(top.clone());
+        tail.push(StackValue::new(operand.clone(), top.kind));
         tail.extend(stack.drain(..));
-        tail.push(top);
+        tail.push(StackValue::new(operand, top.kind));
         *stack = tail;
     }
 
-    fn dup2(&self, stack: &mut Vec<StackValue>) {
+    fn dup2(&self, cfg: &mut ControlFlowGraph, block_id: usize, stack: &mut Vec<StackValue>) {
         if stack.last().map(|v| v.slots) == Some(2) {
-            if let Some(v) = stack.last().cloned() { stack.push(v); }
+            self.dup_top(cfg, block_id, stack);
             return;
         }
         if stack.len() >= 2 {
-            let a = stack[stack.len() - 2].clone();
-            let b = stack[stack.len() - 1].clone();
+            let mut a = stack.remove(stack.len() - 2);
+            let mut b = stack.pop().unwrap();
+            let oa = self.dup_operand(cfg, block_id, &mut a);
+            let ob = self.dup_operand(cfg, block_id, &mut b);
+            stack.push(StackValue::new(oa, a.kind));
+            stack.push(StackValue::new(ob, b.kind));
             stack.push(a);
             stack.push(b);
         }
     }
 
-    fn dup2_x(&self, stack: &mut Vec<StackValue>, below: usize) {
+    fn dup2_x(&self, cfg: &mut ControlFlowGraph, block_id: usize, stack: &mut Vec<StackValue>, below: usize) {
         if stack.len() <= below + 1 { return; }
-        let group: Vec<StackValue> = if stack.last().map(|v| v.slots) == Some(2) { vec![stack.pop().unwrap()] } else { vec![stack.remove(stack.len() - 2), stack.pop().unwrap()] };
+        let mut group: Vec<StackValue> = if stack.last().map(|v| v.slots) == Some(2) {
+            vec![stack.pop().unwrap()]
+        } else {
+            vec![stack.remove(stack.len() - 2), stack.pop().unwrap()]
+        };
+        let operands: Vec<HirInstruction> = group
+            .iter_mut()
+            .map(|v| self.dup_operand(cfg, block_id, v))
+            .collect();
         let split = stack.len().saturating_sub(below);
         let mut tail = Vec::new();
         tail.extend(stack.drain(..split));
-        tail.extend(group.iter().cloned());
+        for (v, op) in group.iter().zip(operands.iter()) {
+            tail.push(StackValue::new(op.clone(), v.kind));
+        }
         tail.extend(stack.drain(..));
-        tail.extend(group);
+        for (v, op) in group.iter().zip(operands.iter()) {
+            tail.push(StackValue::new(op.clone(), v.kind));
+        }
         *stack = tail;
     }
 
@@ -1018,7 +1216,7 @@ fn convert_result_kind(kind: ConvertKind) -> ValueKind {
 }
 
 fn newarray_elem(dim: u8) -> ArrayElemKind {
-    match dim { 4 => ArrayElemKind::Boolean, 5 => ArrayElemKind::Byte, 6 => ArrayElemKind::Char, 7 => ArrayElemKind::Short, 8 => ArrayElemKind::Int, 9 => ArrayElemKind::Long, 10 => ArrayElemKind::Float, 11 => ArrayElemKind::Double, _ => ArrayElemKind::Int }
+    match dim { 4 => ArrayElemKind::Boolean, 5 => ArrayElemKind::Char, 6 => ArrayElemKind::Float, 7 => ArrayElemKind::Double, 8 => ArrayElemKind::Byte, 9 => ArrayElemKind::Short, 10 => ArrayElemKind::Int, 11 => ArrayElemKind::Long, _ => ArrayElemKind::Int }
 }
 
 fn array_elem(op: u8) -> ArrayElemKind {

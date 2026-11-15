@@ -781,3 +781,112 @@ impl CompilerOracle {
             .inline_decision(class_name, method_name, signature)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exclude_blocks_matching_method_only() {
+        let mut o = CompilerOracle::new();
+        o.register_bool(CompileCommandEnum::Exclude, "com/example/Foo.hot", true);
+        assert!(o.should_exclude("com/example/Foo", "hot", "()V"));
+        assert!(!o.should_exclude("com/example/Foo", "cold", "()V"));
+        assert!(!o.should_exclude("com/example/Bar", "hot", "()V"));
+        // Wildcard class pattern (`*` matches any sequence, '/' included).
+        let mut o = CompilerOracle::new();
+        o.register_bool(CompileCommandEnum::Exclude, "*.hot", true);
+        assert!(o.should_exclude("a/b/C", "hot", "()I"));
+        assert!(!o.should_exclude("a/b/C", "hot2", "()I"));
+    }
+
+    #[test]
+    fn compile_only_excludes_everything_else() {
+        let mut o = CompilerOracle::new();
+        o.register_bool(CompileCommandEnum::CompileOnly, "com/example/Foo.keep", true);
+        assert!(!o.should_exclude("com/example/Foo", "keep", "()V"));
+        assert!(o.should_exclude("com/example/Foo", "drop", "()V"));
+        assert!(o.should_exclude("other/Bar", "keep", "()V"));
+    }
+
+    #[test]
+    fn exclude_false_does_not_block() {
+        let mut o = CompilerOracle::new();
+        o.register_bool(CompileCommandEnum::Exclude, "com/example/Foo.x", false);
+        assert!(!o.should_exclude("com/example/Foo", "x", "()V"));
+    }
+
+    #[test]
+    fn inline_decision_last_matching_rule_wins() {
+        let mut o = CompilerOracle::new();
+        o.register_bool(CompileCommandEnum::Inline, "com/example/Foo.m", true);
+        o.register_bool(CompileCommandEnum::DontInline, "com/example/Foo.m", true);
+        assert_eq!(
+            o.inline_decision("com/example/Foo", "m", "()V"),
+            InlineDecision::DontInline
+        );
+        assert!(o.should_not_inline("com/example/Foo", "m", "()V"));
+        assert!(!o.should_inline("com/example/Foo", "m", "()V"));
+
+        // Reversed order: inline registered last wins.
+        let mut o = CompilerOracle::new();
+        o.register_bool(CompileCommandEnum::DontInline, "com/example/Foo.m", true);
+        o.register_bool(CompileCommandEnum::Inline, "com/example/Foo.m", true);
+        assert_eq!(
+            o.inline_decision("com/example/Foo", "m", "()V"),
+            InlineDecision::Inline
+        );
+
+        // Exclude forces DontInline for inlining purposes.
+        let mut o = CompilerOracle::new();
+        o.register_bool(CompileCommandEnum::Exclude, "com/example/Foo.m", true);
+        assert_eq!(
+            o.inline_decision("com/example/Foo", "m", "()V"),
+            InlineDecision::DontInline
+        );
+
+        // Signature-qualified pattern: `(*)` wildcard matches any
+        // descriptor; a literal signature component must match exactly.
+        let mut o = CompilerOracle::new();
+        o.register_bool(CompileCommandEnum::DontInline, "com/example/Foo.m(*)", true);
+        assert!(o.should_not_inline("com/example/Foo", "m", "(I)I"));
+        assert!(o.should_not_inline("com/example/Foo", "m", "()V"));
+        assert!(!o.should_not_inline("com/example/Foo", "other", "(I)I"));
+    }
+
+    #[test]
+    fn compile_threshold_scaling_value() {
+        let mut o = CompilerOracle::new();
+        o.register(
+            CompileCommandEnum::CompileThresholdScaling,
+            "com/example/Foo.hot",
+            Some(OptionValue::Double(0.5)),
+        );
+        assert_eq!(o.compile_threshold_scaling("com/example/Foo", "hot", "()V"), Some(0.5));
+        assert_eq!(o.compile_threshold_scaling("com/example/Foo", "cold", "()V"), None);
+        // Later rule wins.
+        o.register(
+            CompileCommandEnum::CompileThresholdScaling,
+            "com/example/Foo.hot",
+            Some(OptionValue::Double(2.0)),
+        );
+        assert_eq!(o.compile_threshold_scaling("com/example/Foo", "hot", "()V"), Some(2.0));
+    }
+
+    #[test]
+    fn parse_compile_command_flag_and_file_forms() {
+        let mut o = CompilerOracle::new();
+        o.parse_compile_command("exclude,com/example/Foo.bad").unwrap();
+        assert!(o.should_exclude("com/example/Foo", "bad", "()V"));
+
+        let mut o = CompilerOracle::new();
+        o.parse_compile_command("compileonly com/example/Foo.only").unwrap();
+        assert!(!o.should_exclude("com/example/Foo", "only", "()V"));
+        assert!(o.should_exclude("com/example/Foo", "other", "()V"));
+
+        let mut o = CompilerOracle::new();
+        o.parse_compile_command("compilethresholdscaling,com/example/Foo.slow,4.0")
+            .unwrap();
+        assert_eq!(o.compile_threshold_scaling("com/example/Foo", "slow", "()V"), Some(4.0));
+    }
+}

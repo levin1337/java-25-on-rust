@@ -320,6 +320,18 @@ impl CodeCache {
         format!("{}.{}{}", holder, name, sig)
     }
 
+    /// Key under which an nmethod's heap blob is registered in
+    /// `nmethod_blobs`: regular nmethods use the plain method key,
+    /// OSR nmethods append `@entry_bci`.
+    pub fn blob_key(holder: &str, name: &str, sig: &str, entry_bci: i32) -> String {
+        let key = Self::method_key(holder, name, sig);
+        if entry_bci == NMethod::INVOCATION_ENTRY_BCI {
+            key
+        } else {
+            format!("{}@{}", key, entry_bci)
+        }
+    }
+
     /// Insert an nmethod into the registries and the pc index.
     /// Regular nmethods go into `nmethods`; OSR nmethods go into
     /// `osr_nmethods` keyed by (method_key, entry_bci).  Both are
@@ -557,8 +569,16 @@ impl CodeCache {
             nm.method_signature()
         );
         let addr = self.allocate_nmethod_blob(name, blob_type, total, code_bytes.clone())?;
-        let method_key = Self::method_key(nm.method_holder(), nm.method_name(), nm.method_signature());
-        self.register_nmethod_blob(&method_key, addr);
+        // OSR nmethods share the method key; key their heap blob by
+        // (method_key, entry_bci) so regular and OSR blobs don't
+        // overwrite each other in `nmethod_blobs`.
+        let blob_key = Self::blob_key(
+            nm.method_holder(),
+            nm.method_name(),
+            nm.method_signature(),
+            nm.entry_bci(),
+        );
+        self.register_nmethod_blob(&blob_key, addr);
         // The heap address is only a bookkeeping key: CodeHeap does not
         // reserve real memory.  Materialize the code bytes into an RWW
         // region so `entry_point` is actually callable, and relocate
@@ -609,7 +629,7 @@ impl CodeCache {
     }
 
     pub fn make_not_entrant_by_key(&self, key: &str) -> bool {
-        let mut guard = self.nmethods.lock().unwrap();
+        let guard = self.nmethods.lock().unwrap();
         if let Some(nm) = guard.get(key) {
             // NMethod methods take &self (shared atomics), so no mut needed.
             return nm.make_not_entrant_with_reason(
@@ -626,6 +646,44 @@ impl CodeCache {
                 nm.mark_for_deoptimization();
             }
         }
+    }
+
+    /// Immediate deinstallation of every nmethod for `method_key`
+    /// (regular + all OSR variants): mark for deoptimization, force the
+    /// NotEntrant -> Zombie transition and reclaim the heap blobs and
+    /// pc-index entries right away, without waiting for a sweeper
+    /// cycle.  Returns the number of nmethods removed.  Used for
+    /// dependency invalidation where HotSpot calls
+    /// `nmethod::mark_for_deoptimization` + `make_not_entrant` and lets
+    /// the sweeper finish the job — here the reclaim is synchronous so
+    /// the method's code is guaranteed gone when this returns.
+    pub fn deinstall_nmethod(&self, method_key: &str) -> usize {
+        let regular = self.nmethods.lock().unwrap().remove(method_key);
+        let osr_map = self.osr_nmethods.lock().unwrap().remove(method_key);
+        let mut nms: Vec<NMethod> = Vec::new();
+        if let Some(nm) = regular {
+            nms.push(nm);
+        }
+        if let Some(map) = osr_map {
+            nms.extend(map.into_values());
+        }
+        let count = nms.len();
+        for nm in nms {
+            nm.mark_for_deoptimization();
+            nm.make_not_entrant_with_reason(
+                super::nmethod::InvalidationReason::MarkedForDeoptimization,
+            );
+            nm.make_zombie();
+            self.pc_index.lock().unwrap().remove(&nm.code_begin());
+            let blob_key = Self::blob_key(
+                nm.method_holder(),
+                nm.method_name(),
+                nm.method_signature(),
+                nm.entry_bci(),
+            );
+            self.free_nmethod_blob(&blob_key);
+        }
+        count
     }
 
     /// Pure zombie sweep: drop Zombie nmethods and reclaim their blobs.
@@ -645,13 +703,25 @@ impl CodeCache {
             self.remove_pc_index_for_key(key);
             self.free_nmethod_blob(key);
         }
-        // OSR variants.
+        // OSR variants: drop zombies, free their (bci-suffixed) blobs.
         let mut osr = self.osr_nmethods.lock().unwrap();
+        let mut osr_freed: Vec<(String, i32, usize)> = Vec::new();
         for (key, map) in osr.iter_mut() {
-            map.retain(|_, nm| nm.state() != NMethodState::Zombie);
-            let _ = key;
+            map.retain(|bci, nm| {
+                if nm.state() == NMethodState::Zombie {
+                    osr_freed.push((key.clone(), *bci, nm.code_begin()));
+                    false
+                } else {
+                    true
+                }
+            });
         }
         osr.retain(|_, m| !m.is_empty());
+        drop(osr);
+        for (key, bci, begin) in osr_freed {
+            self.pc_index.lock().unwrap().remove(&begin);
+            self.free_nmethod_blob(&format!("{}@{}", key, bci));
+        }
         swept_keys.len()
     }
 
@@ -692,12 +762,26 @@ impl CodeCache {
             self.free_nmethod_blob(key);
         }
 
+        // OSR pass 1: NotEntrant -> Zombie when no live frame uses them.
+        {
+            let mut osr = self.osr_nmethods.lock().unwrap();
+            for (key, map) in osr.iter_mut() {
+                for nm in map.values() {
+                    if nm.is_not_entrant() && !active_stack_keys.contains(key) {
+                        nm.make_zombie();
+                        summary.transitioned_to_zombie += 1;
+                    }
+                }
+            }
+        }
+
+        // OSR pass 2: reclaim zombies and their blobs.
         let mut osr = self.osr_nmethods.lock().unwrap();
-        let mut osr_zombie_begins = Vec::new();
-        for map in osr.values_mut() {
-            map.retain(|_, nm| {
+        let mut osr_freed: Vec<(String, i32, usize, usize)> = Vec::new();
+        for (key, map) in osr.iter_mut() {
+            map.retain(|bci, nm| {
                 if nm.state() == NMethodState::Zombie {
-                    osr_zombie_begins.push(nm.code_begin());
+                    osr_freed.push((key.clone(), *bci, nm.code_begin(), nm.code_size()));
                     false
                 } else {
                     true
@@ -706,11 +790,11 @@ impl CodeCache {
         }
         osr.retain(|_, m| !m.is_empty());
         drop(osr);
-        if !osr_zombie_begins.is_empty() {
-            let mut index = self.pc_index.lock().unwrap();
-            for b in osr_zombie_begins {
-                index.remove(&b);
-            }
+        for (key, bci, begin, size) in osr_freed {
+            summary.swept_zombies += 1;
+            summary.total_freed_bytes += size;
+            self.pc_index.lock().unwrap().remove(&begin);
+            self.free_nmethod_blob(&format!("{}@{}", key, bci));
         }
 
         summary
@@ -788,5 +872,127 @@ fn align_up(v: usize, align: usize) -> usize {
 impl Default for CodeCache {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::share::compiler::compilerDefinitions::CompLevel;
+
+    fn heap_alloc_free_coalesce() {
+        let mut heap = CodeHeap::with_base(CodeBlobType::MethodNonProfiled, 0x1000, 1024);
+        let a = heap.allocate("a".to_string(), 100, CodeBlobKind::Nmethod).unwrap();
+        let b = heap.allocate("b".to_string(), 100, CodeBlobKind::Nmethod).unwrap();
+        assert_eq!(heap.used(), 200);
+        assert!(heap.free_blob(a));
+        assert!(heap.free_blob(b));
+        // Coalesced: the whole 200 bytes should be one free region again,
+        // reusable for a 200-byte allocation.
+        let c = heap.allocate("c".to_string(), 200, CodeBlobKind::Nmethod).unwrap();
+        assert_eq!(heap.used(), 200);
+        let _ = c;
+    }
+
+    #[test]
+    fn heap_first_fit_and_bump() {
+        heap_alloc_free_coalesce();
+        let mut heap = CodeHeap::with_base(CodeBlobType::NonNMethod, 0x2000, 512);
+        let x = heap.allocate("x".to_string(), 64, CodeBlobKind::RuntimeStub).unwrap();
+        let y = heap.allocate("y".to_string(), 64, CodeBlobKind::RuntimeStub).unwrap();
+        assert_eq!(y - x, 64);
+        assert!(heap.free_space() >= 512 - 128);
+        // Allocation beyond capacity fails.
+        assert!(heap.allocate("big".to_string(), 4096, CodeBlobKind::RuntimeStub).is_err());
+    }
+
+    #[test]
+    fn nmethod_install_lookup_and_deinstall() {
+        let cache = CodeCache::new_non_segmented(1 << 20);
+        let nm = NMethod::with_entry_points(
+            "T".to_string(),
+            "m".to_string(),
+            "()V".to_string(),
+            CompLevel::Simple,
+            NMethod::INVOCATION_ENTRY_BCI,
+            0,
+            0,
+            0,
+            0,
+            0,
+            vec![],
+            vec![],
+        );
+        let addr = cache
+            .install_nmethod(nm, vec![0x90, 0xc3], 64)
+            .expect("install");
+        assert_ne!(addr, 0);
+        let found = cache.find_nmethod("T", "m", "()V").expect("registered");
+        assert!(found.is_in_use());
+        assert!(found.entry_point() != 0);
+        // pc -> nmethod lookup inside the published range.
+        let hit = cache.find_nmethod_at_address(addr + 1).expect("pc lookup");
+        assert_eq!(hit.method_name(), "m");
+        assert!(cache.find_nmethod_at_address(addr + 1_000_000).is_none());
+
+        // not-entrant -> sweep -> zombie -> reclaimed.
+        assert!(cache.make_not_entrant("T", "m", "()V"));
+        let summary = cache.sweep_cycle(&HashSet::new());
+        assert_eq!(summary.transitioned_to_zombie, 1);
+        assert_eq!(summary.swept_zombies, 1);
+        assert!(cache.find_nmethod("T", "m", "()V").is_none());
+        assert!(cache.find_nmethod_at_address(addr).is_none());
+    }
+
+    #[test]
+    fn deinstall_removes_regular_and_osr() {
+        let cache = CodeCache::new_non_segmented(1 << 20);
+        let regular = NMethod::with_entry_points(
+            "U".to_string(), "r".to_string(), "()V".to_string(),
+            CompLevel::Simple, NMethod::INVOCATION_ENTRY_BCI,
+            0, 0, 0, 0, 0, vec![], vec![],
+        );
+        let osr = NMethod::with_entry_points(
+            "U".to_string(), "r".to_string(), "()V".to_string(),
+            CompLevel::Simple, 12,
+            0, 0, 0, 0, 0, vec![], vec![],
+        );
+        cache.install_nmethod(regular, vec![0x90, 0xc3], 32).unwrap();
+        cache.install_nmethod(osr, vec![0x90, 0xc3], 32).unwrap();
+        assert_eq!(cache.nmethods_count(), 1);
+        assert_eq!(cache.osr_nmethods_count(), 1);
+        let key = CodeCache::method_key("U", "r", "()V");
+        assert_eq!(cache.deinstall_nmethod(&key), 2);
+        assert!(cache.find_nmethod_by_key(&key).is_none());
+        assert!(cache.find_osr_nmethod_by_key(&key, 12).is_none());
+        assert_eq!(cache.nmethods_count(), 0);
+        assert_eq!(cache.osr_nmethods_count(), 0);
+    }
+
+    #[test]
+    fn osr_not_entrant_swept_to_zombie() {
+        let cache = CodeCache::new_non_segmented(1 << 20);
+        let osr = NMethod::with_entry_points(
+            "V".to_string(), "o".to_string(), "()V".to_string(),
+            CompLevel::Simple, 4,
+            0, 0, 0, 0, 0, vec![], vec![],
+        );
+        cache.install_nmethod(osr, vec![0x90, 0xc3], 32).unwrap();
+        let key = CodeCache::method_key("V", "o", "()V");
+        // Mark the OSR nmethod not-entrant directly.
+        let nm = cache.find_osr_nmethod_by_key(&key, 4).unwrap();
+        nm.make_not_entrant();
+        let summary = cache.sweep_cycle(&HashSet::new());
+        assert_eq!(summary.transitioned_to_zombie, 1);
+        assert!(cache.find_osr_nmethod_by_key(&key, 4).is_none());
+    }
+
+    #[test]
+    fn blob_key_distinguishes_osr() {
+        assert_eq!(
+            CodeCache::blob_key("A", "b", "()V", NMethod::INVOCATION_ENTRY_BCI),
+            "A.b()V"
+        );
+        assert_eq!(CodeCache::blob_key("A", "b", "()V", 7), "A.b()V@7");
     }
 }

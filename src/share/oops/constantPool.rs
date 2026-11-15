@@ -14,6 +14,25 @@ use crate::classfile::Constant;
 use crate::share::utilities::constantTag::ConstantTag;
 use std::io::{self, Error};
 
+/// Kind of a resolved constant-pool member reference (JVMS §4.4.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemberRefKind {
+    Field,
+    Method,
+    InterfaceMethod,
+}
+
+/// Resolved view of a Fieldref/Methodref/InterfaceMethodref constant:
+/// owner class internal name plus member name and descriptor.  This is
+/// the exact triple JIT stub sites and resolved cache entries need.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemberRef<'a> {
+    pub kind: MemberRefKind,
+    pub owner: &'a [u8],
+    pub name: &'a [u8],
+    pub descriptor: &'a [u8],
+}
+
 pub struct ConstantPool<'a> {
     constants: &'a [Constant<'a>],
     cache: Option<ConstantPoolCache>,
@@ -134,6 +153,43 @@ impl<'a> ConstantPool<'a> {
         }
     }
 
+    /// Resolves a Fieldref/Methodref/InterfaceMethodref index to its
+    /// owner/name/descriptor triple, mirroring HotSpot
+    /// `ConstantPool::klass_ref_at` + `name_and_type_at` composition.
+    pub fn member_ref_at(&self, index: u16) -> io::Result<MemberRef<'a>> {
+        let (kind, owner_idx, nat_idx) = match self.get(index)? {
+            Constant::FieldRef(owner, nat) => (MemberRefKind::Field, *owner, *nat),
+            Constant::MethodRef(owner, nat) => (MemberRefKind::Method, *owner, *nat),
+            Constant::InterfaceMethodRef(owner, nat) => {
+                (MemberRefKind::InterfaceMethod, *owner, *nat)
+            }
+            other => {
+                return Err(Error::other(format!(
+                    "Expected member reference constant, got {:?}",
+                    other
+                )));
+            }
+        };
+        let owner = self.class_name_at(owner_idx)?;
+        let (name, descriptor) = self.name_and_type_at(nat_idx)?;
+        Ok(MemberRef {
+            kind,
+            owner,
+            name,
+            descriptor,
+        })
+    }
+
+    /// Kind of the constant at `index` when it is a member reference.
+    pub fn member_ref_kind_at(&self, index: u16) -> io::Result<Option<MemberRefKind>> {
+        Ok(match self.get(index)? {
+            Constant::FieldRef(_, _) => Some(MemberRefKind::Field),
+            Constant::MethodRef(_, _) => Some(MemberRefKind::Method),
+            Constant::InterfaceMethodRef(_, _) => Some(MemberRefKind::InterfaceMethod),
+            _ => None,
+        })
+    }
+
     pub fn int_at(&self, index: u16) -> io::Result<i32> {
         match self.get(index)? {
             Constant::Integer(v) => Ok(*v),
@@ -160,5 +216,95 @@ impl<'a> ConstantPool<'a> {
             Constant::Double(v) => Ok(*v),
             _ => Err(Error::other("Expected Double constant")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn utf8(s: &'static [u8]) -> Constant<'static> {
+        Constant::Utf8(s)
+    }
+
+    fn pool_fixture() -> Vec<Constant<'static>> {
+        vec![
+            Constant::Unusable,                    // 0
+            utf8(b"java/lang/Object"),             // 1
+            Constant::Class(1),                    // 2
+            utf8(b"count"),                        // 3
+            utf8(b"I"),                            // 4
+            Constant::NameAndType(3, 4),           // 5
+            Constant::FieldRef(2, 5),              // 6
+            utf8(b"java/lang/String"),             // 7
+            Constant::Class(7),                    // 8
+            utf8(b"length"),                       // 9
+            utf8(b"()I"),                          // 10
+            Constant::NameAndType(9, 10),          // 11
+            Constant::MethodRef(8, 11),            // 12
+            Constant::InterfaceMethodRef(2, 11),  // 13
+            Constant::Integer(42),                 // 14
+        ]
+    }
+
+    #[test]
+    fn member_ref_at_resolves_fieldref() {
+        let constants = pool_fixture();
+        let pool = ConstantPool::new(&constants);
+        let reference = pool.member_ref_at(6).unwrap();
+        assert_eq!(reference.kind, MemberRefKind::Field);
+        assert_eq!(reference.owner, b"java/lang/Object".as_slice());
+        assert_eq!(reference.name, b"count".as_slice());
+        assert_eq!(reference.descriptor, b"I".as_slice());
+    }
+
+    #[test]
+    fn member_ref_at_resolves_method_and_interface_method() {
+        let constants = pool_fixture();
+        let pool = ConstantPool::new(&constants);
+        let method = pool.member_ref_at(12).unwrap();
+        assert_eq!(method.kind, MemberRefKind::Method);
+        assert_eq!(method.owner, b"java/lang/String".as_slice());
+        assert_eq!(method.name, b"length".as_slice());
+        assert_eq!(method.descriptor, b"()I".as_slice());
+        let iface = pool.member_ref_at(13).unwrap();
+        assert_eq!(iface.kind, MemberRefKind::InterfaceMethod);
+        assert_eq!(iface.owner, b"java/lang/Object".as_slice());
+    }
+
+    #[test]
+    fn member_ref_at_rejects_non_member_constants() {
+        let constants = pool_fixture();
+        let pool = ConstantPool::new(&constants);
+        assert!(pool.member_ref_at(14).is_err());
+        assert!(pool.member_ref_at(1).is_err());
+        assert!(pool.member_ref_at(99).is_err());
+    }
+
+    #[test]
+    fn member_ref_kind_at_reports_kind() {
+        let constants = pool_fixture();
+        let pool = ConstantPool::new(&constants);
+        assert_eq!(
+            pool.member_ref_kind_at(6).unwrap(),
+            Some(MemberRefKind::Field)
+        );
+        assert_eq!(
+            pool.member_ref_kind_at(13).unwrap(),
+            Some(MemberRefKind::InterfaceMethod)
+        );
+        assert_eq!(pool.member_ref_kind_at(14).unwrap(), None);
+    }
+
+    #[test]
+    fn scalar_accessors_roundtrip() {
+        let constants = pool_fixture();
+        let pool = ConstantPool::new(&constants);
+        assert_eq!(pool.int_at(14).unwrap(), 42);
+        assert_eq!(pool.utf8_at(3).unwrap(), b"count".as_slice());
+        assert_eq!(pool.class_name_at(8).unwrap(), b"java/lang/String".as_slice());
+        assert_eq!(pool.name_and_type_at(11).unwrap(), (b"length".as_slice(), b"()I".as_slice()));
+        assert_eq!(pool.tag_at(12).unwrap(), ConstantTag::Methodref);
+        assert_eq!(pool.tag_at(6).unwrap(), ConstantTag::Fieldref);
     }
 }

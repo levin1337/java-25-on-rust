@@ -330,6 +330,7 @@ impl<'a> Scheduler<'a> {
         let mut term = None;
         let mut succs = Vec::new();
         let mut exit_ctrl = entry;
+        let mut emitted_fx: HashSet<NodeId> = HashSet::new();
         let entry_op = self.gvn.node(entry).op.clone();
         loop {
             // Candidates control-dependent on this block's entry control.
@@ -349,6 +350,9 @@ impl<'a> Scheduler<'a> {
                     if self.gvn.node(n).inputs.get(mi).copied() != Some(cur_mem) {
                         continue;
                     }
+                }
+                if !emitted_fx.insert(n) {
+                    continue;
                 }
                 instrs.push(n);
                 emitted_effect = true;

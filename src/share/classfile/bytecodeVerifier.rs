@@ -523,11 +523,11 @@ impl<'m, 'a> BytecodeVerifier<'m, 'a> {
         }
         use VT::*;
         match (expected, actual) {
-            // Top is the "unusable" type: a frame slot typed Top accepts any
-            // incoming value (dead local), but an unusable incoming value is
-            // never assignable to a concrete expected type.
-            (Top, _) => true,
-            (_, Top) => false,
+            // Top is the "unusable" type: it is assignable in both
+            // directions — an unusable incoming value imposes no constraint
+            // on the frame (HotSpot accepts it; the slot is never read on
+            // that path), and a Top frame slot accepts anything.
+            (Top, _) | (_, Top) => true,
             (Null, Null) => true,
             (Null, _) => false,
             (Object(_), Null) => true,
@@ -1411,12 +1411,10 @@ impl<'m, 'a> BytecodeVerifier<'m, 'a> {
                 Ok(Flow::Fallthrough)
             }
             0x5e => {
-                // dup2_x2: ..., unit2, unit1 -> ..., unit2, unit1, unit2, unit1
+                // dup2_x2: ..., unit2, unit1 -> ..., unit1, unit2, unit1
+                // (only the top unit is duplicated, inserted below unit2).
                 let unit1 = self.pop_dup_unit(st, bci)?;
                 let unit2 = self.pop_dup_unit(st, bci)?;
-                for v in &unit2 {
-                    Self::push_entry(st, v.clone());
-                }
                 for v in &unit1 {
                     Self::push_entry(st, v.clone());
                 }
@@ -1761,18 +1759,20 @@ impl<'m, 'a> BytecodeVerifier<'m, 'a> {
         Ok(())
     }
 
-    /// Expected array element descriptor for array load/store opcode `op`,
-    /// or `None` for aaload/aastore (any reference element).
-    fn array_elem_desc(op: u8) -> Option<&'static str> {
+    /// Accepted element descriptor category for array load/store opcode `op`.
+    /// All int-category primitives (B/C/S/Z/I) share the same verification
+    /// type, so any of them may be accessed by any int-category array op.
+    /// Returns `None` for aaload/aastore (any reference element).
+    fn array_elem_category(op: u8) -> Option<&'static [&'static str]> {
         Some(match op {
-            0x2e | 0x4f => "I", // iaload / iastore
-            0x2f | 0x50 => "J", // laload / lastore
-            0x30 | 0x51 => "F", // faload / fastore
-            0x31 | 0x52 => "D", // daload / dastore
-            0x33 | 0x54 => "B", // baload / bastore
-            0x34 | 0x55 => "C", // caload / castore
-            0x35 | 0x56 => "S", // saload / sastore
-            0x32 | 0x53 => return None, // aaload / aastore
+            0x2e | 0x4f => &["I", "B", "C", "S", "Z"], // iaload / iastore
+            0x33 | 0x54 => &["I", "B", "C", "S", "Z"], // baload / bastore
+            0x34 | 0x55 => &["I", "B", "C", "S", "Z"], // caload / castore
+            0x35 | 0x56 => &["I", "B", "C", "S", "Z"], // saload / sastore
+            0x2f | 0x50 => &["J"],                      // laload / lastore
+            0x30 | 0x51 => &["F"],                      // faload / fastore
+            0x31 | 0x52 => &["D"],                      // daload / dastore
+            0x32 | 0x53 => return None,                // aaload / aastore
             _ => return None,
         })
     }
@@ -1785,9 +1785,9 @@ impl<'m, 'a> BytecodeVerifier<'m, 'a> {
             VT::Null => return Ok(()),
             VT::Object(name) if name.starts_with('[') => {
                 let elem = &name[1..];
-                match Self::array_elem_desc(op) {
+                match Self::array_elem_category(op) {
                     Some(expected) => {
-                        if elem != expected {
+                        if !expected.contains(&elem) {
                             return Err(err_at(
                                 bci,
                                 format!("Array type {name} does not match opcode {op:02x}"),
@@ -2050,17 +2050,23 @@ impl<'m, 'a> BytecodeVerifier<'m, 'a> {
             if zero != 0 {
                 return Err(err_at(bci, "Invalid invokeinterface operands"));
             }
-            // JVMS 4.10.1.9: the count operand includes the receiver.
-            if let Some((params, _)) = FieldType::method(desc)
-                && count as usize != params.len() + 1
-            {
-                return Err(err_at(
-                    bci,
-                    format!(
-                        "invokeinterface count {count} != parameter count {}",
-                        params.len() + 1
-                    ),
-                ));
+            // JVMS 4.10.1.9: the count operand includes the receiver and
+            // counts stack words, so long/double arguments take two slots.
+            if let Some((params, _)) = FieldType::method(desc) {
+                let words: usize = params
+                    .iter()
+                    .map(|t| match t {
+                        FieldType::Prim(b'J' | b'D') => 2,
+                        _ => 1,
+                    })
+                    .sum::<usize>()
+                    + 1;
+                if count as usize != words {
+                    return Err(err_at(
+                        bci,
+                        format!("invokeinterface count {count} != parameter count {words}"),
+                    ));
+                }
             }
         }
 
@@ -2342,7 +2348,7 @@ impl<'m, 'a> BytecodeVerifier<'m, 'a> {
             for (succ, sst) in successors {
                 match states.get_mut(&succ) {
                     Some(existing) => {
-                        let merged = merge_states(existing, &sst, self.max_locals);
+                        let merged = merge_states(self, existing, &sst, self.max_locals);
                         if merged != *existing {
                             *existing = merged;
                             queue.push_back(succ);
@@ -2367,25 +2373,47 @@ fn is_cat1(vt: &VT) -> bool {
     !vt.is_category2() && !vt.is_category2_2nd()
 }
 
-fn merge_states(existing: &mut State, incoming: &State, max_locals: usize) -> State {
+fn merge_states<'m, 'a>(
+    v: &BytecodeVerifier<'m, 'a>,
+    existing: &mut State,
+    incoming: &State,
+    max_locals: usize,
+) -> State {
     let mut locals = vec![VT::Top; max_locals];
     for i in 0..max_locals {
         let a = existing.locals.get(i).cloned().unwrap_or(VT::Top);
         let b = incoming.locals.get(i).cloned().unwrap_or(VT::Top);
-        locals[i] = merge_vt(&a, &b);
+        locals[i] = merge_vt(v, &a, &b);
     }
     let n = existing.stack.len().max(incoming.stack.len());
     let mut stack = Vec::with_capacity(n);
     for i in 0..n {
         let a = existing.stack.get(i).cloned().unwrap_or(VT::Top);
         let b = incoming.stack.get(i).cloned().unwrap_or(VT::Top);
-        stack.push(merge_vt(&a, &b));
+        stack.push(merge_vt(v, &a, &b));
     }
     State { locals, stack }
 }
 
+/// Nearest common superclass of `x` and `y` (single-inheritance chain of `x`
+/// walked upward; the first ancestor that `y` is assignable to wins).
+fn common_superclass<'m, 'a>(
+    v: &BytecodeVerifier<'m, 'a>,
+    x: &str,
+    y: &str,
+) -> Option<String> {
+    let mut current = v.klass_info(x.as_bytes())?.super_name?;
+    loop {
+        let name = String::from_utf8_lossy(&current).into_owned();
+        if v.type_assignable(y.as_bytes(), &current) {
+            return Some(name);
+        }
+        current = v.klass_info(&current)?.super_name?;
+    }
+}
+
 /// Merges two verification types at a control-flow join.
-fn merge_vt(a: &VT, b: &VT) -> VT {
+fn merge_vt<'m, 'a>(v: &BytecodeVerifier<'m, 'a>, a: &VT, b: &VT) -> VT {
     use VT::*;
     if a == b {
         return a.clone();
@@ -2411,10 +2439,22 @@ fn merge_vt(a: &VT, b: &VT) -> VT {
         | (Char, Char) => Integer,
         (Object(x), Object(y)) => {
             if x == y {
-                Object(x.clone())
-            } else {
-                Object("java/lang/Object".into())
+                return Object(x.clone());
             }
+            // Least upper bound: if one side is assignable to the other,
+            // the supertype wins (covers subclass/interface merges like
+            // List + ArrayList -> List).
+            if v.type_assignable(x.as_bytes(), y.as_bytes()) {
+                return Object(y.clone());
+            }
+            if v.type_assignable(y.as_bytes(), x.as_bytes()) {
+                return Object(x.clone());
+            }
+            // Unrelated classes: nearest common superclass.
+            if let Some(lub) = common_superclass(v, x, y) {
+                return Object(lub);
+            }
+            Object("java/lang/Object".into())
         }
         (Uninitialized(x), Uninitialized(y)) if x == y => Uninitialized(*x),
         (UninitializedThis, UninitializedThis) => UninitializedThis,

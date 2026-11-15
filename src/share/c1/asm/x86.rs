@@ -647,7 +647,9 @@ impl<'a> X86Emitter<'a> {
     }
 
     fn emit_call(&mut self, dst: Option<&LirOperand>, operands: &[LirOperand], info: &crate::share::c1::c1_Instruction::CallInfo) -> Result<(), BackendError> {
-        let target = info.target.ok_or(BackendError::MissingCallTarget)?;
+        let Some(target) = info.target else {
+            return self.emit_call_stub(dst, operands, info);
+        };
         let win64 = self.options.abi == Abi::WindowsX64;
         let mut gp = 0usize;
         let mut xmm = 0usize;
@@ -722,6 +724,90 @@ impl<'a> X86Emitter<'a> {
         Ok(())
     }
 
+    /// Lowers an unresolved invoke to the `UnresolvedCall` runtime
+    /// stub.  The JIT builds a flat array of raw 64-bit argument
+    /// words on its own stack (receiver first for instance methods,
+    /// then the declared parameters — the same order `try_invoke`
+    /// marshals), then calls the trampoline with:
+    ///   rcx = leaked StubSite (owner/name/descriptor)
+    ///   rdx = pointer to the argument word array
+    ///   r8  = word count
+    ///   r9  = invoke opcode
+    /// The handler resolves the target through `LinkResolver`, runs an
+    /// installed nmethod via `try_invoke` when present and otherwise
+    /// executes the method in `bytecodeInterpreter`.  Integer results
+    /// return in rax; float/double results reach xmm0 through the
+    /// stub's TLS channel, so the destination store is kind-driven.
+    fn emit_call_stub(&mut self, dst: Option<&LirOperand>, operands: &[LirOperand], info: &crate::share::c1::c1_Instruction::CallInfo) -> Result<(), BackendError> {
+        let addr = self
+            .options
+            .stubs
+            .get(&RuntimeStub::UnresolvedCall)
+            .copied()
+            .ok_or(BackendError::MissingRuntimeStub(RuntimeStub::UnresolvedCall))?;
+        let n = operands.len();
+        if n > 64 {
+            return Err(BackendError::Unsupported(format!(
+                "invoke with {} arguments",
+                n
+            )));
+        }
+        let total = (n * 8).div_ceil(16) * 16;
+        if total > 0 {
+            self.emit_rex(true, false, false, false);
+            self.buf.write(&[0x48, 0x81, 0xec])?;
+            self.buf.write_i32(total as i32)?;
+        }
+        for (i, op) in operands.iter().enumerate() {
+            self.emit_operand_raw_to_reg(op, Register::RAX)?;
+            self.mov_mem_reg(Some(Register::SP), None, Scale::S1, (i * 8) as i32, Register::RAX, true)?;
+        }
+        self.mov_reg_imm(Register::RCX, info.site, true)?;
+        self.mov_reg_reg(Register::RDX, Register::SP, true)?;
+        self.mov_reg_imm(Register::R8, n as u64, false)?;
+        self.mov_reg_imm(Register::R9, info.opcode as u64, false)?;
+        self.emit_abs_call(addr)?;
+        if total > 0 {
+            self.emit_rex(true, false, false, false);
+            self.buf.write(&[0x48, 0x81, 0xc4])?;
+            self.buf.write_i32(total as i32)?;
+        }
+        self.pc_descs.push(PcDescEntry { pc_offset: self.pos(), bci: 0, is_safepoint: true });
+        if let Some(dst) = dst {
+            match dst.kind() {
+                LirKind::Float32 | LirKind::Float64 => self.store_xmm_result(dst, XMMRegister::XMM0)?,
+                _ => self.store_gp_result(dst, Register::RAX)?,
+            }
+        }
+        Ok(())
+    }
+
+    /// Loads an operand's raw 64-bit representation (bit pattern for
+    /// floats, tagged word for refs) into a GP register — unlike
+    /// `emit_operand_to_reg` this accepts the float constant kinds the
+    /// CallMethod argument array needs.
+    fn emit_operand_raw_to_reg(&mut self, op: &LirOperand, reg: Register) -> Result<(), BackendError> {
+        match op {
+            LirOperand::ConstI32(v) => self.mov_reg_imm(reg, *v as i32 as u64, false)?,
+            LirOperand::ConstI64(v) => self.mov_reg_imm(reg, *v as u64, true)?,
+            LirOperand::ConstF32(v) => self.mov_reg_imm(reg, *v as u64, false)?,
+            LirOperand::ConstF64(v) => self.mov_reg_imm(reg, *v, true)?,
+            LirOperand::Null => self.mov_reg_imm(reg, 0, false)?,
+            LirOperand::Local { slot, kind }
+            | LirOperand::Stack { slot, kind }
+            | LirOperand::Temp { slot, kind } => {
+                let off = match op {
+                    LirOperand::Local { .. } => self.local_offset(*slot),
+                    LirOperand::Stack { .. } => self.stack_offset(*slot),
+                    _ => self.temp_offset(*slot),
+                };
+                let wide = matches!(kind, LirKind::Int64 | LirKind::Ref | LirKind::Float64);
+                self.mov_reg_mem(reg, Some(Register::FP), None, Scale::S1, -(off as i32), wide)?;
+            }
+        }
+        Ok(())
+    }
+
     fn emit_return(&mut self, value: Option<&LirOperand>, kind: LirKind) -> Result<(), BackendError> {
         if let Some(v) = value {
             match kind {
@@ -745,6 +831,15 @@ impl<'a> X86Emitter<'a> {
     }
 
     fn emit_call_runtime(&mut self, stub: RuntimeStub, operands: &[LirOperand], dst: Option<&LirOperand>, _bci: usize) -> Result<(), BackendError> {
+        // Handlers receive at most the four Win64 argument registers;
+        // the trampoline does not forward stack arguments.
+        if operands.len() > 4 {
+            return Err(BackendError::Unsupported(format!(
+                "runtime stub {:?} with {} operands",
+                stub,
+                operands.len()
+            )));
+        }
         let addr = self.options.stubs.get(&stub).copied().ok_or(BackendError::MissingRuntimeStub(stub))?;
         // Runtime stubs are real `extern "C"` Rust functions: Windows x64
         // takes args in rcx/rdx/r8/r9 with the rest on the stack above a
@@ -1068,7 +1163,7 @@ impl<'a> X86Emitter<'a> {
         match op {
             LirOperand::ConstI32(v) => self.mov_reg_imm(reg, *v as i32 as u64, false)?,
             LirOperand::ConstI64(v) => self.mov_reg_imm(reg, *v as u64, true)?,
-            LirOperand::Null => { self.emit_rex(false, false, false, false); self.buf.write(&[0x31, 0xc0])?; }
+            LirOperand::Null => self.mov_reg_imm(reg, 0, false)?,
             LirOperand::Local { slot, kind } | LirOperand::Stack { slot, kind } | LirOperand::Temp { slot, kind } => {
                 let off = match op { LirOperand::Local { .. } => self.local_offset(*slot), LirOperand::Stack { .. } => self.stack_offset(*slot), _ => self.temp_offset(*slot) };
                 let wide = *kind == LirKind::Int64 || *kind == LirKind::Ref;

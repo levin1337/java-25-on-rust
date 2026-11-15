@@ -9,12 +9,13 @@
  * - Initialization state and static storage cells
  */
 
+use super::constantPool::{MemberRef, MemberRefKind};
 use super::fieldInfo::FieldInfo;
-use super::fieldLayout::FieldLayout;
-use super::klassVtable::{KlassItable, KlassVtable};
+use super::fieldLayout::{FieldLayout, FieldLayoutResult};
+use super::klassVtable::{KlassItable, KlassVtable, VtableEntry};
 use super::method::Code;
 use super::objLayout::ObjLayout;
-use crate::classfile::{ClassFile, Constant};
+use crate::share::classfile::{ClassFile, Constant, Member, SystemDictionary};
 use crate::share::interpreter::bytecodeInterpreter::Value;
 use crate::share::runtime::shareCell::Share;
 use std::io::{self, Error};
@@ -36,6 +37,11 @@ pub struct InstanceKlass<'a> {
     pub total_instance_fields: usize,
     pub instance_size: usize,
     pub nonstatic_field_size: usize,
+    /// Full instance field layout (header + inherited/own field blocks).
+    /// Subclasses consume this to reproduce HotSpot's hole-filling field
+    /// placement; JIT consumers read `FieldInfo::offset` values computed
+    /// from it.
+    pub instance_layout: FieldLayoutResult,
     pub static_field_size: usize,
     pub vtable: KlassVtable,
     pub itable: KlassItable,
@@ -154,10 +160,9 @@ impl<'a> InstanceKlass<'a> {
 
         // Compute memory layout and field byte offsets
         let layout = ObjLayout::default();
-        let super_instance_size = super_klass.as_ref().map_or(0, |s| s.instance_size);
-        let layout_res = FieldLayout::compute_instance_layout(
+        let layout_res = FieldLayout::compute_instance_layout_inheriting(
             &layout,
-            super_instance_size,
+            super_klass.as_ref().map(|s| &s.instance_layout),
             &mut instance_field_infos,
         );
         let static_size = FieldLayout::compute_static_layout(0, &mut static_field_infos);
@@ -189,10 +194,18 @@ impl<'a> InstanceKlass<'a> {
 
         // Build itable for interface implementations, covering the whole
         // transitive superinterface hierarchy (HotSpot registers every
-        // superinterface, direct or indirect, in the itable).
+        // superinterface, direct or indirect, in the itable).  Interfaces
+        // inherited through the superclass chain are seeded as well:
+        // HotSpot's itable of a subclass contains every interface the
+        // superclass implements.
         let mut itable = KlassItable::new(class_name_str);
         let mut all_interfaces: Vec<Arc<InstanceKlass<'a>>> = Vec::new();
         let mut pending: Vec<Arc<InstanceKlass<'a>>> = interfaces.clone();
+        let mut current_super = super_klass.as_ref();
+        while let Some(k) = current_super {
+            pending.extend(k.interfaces.iter().cloned());
+            current_super = k.super_klass.as_ref();
+        }
         let mut seen: std::collections::HashSet<&'a [u8]> = std::collections::HashSet::new();
         while let Some(iface) = pending.pop() {
             if !seen.insert(iface.class.name) {
@@ -209,9 +222,31 @@ impl<'a> InstanceKlass<'a> {
                 if !is_static && !is_private {
                     let m_name = String::from_utf8_lossy(m.name).to_string();
                     let m_sig = String::from_utf8_lossy(m.descriptor).to_string();
-                    if let Some(v_idx) = vtable.index_of_method(&m_name, &m_sig) {
-                        itable.add_entry(iface_name.clone(), m_name, m_sig, v_idx);
-                    }
+                    // HotSpot registers every inherited interface method in
+                    // the vtable: concrete defaults as regular entries and
+                    // abstract methods as miranda entries, so that
+                    // `invokeinterface` can resolve through the itable.
+                    let v_idx = match vtable.index_of_method(&m_name, &m_sig) {
+                        Some(idx) => idx,
+                        None => {
+                            if m.code_attribute().is_some() {
+                                vtable.add_or_override_method(
+                                    iface_name.clone(),
+                                    m_name.clone(),
+                                    m_sig.clone(),
+                                    m.accessFlags,
+                                )
+                            } else {
+                                vtable.add_miranda_method(
+                                    iface_name.clone(),
+                                    m_name.clone(),
+                                    m_sig.clone(),
+                                    m.accessFlags,
+                                )
+                            }
+                        }
+                    };
+                    itable.add_entry(iface_name.clone(), m_name, m_sig, v_idx);
                 }
             }
         }
@@ -229,6 +264,7 @@ impl<'a> InstanceKlass<'a> {
             total_instance_fields,
             instance_size: layout_res.instance_size,
             nonstatic_field_size: layout_res.nonstatic_field_size,
+            instance_layout: layout_res,
             static_field_size: static_size,
             vtable,
             itable,
@@ -548,5 +584,468 @@ impl<'a> InstanceKlass<'a> {
                 kind(m)
             ))),
         }
+    }
+
+    // ------------------------------------------------------------------
+    // JIT metadata queries (additive; used by the compile broker to fill
+    // MethodMetadata: field offsets, call sites, stub sites, vtable
+    // indices).
+    // ------------------------------------------------------------------
+
+    /// `true` for VM-defined array classes whose name is a field
+    /// descriptor starting with `[` (see `ClassLoader::load_array_class`).
+    #[inline]
+    pub fn is_array(&self) -> bool {
+        self.class.name.first() == Some(&b'[')
+    }
+
+    /// Number of array dimensions for array classes (`[[I` -> 2).
+    pub fn array_dimension(&self) -> usize {
+        self.class.name.iter().take_while(|b| **b == b'[').count()
+    }
+
+    /// Element descriptor of an array class: the class name minus the
+    /// leading `[` of the outermost dimension (`[I` -> `I`,
+    /// `[[Ljava/lang/String;` -> `[Ljava/lang/String;`).
+    pub fn array_element_descriptor(&self) -> Option<&'a [u8]> {
+        if self.is_array() && self.class.name.len() > 1 {
+            Some(&self.class.name[1..])
+        } else {
+            None
+        }
+    }
+
+    /// HotSpot `InstanceKlass::is_subclass_of`: `true` when `name`
+    /// names this class or one of its superclasses.
+    pub fn is_subclass_of(&self, name: &[u8]) -> bool {
+        SystemDictionary::is_subclass_of(self, name)
+    }
+
+    /// HotSpot `InstanceKlass::implements_interface`: `true` when
+    /// `name` names a direct or transitive superinterface.
+    pub fn implements_interface(&self, name: &[u8]) -> bool {
+        SystemDictionary::implements_interface(self, name)
+    }
+
+    /// Number of superclasses above this class (`java.lang.Object` -> 0).
+    pub fn super_depth(&self) -> usize {
+        let mut depth = 0;
+        let mut current = self.super_klass();
+        while let Some(k) = current {
+            depth += 1;
+            current = k.super_klass();
+        }
+        depth
+    }
+
+    /// HotSpot `InstanceKlass::java_mirror` analogue.  This port has no
+    /// dedicated `java.lang.Class` heap object per klass; the interpreter
+    /// represents mirrors as `Value::ClassMirror` carrying the internal
+    /// class name, materialized on demand by
+    /// `prims::classNatives::materialize_class`.
+    pub fn java_mirror(&self) -> Value<'a> {
+        Value::ClassMirror(self.class.name)
+    }
+
+    /// Declared methods of this class (raw class-file members).
+    pub fn methods(&self) -> impl Iterator<Item = &Member<'a>> {
+        self.class.methods.iter()
+    }
+
+    /// Declared fields of this class (raw class-file members).
+    pub fn fields(&self) -> impl Iterator<Item = &Member<'a>> {
+        self.class.fields.iter()
+    }
+
+    /// Method declared in this class with the given name and descriptor.
+    pub fn declared_method(&self, name: &[u8], descriptor: &[u8]) -> Option<&Member<'a>> {
+        self.class
+            .methods
+            .iter()
+            .find(|m| m.name == name && m.descriptor == descriptor)
+    }
+
+    /// Field declared in this class with the given name and descriptor.
+    pub fn declared_field(&self, name: &[u8], descriptor: &[u8]) -> Option<&Member<'a>> {
+        self.class
+            .fields
+            .iter()
+            .find(|f| f.name == name && f.descriptor == descriptor)
+    }
+
+    /// `FieldInfo` (byte offset, access flags, slot) declared in this
+    /// class, searching instance fields first then static fields.
+    pub fn field_info(&self, name: &[u8], descriptor: &[u8]) -> Option<&FieldInfo<'a>> {
+        self.instance_field_infos
+            .iter()
+            .chain(self.static_field_infos.iter())
+            .find(|info| info.name == name && info.descriptor == descriptor)
+    }
+
+    /// Resolves a field reference to its declaring class and layout
+    /// info, walking the superclass chain.  `FieldInfo::offset` is the
+    /// byte offset inside the object for instance fields, or the offset
+    /// inside the static field area for static fields (use
+    /// `FieldInfo::slot`/`is_static` to distinguish).
+    pub fn lookup_field(
+        self: &Arc<Self>,
+        name: &[u8],
+        descriptor: &[u8],
+    ) -> Option<(Arc<Self>, FieldInfo<'a>)> {
+        if let Some(info) = self.field_info(name, descriptor) {
+            return Some((Arc::clone(self), info.clone()));
+        }
+        self.super_klass
+            .as_ref()
+            .and_then(|super_k| super_k.lookup_field(name, descriptor))
+    }
+
+    /// Raw method lookup walking the superclass chain; returns the
+    /// declaring class and the index into `InstanceKlass::class.methods`.
+    /// Interface default methods are not covered — use the itable for
+    /// `invokeinterface` targets.
+    pub fn lookup_method(
+        self: &Arc<Self>,
+        name: &[u8],
+        descriptor: &[u8],
+    ) -> Option<(Arc<Self>, usize)> {
+        if let Some(index) = self
+            .class
+            .methods
+            .iter()
+            .position(|m| m.name == name && m.descriptor == descriptor)
+        {
+            return Some((Arc::clone(self), index));
+        }
+        self.super_klass
+            .as_ref()
+            .and_then(|super_k| super_k.lookup_method(name, descriptor))
+    }
+
+    /// Virtual-dispatch lookup: first declaration in the superclass
+    /// chain that is neither private nor static (JLS 8.4.8.1 hiding
+    /// rules, same selection `LinkResolver::resolve_virtual_call`
+    /// performs before consulting interfaces).
+    pub fn lookup_virtual_method(
+        self: &Arc<Self>,
+        name: &[u8],
+        descriptor: &[u8],
+    ) -> Option<(Arc<Self>, usize)> {
+        if let Some(index) = self.class.methods.iter().position(|m| {
+            m.name == name
+                && m.descriptor == descriptor
+                && (m.accessFlags & 0x0002) == 0
+                && (m.accessFlags & 0x0008) == 0
+        }) {
+            return Some((Arc::clone(self), index));
+        }
+        self.super_klass
+            .as_ref()
+            .and_then(|super_k| super_k.lookup_virtual_method(name, descriptor))
+    }
+
+    /// Vtable slot of a virtual method, mirroring
+    /// `klassVtable::index_of_method` used by `LinkResolver`.
+    pub fn vtable_index(&self, name: &[u8], descriptor: &[u8]) -> Option<usize> {
+        let name = String::from_utf8_lossy(name);
+        let sig = String::from_utf8_lossy(descriptor);
+        self.vtable.index_of_method(&name, &sig)
+    }
+
+    /// Vtable entry at `index` (HotSpot `klassVtable::method_at`).
+    pub fn vtable_entry(&self, index: usize) -> Option<&VtableEntry> {
+        self.vtable.entry_at(index)
+    }
+
+    /// Resolves an `invokeinterface` target to the receiver's vtable
+    /// slot through the itable, given the interface's internal name.
+    pub fn itable_vtable_index(
+        &self,
+        interface_name: &[u8],
+        name: &[u8],
+        descriptor: &[u8],
+    ) -> Option<usize> {
+        let iface = std::str::from_utf8(interface_name).ok()?;
+        let name = String::from_utf8_lossy(name);
+        let sig = String::from_utf8_lossy(descriptor);
+        self.itable.resolve_interface_method(iface, &name, &sig)
+    }
+
+    /// Structured view of a Fieldref/Methodref/InterfaceMethodref
+    /// constant-pool index: kind plus owner/name/descriptor slices.
+    /// This is what JIT stub sites and resolved cache entries consume.
+    pub fn resolve_member_ref(&self, index: u16) -> io::Result<MemberRef<'a>> {
+        let kind = match self.constant(index)? {
+            Constant::FieldRef(..) => MemberRefKind::Field,
+            Constant::MethodRef(..) => MemberRefKind::Method,
+            Constant::InterfaceMethodRef(..) => MemberRefKind::InterfaceMethod,
+            other => {
+                return Err(Error::other(format!(
+                    "Expected member reference constant #{index}, got {other:?}"
+                )));
+            }
+        };
+        let [owner, name, descriptor] = self.memberRef(index, kind == MemberRefKind::Field)?;
+        Ok(MemberRef {
+            kind,
+            owner,
+            name,
+            descriptor,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::classfile::Member;
+
+    fn member(access: u16, name: &'static [u8], desc: &'static [u8]) -> Member<'static> {
+        Member {
+            accessFlags: access,
+            name,
+            descriptor: desc,
+            attributes: Vec::new(),
+        }
+    }
+
+    fn class_file(
+        name: &'static [u8],
+        super_name: Option<&'static [u8]>,
+        access: u16,
+        fields: Vec<Member<'static>>,
+        methods: Vec<Member<'static>>,
+        constants: Vec<Constant<'static>>,
+    ) -> ClassFile<'static> {
+        ClassFile {
+            majorVersion: 65,
+            minorVersion: 0,
+            accessFlags: access,
+            name,
+            superName: super_name,
+            interfaces: Vec::new(),
+            constants,
+            fields,
+            methods,
+            attributes: Vec::new(),
+        }
+    }
+
+    fn hierarchy() -> (Arc<InstanceKlass<'static>>, Arc<InstanceKlass<'static>>, Arc<InstanceKlass<'static>>) {
+        let object = Arc::new(
+            InstanceKlass::new(
+                class_file(b"java/lang/Object", None, 0x0021, vec![], vec![], vec![]),
+                None,
+                vec![],
+            )
+            .unwrap(),
+        );
+
+        // Interface I { void m(); }
+        let iface = Arc::new(
+            InstanceKlass::new(
+                class_file(
+                    b"I",
+                    Some(b"java/lang/Object".as_slice()),
+                    0x0601,
+                    vec![],
+                    vec![member(0x0401, b"m", b"()V")],
+                    vec![],
+                ),
+                Some(Arc::clone(&object)),
+                vec![],
+            )
+            .unwrap(),
+        );
+
+        // class A extends Object implements I { int i; long l; static int s; void m(); }
+        let a = Arc::new(
+            InstanceKlass::new(
+                class_file(
+                    b"A",
+                    Some(b"java/lang/Object".as_slice()),
+                    0x0021,
+                    vec![
+                        member(0x0001, b"i", b"I"),
+                        member(0x0001, b"l", b"J"),
+                        member(0x0009, b"s", b"I"),
+                    ],
+                    vec![member(0x0001, b"m", b"()V"), member(0x000a, b"st", b"()V")],
+                    vec![],
+                ),
+                Some(Arc::clone(&object)),
+                vec![Arc::clone(&iface)],
+            )
+            .unwrap(),
+        );
+
+        // class B extends A { Object r; void m(); void n(); }
+        let b = Arc::new(
+            InstanceKlass::new(
+                class_file(
+                    b"B",
+                    Some(b"A".as_slice()),
+                    0x0021,
+                    vec![member(0x0001, b"r", b"Ljava/lang/Object;")],
+                    vec![member(0x0001, b"m", b"()V"), member(0x0001, b"n", b"()V")],
+                    vec![
+                        Constant::Unusable,
+                        Constant::Utf8(b"java/lang/Object"),
+                        Constant::Class(1),
+                        Constant::Utf8(b"x"),
+                        Constant::Utf8(b"I"),
+                        Constant::NameAndType(3, 4),
+                        Constant::FieldRef(2, 5),
+                    ],
+                ),
+                Some(Arc::clone(&a)),
+                vec![],
+            )
+            .unwrap(),
+        );
+        (object, a, b)
+    }
+
+    #[test]
+    fn super_depth_and_subclass_queries() {
+        let (object, a, b) = hierarchy();
+        assert_eq!(object.super_depth(), 0);
+        assert_eq!(a.super_depth(), 1);
+        assert_eq!(b.super_depth(), 2);
+        assert!(b.is_subclass_of(b"B"));
+        assert!(b.is_subclass_of(b"A"));
+        assert!(b.is_subclass_of(b"java/lang/Object"));
+        assert!(!b.is_subclass_of(b"I"));
+        assert!(!b.is_subclass_of(b"Unrelated"));
+    }
+
+    #[test]
+    fn interface_queries_cover_superclass_chain() {
+        let (_, a, b) = hierarchy();
+        assert!(a.implements_interface(b"I"));
+        assert!(b.implements_interface(b"I"));
+        assert!(!a.implements_interface(b"java/io/Serializable"));
+        assert!(!a.is_interface());
+    }
+
+    #[test]
+    fn instance_field_offsets_match_layout() {
+        let (_, a, b) = hierarchy();
+        // A: i fills the klass gap at 12, l (8-byte) at 16.
+        assert_eq!(a.instance_field_infos[0].offset, 12);
+        assert_eq!(a.instance_field_infos[1].offset, 16);
+        // B's first field starts at A's instance_size (24).
+        assert_eq!(b.instance_field_infos[0].offset, 24);
+        assert_eq!(a.instance_size, 24);
+        assert_eq!(b.instance_size, 32);
+    }
+
+    #[test]
+    fn lookup_field_walks_hierarchy() {
+        let (_, a, b) = hierarchy();
+        let b_arc = Arc::clone(&b);
+        let (holder, info) = b_arc.lookup_field(b"i", b"I").unwrap();
+        assert!(Arc::ptr_eq(&holder, &a));
+        assert_eq!(info.offset, 12);
+        assert!(!info.is_static());
+        assert_eq!(info.kind(), Some(crate::share::oops::fieldInfo::FieldKind::Int32));
+
+        let (holder, info) = b_arc.lookup_field(b"r", b"Ljava/lang/Object;").unwrap();
+        assert!(Arc::ptr_eq(&holder, &b));
+        assert_eq!(info.offset, 24);
+
+        // Static field of A resolved through B.
+        let (holder, info) = b_arc.lookup_field(b"s", b"I").unwrap();
+        assert!(Arc::ptr_eq(&holder, &a));
+        assert!(info.is_static());
+
+        assert!(b_arc.lookup_field(b"missing", b"I").is_none());
+    }
+
+    #[test]
+    fn vtable_inherits_and_overrides() {
+        let (_, a, b) = hierarchy();
+        // A: m()V -> slot 0 (st is static, excluded).
+        assert_eq!(a.vtable_index(b"m", b"()V"), Some(0));
+        // B overrides m in place, appends n.
+        assert_eq!(b.vtable_index(b"m", b"()V"), Some(0));
+        assert_eq!(b.vtable_index(b"n", b"()V"), Some(1));
+        let entry = b.vtable_entry(0).unwrap();
+        assert_eq!(entry.holder_klass(), "B");
+        assert_eq!(entry.method_name(), "m");
+        assert_eq!(entry.signature(), "()V");
+
+        // Virtual lookup skips private/static declarations.
+        let (holder, index) = Arc::clone(&b).lookup_virtual_method(b"m", b"()V").unwrap();
+        assert!(Arc::ptr_eq(&holder, &b));
+        assert_eq!(b.class.methods[index].name, b"m".as_slice());
+        // Raw lookup finds inherited methods too.
+        let (_, _) = Arc::clone(&b).lookup_method(b"m", b"()V").unwrap();
+    }
+
+    #[test]
+    fn itable_resolves_interface_methods() {
+        let (_, _, b) = hierarchy();
+        // I.m()V is inherited by B through A; itable maps it to a vtable slot.
+        let v_idx = b.itable_vtable_index(b"I", b"m", b"()V");
+        // B declares its own m()V, so the itable resolves to slot 0.
+        assert_eq!(v_idx, Some(0));
+        assert!(b.itable_vtable_index(b"NoSuchIface", b"m", b"()V").is_none());
+    }
+
+    #[test]
+    fn resolve_member_ref_returns_triple() {
+        let (_, _, b) = hierarchy();
+        let reference = b.resolve_member_ref(6).unwrap();
+        assert_eq!(reference.kind, MemberRefKind::Field);
+        assert_eq!(reference.owner, b"java/lang/Object".as_slice());
+        assert_eq!(reference.name, b"x".as_slice());
+        assert_eq!(reference.descriptor, b"I".as_slice());
+        assert!(b.resolve_member_ref(1).is_err());
+    }
+
+    #[test]
+    fn array_class_queries() {
+        let array = InstanceKlass::new(
+            class_file(b"[I", Some(b"java/lang/Object".as_slice()), 0x0411, vec![], vec![], vec![]),
+            None,
+            vec![],
+        )
+        .unwrap();
+        assert!(array.is_array());
+        assert_eq!(array.array_dimension(), 1);
+        assert_eq!(array.array_element_descriptor(), Some(&b"I"[..]));
+
+        let multi = InstanceKlass::new(
+            class_file(
+                b"[[Ljava/lang/String;",
+                Some(b"java/lang/Object".as_slice()),
+                0x0411,
+                vec![],
+                vec![],
+                vec![],
+            ),
+            None,
+            vec![],
+        )
+        .unwrap();
+        assert_eq!(multi.array_dimension(), 2);
+        assert_eq!(multi.array_element_descriptor(), Some(&b"[Ljava/lang/String;"[..]));
+
+        let (_, _, b) = hierarchy();
+        assert!(!b.is_array());
+        assert_eq!(b.array_element_descriptor(), None);
+    }
+
+    #[test]
+    fn access_flag_queries() {
+        let (_, a, _) = hierarchy();
+        assert!(!a.is_interface());
+        assert!(!a.is_abstract());
+        assert!(!a.is_final());
+        let iface_klass = a.interfaces[0].clone();
+        assert!(iface_klass.is_interface());
+        assert!(iface_klass.is_abstract());
+        assert!(!iface_klass.is_final());
     }
 }

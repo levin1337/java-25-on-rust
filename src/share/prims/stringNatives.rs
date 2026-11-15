@@ -24,16 +24,36 @@ pub(crate) fn string<'a>(
             if object.klass.class.name != b"java/lang/String" {
                 return Ok(None);
             }
-            let invalid = || Error::other("Invalid java.lang.String storage");
-            let Value::PrimitiveArray(handle) =
-                object.fields[object.klass.instanceField(b"value", b"[B")?]
-            else {
-                return Err(invalid());
+            let site = || {
+                crate::share::interpreter::bytecodeInterpreter::current_frame_site()
             };
-            let coder = object.fields[object.klass.instanceField(b"coder", b"B")?].int()?;
+            let value_index = object
+                .klass
+                .instanceField(b"value", b"[B")
+                .map_err(|error| Error::other(format!("{error} site={}", site())))?;
+            let field = object.fields[value_index];
+            let Value::PrimitiveArray(handle) = field else {
+                return Err(Error::other(format!(
+                    "Invalid java.lang.String storage: value={field:?} site={}",
+                    site()
+                )));
+            };
+            let coder_index = object
+                .klass
+                .instanceField(b"coder", b"B")
+                .map_err(|error| Error::other(format!("{error} site={}", site())))?;
+            let coder = object.fields[coder_index].int().map_err(|error| {
+                Error::other(format!(
+                    "Invalid java.lang.String coder: {error} site={}",
+                    site()
+                ))
+            })?;
             let arrays = loader.arrays.borrow();
             let Some(TypeArrayOop::Byte(bytes)) = arrays.get(handle) else {
-                return Err(invalid());
+                return Err(Error::other(format!(
+                    "Invalid java.lang.String storage: array={handle} site={}",
+                    site()
+                )));
             };
             let text = match coder {
                 0 => bytes.iter().map(|&byte| char::from(byte as u8)).collect(),
@@ -47,7 +67,12 @@ pub(crate) fn string<'a>(
                         .collect::<Result<String, _>>()
                         .map_err(|error| Error::new(io::ErrorKind::InvalidData, error))?
                 }
-                _ => return Err(invalid()),
+                _ => {
+                    return Err(Error::other(format!(
+                        "Invalid java.lang.String coder: {coder} site={}",
+                        site()
+                    )));
+                }
             };
             Ok(Some(Cow::Owned(text)))
         }

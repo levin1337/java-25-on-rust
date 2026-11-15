@@ -42,28 +42,28 @@ impl C1Compiler {
     /// constants, field/call-site info, exception handlers) collected
     /// by the compile broker from the owning class.
     pub fn compile_to_code_meta(&mut self, bytecode: &[u8], max_locals: usize, params: Vec<ParamInfo>, metadata: MethodMetadata) -> Result<(Vec<u8>, usize, Vec<PcDesc>), BackendError> {
+        let trace = std::env::var_os("JVM25_TRACE_COMPILE").is_some();
+        if trace { eprintln!("[jit-stage] build_full len={}", bytecode.len()); }
         let cfg = GraphBuilder::build_full(bytecode, max_locals, metadata.clone());
+        if trace { eprintln!("[jit-stage] optimize_cfg"); }
         let cfg = self.compile_hir(cfg);
-        // Executable-tier gate: the backend lowers field/array/allocation/
-        // call/monitor ops to raw memory accesses and runtime stubs that
-        // do not exist yet. Only methods that stay within the primitive
-        // subset may produce runnable code; everything else bails out so
-        // the broker marks the method not-compilable instead of emitting
-        // a blob that would corrupt the heap if ever entered.
+        if trace { eprintln!("[jit-stage] cfg_executable"); }
+        // Executable-tier gate: heap operations lower to `CallRuntime`
+        // stubs backed by real handlers in `jitruntime::stubs`, and
+        // invokes lower to either a direct nmethod call
+        // (`CallInfo.target`) or the `UnresolvedCall` stub, which
+        // resolves the target and runs it compiled or interpreted —
+        // pending outcomes cascade through `invoke_raw` boundaries, so
+        // non-leaf methods are supported.  `Unsupported` nodes and
+        // >4-operand runtime stubs stay rejected.
         if !cfg_executable(&cfg) {
             return Err(BackendError::Unsupported(
-                "method requires heap access or runtime stubs".to_string(),
+                "method requires unsupported instructions".to_string(),
             ));
         }
-        // Compiled frames are invisible to the GC root snapshot, so a
-        // method whose signature passes a reference (receiver included)
-        // cannot be safely JIT-compiled yet.
-        if params.iter().any(|p| p.kind == LirKind::Ref) {
-            return Err(BackendError::Unsupported(
-                "method signature carries references".to_string(),
-            ));
-        }
+        if trace { eprintln!("[jit-stage] lir_generate"); }
         let program = LirGenerator::generate(&cfg, &metadata);
+        if trace { eprintln!("[jit-stage] emit_program"); }
         if std::env::var("JVM25_DUMP_LIR").is_ok() {
             eprintln!("[lir:{}] {:?}", CURRENT_METHOD.with(|m| m.borrow().clone()), program);
         }
@@ -142,17 +142,22 @@ fn parse_descriptor_params(descriptor: &str, is_static: bool) -> Vec<ParamInfo> 
 }
 
 /// True when every instruction in the CFG stays within the executable
-/// subset: pure primitive computation, control flow and returns.
+/// subset: primitive computation, control flow, returns and heap
+/// operations that lower to real `CallRuntime` stub handlers.
 fn cfg_executable(cfg: &ControlFlowGraph) -> bool {
     cfg.blocks
         .iter()
         .all(|block| block.instructions.iter().all(hir_executable))
 }
 
-/// Recursive gate mirroring the unsafe backend lowerings: anything that
-/// dereferences an object/array pointer, allocates, calls out, or needs
-/// a runtime stub is rejected. Nested operand expressions are checked
-/// the same way.
+/// Recursive gate mirroring the executable backend lowerings.  Heap
+/// operations are allowed because `jitruntime::stubs` implements real
+/// handlers for them; `Float64` field/array accesses stay rejected
+/// because runtime-stub results travel through `rax` only (no xmm
+/// return channel).  Method calls are allowed: resolved targets emit
+/// a direct call, unresolved ones go through the `UnresolvedCall`
+/// stub whose handler re-dispatches compiled or interpreted code.
+/// Nested operand expressions are checked the same way.
 fn hir_executable(inst: &HirInstruction) -> bool {
     use HirInstruction as H;
     match inst {
@@ -161,25 +166,13 @@ fn hir_executable(inst: &HirInstruction) -> bool {
         | H::ConstantFloat(_)
         | H::ConstantDouble(_)
         | H::ConstantNull
-        | H::Goto(_)
-        | H::Neg(_) => {
-            // Neg carries an operand; check it.
-            match inst {
-                H::Neg(v) => hir_executable(v),
-                _ => true,
-            }
+        | H::Goto(_) => true,
+        H::Neg(v) => hir_executable(v),
+        H::LoadLocal { .. } | H::LoadStack { .. } => true,
+        H::StoreLocal { value, .. } | H::StoreStack { value, .. } => hir_executable(value),
+        H::MonitorEnter(v) | H::MonitorExit(v) | H::Throw(v) | H::ArrayLength(v) => {
+            hir_executable(v)
         }
-        // Reference-typed frame slots are invisible to the GC root
-        // snapshot (which only scans interpreter frames), so a compiled
-        // method must never hold a Ref in a local or stack slot.
-        H::LoadLocal { kind, .. } | H::LoadStack { kind, .. } => *kind != ValueKind::Ref,
-        H::StoreLocal { kind, value, .. } | H::StoreStack { kind, value, .. } => {
-            *kind != ValueKind::Ref && hir_executable(value)
-        }
-        // Monitor enter/exit and athrow lower to `CallRuntime` stubs
-        // that operate on object-arena handles — they do not dereference
-        // raw pointers, so they are safe to compile.
-        H::MonitorEnter(v) | H::MonitorExit(v) | H::Throw(v) => hir_executable(v),
         H::Add(l, r)
         | H::Sub(l, r)
         | H::Mul(l, r)
@@ -197,22 +190,32 @@ fn hir_executable(inst: &HirInstruction) -> bool {
         H::Return(value) => value.as_deref().map_or(true, hir_executable),
         H::TableSwitch { index, .. } => hir_executable(index),
         H::LookupSwitch { key, .. } => hir_executable(key),
-        // Heap access, allocation, calls, monitors, casts and throws all
-        // require runtime support that does not exist yet.
-        H::LoadField { .. }
-        | H::StoreField { .. }
-        | H::GetStatic { .. }
-        | H::PutStatic { .. }
-        | H::LoadIndexed { .. }
-        | H::StoreIndexed { .. }
-        | H::ArrayLength(_)
-        | H::NewArray { .. }
-        | H::NewObject { .. }
-        | H::AnewArray { .. }
-        | H::Call { .. }
-        | H::CheckCast { .. }
-        | H::InstanceOf { .. }
-        | H::Unsupported { .. } => false,
+        H::LoadField { obj, kind, .. } => {
+            *kind != ValueKind::Float64 && hir_executable(obj)
+        }
+        H::StoreField { obj, value, kind, .. } => {
+            *kind != ValueKind::Float64 && hir_executable(obj) && hir_executable(value)
+        }
+        H::GetStatic { kind, .. } => *kind != ValueKind::Float64,
+        H::PutStatic { value, kind, .. } => {
+            *kind != ValueKind::Float64 && hir_executable(value)
+        }
+        H::LoadIndexed { array, index, elem } => {
+            elem.value_kind() != ValueKind::Float64
+                && hir_executable(array)
+                && hir_executable(index)
+        }
+        H::StoreIndexed { array, index, value, elem } => {
+            elem.value_kind() != ValueKind::Float64
+                && hir_executable(array)
+                && hir_executable(index)
+                && hir_executable(value)
+        }
+        H::NewArray { length, .. } | H::AnewArray { length, .. } => hir_executable(length),
+        H::NewObject { .. } => true,
+        H::CheckCast { value, .. } | H::InstanceOf { value, .. } => hir_executable(value),
+        H::Call { operands, .. } => operands.iter().all(|o| hir_executable(o)),
+        H::Unsupported { .. } => false,
     }
 }
 
@@ -220,10 +223,7 @@ impl AbstractCompiler for C1Compiler {
     fn compiler_type(&self) -> CompilerType { CompilerType::C1 }
 
     fn compile_method(&mut self, task: &CompileTask) -> Result<CompileOutcome, CompileError> {
-<<<<<<< HEAD
-=======
         self.compiled_methods += 1;
->>>>>>> 187eca38ba2fa504e8ec50e0c4e7393023753a01
         let method = task.method_obj.as_ref().ok_or_else(|| CompileError::new(FailureReason::Unresolved, "missing Method handle", CompLevel::Simple))?;
         let bytecode = method.bytecodes();
         if bytecode.is_empty() {
@@ -248,7 +248,23 @@ impl AbstractCompiler for C1Compiler {
             ));
         }
         let params = parse_descriptor_params(task.method.descriptor.as_str(), method.is_static());
-        let metadata = task.jit_metadata.clone().unwrap_or_default();
+        let mut metadata = task.jit_metadata.clone().unwrap_or_default();
+        // Heap-op sites and field kinds are resolved from the owning
+        // class here (the broker only pre-resolves `ldc` constants),
+        // so `CallRuntime` stubs receive real `StubSite` pointers.
+        if let Some(loader) = crate::share::runtime::threading::jvm_loader()
+            && let Some(klass) = loader
+                .classes
+                .borrow()
+                .get(task.method.class_name.as_bytes())
+                .cloned()
+        {
+            crate::share::c1::c1_GraphBuilder::resolve_heap_sites(
+                &klass,
+                bytecode,
+                &mut metadata,
+            );
+        }
         CURRENT_METHOD.with(|m| *m.borrow_mut() = task.method.method_key.clone());
         let (code, frame_size, pc_descs) = self
             .compile_to_code_meta(bytecode, max_locals, params, metadata)

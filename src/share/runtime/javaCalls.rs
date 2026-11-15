@@ -326,7 +326,7 @@ pub fn mainClass<'a>(
             ]),
         }
     }
-    eprintln!("[phase] load main {:?}", t0.elapsed());
+    eprintln!("[phase] load main {:?} name={name:?}", t0.elapsed());
     let klass = loader.load(&encoded)?;
     eprintln!("[phase] main loaded {:?}", t0.elapsed());
     let mut args = JavaCallArguments::new();

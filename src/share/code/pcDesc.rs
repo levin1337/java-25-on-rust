@@ -11,9 +11,16 @@ pub struct PcDesc {
     scope_decode_offset: i32,
     obj_decode_offset: i32,
     flags: i32,
+    /// Bytecode index this pc maps to for deoptimization.  HotSpot keeps
+    /// the bci inside the ScopeDesc chain; the C1 backend currently has
+    /// no scope-data blob, so the broker normalizes the bci it finds in
+    /// `scope_decode_offset` into this field at install time.
+    bci: i32,
 }
 
 impl PcDesc {
+    /// Sentinel for "no valid bci" (MethodCompilation::INVALID_FRAME_STATE_BCI).
+    pub const UNKNOWN_BCI: i32 = -6;
     pub const PCDESC_REEXECUTE: i32 = 1 << 0;
     pub const PCDESC_IS_METHOD_HANDLE_INVOKE: i32 = 1 << 1;
     pub const PCDESC_RETURN_OOP: i32 = 1 << 2;
@@ -30,9 +37,11 @@ impl PcDesc {
             scope_decode_offset,
             obj_decode_offset: 0,
             flags,
+            bci: Self::UNKNOWN_BCI,
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn with_obj(
         pc_offset: i32,
         scope_decode_offset: i32,
@@ -44,6 +53,24 @@ impl PcDesc {
             scope_decode_offset,
             obj_decode_offset,
             flags,
+            bci: Self::UNKNOWN_BCI,
+        }
+    }
+
+    /// Full constructor including the deopt bci.
+    pub fn with_bci(
+        pc_offset: i32,
+        scope_decode_offset: i32,
+        obj_decode_offset: i32,
+        flags: i32,
+        bci: i32,
+    ) -> Self {
+        Self {
+            pc_offset,
+            scope_decode_offset,
+            obj_decode_offset,
+            flags,
+            bci,
         }
     }
 
@@ -80,6 +107,16 @@ impl PcDesc {
     #[inline]
     pub fn flags(&self) -> i32 {
         self.flags
+    }
+
+    #[inline]
+    pub fn bci(&self) -> i32 {
+        self.bci
+    }
+
+    #[inline]
+    pub fn set_bci(&mut self, bci: i32) {
+        self.bci = bci;
     }
 
     #[inline]
@@ -402,3 +439,82 @@ impl Default for PcDescCache {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_descs() -> Vec<PcDesc> {
+        let mut v = vec![PcDesc::new(PcDesc::LOWER_OFFSET_LIMIT, 0, 0)];
+        for (i, off) in [4i32, 16, 40, 128, 512].iter().enumerate() {
+            v.push(PcDesc::with_bci(
+                *off,
+                0,
+                0,
+                PcDesc::PCDESC_REEXECUTE,
+                i as i32 * 3,
+            ));
+        }
+        v.push(PcDesc::new(PcDesc::UPPER_OFFSET_LIMIT, 0, 0));
+        v
+    }
+
+    #[test]
+    fn exact_lookup_finds_desc() {
+        let descs = sample_descs();
+        let mut c = PcDescContainer::new(&descs);
+        let idx = c.find_pc_desc(&descs, 40, false).unwrap();
+        assert_eq!(descs[idx].pc_offset(), 40);
+        assert_eq!(descs[idx].bci(), 6);
+        assert!(c.find_pc_desc(&descs, 41, false).is_none());
+    }
+
+    #[test]
+    fn approximate_lookup_returns_covering_desc() {
+        let descs = sample_descs();
+        let mut c = PcDescContainer::new(&descs);
+        // Approximate mode returns the first desc with pc_offset >= target
+        // (HotSpot quasi-search "upper" semantics).
+        let idx = c.find_pc_desc(&descs, 100, true).unwrap();
+        assert_eq!(descs[idx].pc_offset(), 128);
+        let idx = c.find_pc_desc(&descs, 16, true).unwrap();
+        assert_eq!(descs[idx].pc_offset(), 16);
+        let idx = c.find_pc_desc(&descs, 4, true).unwrap();
+        assert_eq!(descs[idx].pc_offset(), 4);
+    }
+
+    #[test]
+    fn flags_round_trip() {
+        let mut d = PcDesc::new(8, 2, PcDesc::PCDESC_REEXECUTE | PcDesc::PCDESC_RETURN_OOP);
+        assert!(d.should_reexecute());
+        assert!(d.is_return_oop());
+        assert!(!d.rethrow_exception());
+        d.set_rethrow_exception(true);
+        d.set_arg_escape(true);
+        assert!(d.rethrow_exception());
+        assert!(d.arg_escape());
+        d.set_flags(0);
+        assert!(!d.should_reexecute());
+        assert!(!d.arg_escape());
+        assert_eq!(d.bci(), PcDesc::UNKNOWN_BCI);
+        d.set_bci(7);
+        assert_eq!(d.bci(), 7);
+    }
+
+    #[test]
+    fn cache_lru_ordering() {
+        let mut cache = PcDescCache::new();
+        let a = PcDesc::new(1, 0, 0);
+        let b = PcDesc::new(2, 0, 0);
+        cache.add_pc_desc(a);
+        cache.add_pc_desc(b);
+        assert_eq!(cache.last_pc_desc().unwrap().pc_offset(), 2);
+        assert_eq!(
+            cache.find_pc_desc(1, false).map(|d| d.pc_offset()),
+            Some(1)
+        );
+        assert_eq!(cache.find_pc_desc(9, false), None);
+        assert_eq!(cache.find_pc_desc(9, true), None);
+    }
+}
+

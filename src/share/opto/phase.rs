@@ -9,6 +9,7 @@
  */
 
 use super::gvn::PhaseGVN;
+use super::loop_analysis::{self, LoopTree};
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -131,5 +132,80 @@ pub struct PhaseCCP;
 impl PhaseCCP {
     pub fn optimize(gvn: &mut PhaseGVN) -> usize {
         gvn.iter_gvn()
+    }
+}
+
+pub struct PhaseTyperRun;
+
+impl PhaseTyperRun {
+    pub fn optimize(gvn: &PhaseGVN) -> super::typers::PhaseTyper<'_> {
+        let mut typer = super::typers::PhaseTyper::new(gvn);
+        typer.optimize();
+        typer
+    }
+}
+
+pub struct PhaseCanonicalizerRun;
+
+impl PhaseCanonicalizerRun {
+    pub fn optimize(gvn: &mut PhaseGVN) -> usize {
+        super::canonicalizer::PhaseCanonicalizer::optimize(gvn)
+    }
+}
+
+pub struct PhaseMacroExpandRun<'a> {
+    inner: super::macroexpand::PhaseMacroExpand<'a>,
+}
+
+impl<'a> PhaseMacroExpandRun<'a> {
+    pub fn new() -> Self {
+        Self {
+            inner: super::macroexpand::PhaseMacroExpand::new(),
+        }
+    }
+
+    pub fn optimize(&mut self, gvn: &mut PhaseGVN) -> usize {
+        self.inner.optimize(gvn)
+    }
+}
+
+impl Default for PhaseMacroExpandRun<'_> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub struct PhaseIdealLoopRun;
+
+pub struct IdealLoopResult {
+    pub tree: LoopTree,
+    pub invariants: Vec<std::collections::HashSet<super::node::NodeId>>,
+}
+
+impl PhaseIdealLoopRun {
+    pub fn optimize(gvn: &PhaseGVN) -> IdealLoopResult {
+        let tree = loop_analysis::LoopAnalysis::analyze(gvn);
+        let invariants = tree
+            .loops
+            .iter()
+            .map(|l| loop_analysis::loop_invariant_nodes(gvn, &l.body))
+            .collect();
+        IdealLoopResult { tree, invariants }
+    }
+}
+
+pub struct PhaseScheduleBoundary;
+
+impl PhaseScheduleBoundary {
+    pub fn run_scheduler(gvn: &PhaseGVN) -> super::scheduler::Schedule {
+        super::scheduler::Scheduler::new(gvn).schedule()
+    }
+
+    pub fn run_regalloc(
+        gvn: &PhaseGVN,
+        schedule: &super::scheduler::Schedule,
+        param_slots: usize,
+    ) -> Result<super::regalloc::Allocation, String> {
+        super::regalloc::RegisterAllocator::new(gvn, schedule).allocate(param_slots)
     }
 }

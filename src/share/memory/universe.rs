@@ -155,9 +155,7 @@ impl Universe {
 
         match mode {
             HeapGcMode::ParallelMarkSweep => {
-                let workers = std::thread::available_parallelism()
-                    .map(|n| n.get())
-                    .unwrap_or(4);
+                let workers = crate::share::gc::shared::gcEngine::parallel_gc_workers();
                 Box::new(ParallelCollectedHeap::new(
                     Arc::clone(loader),
                     young_size,

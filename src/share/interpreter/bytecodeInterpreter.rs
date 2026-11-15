@@ -36,6 +36,16 @@ pub fn bytecode_count() -> u64 {
 }
 
 pub static NATIVE_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static JIT_OSR_INVOKES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static JIT_OSR_FALLBACKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn jit_osr_invokes() -> u64 {
+    JIT_OSR_INVOKES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn jit_osr_fallbacks() -> u64 {
+    JIT_OSR_FALLBACKS.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 pub fn frame_count() -> u64 {
     FRAME_COUNT.load(std::sync::atomic::Ordering::Relaxed)
@@ -289,6 +299,9 @@ pub(crate) struct Frame<'a> {
     stackSlots: usize,
     owner: &'a [u8],
     monitors: Vec<u64>,
+    osr_bci: Option<i32>,
+    osr_disabled: bool,
+    osr_probe: u32,
     /// Raw pointer/length to the declaring class's constant pool, used by
     /// `stackWalkInfo` to resolve LineNumberTable entries. The `InstanceKlass`
     /// `Arc` owning the `ClassFile` (and thus this `Vec`'s buffer) is kept
@@ -418,6 +431,13 @@ impl<'a> Frame<'a> {
         if target < self.pc && !env_flag("JVM25_NO_JIT") && !jit_skip(self.owner, &self.code)
         {
             let key = self.code.bytes.as_ptr() as usize;
+            self.osr_probe = self.osr_probe.wrapping_sub(1);
+            if self.osr_probe == u32::MAX {
+                self.osr_probe = 255;
+                if crate::share::oops::methodCounters::compiled_addr(key) != 0 {
+                    self.osr_bci = Some(target as i32);
+                }
+            }
             if crate::share::oops::methodCounters::backedge_tick(key) {
                 if env_flag("JVM25_TRACE_COMPILE") {
                     eprintln!(
@@ -906,7 +926,9 @@ pub fn execute_labeled<'a>(
                 return Ok(value);
             }
             Some(crate::share::jitruntime::CompiledResult::Thrown(handle)) => {
-                return Err(Error::other(JavaThrowable(handle)));
+                if code.exception_table.is_empty() {
+                    return Err(Error::other(JavaThrowable(handle)));
+                }
             }
             Some(crate::share::jitruntime::CompiledResult::Deoptimize) => {
                 // Uncommon trap / unsupported stub: retire the
@@ -974,7 +996,16 @@ pub fn execute_labeled<'a>(
     } else {
         None
     };
-    let result = executeFrame(loader, klass, code, arguments, output, depth, owner);
+    let result = executeFrame(
+        loader,
+        klass,
+        code,
+        arguments,
+        output,
+        depth,
+        owner,
+        access_flags,
+    );
     if let Some(value) = monitor {
         let _ = monitorExit(loader, output, depth, value);
     }
@@ -1035,6 +1066,7 @@ fn executeFrame<'a>(
     output: &mut dyn Write,
     depth: usize,
     owner: &'a [u8],
+    access_flags: u16,
 ) -> io::Result<Option<Value<'a>>> {
     FRAME_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if depth >= 128 {
@@ -1065,6 +1097,9 @@ fn executeFrame<'a>(
         locals,
         owner,
         monitors: Vec::new(),
+        osr_bci: None,
+        osr_disabled: false,
+        osr_probe: 0,
         constants_ptr: klass.class.constants.as_ptr(),
         constants_len: klass.class.constants.len(),
     };
@@ -1142,6 +1177,67 @@ fn executeFrame<'a>(
                     return Err(error);
                 }
             },
+        }
+        if let Some(bci) = frame.osr_bci.take()
+            && frame.pc as i32 == bci
+            && !frame.osr_disabled
+            && frame.monitors.is_empty()
+            && let Some(value) = osr_invoke(&mut frame, arguments, access_flags, depth, bci)
+        {
+            return Ok(value);
+        }
+    }
+}
+
+fn osr_invoke<'a>(
+    frame: &mut Frame<'a>,
+    arguments: &[Value<'a>],
+    access_flags: u16,
+    depth: usize,
+    bci: i32,
+) -> Option<Option<Value<'a>>> {
+    let code_key = frame.code.bytes.as_ptr() as usize;
+    let addr = crate::share::oops::methodCounters::compiled_addr(code_key);
+    let in_use = addr != 0
+        && crate::share::code::codeCache::CodeCache::global()
+            .find_nmethod_at_address(addr)
+            .is_some_and(|nm| nm.is_in_use());
+    if !in_use {
+        if addr != 0 {
+            crate::share::oops::methodCounters::clear_compiled(code_key);
+        }
+        frame.osr_disabled = true;
+        return None;
+    }
+    if std::env::var_os("JVM25_TRACE_COMPILE").is_some() {
+        eprintln!("[osr-invoke] {}.{}{} bci={}", dotted(&frame.owner), String::from_utf8_lossy(frame.code.name), String::from_utf8_lossy(frame.code.descriptor), bci);
+    }
+    match crate::share::jitruntime::try_invoke(
+        addr,
+        frame.code.descriptor,
+        access_flags & 0x0008 != 0,
+        arguments,
+        depth,
+    ) {
+        Some(crate::share::jitruntime::CompiledResult::Value(value)) => {
+            JIT_OSR_INVOKES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Some(value)
+        }
+        Some(crate::share::jitruntime::CompiledResult::Thrown(_)) | None => {
+            JIT_OSR_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            frame.osr_disabled = true;
+            None
+        }
+        Some(crate::share::jitruntime::CompiledResult::Deoptimize) => {
+            JIT_OSR_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if let Some(nm) = crate::share::code::codeCache::CodeCache::global()
+                .find_nmethod_at_address(addr)
+            {
+                nm.make_not_entrant();
+            }
+            crate::share::oops::methodCounters::clear_compiled(code_key);
+            frame.osr_disabled = true;
+            None
         }
     }
 }
@@ -2259,6 +2355,24 @@ fn step<'a>(
                     };
                     object.fields[index] = val;
                     return Ok(None);
+                }
+                if env_flag("JVM25_DEBUG_FIELD")
+                    && name == b"value"
+                    && matches!(object.fields.get(index), Some(Value::Null) | None)
+                {
+                    eprintln!(
+                        "[field-null] {}.{}{} idx={} len={} handle={} klass={} pc={} in {}.{}",
+                        String::from_utf8_lossy(owner),
+                        String::from_utf8_lossy(name),
+                        String::from_utf8_lossy(descriptor),
+                        index,
+                        object.fields.len(),
+                        handle,
+                        String::from_utf8_lossy(object.klass.class.name),
+                        pc,
+                        String::from_utf8_lossy(frame.owner),
+                        String::from_utf8_lossy(frame.code.name),
+                    );
                 }
                 Ok(Some(object.fields[index]))
             })();

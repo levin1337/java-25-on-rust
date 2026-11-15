@@ -14,6 +14,7 @@
 
 use super::builder::{BuilderContext, ExceptionHandler, MethodCode};
 use super::codegen::{BackendError, BackendOptions, ParamKind, ParamSlot};
+use crate::share::oops::objLayout::ObjLayoutMode;
 use super::compile::Compile;
 use crate::share::compiler::abstractCompiler::{AbstractCompiler, CompileError, CompilerType};
 use crate::share::compiler::compileTask::{CompileOutcome, CompileTask, FailureReason};
@@ -141,6 +142,7 @@ impl AbstractCompiler for C2Compiler {
             stubs: crate::share::jitruntime::stub_map(),
             params,
             emit_safepoints: true,
+            obj_layout: ObjLayoutMode::Uncompressed,
         };
         let mut compile = Compile::compile(&method_code, &ctx);
         let emitted = compile

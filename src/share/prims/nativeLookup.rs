@@ -500,7 +500,10 @@ fn invokeInstanceInner<'a>(
     }
 
     // TEST-ONLY wiring for urlNatives (to be placed by orchestrator).
-    if (owner.starts_with(b"java/net/") || owner == b"java/lang/ClassLoader" || owner.starts_with(b"jvm25/"))
+    if (owner.starts_with(b"java/net/")
+        || owner.starts_with(b"sun/net/www/protocol/")
+        || owner == b"java/lang/ClassLoader"
+        || owner.starts_with(b"jvm25/"))
         && let Some(result) =
             super::urlNatives::invoke_instance(loader, owner, name, descriptor, arguments)?
     {
@@ -540,6 +543,14 @@ fn invokeInstanceInner<'a>(
         };
         // Binary name -> internal name ("java.lang.String" -> "java/lang/String",
         // "[Ljava.lang.String;" -> "[Ljava/lang/String;").
+        if binary.contains('=') {
+            eprintln!(
+                "[findclass-suspect] {} binary={:?} site={}",
+                String::from_utf8_lossy(name),
+                binary,
+                crate::share::interpreter::bytecodeInterpreter::current_frame_site()
+            );
+        }
         let internal = binary.replace('.', "/");
         let internal = loader.storage.alloc_str(&internal);
         return match loader.load(internal.as_bytes()) {
@@ -1979,6 +1990,12 @@ fn invokeStaticInner<'a>(
         }
         (b"jdk/internal/loader/BootLoader", b"setBootLoaderUnnamedModule0", b"(Ljava/lang/Module;)V") => {
             Some(None)
+        }
+        // JVM_GetSystemPackageLocation: code-source location of a boot-layer
+        // package. Null is the spec-sanctioned "unknown" answer; callers use
+        // it only for package sealing/spec-version checks.
+        (b"jdk/internal/loader/BootLoader", b"getSystemPackageLocation", b"(Ljava/lang/String;)Ljava/lang/String;") => {
+            Some(Some(Value::Null))
         }
         // java.lang.Module VM-graph updates. Java-side state (reads,
         // exportedPackages/openPackages, ReflectionData) is maintained by

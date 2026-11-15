@@ -226,6 +226,19 @@ impl<'a> LirGenerator<'a> {
         LirOperand::ConstI64(stub_site_ptr(self.metadata.sites.get(&cp_index)) as i64)
     }
 
+    /// Raw leaked `StubSite` pointer for invoke call sites; carried on
+    /// `CallInfo.site` so the x86 backend can feed the CallMethod stub
+    /// without another metadata lookup.
+    fn call_site_ptr(&self, cp_index: u32) -> u64 {
+        stub_site_ptr(self.metadata.sites.get(&cp_index))
+    }
+
+    fn resolved_call_info(&self, info: &CallInfo) -> CallInfo {
+        let mut info = info.clone();
+        info.site = self.call_site_ptr(info.cp_index);
+        info
+    }
+
     pub fn generate(cfg: &ControlFlowGraph, metadata: &'a super::c1_GraphBuilder::MethodMetadata) -> LirProgram {
         let mut generator = Self::new(metadata);
         generator.local_count = scan_local_count(cfg).max(cfg.max_locals);
@@ -302,8 +315,9 @@ impl<'a> LirGenerator<'a> {
             }
             HirInstruction::Call { info, operands } => {
                 if info.return_kind == ValueKind::Void {
+                    let info = self.resolved_call_info(info);
                     let ops = self.emit_operands(out, operands);
-                    out.push(LirOp::Call { dst: None, operands: ops, info: info.clone() });
+                    out.push(LirOp::Call { dst: None, operands: ops, info });
                 } else {
                     let _ = self.emit_expr(out, inst);
                 }
@@ -345,22 +359,10 @@ impl<'a> LirGenerator<'a> {
                 let dst = self.alloc_temp(LirKind::Ref);
                 out.push(LirOp::CallRuntime { stub: RuntimeStub::NewInstance, operands: vec![self.site_operand(*cp_index)], dst: Some(dst.clone()), bci: 0 });
             }
-<<<<<<< HEAD
             HirInstruction::LoadField { obj, cp_index, kind, .. } => {
                 let obj = self.emit_expr(out, obj);
                 let dst = self.alloc_temp(LirKind::from_value_kind(*kind));
                 out.push(LirOp::CallRuntime { stub: RuntimeStub::GetField, operands: vec![obj, self.site_operand(*cp_index)], dst: Some(dst.clone()), bci: 0 });
-=======
-            HirInstruction::LoadField { obj, offset, kind, .. } => {
-                if let Some(offset) = offset {
-                    let obj = self.emit_expr(out, obj);
-                    let dst = self.alloc_temp(LirKind::from_value_kind(*kind));
-                    out.push(LirOp::LoadField { dst, obj, offset: *offset, kind: LirKind::from_value_kind(*kind) });
-                } else {
-                    let obj_op = self.emit_expr(out, obj);
-                    out.push(LirOp::CallRuntime { stub: RuntimeStub::UnresolvedField, operands: vec![obj_op], dst: None, bci: 0 });
-                }
->>>>>>> 187eca38ba2fa504e8ec50e0c4e7393023753a01
             }
             HirInstruction::StoreField { obj, cp_index, value, .. } => {
                 let obj = self.emit_expr(out, obj);
@@ -458,13 +460,14 @@ impl<'a> LirGenerator<'a> {
                 dst
             }
             HirInstruction::Call { info, operands } => {
+                let info = self.resolved_call_info(info);
                 let ops = self.emit_operands(out, operands);
                 if info.return_kind == ValueKind::Void {
-                    out.push(LirOp::Call { dst: None, operands: ops, info: info.clone() });
+                    out.push(LirOp::Call { dst: None, operands: ops, info });
                     LirOperand::ConstI32(0)
                 } else {
                     let dst = self.alloc_temp(LirKind::from_value_kind(info.return_kind));
-                    out.push(LirOp::Call { dst: Some(dst.clone()), operands: ops, info: info.clone() });
+                    out.push(LirOp::Call { dst: Some(dst.clone()), operands: ops, info });
                     dst
                 }
             }
@@ -493,7 +496,6 @@ impl<'a> LirGenerator<'a> {
                 out.push(LirOp::CallRuntime { stub: RuntimeStub::AnewArray, operands: vec![site, len], dst: Some(dst.clone()), bci: 0 });
                 dst
             }
-<<<<<<< HEAD
             HirInstruction::NewObject { cp_index, .. } => {
                 let dst = self.alloc_temp(LirKind::Ref);
                 out.push(LirOp::CallRuntime { stub: RuntimeStub::NewInstance, operands: vec![self.site_operand(*cp_index)], dst: Some(dst.clone()), bci: 0 });
@@ -509,19 +511,6 @@ impl<'a> LirGenerator<'a> {
                 let dst = self.alloc_temp(LirKind::from_value_kind(*kind));
                 out.push(LirOp::CallRuntime { stub: RuntimeStub::GetStatic, operands: vec![self.site_operand(*cp_index)], dst: Some(dst.clone()), bci: 0 });
                 dst
-=======
-            HirInstruction::LoadField { obj, offset, kind, .. } => {
-                if let Some(offset) = offset {
-                    let obj = self.emit_expr(out, obj);
-                    let dst = self.alloc_temp(LirKind::from_value_kind(*kind));
-                    out.push(LirOp::LoadField { dst: dst.clone(), obj, offset: *offset, kind: LirKind::from_value_kind(*kind) });
-                    dst
-                } else {
-                    let obj_op = self.emit_expr(out, obj);
-                    out.push(LirOp::CallRuntime { stub: RuntimeStub::UnresolvedField, operands: vec![obj_op], dst: None, bci: 0 });
-                    LirOperand::ConstI32(0)
-                }
->>>>>>> 187eca38ba2fa504e8ec50e0c4e7393023753a01
             }
             HirInstruction::LoadIndexed { array, index, elem } => {
                 let array = self.emit_expr(out, array);
@@ -700,16 +689,20 @@ fn array_load_kind(elem: ArrayElemKind) -> i32 {
     }
 }
 
+/// `newarray` element code: the JVM typecode consumed by
+/// `TypeArrayOop::new` (4=boolean, 5=char, 6=float, 7=double,
+/// 8=byte, 9=short, 10=int, 11=long).  `Ref` never reaches
+/// `newarray` (that is `anewarray`); 12 is kept as a sentinel.
 fn elem_code(elem: ArrayElemKind) -> i32 {
     match elem {
         ArrayElemKind::Boolean => 4,
-        ArrayElemKind::Byte => 5,
-        ArrayElemKind::Char => 6,
-        ArrayElemKind::Short => 7,
-        ArrayElemKind::Int => 8,
-        ArrayElemKind::Long => 9,
-        ArrayElemKind::Float => 10,
-        ArrayElemKind::Double => 11,
+        ArrayElemKind::Char => 5,
+        ArrayElemKind::Float => 6,
+        ArrayElemKind::Double => 7,
+        ArrayElemKind::Byte => 8,
+        ArrayElemKind::Short => 9,
+        ArrayElemKind::Int => 10,
+        ArrayElemKind::Long => 11,
         ArrayElemKind::Ref => 12,
     }
 }

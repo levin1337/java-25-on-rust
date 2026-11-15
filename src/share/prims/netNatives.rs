@@ -28,7 +28,10 @@ use super::offHeapMemory::OffHeapMemory;
 
 pub(crate) enum Sock {
     Fresh { stream: bool, bound: Option<SocketAddr> },
-    Listener(TcpListener),
+    Listener {
+        listener: TcpListener,
+        pending: Option<(TcpStream, SocketAddr)>,
+    },
     Connected { stream: TcpStream, local: SocketAddr, remote: SocketAddr },
     Datagram {
         sock: UdpSocket,
@@ -341,7 +344,7 @@ pub(crate) const POLL_HUP: i32 = 8;
 pub(crate) const POLL_NVAL: i32 = 16;
 pub(crate) const POLL_CONN: i32 = 32;
 
-pub(crate) fn sock_ready(sock: &Sock) -> i32 {
+pub(crate) fn sock_ready(sock: &mut Sock) -> i32 {
     match sock {
         Sock::Connected { stream, .. } => {
             let mut probe = [0u8; 1];
@@ -354,7 +357,23 @@ pub(crate) fn sock_ready(sock: &Sock) -> i32 {
             }
             ready
         }
-        Sock::Listener(_) | Sock::Datagram { .. } => POLL_IN | POLL_OUT,
+        Sock::Listener { listener, pending } => {
+            // A listening socket is readable only while a connection is
+            // pending; probe with try-accept and stash the stream so a
+            // later `Net.accept` returns it instead of re-accepting.
+            if pending.is_none() {
+                if let Ok((stream, remote)) = listener.accept() {
+                    stream.set_nonblocking(true).ok();
+                    *pending = Some((stream, remote));
+                }
+            }
+            if pending.is_some() {
+                POLL_IN | POLL_OUT
+            } else {
+                POLL_OUT
+            }
+        }
+        Sock::Datagram { .. } => POLL_IN | POLL_OUT,
         Sock::Fresh { .. } => POLL_OUT,
     }
 }
@@ -940,14 +959,17 @@ pub(crate) fn invoke_static<'a>(
         }
 
         (b"java/net/Inet4AddressImpl", b"getLocalHostName", b"()Ljava/lang/String;")
-        | (b"java/net/Inet6AddressImpl", b"getLocalHostName", b"()Ljava/lang/String;") => {
+        | (b"java/net/Inet6AddressImpl", b"getLocalHostName", b"()Ljava/lang/String;")
+        | (b"java/net/InetAddressImpl", b"getLocalHostName", b"()Ljava/lang/String;") => {
             let name = std::env::var("COMPUTERNAME")
                 .or_else(|_| std::env::var("HOSTNAME"))
                 .unwrap_or_else(|_| "localhost".to_string());
             Some(Some(host_string(loader, &name)))
         }
         (b"java/net/Inet4AddressImpl", b"lookupAllHostAddr", b"(Ljava/lang/String;)[Ljava/net/InetAddress;")
-        | (b"java/net/Inet6AddressImpl", b"lookupAllHostAddr", b"(Ljava/lang/String;I)[Ljava/net/InetAddress;") => {
+        | (b"java/net/Inet6AddressImpl", b"lookupAllHostAddr", b"(Ljava/lang/String;I)[Ljava/net/InetAddress;")
+        | (b"java/net/InetAddressImpl", b"lookupAllHostAddr", b"(Ljava/lang/String;)[Ljava/net/InetAddress;")
+        | (b"java/net/InetAddressImpl", b"lookupAllHostAddr", b"(Ljava/lang/String;I)[Ljava/net/InetAddress;") => {
             let host = match arguments.first() {
                 Some(value) => super::stringNatives::string(loader, *value)
                     .ok()
@@ -960,7 +982,8 @@ pub(crate) fn invoke_static<'a>(
             Some(Some(inet4_array(loader, &entries)?))
         }
         (b"java/net/Inet4AddressImpl", b"getHostByAddr", b"([B)Ljava/lang/String;")
-        | (b"java/net/Inet6AddressImpl", b"getHostByAddr", b"([B)Ljava/lang/String;") => {
+        | (b"java/net/Inet6AddressImpl", b"getHostByAddr", b"([B)Ljava/lang/String;")
+        | (b"java/net/InetAddressImpl", b"getHostByAddr", b"([B)Ljava/lang/String;") => {
             let text = match arguments.first() {
                 Some(Value::PrimitiveArray(handle)) => {
                     let arrays = loader.arrays.borrow();
@@ -985,8 +1008,14 @@ pub(crate) fn invoke_static<'a>(
             }
             Some(Some(host_string(loader, &text)))
         }
-        (b"java/net/Inet4AddressImpl", b"isReachable0", b"([BII[BI)Z")
-        | (b"java/net/Inet6AddressImpl", b"isReachable0", b"([BIII[BI)Z") => {
+        (b"java/net/Inet4AddressImpl", b"isReachable0", b"([BI[BI)Z")
+        | (b"java/net/Inet4AddressImpl", b"isReachable0", b"([BII[BI)Z")
+        | (b"java/net/Inet6AddressImpl", b"isReachable0", b"([BII[BII)Z")
+        | (b"java/net/Inet6AddressImpl", b"isReachable0", b"([BIII[BI)Z")
+        | (b"java/net/InetAddressImpl", b"isReachable0", b"([BI[BI)Z")
+        | (b"java/net/InetAddressImpl", b"isReachable0", b"([BII[BI)Z")
+        | (b"java/net/InetAddressImpl", b"isReachable0", b"([BII[BII)Z")
+        | (b"java/net/InetAddressImpl", b"isReachable0", b"([BIII[BI)Z") => {
             Some(Some(Value::Int(0)))
         }
 
@@ -1451,7 +1480,7 @@ fn net_channel<'a>(
                         let listener = TcpListener::bind(addr)
                             .map_err(|e| sock_io_err(loader, e))?;
                         listener.set_nonblocking(true).ok();
-                        *s = Sock::Listener(listener);
+                        *s = Sock::Listener { listener, pending: None };
                         Ok(())
                     }
                     Sock::Fresh { stream: false, .. } => {
@@ -1476,7 +1505,7 @@ fn net_channel<'a>(
             let _ = backlog;
             with_sock(id, |s| {
                 match s {
-                    Sock::Listener(_) => Ok(()), // already listening
+                    Sock::Listener { .. } => Ok(()), // already listening
                     Sock::Fresh { stream: true, bound } => {
                         let addr = bound.unwrap_or(SocketAddr::new(
                             std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED),
@@ -1485,7 +1514,7 @@ fn net_channel<'a>(
                         let listener = TcpListener::bind(addr)
                             .map_err(|e| sock_io_err(loader, e))?;
                         listener.set_nonblocking(true).ok();
-                        *s = Sock::Listener(listener);
+                        *s = Sock::Listener { listener, pending: None };
                         Ok(())
                     }
                     _ => Err(io::Error::other("Socket is not bound")),
@@ -1502,7 +1531,7 @@ fn net_channel<'a>(
             return with_sock(id, |s| {
                 let bound = match s {
                     Sock::Fresh { stream: true, bound } => bound.take(),
-                    Sock::Connected { .. } | Sock::Listener(_) => {
+                    Sock::Connected { .. } | Sock::Listener { .. } => {
                         return Err(io::Error::other("Already connected"));
                     }
                     _ => return Err(io::Error::other("Not a stream socket")),
@@ -1525,15 +1554,23 @@ fn net_channel<'a>(
             // (alloc_sock re-locks SOCKETS; inet_socket_address runs the
             // interpreter) outside it to avoid deadlock.
             let accepted = with_sock(id, |s| match s {
-                Sock::Listener(listener) => match listener.accept() {
-                    Ok((stream, remote)) => {
-                        stream.set_nonblocking(true).ok();
+                Sock::Listener { listener, pending } => {
+                    // A readiness probe may already have accepted a pending
+                    // connection; hand it out before touching the listener.
+                    if let Some((stream, remote)) = pending.take() {
                         let local = stream.local_addr().unwrap_or(remote);
-                        Ok(Some((stream, local, remote)))
+                        return Ok(Some((stream, local, remote)));
                     }
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
-                    Err(e) => Err(sock_io_err(loader, e)),
-                },
+                    match listener.accept() {
+                        Ok((stream, remote)) => {
+                            stream.set_nonblocking(true).ok();
+                            let local = stream.local_addr().unwrap_or(remote);
+                            Ok(Some((stream, local, remote)))
+                        }
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
+                        Err(e) => Err(sock_io_err(loader, e)),
+                    }
+                }
                 _ => Err(io::Error::other("Not a server socket")),
             })?;
             let retval = match accepted {
@@ -1582,7 +1619,9 @@ fn net_channel<'a>(
                 Sock::Connected { local, remote, .. } => {
                     Ok((if is_local { local } else { remote }).port() as i64)
                 }
-                Sock::Listener(l) => Ok(l.local_addr().map(|a| a.port()).unwrap_or(0) as i64),
+                Sock::Listener { listener, .. } => {
+                    Ok(listener.local_addr().map(|a| a.port()).unwrap_or(0) as i64)
+                }
                 Sock::Datagram { sock, bound, .. } => Ok(bound
                     .or_else(|| sock.local_addr().ok())
                     .map(|a| a.port())
@@ -1601,7 +1640,7 @@ fn net_channel<'a>(
                     let a = if is_local { local } else { remote };
                     match a.ip() { std::net::IpAddr::V4(v) => Ok(v), _ => Ok(Ipv4Addr::UNSPECIFIED) }
                 }
-                Sock::Listener(l) => Ok(match l.local_addr().ok().map(|a| a.ip()) {
+                Sock::Listener { listener, .. } => Ok(match listener.local_addr().ok().map(|a| a.ip()) {
                     Some(std::net::IpAddr::V4(v)) => v,
                     _ => Ipv4Addr::UNSPECIFIED,
                 }),
@@ -1627,7 +1666,8 @@ fn net_channel<'a>(
             let val = sock_opts().as_ref().unwrap().get(&(id, level, opt)).copied().unwrap_or(0);
             return Ok(Some(Some(Value::Int(val))));
         }
-        (b"sun/nio/ch/Net", b"setIntOption0", b"(Ljava/io/FileDescriptor;ZIIII)V") => {
+        (b"sun/nio/ch/Net", b"setIntOption0", b"(Ljava/io/FileDescriptor;ZIIIZ)V")
+        | (b"sun/nio/ch/Net", b"setIntOption0", b"(Ljava/io/FileDescriptor;ZIIII)V") => {
             let id = fd_id(loader, arguments[0])?;
             let level = match arguments.get(2) { Some(Value::Int(v)) => *v, _ => 0 };
             let opt = match arguments.get(3) { Some(Value::Int(v)) => *v, _ => 0 };
@@ -1646,7 +1686,7 @@ fn net_channel<'a>(
         (b"sun/nio/ch/Net", b"pollConnect", b"(Ljava/io/FileDescriptor;J)Z") => {
             let id = fd_id(loader, arguments[0])?;
             let connected = with_sock(id, |s| {
-                Ok(matches!(s, Sock::Connected { .. } | Sock::Listener(_)))
+                Ok(matches!(s, Sock::Connected { .. } | Sock::Listener { .. }))
             })?;
             return Ok(Some(Some(Value::Int(connected as i32))));
         }
@@ -1707,7 +1747,7 @@ fn net_channel<'a>(
             return datagram_channel_receive0(loader, arguments)
                 .map(|v| Some(Some(v)));
         }
-        (b"sun/nio/ch/DatagramChannelImpl", b"send0", b"(Ljava/io/FileDescriptor;JIJII)I") => {
+        (b"sun/nio/ch/DatagramChannelImpl", b"send0", b"(Ljava/io/FileDescriptor;JIJI)I") => {
             return datagram_channel_send0(loader, arguments)
                 .map(|v| Some(Some(v)));
         }

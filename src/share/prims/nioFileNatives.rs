@@ -76,7 +76,7 @@ fn windows_exception<'a>(
     message: &str,
 ) -> io::Error {
     let class_name = b"sun/nio/fs/WindowsException";
-    if code == 2 || code == 3 {
+    if (code == 2 || code == 3) && std::env::var_os("JVM25_TRACE_WIN").is_some() {
         eprintln!("[WindowsException] code={code} msg={message}");
         eprintln!("{}", std::backtrace::Backtrace::force_capture());
     }
@@ -107,7 +107,9 @@ fn win32_error<'a>(loader: &ClassLoader<'a>, error: &io::Error) -> io::Error {
         AlreadyExists => 80,    // ERROR_ALREADY_EXISTS
         _ => 1,                 // ERROR_INVALID_FUNCTION
     };
-    eprintln!("[win32_error] code={code} error={error}");
+    if std::env::var_os("JVM25_TRACE_WIN").is_some() {
+        eprintln!("[win32_error] code={code} error={error}");
+    }
     windows_exception(loader, code, &error.to_string())
 }
 
@@ -627,6 +629,48 @@ fn write_buffer(address: i64, data: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+/// Computes the byte length of a self-relative `SECURITY_DESCRIPTOR`
+/// stored in off-heap memory by walking its owner/group/SACL/DACL offsets.
+fn security_descriptor_size(address: i64) -> io::Result<usize> {
+    let base = u64::try_from(address).map_err(|_| invalid("Invalid security descriptor"))?;
+    let memory = OffHeapMemory::global();
+    let u32_at = |off: u64| -> io::Result<u32> {
+        Ok(u32::from_le_bytes([
+            memory.get_byte(base + off)? as u8,
+            memory.get_byte(base + off + 1)? as u8,
+            memory.get_byte(base + off + 2)? as u8,
+            memory.get_byte(base + off + 3)? as u8,
+        ]))
+    };
+    let offset_owner = u64::from(u32_at(4)?);
+    let offset_group = u64::from(u32_at(8)?);
+    let offset_sacl = u64::from(u32_at(12)?);
+    let offset_dacl = u64::from(u32_at(16)?);
+    let mut size = 20usize;
+    let mut consider = |offset: u64, is_acl: bool, size: &mut usize| -> io::Result<()> {
+        if offset == 0 {
+            return Ok(());
+        }
+        let component = if is_acl {
+            // ACL: AclSize is a u16 at offset+2.
+            let b0 = memory.get_byte(base + offset + 2)? as u8;
+            let b1 = memory.get_byte(base + offset + 3)? as u8;
+            u64::from(u16::from_le_bytes([b0, b1]))
+        } else {
+            // SID: size = 8 + 4 * SubAuthorityCount (byte at offset+1).
+            let count = memory.get_byte(base + offset + 1)? as u8;
+            8 + 4 * u64::from(count)
+        };
+        *size = (*size).max((offset + component) as usize);
+        Ok(())
+    };
+    consider(offset_owner, false, &mut size)?;
+    consider(offset_group, false, &mut size)?;
+    consider(offset_sacl, true, &mut size)?;
+    consider(offset_dacl, true, &mut size)?;
+    Ok(size)
+}
+
 pub(crate) fn file_descriptor_handle<'a>(loader: &ClassLoader<'a>, value: Value<'a>) -> io::Result<u64> {
     let Value::Object(handle) = value else {
         return Err(invalid("Expected FileDescriptor"));
@@ -673,9 +717,6 @@ pub(crate) fn dispatcher<'a>(
                 eprintln!("[CreateFile0] path={:?} desired={:#x} disp={}", path, desired, disposition);
             }
             let _ = share;
-            if path.contains("asm-9.10.1") {
-                eprintln!("[CreateFile0] path={path:?} desired={desired:#x} disp={disposition}");
-            }
             let mut options = std::fs::OpenOptions::new();
             // FILE_* / GENERIC_* desired-access bits.
             let wants_read = desired
@@ -743,14 +784,13 @@ pub(crate) fn dispatcher<'a>(
         (b"GetFileAttributesEx0", b"(JJ)V") => {
             let path = read_wide_path(arg(0))?;
             let out = arg(1);
-            if path.contains("asm-9.10.1") {
-                eprintln!("[GetFileAttributesEx0] path={path:?}");
-            }
             let mut data = [0u8; 36];
             let meta = match std::fs::metadata(java_path(&path)) {
                 Ok(meta) => meta,
                 Err(error) => {
-                    eprintln!("[GetFileAttributesEx0] MISSING {path:?}: {error}");
+                    if std::env::var_os("JVM25_TRACE_WIN").is_some() {
+                        eprintln!("[GetFileAttributesEx0] MISSING {path:?}: {error}");
+                    }
                     return Err(win32_error(loader, &error));
                 }
             };
@@ -770,6 +810,158 @@ pub(crate) fn dispatcher<'a>(
             }
             write_buffer(out, &data)?;
             return Ok(Some(Value::Null));
+        }
+        (b"GetFileSecurity0", b"(JIJI)I") => {
+            let path = read_wide_path(arg(0))?;
+            let requested = arg(1) as u32;
+            let desc_address = arg(2);
+            let n_length = arg(3) as u32;
+            #[link(name = "advapi32")]
+            unsafe extern "system" {
+                fn GetFileSecurityW(
+                    file_name: *const u16,
+                    requested_information: u32,
+                    descriptor: *mut u8,
+                    length: u32,
+                    length_needed: *mut u32,
+                ) -> i32;
+            }
+            let wide: Vec<u16> = path
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+            let fs_path = java_path(&path);
+            let mut needed = 0u32;
+            let result = unsafe {
+                if desc_address == 0 || n_length == 0 {
+                    GetFileSecurityW(
+                        wide.as_ptr(),
+                        requested,
+                        std::ptr::null_mut(),
+                        0,
+                        &mut needed,
+                    )
+                } else {
+                    let mut buffer = vec![0u8; n_length as usize];
+                    let ok = GetFileSecurityW(
+                        wide.as_ptr(),
+                        requested,
+                        buffer.as_mut_ptr(),
+                        n_length,
+                        &mut needed,
+                    );
+                    if ok != 0 {
+                        write_buffer(desc_address, &buffer)?;
+                    }
+                    ok
+                }
+            };
+            let _ = fs_path;
+            if result != 0 {
+                return Ok(Some(Value::Int(n_length as i32)));
+            }
+            let code = io::Error::last_os_error().raw_os_error().unwrap_or(0) as u32;
+            if code == 122 {
+                // ERROR_INSUFFICIENT_BUFFER: report the required length.
+                return Ok(Some(Value::Int(needed as i32)));
+            }
+            return Err(windows_exception(loader, code as i32, "GetFileSecurity failed"));
+        }
+        (b"AccessCheck", b"(JJIIIII)Z") => {
+            // token(J), securityInfo(J=SD ptr), accessMask(I),
+            // genericRead/Write/Execute/All(IIII) -> Z
+            let _token_arg = arg(0);
+            let sd_address = arg(1);
+            let access_mask = arg(2) as u32;
+            let generic_read = arg(3) as u32;
+            let generic_write = arg(4) as u32;
+            let generic_execute = arg(5) as u32;
+            let generic_all = arg(6) as u32;
+
+            #[repr(C)]
+            struct GenericMapping {
+                generic_read: u32,
+                generic_write: u32,
+                generic_execute: u32,
+                generic_all: u32,
+            }
+            #[link(name = "advapi32")]
+            unsafe extern "system" {
+                fn OpenProcessToken(
+                    process: *mut core::ffi::c_void,
+                    desired_access: u32,
+                    token: *mut *mut core::ffi::c_void,
+                ) -> i32;
+                fn MapGenericMask(access: *mut u32, mapping: *const GenericMapping);
+                fn AccessCheck(
+                    security_descriptor: *const u8,
+                    client_token: *mut core::ffi::c_void,
+                    desired_access: u32,
+                    generic_mapping: *const GenericMapping,
+                    privilege_set: *mut u8,
+                    privilege_set_length: *mut u32,
+                    granted_access: *mut u32,
+                    access_status: *mut i32,
+                ) -> i32;
+            }
+            #[link(name = "kernel32")]
+            unsafe extern "system" {
+                fn CloseHandle(handle: *mut core::ffi::c_void) -> i32;
+            }
+            const TOKEN_QUERY: u32 = 0x0008;
+
+            // The JDK hands us a token handle produced by our own
+            // OpenProcessToken stub; obtain a real process token instead.
+            let mut token: *mut core::ffi::c_void = std::ptr::null_mut();
+            let pseudo_process = (-1isize) as *mut core::ffi::c_void;
+            let opened = unsafe { OpenProcessToken(pseudo_process, TOKEN_QUERY, &mut token) };
+            if opened == 0 || token.is_null() {
+                return Err(windows_exception(
+                    loader,
+                    io::Error::last_os_error().raw_os_error().unwrap_or(0) as i32,
+                    "OpenProcessToken failed",
+                ));
+            }
+
+            let sd_size = security_descriptor_size(sd_address)?;
+            let sd = OffHeapMemory::global().read_bytes(sd_address as u64, sd_size)?;
+
+            let mut mapping = GenericMapping {
+                generic_read,
+                generic_write,
+                generic_execute,
+                generic_all,
+            };
+            let mut mask = access_mask;
+            // PRIVILEGE_SET with PrivilegeCount = 0, as the JDK passes.
+            let mut privilege_set = [0u8; 4];
+            let mut privilege_set_length = privilege_set.len() as u32;
+            let mut granted_access = 0u32;
+            let mut access_status = 0i32;
+            let ok = unsafe {
+                MapGenericMask(&mut mask, &mapping);
+                AccessCheck(
+                    sd.as_ptr(),
+                    token,
+                    mask,
+                    &mapping,
+                    privilege_set.as_mut_ptr(),
+                    &mut privilege_set_length,
+                    &mut granted_access,
+                    &mut access_status,
+                )
+            };
+            unsafe {
+                CloseHandle(token);
+            }
+            if ok == 0 {
+                return Err(windows_exception(
+                    loader,
+                    io::Error::last_os_error().raw_os_error().unwrap_or(0) as i32,
+                    "AccessCheck failed",
+                ));
+            }
+            return Ok(Some(Value::Int(i32::from(access_status != 0))));
         }
         (b"DeleteFile0", b"(J)V") => {
             let path = read_wide_path(arg(0))?;
@@ -949,10 +1141,12 @@ pub(crate) fn dispatcher<'a>(
         (b"GetLengthSid", b"(J)I") => Value::Int(0),
         (b"FindFirstFile0", b"(JLsun/nio/fs/WindowsNativeDispatcher$FirstFile;)V") => {
             let search = read_wide_path(arg(0))?;
-            let stack = loader.call_stack.snapshot();
-            let depth = stack.len();
-            let tail: Vec<String> = stack.iter().rev().take(24).map(|n| String::from_utf8_lossy(n).into_owned()).collect();
-            eprintln!("[FindFirstFile0] search={search:?} depth={depth} stack(top->bottom)={tail:?}");
+            if std::env::var_os("JVM25_TRACE_FF").is_some() {
+                let stack = loader.call_stack.snapshot();
+                let depth = stack.len();
+                let tail: Vec<String> = stack.iter().rev().take(24).map(|n| String::from_utf8_lossy(n).into_owned()).collect();
+                eprintln!("[FindFirstFile0] search={search:?} depth={depth} stack(top->bottom)={tail:?}");
+            }
             let (dir, pattern) = split_search_path(&search);
             let dir = if dir.is_empty() { ".".to_string() } else { dir };
             let (handle, first) = match dir_open(&dir, &pattern) {
@@ -981,10 +1175,12 @@ pub(crate) fn dispatcher<'a>(
         }
         (b"FindFirstFile1", b"(JJ)J") => {
             let search = read_wide_path(arg(0))?;
-            let stack = loader.call_stack.snapshot();
-            let depth = stack.len();
-            let tail: Vec<String> = stack.iter().rev().take(24).map(|n| String::from_utf8_lossy(n).into_owned()).collect();
-            eprintln!("[FindFirstFile1] search={search:?} depth={depth} stack(top->bottom)={tail:?}");
+            if std::env::var_os("JVM25_TRACE_FF").is_some() {
+                let stack = loader.call_stack.snapshot();
+                let depth = stack.len();
+                let tail: Vec<String> = stack.iter().rev().take(24).map(|n| String::from_utf8_lossy(n).into_owned()).collect();
+                eprintln!("[FindFirstFile1] search={search:?} depth={depth} stack(top->bottom)={tail:?}");
+            }
             let (dir, pattern) = split_search_path(&search);
             let dir = if dir.is_empty() { ".".to_string() } else { dir };
             let (handle, first) = match dir_open(&dir, &pattern) {
@@ -1237,6 +1433,83 @@ fn lock_range(file: &std::fs::File, _pos: i64, _size: i64, block: bool, shared: 
 #[cfg(not(windows))]
 fn unlock_range(file: &std::fs::File, _pos: i64, _size: i64) -> io::Result<()> {
     file.unlock()
+}
+
+/// `sun.nio.ch.FileKey.init(FileDescriptor)` — fills volume serial number and
+/// 64-bit file index from the descriptor's file metadata.
+pub(crate) fn file_key_init<'a>(
+    loader: &ClassLoader<'a>,
+    arguments: &[Value<'a>],
+) -> io::Result<()> {
+    let receiver = match arguments.first().copied().unwrap_or(Value::Null) {
+        Value::Object(handle) => handle,
+        _ => return Err(invalid("Expected FileKey receiver")),
+    };
+    let fd = file_descriptor_handle(
+        loader,
+        arguments.get(1).copied().unwrap_or(Value::Null),
+    )?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        #[repr(C)]
+        struct ByHandleFileInformation {
+            attrs: u32,
+            creation: u64,
+            last_access: u64,
+            last_write: u64,
+            volume_serial: u32,
+            size_high: u32,
+            size_low: u32,
+            links: u32,
+            index_high: u32,
+            index_low: u32,
+        }
+        unsafe extern "system" {
+            fn GetFileInformationByHandle(handle: *mut core::ffi::c_void, info: *mut ByHandleFileInformation) -> i32;
+        }
+        let mut info = ByHandleFileInformation {
+            attrs: 0, creation: 0, last_access: 0, last_write: 0,
+            volume_serial: 0, size_high: 0, size_low: 0, links: 0,
+            index_high: 0, index_low: 0,
+        };
+        let ok = with_entry(fd, |entry| {
+            let file = file_of(entry)?;
+            let raw = file.as_raw_handle() as *mut core::ffi::c_void;
+            Ok(unsafe { GetFileInformationByHandle(raw, &mut info) != 0 })
+        })
+        .unwrap_or(false);
+        if ok {
+            let index = ((info.index_high as u64) << 32) | info.index_low as u64;
+            let fields: [(&[u8], &[u8], i64); 3] = [
+                (b"dwVolumeSerialNumber", b"J", info.volume_serial as i64),
+                (b"nFileIndexHigh", b"J", (index >> 32) as i64),
+                (b"nFileIndexLow", b"J", (index & 0xFFFF_FFFF) as i64),
+            ];
+        let klass = {
+            let objects = loader.borrow_objects();
+            objects
+                .get(receiver)
+                .map(|o| o.klass.clone())
+                .ok_or_else(|| invalid("Invalid FileKey object"))?
+        };
+        for (name, descriptor, value) in fields {
+            if let Ok(slot) = klass.instanceField(name, descriptor) {
+                let mut objects = loader.borrow_objects_mut();
+                if let Some(object) = objects.get_mut(receiver)
+                    && slot < object.fields.len()
+                {
+                    object.fields[slot] = Value::Long(value);
+                }
+            }
+        }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (receiver, fd);
+    }
+    Ok(())
 }
 
 /// `sun.nio.ch.FileDispatcherImpl` static natives.
@@ -1589,7 +1862,7 @@ pub(crate) fn dispatcher_impl<'a>(
             }
             Value::Int(0)
         }
-        (b"transferTo0", b"(Ljava/io/FileDescriptor;JJLjava/io/FileDescriptor;JZ)J") => {
+        (b"transferTo0", b"(Ljava/io/FileDescriptor;JJLjava/io/FileDescriptor;Z)J") => {
             let src = file_descriptor_handle(
                 loader,
                 arguments.first().copied().unwrap_or(Value::Null),

@@ -143,6 +143,8 @@ fn native_declaring_owner<'a>(
     None
 }
 
+pub static NATIVE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 static CALL_TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 thread_local! {
@@ -158,10 +160,22 @@ pub fn current_native() -> String {
 
 struct NativeGuard {
     previous: String,
+    active: bool,
+}
+
+fn native_debug_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("JVM25_DUMP").is_some())
 }
 
 impl NativeGuard {
     fn enter(owner: &[u8], name: &[u8]) -> Self {
+        if !native_debug_enabled() {
+            return Self {
+                previous: String::new(),
+                active: false,
+            };
+        }
         let label = format!(
             "{}.{}",
             String::from_utf8_lossy(owner),
@@ -172,12 +186,18 @@ impl NativeGuard {
             let mut cell = cell.borrow_mut();
             std::mem::replace(&mut *cell, label)
         });
-        Self { previous }
+        Self {
+            previous,
+            active: true,
+        }
     }
 }
 
 impl Drop for NativeGuard {
     fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
         CURRENT_NATIVE.with(|cell| {
             *cell.borrow_mut() = std::mem::take(&mut self.previous);
         });
@@ -185,8 +205,14 @@ impl Drop for NativeGuard {
     }
 }
 
+fn trace_native_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("JVM25_TRACE_NATIVE").is_some())
+}
+
 fn maybe_dump_stack(loader: &crate::share::classfile::classLoader::ClassLoader<'_>) {
-    if std::env::var_os("JVM25_CALLDUMP").is_none() {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var_os("JVM25_CALLDUMP").is_some()) {
         return;
     }
     if CALL_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 2_000_000 != 0 {
@@ -214,11 +240,12 @@ pub fn invokeInstance<'a>(
 ) -> io::Result<Option<Option<crate::share::interpreter::bytecodeInterpreter::Value<'a>>>> {
     let _rg = crate::share::recprobe::Guard::enter("invokeInstance");
     let _ng = NativeGuard::enter(owner, name);
+    NATIVE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     maybe_dump_stack(loader);
     use super::jvm::Jvm;
     use crate::share::interpreter::bytecodeInterpreter::Value;
 
-    if std::env::var_os("JVM25_TRACE_NATIVE").is_some() {
+    if trace_native_enabled() {
         eprintln!(
             "[invokeInstance] {}.{}{}",
             String::from_utf8_lossy(owner),
@@ -288,8 +315,9 @@ pub fn invokeInstance<'a>(
     }
 
     // TEST-ONLY wiring for urlNatives (to be placed by orchestrator).
-    if let Some(result) =
-        super::urlNatives::invoke_instance(loader, owner, name, descriptor, arguments)?
+    if (owner.starts_with(b"java/net/") || owner == b"java/lang/ClassLoader" || owner.starts_with(b"jvm25/"))
+        && let Some(result) =
+            super::urlNatives::invoke_instance(loader, owner, name, descriptor, arguments)?
     {
         return Ok(Some(result));
     }
@@ -300,6 +328,11 @@ pub fn invokeInstance<'a>(
         {
             return Ok(Some(result));
         }
+    }
+
+    if owner == b"sun/nio/ch/FileKey" && name == b"init" {
+        return super::nioFileNatives::file_key_init(loader, arguments)
+            .map(|_| Some(None));
     }
 
     if owner == b"java/lang/ClassLoader"
@@ -1298,12 +1331,13 @@ pub fn invokeStatic<'a>(
 ) -> io::Result<Option<Option<crate::share::interpreter::bytecodeInterpreter::Value<'a>>>> {
     let _rg = crate::share::recprobe::Guard::enter("invokeStatic");
     let _ng = NativeGuard::enter(owner, name);
+    NATIVE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     maybe_dump_stack(loader);
     use super::jvm::Jvm;
     use super::jvmNatives::JvmNatives;
     use crate::share::interpreter::bytecodeInterpreter::Value;
 
-    if std::env::var_os("JVM25_TRACE_NATIVE").is_some() {
+    if trace_native_enabled() {
         eprintln!(
             "[invokeStatic] {}.{}{}",
             String::from_utf8_lossy(owner),
@@ -1312,8 +1346,11 @@ pub fn invokeStatic<'a>(
         );
     }
 
-    if let Some(result) =
-        super::reflectionNatives::invoke_static(loader, owner, name, descriptor, arguments)?
+    if (owner == b"java/lang/Class"
+        || owner.starts_with(b"java/lang/reflect/")
+        || owner.starts_with(b"jdk/internal/reflect/"))
+        && let Some(result) =
+            super::reflectionNatives::invoke_static(loader, owner, name, descriptor, arguments)?
     {
         return Ok(Some(result));
     }
@@ -1340,8 +1377,11 @@ pub fn invokeStatic<'a>(
         }
     }
 
-    if let Some(result) =
-        super::netNatives::invoke_static(loader, owner, name, descriptor, arguments)?
+    if (owner.starts_with(b"java/net/")
+        || owner.starts_with(b"sun/nio/ch/")
+        || owner.starts_with(b"jdk/net/"))
+        && let Some(result) =
+            super::netNatives::invoke_static(loader, owner, name, descriptor, arguments)?
     {
         return Ok(Some(result));
     }
@@ -1742,6 +1782,52 @@ pub fn invokeStatic<'a>(
         | (b"java/lang/Module", b"addExports0", _)
         | (b"java/lang/Module", b"addExportsToAll0", _)
         | (b"java/lang/Module", b"addExportsToAllUnnamed0", _) => Some(None),
+        // Lambda proxy class archive is a HotSpot hidden-class cache; this
+        // interpreter generates lambda classes directly, so archive lookups
+        // always miss and inserts are ignored.
+        (b"java/lang/ClassLoader", b"retrieveDirectives", b"()Ljava/lang/AssertionStatusDirectives;") => {
+            // No -ea/-da/-esa options are parsed by this launcher, so the
+            // VM reports HotSpot's default: empty directives, assertions off.
+            let klass = loader.load(b"java/lang/AssertionStatusDirectives")?;
+            let _ = crate::share::interpreter::bytecodeInterpreter::initialize(
+                loader, &klass, &mut io::sink(), 0,
+            );
+            let object = crate::share::oops::instanceOop::InstanceOop::new(klass.clone())?;
+            let handle = loader.alloc_object(object);
+            let strings = crate::share::oops::objArrayOop::ObjArrayOop::withComponent(
+                0,
+                b"java/lang/String",
+            )?;
+            let string_array = Value::ObjectArray(loader.alloc_obj_array(strings));
+            let bools = crate::share::oops::typeArrayOop::TypeArrayOop::Boolean(Vec::new());
+            let bool_array = Value::PrimitiveArray(loader.alloc_type_array(bools));
+            let fields: [(&[u8], &[u8], Value<'_>); 5] = [
+                (b"classes", b"[Ljava/lang/String;", string_array),
+                (b"classEnabled", b"[Z", bool_array),
+                (b"packages", b"[Ljava/lang/String;", string_array),
+                (b"packageEnabled", b"[Z", bool_array),
+                (b"deflt", b"Z", Value::Int(0)),
+            ];
+            for (field, descriptor, value) in fields {
+                if let Ok(slot) = klass.instanceField(field, descriptor) {
+                    let mut objects = loader.borrow_objects_mut();
+                    if let Some(object) = objects.get_mut(handle)
+                        && slot < object.fields.len()
+                    {
+                        object.fields[slot] = value;
+                    }
+                }
+            }
+            Some(Some(Value::Object(handle)))
+        }
+        (b"java/lang/invoke/LambdaProxyClassArchive", b"addToArchive", _) => Some(None),
+        (b"java/lang/invoke/LambdaProxyClassArchive", b"findFromArchive", _) => {
+            Some(Some(Value::Null))
+        }
+        (b"jdk/internal/loader/RawNativeLibraries", b"load0", _) => {
+            Some(Some(Value::Int(0)))
+        }
+        (b"jdk/internal/loader/RawNativeLibraries", b"unload0", _) => Some(None),
         (b"java/lang/ref/Finalizer", b"isFinalizationEnabled", b"()Z") => {
             Some(Some(Value::Int(1)))
         }
@@ -1851,6 +1937,12 @@ pub fn invokeStatic<'a>(
                 super::defineClassNatives::define_class1(loader, arguments)
             };
             match result {
+                Ok(value) => value.map(Some),
+                Err(error) => return Err(error),
+            }
+        }
+        (b"java/lang/ClassLoader", b"defineClass2", b"(Ljava/lang/ClassLoader;Ljava/lang/String;Ljava/nio/ByteBuffer;IILjava/security/ProtectionDomain;Ljava/lang/String;)Ljava/lang/Class;") => {
+            match super::defineClassNatives::define_class2(loader, arguments) {
                 Ok(value) => value.map(Some),
                 Err(error) => return Err(error),
             }

@@ -305,6 +305,37 @@ fn run_deflate<'a>(
     Ok((consumed as u64) | ((written as u64) << 31) | ((finished as u64) << 62))
 }
 
+/// Builds the canonical argument vector expected by `run_inflate`/
+/// `run_deflate`: `[receiver, addr, inVal, inOff, inLen, outVal, outOff,
+/// outLen, (flush, params)]`. `spec` entries are `(value_index, offset_index,
+/// length_index)`; a `None` offset means the address already includes it.
+fn canonical_args<'a>(
+    arguments: &[Value<'a>],
+    input: (usize, Option<usize>, usize),
+    output: (usize, Option<usize>, usize),
+    flush: Option<usize>,
+) -> Vec<Value<'a>> {
+    let pick = |index: Option<usize>| -> Value<'a> {
+        index
+            .and_then(|i| arguments.get(i).copied())
+            .unwrap_or(Value::Int(0))
+    };
+    let mut out = Vec::with_capacity(10);
+    out.push(arg_value(arguments, 0));
+    out.push(arg_value(arguments, 1));
+    out.push(arg_value(arguments, input.0));
+    out.push(pick(input.1));
+    out.push(arg_value(arguments, input.2));
+    out.push(arg_value(arguments, output.0));
+    out.push(pick(output.1));
+    out.push(arg_value(arguments, output.2));
+    if let Some(flush_index) = flush {
+        out.push(arg_value(arguments, flush_index));
+        out.push(arg_value(arguments, flush_index + 1));
+    }
+    out
+}
+
 /// Instance natives for Inflater/Deflater.
 pub(crate) fn instance<'a>(
     loader: &ClassLoader<'a>,
@@ -318,18 +349,62 @@ pub(crate) fn instance<'a>(
     if !is_inflater && !is_deflater {
         return Ok(None);
     }
-    let result = match (name, descriptor) {
-        (b"inflateBytesBytes", b"(J[BII[BII)J") => run_inflate(loader, arguments, 2)?,
-        (b"inflateBytesBytes", b"(J[BI[BI[BI)J") => run_inflate(loader, arguments, 2)?,
-        (b"inflateBytesBuffer", b"(J[BIIJI)J") => run_inflate(loader, arguments, 2)?,
-        (b"inflateBufferBytes", b"(JJ[BII[BI)J") => run_inflate(loader, arguments, 3)?,
-        (b"inflateBufferBuffer", b"(JJIJI)J") => run_inflate(loader, arguments, 3)?,
-        (b"deflateBytesBytes", b"(J[BII[BIIII)J") => run_deflate(loader, arguments, 2, 8)?,
-        (b"deflateBytesBytes", b"(J[BI[I[BIIII)J") => run_deflate(loader, arguments, 2, 10)?,
-        (b"deflateBytesBuffer", b"(J[BIIJIIII)J") => run_deflate(loader, arguments, 2, 10)?,
-        (b"deflateBufferBytes", b"(JJ[BII[BIIII)J") => run_deflate(loader, arguments, 3, 11)?,
-        (b"deflateBufferBuffer", b"(JJIJIIII)J") => run_deflate(loader, arguments, 3, 11)?,
-        _ => return Ok(None),
+    // JDK 21 signatures: buffer addresses carry their own offset, so the
+    // canonical (value, offset, length) triples use offset 0 for `long`
+    // address operands.
+    let normalized: Option<(Vec<Value<'a>>, usize)> = match (name, descriptor) {
+        // inflateBytesBuffer(addr, inArr, inOff, inLen, outAddr, outLen)
+        (b"inflateBytesBuffer", b"(J[BIIJI)J") => Some((
+            canonical_args(arguments, (2, Some(3), 4), (5, None, 6), None),
+            2,
+        )),
+        // inflateBufferBytes(addr, inAddr, inLen, outArr, outOff, outLen)
+        (b"inflateBufferBytes", b"(JJI[BII)J") => Some((
+            canonical_args(arguments, (2, None, 3), (4, Some(5), 6), None),
+            2,
+        )),
+        // inflateBufferBuffer(addr, inAddr, inLen, outAddr, outLen)
+        (b"inflateBufferBuffer", b"(JJIJI)J") => Some((
+            canonical_args(arguments, (2, None, 3), (4, None, 5), None),
+            2,
+        )),
+        // deflateBytesBuffer(addr, inArr, inOff, inLen, outAddr, outLen, flush, params)
+        (b"deflateBytesBuffer", b"(J[BIIJIII)J") => Some((
+            canonical_args(arguments, (2, Some(3), 4), (5, None, 6), Some(7)),
+            2,
+        )),
+        // deflateBufferBytes(addr, inAddr, inLen, outArr, outOff, outLen, flush, params)
+        (b"deflateBufferBytes", b"(JJI[BIIII)J") => Some((
+            canonical_args(arguments, (2, None, 3), (4, Some(5), 6), Some(7)),
+            2,
+        )),
+        // deflateBufferBuffer(addr, inAddr, inLen, outAddr, outLen, flush, params)
+        (b"deflateBufferBuffer", b"(JJIJIII)J") => Some((
+            canonical_args(arguments, (2, None, 3), (4, None, 5), Some(6)),
+            2,
+        )),
+        _ => None,
+    };
+    let result = if let Some((args, layout)) = normalized {
+        if is_inflater {
+            run_inflate(loader, &args, layout)?
+        } else {
+            run_deflate(loader, &args, layout, 8)?
+        }
+    } else {
+        match (name, descriptor) {
+            (b"inflateBytesBytes", b"(J[BII[BII)J") => run_inflate(loader, arguments, 2)?,
+            (b"inflateBytesBytes", b"(J[BI[BI[BI)J") => run_inflate(loader, arguments, 2)?,
+            (b"inflateBytesBuffer", b"(J[BIIJI)J") => run_inflate(loader, arguments, 2)?,
+            (b"inflateBufferBytes", b"(JJ[BII[BI)J") => run_inflate(loader, arguments, 3)?,
+            (b"inflateBufferBuffer", b"(JJIJI)J") => run_inflate(loader, arguments, 3)?,
+            (b"deflateBytesBytes", b"(J[BII[BIIII)J") => run_deflate(loader, arguments, 2, 8)?,
+            (b"deflateBytesBytes", b"(J[BI[I[BIIII)J") => run_deflate(loader, arguments, 2, 10)?,
+            (b"deflateBytesBuffer", b"(J[BIIJIIII)J") => run_deflate(loader, arguments, 2, 10)?,
+            (b"deflateBufferBytes", b"(JJ[BII[BIIII)J") => run_deflate(loader, arguments, 3, 11)?,
+            (b"deflateBufferBuffer", b"(JJIJIIII)J") => run_deflate(loader, arguments, 3, 11)?,
+            _ => return Ok(None),
+        }
     };
     Ok(Some(Value::Long(result as i64)))
 }
@@ -377,6 +452,15 @@ pub(crate) fn statik<'a>(
         | (b"java/util/zip/Deflater", b"end", b"(J)V") => {
             let handle = arg_i64(arguments, 0) as u64;
             table().lock().unwrap().streams.remove(&handle);
+            return Ok(Some(Value::Null));
+        }
+        // Preset dictionaries are not supported by flate2; accepting them
+        // keeps `Inflater.setDictionary`/`Deflater.setDictionary` callers
+        // working for streams that never actually use one.
+        (b"java/util/zip/Inflater", b"setDictionary", b"(J[BII)V")
+        | (b"java/util/zip/Deflater", b"setDictionary", b"(J[BII)V")
+        | (b"java/util/zip/Inflater", b"setDictionaryBuffer", b"(JJI)V")
+        | (b"java/util/zip/Deflater", b"setDictionaryBuffer", b"(JJI)V") => {
             return Ok(Some(Value::Null));
         }
         (b"java/util/zip/Inflater", b"getAdler", b"(J)I")

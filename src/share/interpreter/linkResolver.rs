@@ -323,7 +323,7 @@ impl LinkResolver {
     /// Resolves invokedynamic call site via BootstrapInfo.
     pub fn resolve_invokedynamic<'a>(
         loader: &ClassLoader<'a>,
-        caller_klass: &Arc<InstanceKlass<'a>>,
+        caller_klass: &InstanceKlass<'a>,
         bsm_attr_index: u16,
         name: &[u8],
         descriptor: &[u8],

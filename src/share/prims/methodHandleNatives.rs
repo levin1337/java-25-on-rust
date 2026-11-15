@@ -2260,7 +2260,7 @@ pub(crate) fn invoke_static<'a>(
         (b"getNamedCon", b"(I[Ljava/lang/Object;)I") => Some(Value::Int(0)),
         (
             b"copyOutBootstrapArguments",
-            b"(Ljava/lang/Class;[I;III[Ljava/lang/Object;IZLjava/lang/Object;)V",
+            b"(Ljava/lang/Class;[III[Ljava/lang/Object;IZLjava/lang/Object;)V",
         ) => None,
         // VM-entry points used by the HotSpot invokedynamic/condy linkage
         // path; this interpreter resolves call sites through its own

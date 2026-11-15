@@ -73,6 +73,72 @@ pub(crate) fn define_class0<'a>(
     define_from_window(loader, bytes_value, offset, length).map(Some)
 }
 
+/// Reads an instance field of a buffer object, walking the hierarchy.
+fn buffer_field<'a>(
+    loader: &ClassLoader<'a>,
+    handle: usize,
+    name: &[u8],
+    descriptor: &[u8],
+) -> Option<Value<'a>> {
+    let objects = loader.borrow_objects();
+    let object = objects.get(handle)?;
+    let slot = object.klass.instanceField(name, descriptor).ok()?;
+    object.fields.get(slot).copied()
+}
+
+/// `ClassLoader.defineClass2(ClassLoader, String, ByteBuffer, int, int,
+/// ProtectionDomain, String)` — same as `defineClass1` but the class bytes
+/// come from a `java.nio.ByteBuffer` (heap or direct) instead of `byte[]`.
+pub(crate) fn define_class2<'a>(
+    loader: &ClassLoader<'a>,
+    arguments: &[Value<'a>],
+) -> io::Result<Option<Value<'a>>> {
+    // (loader, name, buffer, offset, length, protectionDomain, source)
+    let Value::Object(handle) = arguments.get(2).copied().unwrap_or(Value::Null) else {
+        return Err(io::Error::other("defineClass2: expected ByteBuffer"));
+    };
+    let offset = arguments
+        .get(3)
+        .and_then(|value| value.int().ok())
+        .unwrap_or(0)
+        .max(0) as usize;
+    let length = arguments
+        .get(4)
+        .and_then(|value| value.int().ok())
+        .unwrap_or(0)
+        .max(0) as usize;
+    // Heap buffers carry `hb` + `offset`; direct buffers carry `address`.
+    let window: Vec<u8> = if let Some(Value::PrimitiveArray(array)) =
+        buffer_field(loader, handle, b"hb", b"[B")
+    {
+        let base = match buffer_field(loader, handle, b"offset", b"I") {
+            Some(Value::Int(v)) => v.max(0) as usize,
+            _ => 0,
+        };
+        let arrays = loader.arrays.borrow();
+        let Some(TypeArrayOop::Byte(bytes)) = arrays.get(array) else {
+            return Err(io::Error::other("defineClass2: expected byte[] backing"));
+        };
+        let start = base + offset;
+        if start > bytes.len() || length > bytes.len() - start {
+            return Err(io::Error::other("defineClass2: offset/length out of bounds"));
+        }
+        bytes[start..start + length].iter().map(|&b| b as u8).collect()
+    } else {
+        let address = match buffer_field(loader, handle, b"address", b"J") {
+            Some(Value::Long(v)) if v != 0 => v as u64,
+            _ => return Err(io::Error::other("defineClass2: not a buffer")),
+        };
+        super::offHeapMemory::OffHeapMemory::global()
+            .read_bytes(address + offset as u64, length)?
+    };
+    let owned = loader.storage.alloc_slice_copy(&window);
+    let class = ClassFile::parse(owned, false).map_err(linkage_error)?;
+    let name = class.name;
+    loader.define_class(class)?;
+    Ok(Some(Value::ClassMirror(name)))
+}
+
 /// `ClassLoader.defineClass1(ClassLoader, String, byte[], int, int,
 /// ProtectionDomain, String)` — the JDK 9+ entry point used by
 /// `ClassLoader.defineClass` for ordinary (non-hidden) classes.

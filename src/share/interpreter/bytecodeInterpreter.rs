@@ -10,7 +10,7 @@ use super::bytecodes;
 use super::linkResolver::LinkResolver;
 use super::numeric;
 use crate::classfile::decodeString;
-use crate::share::classfile::classLoader::ClassLoader;
+use crate::share::classfile::classLoader::{CallSiteKey, ClassLoader};
 use crate::share::classfile::systemDictionary::SystemDictionary;
 use crate::share::interpreter::bootstrapInfo::BootstrapArg;
 use crate::share::oops::instanceOop::InstanceOop;
@@ -27,6 +27,19 @@ use crate::{
 use std::cell::RefCell;
 use std::io::{self, Error, Write};
 use std::sync::Arc;
+
+static BYTECODE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static FRAME_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn bytecode_count() -> u64 {
+    BYTECODE_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub static NATIVE_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn frame_count() -> u64 {
+    FRAME_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 fn env_flag(name: &str) -> bool {
     static FLAGS: std::sync::OnceLock<std::collections::HashMap<String, bool>> =
@@ -827,6 +840,7 @@ fn executeFrame<'a>(
     depth: usize,
     owner: &'a [u8],
 ) -> io::Result<Option<Value<'a>>> {
+    FRAME_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if depth >= 128 {
         return Err(jex(
             loader,
@@ -860,6 +874,7 @@ fn executeFrame<'a>(
     let mut safepoint_tick = 0u32;
     loop {
         safepoint_tick = safepoint_tick.wrapping_add(1);
+        BYTECODE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if safepoint_tick & 0x3ff == 0 {
             crate::share::runtime::threading::schedule(loader, output, depth)?;
             crate::share::memory::heap::safepoint();
@@ -1291,6 +1306,22 @@ fn methodAccessFlags<'a>(
         current = owner.super_klass.as_deref();
     }
     0
+}
+
+/// Returns the cached resolution for an invoke* call site or resolves,
+/// caches, and returns it. Only successful resolutions are cached;
+/// failures re-resolve every time (matching uncached semantics).
+fn cached_call<'a>(
+    loader: &ClassLoader<'a>,
+    key: CallSiteKey,
+    resolve: impl FnOnce() -> io::Result<(Arc<InstanceKlass<'a>>, Code<'a>)>,
+) -> io::Result<(Arc<InstanceKlass<'a>>, Code<'a>)> {
+    if let Some(hit) = loader.invoke_cache.borrow().get(&key) {
+        return Ok(hit.clone());
+    }
+    let resolved = resolve()?;
+    loader.invoke_cache.borrow_mut().insert(key, resolved.clone());
+    Ok(resolved)
 }
 
 fn step<'a>(
@@ -2353,8 +2384,9 @@ fn step<'a>(
                 frame.push(value)?;
                 return Ok(Step::Continue);
             }
-            if opcode != 0xb8
-                && let Some(result) = crate::share::prims::nativeLookup::invokeInstance(
+            if opcode != 0xb8 {
+                let __t = std::time::Instant::now();
+                let result = crate::share::prims::nativeLookup::invokeInstance(
                     loader,
                     owner,
                     name,
@@ -2362,14 +2394,19 @@ fn step<'a>(
                     &frame.stack[start..],
                     output,
                     depth,
-                )?
-            {
-                frame.stack.truncate(start);
-                frame.stackSlots -= slots;
-                if let Some(value) = result {
-                    frame.push(value)?;
+                )?;
+                NATIVE_NANOS.fetch_add(
+                    __t.elapsed().as_nanos() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                if let Some(result) = result {
+                    frame.stack.truncate(start);
+                    frame.stackSlots -= slots;
+                    if let Some(value) = result {
+                        frame.push(value)?;
+                    }
+                    return Ok(Step::Continue);
                 }
-                return Ok(Step::Continue);
             }
 
             if opcode == 0xb8 {
@@ -2532,7 +2569,8 @@ fn step<'a>(
                     frame.stackSlots -= slots;
                     return Ok(Step::Continue);
                 }
-                if let Some(result) = crate::share::prims::nativeLookup::invokeStatic(
+                let __t = std::time::Instant::now();
+                let native_result = crate::share::prims::nativeLookup::invokeStatic(
                     loader,
                     owner,
                     name,
@@ -2540,7 +2578,12 @@ fn step<'a>(
                     &frame.stack[start..],
                     output,
                     depth,
-                )? {
+                )?;
+                NATIVE_NANOS.fetch_add(
+                    __t.elapsed().as_nanos() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                if let Some(result) = native_result {
                     frame.stack.truncate(start);
                     frame.stackSlots -= slots;
                     if let Some(value) = result {
@@ -2589,9 +2632,12 @@ fn step<'a>(
                 let target = loader
                     .load(owner)
                     .map_err(|error| linkageExc(loader, output, depth, error))?;
-                let (target, code) = LinkResolver::resolve_static_call(&target, name, descriptor)
-                    .map_err(methodError)
-                    .map_err(|error| linkageExc(loader, output, depth, error))?;
+                let key = CallSiteKey::new(2, &target, owner, name, descriptor);
+                let (target, code) = cached_call(loader, key, || {
+                    LinkResolver::resolve_static_call(&target, name, descriptor)
+                })
+                .map_err(methodError)
+                .map_err(|error| linkageExc(loader, output, depth, error))?;
                 initialize(loader, &target, output, depth + 1)?;
                 (target, code)
             } else {
@@ -2756,17 +2802,15 @@ fn step<'a>(
                         loader.load(b"java/lang/Object")?
                     }
                     _ => {
-                        if env_flag("JVM25_TRACE") {
-                            eprintln!(
-                                "[icce-site] {}.{}{} pc={} in {} recv={:?}",
-                                String::from_utf8_lossy(owner),
-                                String::from_utf8_lossy(name),
-                                String::from_utf8_lossy(descriptor),
-                                pc,
-                                String::from_utf8_lossy(klass.class.name),
-                                receiver,
-                            );
-                        }
+                        eprintln!(
+                            "[icce-site] {}.{}{} pc={} in {} recv={:?}",
+                            String::from_utf8_lossy(owner),
+                            String::from_utf8_lossy(name),
+                            String::from_utf8_lossy(descriptor),
+                            pc,
+                            String::from_utf8_lossy(klass.class.name),
+                            receiver,
+                        );
                         return Err(jex(
                             loader,
                             output,
@@ -2815,17 +2859,26 @@ fn step<'a>(
                     let target = loader
                         .load(owner)
                         .map_err(|error| linkageExc(loader, output, depth, error))?;
-                    LinkResolver::resolve_special_call(&target, name, descriptor)
-                        .map_err(methodError)
-                        .map_err(|error| linkageExc(loader, output, depth, error))?
+                    let key = CallSiteKey::new(1, &target, owner, name, descriptor);
+                    cached_call(loader, key, || {
+                        LinkResolver::resolve_special_call(&target, name, descriptor)
+                    })
+                    .map_err(methodError)
+                    .map_err(|error| linkageExc(loader, output, depth, error))?
                 } else if opcode == 0xb9 {
-                    LinkResolver::resolve_interface_call(&object_klass, owner, name, descriptor)
-                        .map_err(methodError)
-                        .map_err(|error| linkageExc(loader, output, depth, error))?
+                    let key = CallSiteKey::new(3, &object_klass, owner, name, descriptor);
+                    cached_call(loader, key, || {
+                        LinkResolver::resolve_interface_call(&object_klass, owner, name, descriptor)
+                    })
+                    .map_err(methodError)
+                    .map_err(|error| linkageExc(loader, output, depth, error))?
                 } else {
-                    LinkResolver::resolve_virtual_call(&object_klass, name, descriptor)
-                        .map_err(methodError)
-                        .map_err(|error| linkageExc(loader, output, depth, error))?
+                    let key = CallSiteKey::new(0, &object_klass, owner, name, descriptor);
+                    cached_call(loader, key, || {
+                        LinkResolver::resolve_virtual_call(&object_klass, name, descriptor)
+                    })
+                    .map_err(methodError)
+                    .map_err(|error| linkageExc(loader, output, depth, error))?
                 }
             };
 
@@ -2882,14 +2935,9 @@ fn step<'a>(
             let name = klass.utf8(*name_idx)?;
             let descriptor = klass.utf8(*desc_idx)?;
 
-            let caller_rc = Arc::new(InstanceKlass::new(
-                klass.class.clone(),
-                klass.super_klass(),
-                klass.interfaces.clone(),
-            )?);
             let bs_info = LinkResolver::resolve_invokedynamic(
                 loader,
-                &caller_rc,
+                klass,
                 *bsm_attr_idx,
                 name,
                 descriptor,

@@ -296,7 +296,25 @@ pub fn mainClass<'a>(
         eprintln!("[phase] 3 {:?}", t0.elapsed());
         let args = JavaCallArguments::new();
         let _ = JavaCalls::call_static(loader, &system, b"initPhase3", b"()V", &args, output);
-        eprintln!("[phase] done {:?}", t0.elapsed());
+        eprintln!(
+            "[phase] done {:?} bytecodes={} classes={}",
+            t0.elapsed(),
+            crate::share::interpreter::bytecodeInterpreter::bytecode_count(),
+            loader.classes.borrow().len()
+        );
+        eprintln!(
+            "[phase]   frames={} natives={}",
+            crate::share::interpreter::bytecodeInterpreter::frame_count(),
+            crate::share::prims::nativeLookup::NATIVE_COUNT.load(
+                std::sync::atomic::Ordering::Relaxed
+            )
+        );
+        eprintln!(
+            "[phase]   native_nanos={}",
+            crate::share::interpreter::bytecodeInterpreter::NATIVE_NANOS.load(
+                std::sync::atomic::Ordering::Relaxed
+            )
+        );
     }
     let mut encoded = Vec::with_capacity(name.len());
     for unit in name.encode_utf16() {

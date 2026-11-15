@@ -9,6 +9,7 @@
 use super::systemDictionary::SystemDictionary;
 use crate::share::interpreter::bytecodeInterpreter::Value;
 use crate::share::oops::instanceOop::InstanceOop;
+use crate::share::oops::method::Code;
 use crate::share::oops::objArrayOop::ObjArrayOop;
 use crate::share::oops::typeArrayOop::TypeArrayOop;
 use crate::share::runtime::synchronizer::Synchronizer;
@@ -180,6 +181,43 @@ pub enum ClassSource {
     Directory(PathBuf),
 }
 
+/// Identity of an invoke* call site resolution. Pointers reference stable
+/// 'a-lifetime slices inside parsed class files and canonical `Arc`
+/// `InstanceKlass` allocations that live in `classes`/`lambda_cache`
+/// forever, so the key is stable for the loader's lifetime.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct CallSiteKey {
+    kind: u8,
+    klass: usize,
+    owner_ptr: usize,
+    owner_len: usize,
+    name_ptr: usize,
+    name_len: usize,
+    desc_ptr: usize,
+    desc_len: usize,
+}
+
+impl CallSiteKey {
+    pub(crate) fn new(
+        kind: u8,
+        klass: &Arc<InstanceKlass<'_>>,
+        owner: &[u8],
+        name: &[u8],
+        descriptor: &[u8],
+    ) -> Self {
+        Self {
+            kind,
+            klass: Arc::as_ptr(klass) as usize,
+            owner_ptr: owner.as_ptr() as usize,
+            owner_len: owner.len(),
+            name_ptr: name.as_ptr() as usize,
+            name_len: name.len(),
+            desc_ptr: descriptor.as_ptr() as usize,
+            desc_len: descriptor.len(),
+        }
+    }
+}
+
 pub struct ClassLoader<'a> {
     pub(crate) storage: &'a SyncBump,
     pub(crate) sources: Share<Vec<ClassSource>>,
@@ -236,6 +274,10 @@ pub struct ClassLoader<'a> {
     /// Classpath origin of each loaded class, used to synthesize the
     /// `protectionDomain`/`CodeSource` a real `defineClass` would store.
     pub(crate) class_origins: Share<HashMap<Vec<u8>, Option<ClassOrigin>>>,
+    /// Resolved invoke* targets (klass + parsed Code) keyed by call site.
+    /// Method resolution is deterministic per receiver class, so hits skip
+    /// the vtable scan and `Code::parse` on every call.
+    pub(crate) invoke_cache: Share<HashMap<CallSiteKey, (Arc<InstanceKlass<'a>>, Code<'a>)>>,
     loader_type: ClassLoaderType,
 }
 
@@ -528,6 +570,7 @@ impl<'a> ClassLoader<'a> {
             class_objects: Share::new(HashMap::new()),
             class_object_names: Share::new(HashMap::new()),
             class_origins: Share::new(HashMap::new()),
+            invoke_cache: Share::new(HashMap::new()),
             loader_type: ClassLoaderType::AppLoader,
         })
     }
@@ -614,6 +657,7 @@ impl<'a> ClassLoader<'a> {
             class_objects: Share::new(HashMap::new()),
             class_object_names: Share::new(HashMap::new()),
             class_origins: Share::new(HashMap::new()),
+            invoke_cache: Share::new(HashMap::new()),
             loader_type: ClassLoaderType::AppLoader,
         })
     }

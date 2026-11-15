@@ -613,6 +613,12 @@ pub(crate) fn invoke<'a>(
             };
             let append = false;
             let path = java_path(text.as_ref());
+            if std::env::var_os("JVM25_TRACE_JAR").is_some() && path.contains(".jar") {
+                static JAR_OPENS: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+                let n = JAR_OPENS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                eprintln!("[jar-open #{n}] {path}");
+            }
             let handle = nioFileNatives::open_file(&path, read, write, append, false)
                 .map_err(|error| {
                     io::Error::other(format!(

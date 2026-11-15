@@ -204,7 +204,7 @@ pub(crate) fn invoke<'a>(
             netNatives::sock_drain(fd)?;
             Ok(Some(None))
         }
-        (b"poll0", b"(JI[I[I[IJIJ)I") => {
+        (b"poll0", b"(JI[I[I[IJJ)I") => {
             poll0(loader, arguments).map(|value| Some(Some(value)))
         }
         _ => Ok(None),

@@ -602,7 +602,10 @@ impl ClassVerifier {
 /// verify_class` / `classFileParser`: access-flag legality, `<init>` /
 /// `<clinit>` shape, constant-pool tag version gates and class-kind
 /// consistency.
-fn verify_class_structure(class: &ClassFile<'_>) -> io::Result<()> {
+fn verify_class_structure<'a>(
+    class: &ClassFile<'a>,
+    loader: Option<&ClassLoader<'a>>,
+) -> io::Result<()> {
     const ACC_PUBLIC: u16 = 0x0001;
     const ACC_FINAL: u16 = 0x0010;
     const ACC_SUPER: u16 = 0x0020;
@@ -651,9 +654,17 @@ fn verify_class_structure(class: &ClassFile<'_>) -> io::Result<()> {
         }
     }
     if is_enum && !is_module {
-        // Enum classes must extend java.lang.Enum (checked at link time in
-        // HotSpot; the superclass name is available here).
-        if class.superName != Some(b"java/lang/Enum".as_slice()) {
+        // Enum classes must extend java.lang.Enum. Enum constant-specific
+        // subclasses (ACC_ENUM set, e.g. `MyEnum$1`) legally extend the
+        // enum class itself, so accept an enum superclass as well.
+        let super_ok = match class.superName {
+            Some(name) if name == b"java/lang/Enum" => true,
+            Some(super_name) => loader
+                .and_then(|l| l.load(super_name).ok())
+                .is_some_and(|k| k.class.accessFlags & 0x4000 != 0),
+            None => false,
+        };
+        if !super_ok {
             return Err(Error::other(format!(
                 "ClassFormatError: enum class {} must extend java.lang.Enum (super={})",
                 String::from_utf8_lossy(class.name),
@@ -729,7 +740,7 @@ impl Verifier {
         class: &ClassFile<'a>,
         loader: Option<&ClassLoader<'a>>,
     ) -> io::Result<()> {
-        verify_class_structure(class)?;
+        verify_class_structure(class, loader)?;
 
         let is_interface = (class.accessFlags & 0x0200) != 0;
         let is_abstract = (class.accessFlags & 0x0400) != 0;

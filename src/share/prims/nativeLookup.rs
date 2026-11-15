@@ -702,6 +702,16 @@ fn invokeInstanceInner<'a>(
             Some(Value::Long(1_000_000_000))
         }
         (b"jdk/internal/perf/Perf", b"detach", b"(Ljava/nio/ByteBuffer;)V") => None,
+        (b"jdk/internal/misc/ScopedMemoryAccess", b"closeScope0", b"(Ljdk/internal/foreign/MemorySessionImpl;Ljdk/internal/misc/ScopedMemoryAccess$ScopedAccessError;)V") => {
+            // Scoped-memory cleanup: rethrow the supplied ScopedAccessError
+            // when present; closing the scope itself is a no-op for us.
+            if let Some(Value::Object(handle)) = arguments.get(2) {
+                return Err(io::Error::other(
+                    crate::share::interpreter::bytecodeInterpreter::JavaThrowable(*handle),
+                ));
+            }
+            None
+        }
         (b"java/lang/Object", b"wait0", b"(J)V") => {
             let receiver = arguments.first().copied().unwrap_or(Value::Null);
             let Some(key) =
@@ -2584,6 +2594,9 @@ fn invokeStaticInner<'a>(
                 None => return Ok(None),
             }
         }
+        _ if owner == b"jdk/jfr/internal/JVM" => {
+            jfr_native(loader, name, descriptor, arguments)?
+        }
         _ => {
             let class_name = String::from_utf8_lossy(owner);
             let method_name = String::from_utf8_lossy(name);
@@ -2608,6 +2621,59 @@ fn invokeStaticInner<'a>(
     Ok(result)
 }
 
+
+/// `jdk.jfr.internal.JVM` natives. JFR stays disabled in this runtime
+/// (`isAvailable` reports false), so the entry points are inert stubs
+/// returning type-appropriate defaults.
+fn jfr_native<'a>(
+    loader: &crate::share::classfile::classLoader::ClassLoader<'a>,
+    name: &[u8],
+    descriptor: &[u8],
+    arguments: &[crate::share::interpreter::bytecodeInterpreter::Value<'a>],
+) -> io::Result<Option<Option<crate::share::interpreter::bytecodeInterpreter::Value<'a>>>> {
+    use crate::share::interpreter::bytecodeInterpreter::Value;
+    let boolean = |flag: bool| Some(Value::Int(i32::from(flag)));
+    let long = |v: i64| Some(Value::Long(v));
+    let result = match name {
+        b"isAvailable" | b"isRecording" | b"isContainerized" | b"isProduct"
+        | b"isExcluded" | b"isInstrumented" | b"shouldRotateDisk"
+        | b"getAllowedToDoEventRetransforms" | b"createJFR" | b"destroyJFR"
+        | b"setThreshold" | b"setCutoff" | b"setThrottle" | b"addStringConstant"
+        | b"setConfiguration" => boolean(false),
+        b"counterTime" | b"nanosNow" => long(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as i64)
+                .unwrap_or(0),
+        ),
+        b"commit" => match arguments.first() {
+            Some(Value::Long(v)) => long(*v),
+            _ => long(0),
+        },
+        b"getTicksFrequency" => long(1_000_000_000),
+        b"getUnloadedEventClassCount" | b"getClassId" | b"getStackTraceId"
+        | b"getThreadId" | b"getTypeId" | b"getChunkStartNanos"
+        | b"hostTotalMemory" | b"hostTotalSwapMemory" | b"registerStackFilter" => long(0),
+        b"getTimeConversionFactor" => Some(Value::Double(1.0)),
+        b"getPid" | b"getDumpPath" => {
+            Some(Value::HostString(loader.storage.alloc_str("0")))
+        }
+        b"getAllEventClasses" => {
+            let array = crate::share::oops::objArrayOop::ObjArrayOop::withComponent(
+                0,
+                b"java/lang/Class",
+            )?;
+            Some(Value::ObjectArray(loader.alloc_obj_array(array)))
+        }
+        b"setMethodTraceFilters" | b"drainStaleMethodTracerIds" => {
+            let array = crate::share::oops::typeArrayOop::TypeArrayOop::Long(Vec::new());
+            Some(Value::PrimitiveArray(loader.alloc_type_array(array)))
+        }
+        _ if descriptor.ends_with(b")V") => None,
+        _ => Some(Value::Null),
+    };
+    Ok(Some(result))
+}
 
 /// `jdk.internal.jimage.NativeImageBuffer.getNativeMap`: memory-maps the
 /// runtime image for the `jrt:` filesystem. We satisfy it with a heap

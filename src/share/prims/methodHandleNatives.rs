@@ -2081,6 +2081,13 @@ pub(crate) fn method_handle_invoke<'a>(
                     String::from_utf8_lossy(descriptor)
                 );
             }
+            // BoundMethodHandle species carry no `member` field; their
+            // behaviour lives in the LambdaForm.
+            if let Ok(klass) = object_klass(loader, mh) {
+                if klass.class.name.starts_with(b"java/lang/invoke/BoundMethodHandle") {
+                    return lambda_form_invoke(loader, mh, name, descriptor, arguments);
+                }
+            }
             return Err(error);
         }
     };
@@ -2237,6 +2244,269 @@ pub(crate) fn method_handle_invoke<'a>(
         }
         None => Ok(None),
     }
+}
+
+/// Evaluates one expression `LambdaForm.Name`: its `NamedFunction.member`
+/// is invoked with the already-evaluated values referenced by the name's
+/// `arguments` array (each element is a `Name` whose `index` selects a
+/// slot in the form's value vector).
+fn lambda_name_eval<'a>(
+    loader: &ClassLoader<'a>,
+    name_handle: usize,
+    values: &[Value<'a>],
+) -> io::Result<Value<'a>> {
+    let function_value = object_field(
+        loader,
+        name_handle,
+        b"function",
+        b"Ljava/lang/invoke/LambdaForm$NamedFunction;",
+    )?;
+    let Value::Object(function) = function_value else {
+        return Err(invalid("Unsupported LambdaForm name"));
+    };
+    let args_value = object_field(loader, name_handle, b"arguments", b"[Ljava/lang/Object;")?;
+    let mut call_args: Vec<Value<'a>> = Vec::new();
+    if let Value::ObjectArray(arg_array) = args_value {
+        let arg_handles: Vec<usize> = {
+            let arrays = loader.obj_arrays.borrow();
+            let array = arrays
+                .get(arg_array)
+                .ok_or_else(|| invalid("Invalid LambdaForm arguments"))?;
+            array
+                .elements
+                .iter()
+                .map(|v| match v {
+                    Value::Object(h) => Ok(*h),
+                    _ => Err(invalid("LambdaForm argument is not a name")),
+                })
+                .collect::<io::Result<Vec<_>>>()?
+        };
+        for arg_name in arg_handles {
+            let index_value = object_field(loader, arg_name, b"index", b"S")?;
+            let index = index_value.int()? as usize;
+            call_args.push(values.get(index).copied().unwrap_or(Value::Null));
+        }
+    }
+    let member_value = object_field(
+        loader,
+        function,
+        b"member",
+        b"Ljava/lang/invoke/MemberName;",
+    )?;
+    let Value::Object(member_handle) = member_value else {
+        return Err(invalid("LambdaForm function without MemberName"));
+    };
+    let state = read_member_state(loader, member_handle)?;
+    lambda_function_invoke(loader, state, &call_args)
+}
+
+/// Dispatches a `LambdaForm.NamedFunction` member: field accesses read or
+/// write the first evaluated argument, `MethodHandle.invoke*` expressions
+/// recurse into `method_handle_invoke`, and ordinary method references go
+/// through the same resolution path as `DirectMethodHandle`.
+fn lambda_function_invoke<'a>(
+    loader: &ClassLoader<'a>,
+    state: MemberState<'a>,
+    call_args: &[Value<'a>],
+) -> io::Result<Value<'a>> {
+    let ref_kind = member_ref_kind(state.flags);
+    let member_descriptor = member_descriptor(loader, &state)?;
+    if member_is_field(&state) {
+        let type_name = class_name(loader, state.r#type)?;
+        let field_descriptor = mirror_descriptor(&type_name);
+        match ref_kind {
+            REF_GET_FIELD => {
+                let receiver = call_args.first().copied().unwrap_or(Value::Null);
+                return read_named_field(loader, receiver, &state.name, &field_descriptor);
+            }
+            REF_GET_STATIC => {
+                let clazz_name = state
+                    .clazz
+                    .clone()
+                    .ok_or_else(|| no_such_field(loader, &state.name, &field_descriptor))?;
+                let klass = loader
+                    .load(&clazz_name)
+                    .map_err(|_| class_not_found(loader, &clazz_name))?;
+                let cell = klass.staticField(&state.name, &field_descriptor)?;
+                return Ok(cell.get());
+            }
+            REF_PUT_FIELD => {
+                let receiver = call_args.first().copied().unwrap_or(Value::Null);
+                let value = call_args.get(1).copied().unwrap_or(Value::Null);
+                write_named_field(loader, receiver, &state.name, &field_descriptor, value)?;
+                return Ok(Value::Null);
+            }
+            REF_PUT_STATIC => {
+                let clazz_name = state
+                    .clazz
+                    .clone()
+                    .ok_or_else(|| no_such_field(loader, &state.name, &field_descriptor))?;
+                let klass = loader
+                    .load(&clazz_name)
+                    .map_err(|_| class_not_found(loader, &clazz_name))?;
+                let cell = klass.staticField(&state.name, &field_descriptor)?;
+                cell.set(call_args.first().copied().unwrap_or(Value::Null));
+                return Ok(Value::Null);
+            }
+            _ => return Err(invalid("Unsupported LambdaForm field kind")),
+        }
+    }
+    // `MethodHandle.invoke{,Exact,Basic}` expressions take the target
+    // handle as their first argument.
+    if state.clazz.as_deref() == Some(b"java/lang/invoke/MethodHandle".as_slice())
+        && matches!(state.name.as_slice(), b"invoke" | b"invokeExact" | b"invokeBasic")
+    {
+        let Some(&Value::Object(target)) = call_args.first() else {
+            return Err(invalid("LambdaForm invoke without target"));
+        };
+        // invokeBasic is signature-polymorphic: present the target's own
+        // type so the exactness check passes; invoke/invokeExact carry the
+        // call-site type in the MemberName.
+        let descriptor = if state.name == b"invokeBasic" {
+            let mh_type = object_field(loader, target, b"type", b"Ljava/lang/invoke/MethodType;")?;
+            method_type_descriptor(loader, mh_type)?
+        } else {
+            member_descriptor.clone()
+        };
+        let mut nested = Vec::with_capacity(call_args.len());
+        nested.push(Value::Object(target));
+        nested.extend_from_slice(&call_args[1..]);
+        return method_handle_invoke(loader, target, &state.name, &descriptor, &nested)
+            .map(|v| v.unwrap_or(Value::Null));
+    }
+    let Some(clazz_name) = state.clazz.clone() else {
+        return Err(no_such_method(loader, &state.name, b""));
+    };
+    match ref_kind {
+        REF_INVOKE_VIRTUAL | REF_INVOKE_INTERFACE => {
+            let Some(&receiver) = call_args.first() else {
+                return Err(invalid("MethodHandle receiver"));
+            };
+            if matches!(receiver, Value::Null) {
+                return Err(null_pointer(loader));
+            }
+            let receiver_klass = receiver_klass(loader, receiver)?;
+            let found = find_method_member(&receiver_klass, &state.name, &member_descriptor, false)
+                .or_else(|| find_interface_method(&receiver_klass, &state.name, &member_descriptor));
+            let Some((target_klass, index)) = found else {
+                return Err(no_such_method(loader, &state.name, &member_descriptor));
+            };
+            execute_member(loader, &target_klass, index, call_args, false, target_klass.class.name)
+                .map(|v| v.unwrap_or(Value::Null))
+        }
+        REF_INVOKE_STATIC | REF_INVOKE_SPECIAL => {
+            let klass = loader
+                .load(&clazz_name)
+                .map_err(|_| class_not_found(loader, &clazz_name))?;
+            let want_static = ref_kind == REF_INVOKE_STATIC;
+            let found = find_method_member(&klass, &state.name, &member_descriptor, want_static)
+                .or_else(|| {
+                    find_method_member(&klass, &state.name, &member_descriptor, !want_static)
+                });
+            let Some((target_klass, index)) = found else {
+                return Err(no_such_method(loader, &state.name, &member_descriptor));
+            };
+            execute_member(
+                loader,
+                &target_klass,
+                index,
+                call_args,
+                want_static,
+                target_klass.class.name,
+            )
+            .map(|v| v.unwrap_or(Value::Null))
+        }
+        REF_NEW_INVOKE_SPECIAL => {
+            if state.name != b"<init>" {
+                return Err(invalid("NewInvokeSpecial requires <init>"));
+            }
+            let klass = loader
+                .load(&clazz_name)
+                .map_err(|_| class_not_found(loader, &clazz_name))?;
+            let _ = bytecodeInterpreter::initialize(loader, &klass, &mut io::sink(), 0);
+            let object = InstanceOop::new(klass.clone())?;
+            let handle = loader.alloc_object(object);
+            let found = klass
+                .class
+                .methods
+                .iter()
+                .position(|method| {
+                    method.name == b"<init>"
+                        && method.descriptor == member_descriptor
+                        && method.accessFlags & ACC_STATIC == 0
+                })
+                .map(|index| (Arc::clone(&klass), index));
+            let Some((target_klass, index)) = found else {
+                return Err(no_such_method(loader, b"<init>", &member_descriptor));
+            };
+            let mut ctor_args = Vec::with_capacity(call_args.len() + 1);
+            ctor_args.push(Value::Object(handle));
+            ctor_args.extend_from_slice(call_args);
+            execute_member(
+                loader,
+                &target_klass,
+                index,
+                &ctor_args,
+                false,
+                target_klass.class.name,
+            )?;
+            Ok(Value::Object(handle))
+        }
+        _ => Err(invalid("Unsupported LambdaForm reference kind")),
+    }
+}
+
+/// Executes a `BoundMethodHandle` (or any MethodHandle lacking a `member`
+/// field) by interpreting its `LambdaForm`: the first `arity` names bind
+/// the call arguments and the remaining names are evaluated in order,
+/// each invoking its `NamedFunction` member.
+fn lambda_form_invoke<'a>(
+    loader: &ClassLoader<'a>,
+    mh: usize,
+    _name: &[u8],
+    _descriptor: &[u8],
+    arguments: &[Value<'a>],
+) -> io::Result<Option<Value<'a>>> {
+    let form_value = object_field(loader, mh, b"form", b"Ljava/lang/invoke/LambdaForm;")?;
+    let Value::Object(form) = form_value else {
+        return Err(invalid("MethodHandle without LambdaForm"));
+    };
+    let names_value = object_field(loader, form, b"names", b"[Ljava/lang/invoke/LambdaForm$Name;")?;
+    let Value::ObjectArray(names_array) = names_value else {
+        return Err(invalid("LambdaForm without names"));
+    };
+    let arity = object_field(loader, form, b"arity", b"I")?.int()? as usize;
+    let result_index = object_field(loader, form, b"result", b"I")?.int()? as isize;
+    let name_handles: Vec<usize> = {
+        let arrays = loader.obj_arrays.borrow();
+        let array = arrays
+            .get(names_array)
+            .ok_or_else(|| invalid("Invalid LambdaForm names"))?;
+        array
+            .elements
+            .iter()
+            .map(|v| match v {
+                Value::Object(h) => Ok(*h),
+                _ => Err(invalid("LambdaForm name is not an object")),
+            })
+            .collect::<io::Result<Vec<_>>>()?
+    };
+    let count = name_handles.len();
+    let mut values: Vec<Value<'a>> = vec![Value::Empty; count];
+    for i in 0..arity.min(count) {
+        // arguments[0] is the MethodHandle receiver, matching names[0]
+        // ("this"); the remaining slots are the call arguments.
+        values[i] = arguments.get(i).copied().unwrap_or(Value::Null);
+    }
+    for i in arity..count {
+        values[i] = lambda_name_eval(loader, name_handles[i], &values)?;
+    }
+    let index = if result_index < 0 {
+        count.saturating_sub(1)
+    } else {
+        result_index as usize
+    };
+    Ok(Some(values.get(index).copied().unwrap_or(Value::Null)))
 }
 
 /// `MethodHandle.linkTo{Static,Virtual,Special,Interface,Native}`: the

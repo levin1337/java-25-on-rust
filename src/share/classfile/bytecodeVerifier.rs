@@ -800,12 +800,16 @@ impl<'m, 'a> BytecodeVerifier<'m, 'a> {
                     st.extend(second);
                     (d, prev_locals.clone(), st)
                 } else if (248..=250).contains(&frame_type) {
-                    // chop_frame
+                    // chop_frame: k counts logical locals, while the
+                    // expanded representation gives category-2 values two
+                    // slots (primary + 2nd marker).
                     let d = read_u2(bytes, &mut pos)? as usize;
                     let k = (251 - frame_type) as usize;
                     let mut locals = prev_locals.clone();
                     for _ in 0..k {
-                        locals.pop();
+                        if matches!(locals.pop(), Some(vt) if vt.is_category2_2nd()) {
+                            locals.pop();
+                        }
                     }
                     (d, locals, Vec::new())
                 } else if frame_type == 251 {
@@ -1787,7 +1791,10 @@ impl<'m, 'a> BytecodeVerifier<'m, 'a> {
                 let elem = &name[1..];
                 match Self::array_elem_desc(op) {
                     Some(expected) => {
-                        if elem != expected {
+                        // baload/bastore also accept boolean arrays.
+                        let elem_ok = elem == expected
+                            || ((op == 0x33 || op == 0x54) && elem == "Z");
+                        if !elem_ok {
                             return Err(err_at(
                                 bci,
                                 format!("Array type {name} does not match opcode {op:02x}"),
@@ -2050,17 +2057,20 @@ impl<'m, 'a> BytecodeVerifier<'m, 'a> {
             if zero != 0 {
                 return Err(err_at(bci, "Invalid invokeinterface operands"));
             }
-            // JVMS 4.10.1.9: the count operand includes the receiver.
-            if let Some((params, _)) = FieldType::method(desc)
-                && count as usize != params.len() + 1
-            {
-                return Err(err_at(
-                    bci,
-                    format!(
-                        "invokeinterface count {count} != parameter count {}",
-                        params.len() + 1
-                    ),
-                ));
+            // JVMS 4.10.1.9: the count operand is the number of argument
+            // slots including the receiver; category-2 values take two.
+            if let Some((params, _)) = FieldType::method(desc) {
+                let slots: usize = params
+                    .iter()
+                    .map(|p| if p.vtype().is_category2() { 2 } else { 1 })
+                    .sum::<usize>()
+                    + 1;
+                if count as usize != slots {
+                    return Err(err_at(
+                        bci,
+                        format!("invokeinterface count {count} != parameter count {slots}"),
+                    ));
+                }
             }
         }
 

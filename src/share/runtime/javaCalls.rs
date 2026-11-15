@@ -362,6 +362,9 @@ pub fn mainClass<'a>(
     if res.is_some() {
         return Err(io::Error::other("main must return void"));
     }
+    // JVM exit semantics: stay alive until all non-daemon Java threads
+    // finish, like a real VM does after main() returns.
+    crate::share::runtime::threading::wait_non_daemon(loader);
     Ok(())
 }
 

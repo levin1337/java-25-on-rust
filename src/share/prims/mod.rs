@@ -13,6 +13,7 @@ pub(crate) mod defineClassNatives;
 pub(crate) mod methodHandleNatives;
 pub mod nativeLibraries;
 pub mod nativeLookup;
+pub(crate) mod jdkIntrinsics;
 pub(crate) mod netNatives;
 pub(crate) mod nioFileNatives;
 pub(crate) mod objectNatives;

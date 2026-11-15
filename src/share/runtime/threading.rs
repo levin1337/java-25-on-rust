@@ -419,6 +419,10 @@ fn is_infra_thread(loader: &ClassLoader<'_>, handle: usize) -> bool {
         b"java/lang/management/NotificationThread",
         b"jdk/internal/misc/InnocuousThread",
         b"jdk/internal/misc/InnocuousForkJoinWorkerThread",
+        b"java/lang/ref/Reference$ReferenceHandler",
+        b"java/lang/ref/Finalizer$FinalizerThread",
+        b"java/lang/ref/Cleaner$CleanerThread",
+        b"java/lang/ref/Finalizer$Cleaner",
     ];
     let objects = loader.borrow_objects();
     let Some(object) = objects.get(handle) else {
@@ -579,6 +583,62 @@ pub fn unpark(loader: &ClassLoader<'_>, value: Value<'_>) -> io::Result<()> {
         PARK_COND.notify_all();
     }
     Ok(())
+}
+
+/// JVM shutdown semantics: after `main` returns the VM stays alive until
+/// every non-daemon Java thread finishes (daemon threads never block
+/// exit). Polls the registry; infra threads were retired at `register`
+/// time so they never appear here as pending work.
+pub fn wait_non_daemon(loader: &ClassLoader<'_>) {
+    loop {
+        let pending = {
+            let threads = loader.java_threads.borrow();
+            if threads.is_empty() {
+                false
+            } else {
+                let objects = loader.borrow_objects();
+                threads.iter().any(|(handle, info)| {
+                    if info.state == ThreadState::Finished {
+                        return false;
+                    }
+                    // `daemon` is a `Z` field on java.lang.Thread; a
+                    // missing/unreadable field is treated as non-daemon
+                    // (the JDK default for user threads).
+                    objects
+                        .get(*handle)
+                        .and_then(|object| {
+                            let slot = object
+                                .klass
+                                .instanceField(b"daemon", b"Z")
+                                .ok()?;
+                            object.fields.get(slot).copied()
+                        })
+                        .map(|value| !matches!(value, Value::Int(1)))
+                        .unwrap_or(true)
+                })
+            }
+        };
+        if !pending {
+            return;
+        }
+        if std::env::var_os("JVM25_BLOCKTRACE").is_some() {
+            let threads = loader.java_threads.borrow();
+            let pending: Vec<_> = threads
+                .iter()
+                .filter(|(_, info)| info.state != ThreadState::Finished)
+                .map(|(h, i)| {
+                    let name = loader
+                        .borrow_objects()
+                        .get(*h)
+                        .map(|o| String::from_utf8_lossy(&o.klass.class.name).into_owned())
+                        .unwrap_or_default();
+                    (*h, i.state, i.tid, name)
+                })
+                .collect();
+            eprintln!("[wait-nondaemon] pending={pending:?}");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 /// `Thread.yield0`: yields the calling OS thread.

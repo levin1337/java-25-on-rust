@@ -2577,6 +2577,18 @@ fn step<'a>(
                     frame.stackSlots -= slots;
                     return Ok(Step::Continue);
                 }
+                if let Some(intrinsic) = crate::share::prims::jdkIntrinsics::invoke(
+                    loader,
+                    owner,
+                    name,
+                    descriptor,
+                    &frame.stack[start..],
+                )? {
+                    frame.stack.truncate(start);
+                    frame.stackSlots -= slots;
+                    frame.push(intrinsic)?;
+                    return Ok(Step::Continue);
+                }
                 let __t = std::time::Instant::now();
                 let native_result = crate::share::prims::nativeLookup::invokeStatic(
                     loader,

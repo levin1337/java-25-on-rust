@@ -1125,6 +1125,14 @@ fn executeFrame<'a>(
                     }
                 }
                 None => {
+                    let error = java_error_throwable(loader, output, depth, error);
+                    if throwable_of(&error).is_some() {
+                        let handle = throwable_of(&error).unwrap();
+                        let exc = Value::Object(handle);
+                        if frame.handle_exception(insn_pc, exc, loader, klass) {
+                            continue;
+                        }
+                    }
                     if env_flag("JVM25_TRACE") {
                         let mut frames = Vec::new();
                         for_each_active_frame(&mut |f| frames.push(f.site()));
@@ -1234,6 +1242,43 @@ pub(crate) fn throwableObject<'a>(
         }
     }
     Ok(handle)
+}
+
+/// Some natives report Java exceptions as plain `io::Error` strings in
+/// the form `java.io.IOException: message` (or `java/io/IOException: ...`).
+/// Convert those into real throwable objects so `catch` clauses can
+/// match them; anything else is returned unchanged.
+fn java_error_throwable<'a>(
+    loader: &ClassLoader<'a>,
+    output: &mut dyn Write,
+    depth: usize,
+    error: Error,
+) -> Error {
+    if throwable_of(&error).is_some() {
+        return error;
+    }
+    let text = error.to_string();
+    let Some((class, message)) = text.split_once(": ") else {
+        return error;
+    };
+    let internal = if class.contains('/') {
+        class.to_owned()
+    } else {
+        class.replace('.', "/")
+    };
+    let looks_like_class = ["java/", "javax/", "jdk/", "sun/"]
+        .iter()
+        .any(|prefix| internal.starts_with(prefix))
+        && internal
+            .rsplit('/')
+            .next()
+            .is_some_and(|simple| {
+                simple.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+            });
+    if !looks_like_class {
+        return error;
+    }
+    jex(loader, output, depth, internal.as_bytes(), Some(message))
 }
 
 /// Builds an `io::Error` carrying a real throwable object for `class_name`.

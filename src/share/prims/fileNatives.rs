@@ -602,10 +602,11 @@ pub(crate) fn invoke<'a>(
             let path = java_path(text.as_ref());
             let handle = nioFileNatives::open_file(&path, true, false, false, false)
                 .map_err(|error| {
-                    io::Error::other(format!(
-                        "java.io.FileNotFoundException: {}",
-                        error
-                    ))
+                    nioFileNatives::throw_java(
+                        loader,
+                        b"java/io/FileNotFoundException",
+                        &format!("{path} ({error})"),
+                    )
                 })?;
             let fd = stream_fd_object(loader, arg(0))?;
             set_fd_fields(loader, fd, handle as i64)?;
@@ -622,10 +623,11 @@ pub(crate) fn invoke<'a>(
             let path = java_path(text.as_ref());
             let handle = nioFileNatives::open_file(&path, false, true, append, !append)
                 .map_err(|error| {
-                    io::Error::other(format!(
-                        "java.io.FileNotFoundException: {}",
-                        error
-                    ))
+                    nioFileNatives::throw_java(
+                        loader,
+                        b"java/io/FileNotFoundException",
+                        &format!("{path} ({error})"),
+                    )
                 })?;
             let fd = stream_fd_object(loader, arg(0))?;
             set_fd_fields(loader, fd, handle as i64)?;
@@ -657,10 +659,11 @@ pub(crate) fn invoke<'a>(
             }
             let handle = nioFileNatives::open_file(&path, read, write, append, false)
                 .map_err(|error| {
-                    io::Error::other(format!(
-                        "java.io.FileNotFoundException: {}",
-                        error
-                    ))
+                    nioFileNatives::throw_java(
+                        loader,
+                        b"java/io/FileNotFoundException",
+                        &format!("{path} ({error})"),
+                    )
                 })?;
             let fd = stream_fd_object(loader, arg(0))?;
             set_fd_fields(loader, fd, handle as i64)?;

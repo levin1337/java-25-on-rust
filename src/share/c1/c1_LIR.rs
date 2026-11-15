@@ -345,10 +345,22 @@ impl<'a> LirGenerator<'a> {
                 let dst = self.alloc_temp(LirKind::Ref);
                 out.push(LirOp::CallRuntime { stub: RuntimeStub::NewInstance, operands: vec![self.site_operand(*cp_index)], dst: Some(dst.clone()), bci: 0 });
             }
+<<<<<<< HEAD
             HirInstruction::LoadField { obj, cp_index, kind, .. } => {
                 let obj = self.emit_expr(out, obj);
                 let dst = self.alloc_temp(LirKind::from_value_kind(*kind));
                 out.push(LirOp::CallRuntime { stub: RuntimeStub::GetField, operands: vec![obj, self.site_operand(*cp_index)], dst: Some(dst.clone()), bci: 0 });
+=======
+            HirInstruction::LoadField { obj, offset, kind, .. } => {
+                if let Some(offset) = offset {
+                    let obj = self.emit_expr(out, obj);
+                    let dst = self.alloc_temp(LirKind::from_value_kind(*kind));
+                    out.push(LirOp::LoadField { dst, obj, offset: *offset, kind: LirKind::from_value_kind(*kind) });
+                } else {
+                    let obj_op = self.emit_expr(out, obj);
+                    out.push(LirOp::CallRuntime { stub: RuntimeStub::UnresolvedField, operands: vec![obj_op], dst: None, bci: 0 });
+                }
+>>>>>>> 187eca38ba2fa504e8ec50e0c4e7393023753a01
             }
             HirInstruction::StoreField { obj, cp_index, value, .. } => {
                 let obj = self.emit_expr(out, obj);
@@ -481,6 +493,7 @@ impl<'a> LirGenerator<'a> {
                 out.push(LirOp::CallRuntime { stub: RuntimeStub::AnewArray, operands: vec![site, len], dst: Some(dst.clone()), bci: 0 });
                 dst
             }
+<<<<<<< HEAD
             HirInstruction::NewObject { cp_index, .. } => {
                 let dst = self.alloc_temp(LirKind::Ref);
                 out.push(LirOp::CallRuntime { stub: RuntimeStub::NewInstance, operands: vec![self.site_operand(*cp_index)], dst: Some(dst.clone()), bci: 0 });
@@ -496,6 +509,19 @@ impl<'a> LirGenerator<'a> {
                 let dst = self.alloc_temp(LirKind::from_value_kind(*kind));
                 out.push(LirOp::CallRuntime { stub: RuntimeStub::GetStatic, operands: vec![self.site_operand(*cp_index)], dst: Some(dst.clone()), bci: 0 });
                 dst
+=======
+            HirInstruction::LoadField { obj, offset, kind, .. } => {
+                if let Some(offset) = offset {
+                    let obj = self.emit_expr(out, obj);
+                    let dst = self.alloc_temp(LirKind::from_value_kind(*kind));
+                    out.push(LirOp::LoadField { dst: dst.clone(), obj, offset: *offset, kind: LirKind::from_value_kind(*kind) });
+                    dst
+                } else {
+                    let obj_op = self.emit_expr(out, obj);
+                    out.push(LirOp::CallRuntime { stub: RuntimeStub::UnresolvedField, operands: vec![obj_op], dst: None, bci: 0 });
+                    LirOperand::ConstI32(0)
+                }
+>>>>>>> 187eca38ba2fa504e8ec50e0c4e7393023753a01
             }
             HirInstruction::LoadIndexed { array, index, elem } => {
                 let array = self.emit_expr(out, array);

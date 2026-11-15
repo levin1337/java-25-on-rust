@@ -220,6 +220,10 @@ impl AbstractCompiler for C1Compiler {
     fn compiler_type(&self) -> CompilerType { CompilerType::C1 }
 
     fn compile_method(&mut self, task: &CompileTask) -> Result<CompileOutcome, CompileError> {
+<<<<<<< HEAD
+=======
+        self.compiled_methods += 1;
+>>>>>>> 187eca38ba2fa504e8ec50e0c4e7393023753a01
         let method = task.method_obj.as_ref().ok_or_else(|| CompileError::new(FailureReason::Unresolved, "missing Method handle", CompLevel::Simple))?;
         let bytecode = method.bytecodes();
         if bytecode.is_empty() {

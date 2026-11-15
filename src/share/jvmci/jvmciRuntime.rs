@@ -87,6 +87,7 @@ pub struct FailedSpeculation {
 /// side record here since `code/` is outside this port's scope).
 #[derive(Clone, Debug)]
 pub struct JvmciNmethodData {
+    #[allow(dead_code)]
     has_name: bool,
     nmethod_mirror_index: i32,
     nmethod_entry_patch_offset: i32,

@@ -156,11 +156,14 @@ pub type SharedCompileState = Rc<RefCell<JvmciCompileState>>;
 /// thread from a native runtime when required).
 pub struct JvmciEnv {
     /// JNI environment token for the shared-library heap (0 = none).
+    #[allow(dead_code)]
     jni_env: u64,
+    #[allow(dead_code)]
     pop_frame_on_close: bool,
     detach_on_close: bool,
     runtime: Option<Arc<JvmciRuntime>>,
     is_hotspot: bool,
+    #[allow(dead_code)]
     throw_to_caller: bool,
     file: &'static str,
     line: u32,

@@ -79,6 +79,7 @@ struct JvmciState {
     /// `_fatal_log_fd` analogue (stderr until a file is configured).
     fatal_log_fd: AtomicI32,
     /// `_first_error_tid`.
+    #[allow(dead_code)]
     first_error_tid: AtomicI32,
     /// `_events` / `_verbose_events` level bookkeeping.
     events_initialized: AtomicU8,

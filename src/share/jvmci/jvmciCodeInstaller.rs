@@ -1251,6 +1251,7 @@ impl<'a> CodeInstaller<'a> {
                     if bci_ == BEFORE_BCI {
                         bci_ = SYNCHRONIZATION_ENTRY_BCI;
                     }
+                    bci_ = Self::map_jvmci_bci(bci_);
                     let (holder, name, sig) = method_key
                         .as_deref()
                         .map(split_method_key)

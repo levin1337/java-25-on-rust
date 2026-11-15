@@ -698,12 +698,13 @@ impl<'a> AdlParser<'a> {
             self.synerr("missing '(' in instruct definition\n");
             return;
         }
-        self.get_oplist(&mut instr.borrow_mut().parameters, &mut instr.borrow_mut().local_names);
+        self.get_oplist_for(&instr);
         self.skipws();
         if !(self.curchar == b'%' && self.byte(1) == b'{') {
             self.synerr("missing '%%{' in instruction definition\n");
             return;
         }
+        self.next_char();
         self.next_char();
         let mut match_rules_cnt: i32 = 0;
         loop {
@@ -1128,7 +1129,7 @@ impl<'a> AdlParser<'a> {
             self.synerr("missing '(' in operand definition\n");
             return;
         }
-        self.get_oplist(&mut oper.borrow_mut().parameters, &mut oper.borrow_mut().local_names);
+        self.get_oplist_for(&oper);
         self.skipws();
         if !(self.curchar == b'%' && self.byte(1) == b'{') {
             self.synerr("missing '%%{' in operand definition\n");
@@ -3045,19 +3046,19 @@ impl<'a> AdlParser<'a> {
                         self.buf.buf[self.ptr] = self.curchar;
                         format_rep_vars.push(rep_var);
                         format_strings.push(SIGNAL.to_string());
+                        continue;
                     }
-                    // (3) adjacent string literal
+                    // (3) closing quote or adjacent string literal
                     if self.curchar == b'"' {
                         self.next_char();
                         self.skipws();
-                        if self.curchar != b'"' {
-                            break;
-                        } else {
+                        if self.curchar == b'"' {
+                            // adjacent string literal: consume its opening quote
                             self.next_char();
+                            continue;
                         }
-                    } else {
-                        break;
                     }
+                    break;
                 }
             }
             self.skipws();
@@ -3891,10 +3892,26 @@ impl<'a> AdlParser<'a> {
         inst.borrow_mut().insencode = Some(encrule);
     }
 
+    // Ensure an `encode` form exists so ins_encode/postalloc_expand/constant
+    // blocks have somewhere to register their encoding classes (the C++
+    // adlc requires an explicit encode section; we synthesize an empty one).
+    fn ensure_encode_form(&mut self) -> FormRef {
+        if let Some(enc) = self.ad.encode.clone() {
+            return enc;
+        }
+        let mut ef = Form::new(FormKind::Encode);
+        ef.ident = "encode".to_string();
+        let r = Rc::new(RefCell::new(ef));
+        self.ad.global_names.insert("encode".to_string(), r.clone());
+        self.ad.add_form(r.clone());
+        self.ad.encode = Some(r.clone());
+        r
+    }
+
     fn ins_encode_parse_block(&mut self, inst: &FormRef) {
         let prefix = "__ins_encode_";
         let ec_name = format!("{}{}", prefix, inst.borrow().ident);
-        let enc = self.ad.encode.as_ref().unwrap().clone();
+        let enc = self.ensure_encode_form();
         let encoding = self.add_enc_class(&enc, &ec_name);
         encoding.borrow_mut().linenum = self.linenum();
         // synthesize parameters from instruct's parameters
@@ -4098,7 +4115,7 @@ impl<'a> AdlParser<'a> {
     fn constant_parse(&mut self, inst: &FormRef) {
         let prefix = "__constant_";
         let ec_name = format!("{}{}", prefix, inst.borrow().ident);
-        let enc = self.ad.encode.as_ref().unwrap().clone();
+        let enc = self.ensure_encode_form();
         let encoding = self.add_enc_class(&enc, &ec_name);
         encoding.borrow_mut().linenum = self.linenum();
         {
@@ -4487,6 +4504,19 @@ impl<'a> AdlParser<'a> {
         let mut b = reg.borrow_mut();
         b.rclasses.push("dynamic".to_string());
         b.reg_class.insert("dynamic".to_string(), rc);
+    }
+
+    // Parse an operand list ("(type name, ...)") into a form's parameters
+    // and local_names table without holding two simultaneous mutable borrows.
+    fn get_oplist_for(&mut self, form: &FormRef) {
+        let (mut params, mut locals) = {
+            let mut b = form.borrow_mut();
+            (std::mem::take(&mut b.parameters), std::mem::take(&mut b.local_names))
+        };
+        self.get_oplist(&mut params, &mut locals);
+        let mut b = form.borrow_mut();
+        b.parameters = params;
+        b.local_names = locals;
     }
 
     //------------------------------get_oplist----------------------------------

@@ -7,14 +7,13 @@
 [![Rust](https://img.shields.io/badge/Rust-000000?style=for-the-badge&logo=rust&logoColor=white)](https://www.rust-lang.org)
 [![Java 25](https://img.shields.io/badge/Java-25-orange?style=for-the-badge&logo=openjdk&logoColor=white)](https://openjdk.org)
 [![Status](https://img.shields.io/badge/status-work%20in%20progress-yellow?style=for-the-badge)]()
-[![License](https://img.shields.io/badge/license-proprietary-red?style=for-the-badge)]()
 
 <p>
   <img src="https://img.shields.io/badge/HotSpot-C%2B%2B%20%E2%86%92%20Rust-blueviolet?style=for-the-badge" alt="port">
   <img src="https://img.shields.io/badge/goal-Minecraft-green?style=for-the-badge" alt="goal">
 </p>
 
-> 🚧 **Проект в активной разработке.** Это амбициозный WIP-порт: структура `share/` повторяет оригинальный HotSpot 1:1, но не все подсистемы завершены.
+> 🚧 **Проект в активной разработке.** Структура `src/share/` повторяет HotSpot 25 **1:1** — все 24 директории `share/` присутствуют и наполняются параллельно командой сабагентов.
 
 </div>
 
@@ -24,39 +23,50 @@
 
 Переписать **OpenJDK HotSpot JVM (Java 25)** с C++ на **Rust**, сохранив:
 
-- 🏗️ **Полную структуру оригинальной JVM** — каждый модуль HotSpot (`classfile`, `interpreter`, `opto`, `gc`, `runtime`…) имеет свой аналог в `src/share/`
-- ⚡ **Максимальную производительность** — чистый, оптимизированный код без лишних аллокаций (arena-аллокатор `bumpalo`, zero-cost абстракции)
+- 🏗️ **Полную структуру оригинальной JVM** — каждый модуль `share/` из `srcJVMc++` (C++-референс OpenJDK 25 в репозитории) имеет свой аналог в `src/share/`
+- ⚡ **Максимальную производительность** — чистый оптимизированный код, arena-аллокации, JIT C1+C2
 - ✅ **Совместимость** — запуск любых Java-приложений, включая тяжёлые, цель — **Minecraft без ошибок**
 - 🧪 **Полный тестовый прогон** — все тесты JVM должны проходить на Rust-версии
 
 ---
 
-## 🗺️ Карта переноса
-
-Структура `src/share/` зеркалит `src/hotspot/share/` из OpenJDK:
+## 🗺️ Структура `src/share/` — 1:1 с HotSpot
 
 ```
 src/share/
-├── classfile/      📦 Парсер .class, ClassLoader, JImage, SymbolTable,
-│                   SystemDictionary, верификатор байткода
-├── interpreter/    🏃 Байткод-интерпретатор, шаблоны, LinkResolver
-├── opto/           🔥 Оптимизирующий JIT-компилятор (C2)
-├── c1/             ⚙️  Быстрый JIT-компилятор (C1)
-├── compiler/       🧠 CompileBroker, CompileQueue, CompilerOracle
-├── code/           💾 CodeCache, CodeBlob, nmethod, PcDesc
-├── gc/             🗑️  Сборщики мусора: Serial, Parallel, G1, ZGC, Shenandoah, Epsilon
-├── runtime/        🔧 Runtime, Threads, JNI, Signals, JNI-окружение
-├── oops/           🧬 Object-модель: Klass, oop, метаданные
-├── memory/         🧠 Universe, управление памятью, oopFactory
-├── ci/             🔗 Compiler Interface (ciMethod, ciType, …)
-├── cds/            📀 Class Data Sharing, metaspace shared
-├── code/ + services/  JVMTI, Serviceability Agent
-├── logging/        📝 HotSpot Logging (Log, LogConfiguration, Tags)
+├── adlc/           🔧 Architecture Description Language Compiler
+├── asm/            🧩 Assembler: register/reloc/codeBuffer/x86_64/MacroAssembler
+├── c1/             ⚙️  Быстрый JIT-компилятор (C1): HIR/LIR, x64 backend, runtime-стабы
+├── cds/            📀 Class Data Sharing: archive/filemap/metaspaceShared (реальный формат)
+├── ci/             🔗 Compiler Interface: ciMethod/ciType/ciField/ciEnv/ciLiveness
+├── classfile/      📦 Парсер .class, ClassLoader, JImage, верификатор, attributes
+├── code/           💾 CodeCache, nmethod, PcDesc, scopeDesc, vtable stubs, адаптеры
+├── compiler/       🧠 CompileBroker, CompileQueue, CompilationPolicy
+├── gc/             🗑️  Serial, Parallel, G1 (~6900 строк), ZGC (18 модулей),
+│                   Shenandoah, Epsilon — полные структурные порты
+├── include/        🔌 JNI/JVM FFI-типы, JVM_* экспорты, JMM, CDS-структуры
+├── interpreter/    🏃 Байткод-интерпретатор, шаблоны, rewriter, zero/
+├── jfr/            📹 Java Flight Recorder: writers/recorder/metadata/periodic
+├── jitruntime/     🌉 Мост интерпретатор↔JIT, executable stubs, frame metadata
+├── jvmci/          ☕ JVMCI интерфейс (Graal)
+├── libadt/         🧰 Arena/Dict/VectorSet — resource management HotSpot
+├── logging/        📝 HotSpot Logging (-Xlog): конфигурация, стримы, dcmd
+├── memory/         🧠 Universe, heap, arena, управление памятью
+├── metaprogramming/ ⚙️  Compile-time трейты (EnableIf, PrimitiveCast)
 ├── nmt/            📊 Native Memory Tracking
-├── prims/          🔩 JVM Intrinsics / runtime-рутины
-├── utilities/      🛠️  Утилиты: growableArray, stringStream, …
-└── services/       🔌 JVMTI / Serviceability
+├── oops/           🧬 Object-модель: Klass, markWord, compressedOops, metaspace
+├── opto/           🔥 Оптимизирующий JIT (C2): типы, ноды, GVN, liveness,
+│                   scheduler, x64 codegen
+├── platform/       🖥️  Windows: cpu_features (cpuid/AVX-512), file_io, threads
+├── precompiled/    📦 Precompiled headers аналоги
+├── prims/          🔩 JVM Intrinsics / runtime-рутины (~700 нативов java.base)
+├── runtime/        🔧 Runtime, Threads, deopt, frame, JNI API
+├── sanitizers/     🧹 ASan/UBSan-аннотации
+├── services/       🔌 Attach Listener (V1/V2), dcmd framework, writeableFlags, HPROF
+└── utilities/      🛠️  growableArray, hashtable, utf8, decoder, zip, события
 ```
+
+Референс C++-исходников: `srcJVMc++/share/` (полное дерево OpenJDK 25 HotSpot).
 
 ---
 
@@ -64,129 +74,92 @@ src/share/
 
 ### Требования
 
-- [Rust](https://rustup.rs) (edition 2024, свежий stable)
-- JDK / JRE с образом модулей (`jimage`) для запуска программ
+- Rust (edition 2024, свежий stable)
+- JDK с образом модулей (`jimage`) для запуска программ
 
-### Сборка
+### Сборка и запуск
 
 ```bash
 cargo build --release
-```
 
-### Запуск Java-приложения
-
-```bash
-# Запуск main-класса
-./target/release/jvm25-rust -cp path/to/classes com.example.Main arg1 arg2
-
-# Запуск JAR-файла
-./target/release/jvm25-rust -jar app.jar
-
-# С образом модулей JDK (jimage)
 ./target/release/jvm25-rust --modules /path/to/lib/modules -cp classes Main
-
-# Передача системных свойств
-./target/release/jvm25-rust -Dfoo=bar -cp classes Main
-```
-
-### Дебаг одного .class файла
-
-```bash
-./target/release/jvm25-rust path/to/Foo.class
-# → Foo (major.minor) | N fields | M methods
+./target/release/jvm25-rust -jar app.jar
+JVM25_NO_JIT=1 ./target/release/jvm25-rust --modules ... -cp classes Main  # без JIT
 ```
 
 ### Тесты
 
 ```bash
-cargo test
+cargo test                 # unit + integration
+cargo test --lib opto      # C2-модуль
+cargo test --test asm_x86  # ассемблерный слой
+# JIT e2e: tests/jit/run-jit-tests.ps1 (JitBench: interpreter vs JIT diff)
 ```
 
----
-
-## 🧩 Стек технологий
-
-| Компонент | Технология |
-|---|---|
-| Язык | **Rust** (edition 2024) |
-| Аллокатор | `bumpalo` — arena-аллокации в стиле HotSpot |
-| Загрузка нативных библиотек | `libloading` |
-| JAR / ZIP | `zip` (deflate через `flate2-zlib-rs`) |
-| Референс | OpenJDK `jdk25u` (HotSpot, C++) |
+Отладочные флаги: `JVM25_TRACE`, `JVM25_DUMP`, `JVM25_BLOCKTRACE`, `JVM25_TRACE_COMPILE`, `JVM25_C1_THRESHOLD`, `JVM25_NO_JIT`, `JVM25_PROFILE_NATIVE`, `JVM25_MEMSTAT`, `JVM25_STACK_MB`, `JVM25_NO_VERIFY`, `JVM25_DUMP_JIT`, `JVM25_DUMP_LIR`.
 
 ---
 
 ## 📈 Статус разработки
 
-Актуально на 2026-11-15. ~73k строк Rust в `src/share/` (~200k LOC C++ HotSpot как референс).
+Актуально на 2026-11-15. **~103k+ строк Rust** в `src/share/` (было ~73k до волны портирования GC/JIT/инфраструктуры).
 
 ### ✅ Работает и проверено тестами
 
 | Подсистема | Что сделано |
 |---|---|
-| **Classfile / ClassLoader** | Парсер class-файлов Java 25 (constant pool, атрибуты, структурная верификация имён/флагов), загрузка из директорий, JAR и **реального `lib/modules` JDK** через JImage (декомпрессия, MUTF-8, модульный индекс, ошибки формата). Верификатор байткода подключён для классов вне boot-образа (`VerifyError`, отключается `JVM25_NO_VERIFY=1`). |
-| **Иерархия и линковка** | Резолюция методов/полей, itable, интерфейсные default-методы, гетерогенные ошибки связывания (`LinkageErrorKind` → реальные Java-исключения), `ClassCircularityError`, порядок инициализации `<clinit>` по JVMS 5.5. |
-| **Рефлексия** | `java.lang.Class`, `java.lang.reflect`: `getMethod`/`getField`/`getDeclared*`, `invoke`, конструкторы, массивы, `newInstance`, модификаторы (включая InnerClasses). Вывод `ReflTest` **побайтово совпадает с JDK 21**. |
-| **invokedynamic** | `LambdaMetafactory` (лямбды, захват, method refs), `StringConcatFactory`, **generic bootstrap** через настоящие bootstrap-методы (`genericBootstrap.rs`), `condy` (ConstantDynamic) — кэши `indy_targets`/`condy_values`. |
-| **Потоки и синхронизация** | Кооперативные Java-потоки поверх OS-потоков, мониторы, `wait`/`notify`/`notifyAll`, `park`/`unpark`, `sleep`, прерывания, shutdown hooks, ожидание non-daemon потоков после `main` (семантика JVM), `JVM25_STACK_MB` для стека. |
-| **Память и GC** | Mark-and-sweep с safepoint'ами, обход корней (стеки кадров, статика, `gc_extra_roots`), free-slot reuse, pending-reference list для `Reference`. |
-| **Файлы / NIO** | `FileDispatcherImpl`/`WindowsFileDispatcherImpl` полностью: `pread/pwrite`, `readv/writev`, `lock/release`, `map/unmap/transferTo/setDirect` с когерентной записью маппингов, `FileChannel.map`, `FileKey` через `GetFileInformationByHandle`, стандартные дескрипторы 0/1/2, неseekable pipes, `ProcessBuilder` с pipes. |
-| **Сеть** | TCP-сокеты полный цикл (socket/bind/listen/connect/accept/read/write/shutdown/poll), эхо через Java-потоки, **Selector** (WEPoll + `poll0`), non-blocking каналы, UDP send/receive, `InetAddress`, `isReachable`, multicast-заглушки, `jdk.net` опции. Совместимость сигнатур JDK 21 и JDK 25. |
-| **ZIP / Deflater** | `java.util.zip` + `Inflater`: все варианты `deflateBytesBuffer`/`deflateBufferBytes`/`deflateBufferBuffer`/`inflate*`, preset dictionary, `ZipFile`/`JarFile`, чтение JAR-манифестов и class-path. |
-| **Нативные методы** | ~343 дескриптора в `nativeLookup` + специализированные модули (`prims/`, 27k строк). Аудит против JDK 21 `src.zip`: **499 объявлений, ~17 остатка** — почти все осознанные стабы. |
-| **Class definition** | `ClassLoader.defineClass`, `defineClass2` (из `byte[]` и `ByteBuffer` — heap и direct), регистрация в loader, парсинг и linkage. |
-| **MethodHandle / VarHandle** | `MethodHandleNatives`, `VarHandleNatives` (включая view-буферы), `Unsafe` (CAS, off-heap, array base/scale). |
-| **JNI** | Загрузка DLL, `JNI_OnLoad`, `RegisterNatives`, вызовы x64 Windows, JNI references. Desktop-нативы (LWJGL) не проверены запуском. |
-| **Bootstrap** | `System.initPhase*`, `platformProperties`/`vmProperties` позиционные массивы, charset, сигналы, `System.out/err` через `setOut0`, `SharedSecrets`, `Reference` init. |
-| **Misc** | `Process`/`ProcessImpl`, `RandomAccessFile` (режимы JDK), `Shutdown.halt0`, `StackWalker` (частично, `stackwalk.rs`), `Module`/`defineModule0`, `LambdaProxyClassArchive`/`RawNativeLibraries` стабы, `jdkIntrinsics` (быстрые JDK-хелперы), negative-result кэш и native-профайлер (`JVM25_PROFILE_NATIVE`). |
+| **Classfile / ClassLoader** | Полный парсер class-файлов Java 25: все JVMS-атрибуты структурно (`attributes.rs` ~1250 строк — BootstrapMethods/indy/condy, Signature grammar, Annotations, Module, Record, StackMapTable-декодер), верификатор с JVMS-проверками, загрузка из директорий/JAR/**JImage `lib/modules`**. |
+| **Иерархия и линковка** | Резолюция методов/полей, itable/vtable, default-методы, `<clinit>` порядок JVMS 5.5, реальные Java-исключения связывания. |
+| **Рефлексия / indy** | `java.lang.reflect`, `LambdaMetafactory`, `StringConcatFactory`, generic bootstrap, condy. |
+| **Потоки / синхронизация** | Java-потоки на OS-потоках, мониторы, wait/notify, park/unpark, shutdown hooks. |
+| **Память и GC** | Рабочий mark-sweep с safepoints и `gc_extra_roots`; reference processing починен (pending-list — GC-корень). |
+| **Файлы / NIO / Сеть / ZIP** | FileDispatcher (pread/pwrite/mmap/locks), Selector/WEPoll, TCP/UDP, `java.util.zip` Inflater — всё проверено e2e. |
+| **Нативные методы** | **~700/777 нативов java.base** (аудит против src.zip JDK 25). Остаток ~77: FFM/libffi, Windows ACL, host-locale — capability-gated. |
+| **C1 JIT** | **Работает e2e**: heap-стабы (getfield/putfield/array/new/cast/instanceof/athrow с семантикой интерпретатора), JIT→JIT прямые вызовы, JIT→интерпретатор через stub, non-leaf unwind, рекурсия, проброс исключений, deopt/OSR-fallback. GC-безопасность JIT-фреймов через `FrameRoots`+`gc_extra_roots`. |
+| **C2 JIT (opto)** | Типы/ноды/GVN/scheduler/liveness+interference/x64-эмиттер; рабочее подмножество: примитивная арифметика, idiv с исключениями, массивы через стабы, float/double SSE. 45/45 тестов. |
+| **asm/ (MacroAssembler)** | Полный порт: register/reloc/codeBuffer/x86_64 кодировки/MacroAssembler с oopmaps, safepoint_poll, G1 write barriers. 12/12 тестов. |
+| **code/ + compiler/** | CompileBroker с реальными C1/C2 очередями и worker-потоками, policy, nmethod с PcDesc/DeoptLiveMap, CodeCache с адаптерами и vtable-стабами (реальный x64-код). |
+| **ci/** | Compiler Interface: CiEnv/CiInstanceKlass/CiMethod/CiField/CIType/ciLiveness (полный MethodLiveness). |
+| **GC-коллекторы** | **Полные структурные порты**: G1 (~6900 строк: card table/set, remsets, SATB, par-scan, policy, young gen sizer — 39/39 тестов), ZGC (18 модулей: цветные указатели, forwarding, relocation, barriers — 22/22), Shenandoah (SATB, mark bitmap, pacer — 59/59), Epsilon (эластичная TLAB). |
+| **cds/** | Реальный формат CDS-архива: FileMapInfo/mmap, CRC, VirtualSpaceList, dump/load, `-Xshare:*`. 25/25 тестов. |
+| **logging/** | HotSpot `-Xlog` 1:1: конфигурация, tag sets, stream, decorations, `jcmd VM.log`. 46 тестов. |
+| **services/ (без JVMTI)** | Attach Listener V1/V2 протокол (pipe), dcmd framework, реальные команды (VM.*, GC.run, Thread.print), writeableFlags, HPROF-дамп. |
+| **platform/** | Windows: cpuid-детекция ISA (SSE→AVX-512, XCR0), cache line sizes, file_io, thread sync, Park-Miller random. |
+| **include/libadt/metaprogramming** | JNI/JVM FFI-типы (~150 `JVM_*` экспортов), Arena/Dict/VectorSet, compile-time трейты. |
+| **jfr/** | Ядро JFR: writers (varint/strings/chunk FLR), checkpoint manager, recorder service, metadata — каркас + ключевые события. |
+| **jvmci/** | JVMCI интерфейс для Graal-интеграции (структурный порт). |
+| **adlc/ + utilities/** | ADLC parser/генератор, утилиты HotSpot (hashtable, utf8, decoder, zip, events). |
 
 ### 🟡 В работе
 
 | Подсистема | Состояние |
 |---|---|
-| **Tiered compilation** | Счётчики HotSpot-style подключены: `invocation_tick` на каждый вызов, `backedge_tick` на обратных ветвях, пороги (`JVM25_C1_THRESHOLD`, по умолчанию 1000/4000), hot-set, `[compile-request:*]` лог (`JVM25_TRACE_COMPILE`). **Бэкенд JIT ещё не подключён** — скомпилированный код не вызывается. |
-| **C1 / opto / compiler / code** | Структуры портированы (~12k строк): GraphBuilder, IR, Instruction, Optimizer, x64 `CodeBuffer` (RWX через VirtualProtect), node/GVN, CompileBroker/Queue/Oracle, CodeCache/nmethod/PcDesc/scopeDesc. Генерация машинного кода и связь с интерпретатором — впереди. |
-| **GC-коллекторы** | Каркасы Serial/Parallel/G1/Z/Shenandoah/Epsilon + barrier sets (~2.7k строк). Рабочий путь — единый mark-sweep в `memory/heap.rs`; выбор коллектора и write-барьеры не подключены. |
-| **JNI desktop** | Механизм есть; `GetModule`→null, `IsVirtualThread`→false; LWJGL/Minecraft-нативы не прогонялись. |
-| **StackWalker** | `stackwalk.rs` + `StackFrameInfo` классы в tests; `StackTraceElement.initStackTraceElement` (single) не реализован — нужен MemberName plumbing. |
-| **CDS / NMT / Logging** | Модули есть (cds/, nmt/, logging/), совместимость архивов CDS и JFR не подтверждена. |
-| **Minecraft** | Fabric 1.21.11 (KnotClassLoader) доходит до сканирования ресурсов (`JarFile.checkForSpecialAttributes`); процесс жив, но интерпретатор слишком медленный — часы на старте без JIT. Сервер 1.16.1 ранее проходил bootstrap. |
+| **C2 покрытие** | Расширение опкодов: fields/calls/ref-arrays в работе; полный regalloc (Chaitin), интеграция с `asm/` MacroAssembler. |
+| **Настоящий OSR** | Сейчас best-effort whole-method вызов; нужен перенос locals/stack в OSR-entry. |
+| **Деоптимизация** | Fallback = переисполнение метода; нужен точный frame-state restore с BCI. |
+| **GC-интеграция** | Коллекторы портированы структурно, но выбор коллектора/барьеры в JIT-коде не подключены; рабочий путь — mark-sweep. |
+| **jvm.dll** | Экспорты `JNI_CreateJavaVM`/`JVM_*` для запуска штатным `java.exe` — в работе. |
+| **interpreter/** | Доводка `templateInterpreter*`, `zero/`, `bytecodeUtils`, `rewriter` до полной структуры. |
+| **JFR события** | Каркас готов; генерация всех ~171 событий из events.xml и emit-точки — впереди. |
+| **Minecraft** | Fabric-сервер 1.16.1 проходит bootstrap; client — упирается в скорость интерпретатора до завершения JIT. |
 
-### 🔴 Осталось перенести / сделать
+### 🔴 Осталось
 
-1. **JIT-машинный код** — главный блокер производительности: baseline C1 → OSR → C2, переходы interpreter↔compiled, deopt, safepoint'ы в скомпилированном коде. Без этого MC непригоден по скорости.
-2. **GC-коллекторы** — реализация Serial/Parallel/G1/Z/Shenandoah/Epsilon поверх единого heap, card tables / write barriers, remembered sets.
-3. **Reference processing** — Cleaner'ы/Phantom/Weak семантика, обработка pending list (сейчас список есть, обработчика нет → утечки direct-памяти).
-4. **Windows async I/O** — `Iocp`, `WindowsAsynchronous{File,Socket,ServerSocket}ChannelImpl` (11 нативов; Netty обычно не требует, но `AsynchronousFileChannel` API сломан).
-5. **Module graph** — `Module.addExports0/addReads0/...` сейчас no-op (Java-сторона сама ведёт состояние — работает, но не HotSpot-семантика).
-6. **StackWalker полный** — `StackStreamFactory.callStackWalk/fetchStackFrames`, `initStackTraceElement`, MemberName для фреймов.
-7. **jvm.dll** — сборка DLL с `JNI_CreateJavaVM`/`JNI_GetCreatedJavaVMs`/`JVM_*` экспортами для запуска штатным `java.exe`.
-8. **CDS-архивы, JFR, полная диагностика** — модули-заготовки без верификации.
-9. **Виртуальные потоки** — `VirtualThread` механика (JVMTI-хуки заглушены).
-10. **Тестовое покрытие** — расширить сравнительные прогоны с HotSpot 25: `java -jar`, загрузчики, JNI, GC-политики, ошибки class-файлов.
+1. **Стабилизация сборки** — параллельная работа агентов оставляет временные ошибки компиляции в WIP-областях.
+2. **C2 codegen** — matcher/regalloc/output через новый `asm/` слой.
+3. **Производительность JIT** — FrameRoots (консервативный скан) заменить точными oop-maps; сейчас JIT scale=1 медленнее интерпретатора (~63s vs ~25s на JitBench).
+4. **jvm.dll + CDS-загрузка JDK-архивов**.
+5. **FFM (libffi)**, Windows ACL, host-locale — остаток ~77 нативов.
+6. **Minecraft client** — финальная цель.
 
-### Скорость (текущее состояние)
+### 📊 JIT-бенчмарк (JitBench scale=1, release)
 
-- Bootstrap до `main`: ~6–14 с (JImage-сканы ServiceLoader'ов, charset).
-- Интерпретатор: ~1–2M байткодов/с на простых методах; `Hot.sum` (2M итераций) ~секунды.
-- Minecraft client: прогрессирует, но старт — часы; узкое место — интерпретация `JarFile.match` и классов Knot/Fabric.
+| Режим | Время | Результат |
+|---|---|---|
+| Интерпретатор | ~25s | CHECKSUM `-6033222509371927279` |
+| C1 JIT | ~64s (вкл. компиляцию ~150 методов) | ✅ **побайтово идентичен** |
 
-### 🧪 Тесты
-
-`cargo test` — unit-тесты зелёные. E2E (реальный JDK 21 `lib/modules`):
-
-| Тест | Результат |
-|---|---|
-| Hello / JdkHello / ExcTest / Uncaught / Repeat / SyncTest / EdgeTest / Cf / Conc / Deep / LoadNet / ProcTest | ✅ |
-| LambdaTest (лямбды, captures, method refs) | ✅ |
-| ReflTest vs JDK | ✅ побайтово идентичен |
-| ZipTest / ZipT / ZipOne / JarTest | ✅ |
-| NioTest / SelOnly / MapTest / SockTest (TCP+потоки) | ✅ |
-| classlinkage (10 тестов: интерфейсы, перегрузки, malformed class) | ✅ |
-| Minecraft server Fabric 1.16.1 | 🟡 bootstrap пройден |
-| Minecraft client Fabric 1.21.11 | 🟡 в работе (медленно) |
-
-Отладочные флаги: `JVM25_TRACE`, `JVM25_DUMP`, `JVM25_BLOCKTRACE`, `JVM25_TRACE_COMPILE`, `JVM25_PROFILE_NATIVE`, `JVM25_MEMSTAT`, `JVM25_STACK_MB`, `JVM25_NO_VERIFY`.
+Корректность JIT полная; скорость пока ниже интерпретатора — FrameRoots-скан на каждый stub-вызов доминирует. Ускорение ожидается после oop-maps и C2.
 
 ---
 
@@ -197,21 +170,3 @@ cargo test
 1. 🍴 Сделай fork
 2. 🌿 Создай ветку `feature/<module-name>`
 3. 🔀 Открой Pull Request
-
-Ориентир для переноса — исходники OpenJDK 25 (`src/hotspot/share/`). Каждый PR должен сохранять структуру и нейминг оригинала.
-
----
-
-## ⚠️ Disclaimer
-
-Это **некоммерческий исследовательский проект**. Не аффилирован с Oracle или OpenJDK. HotSpot — товарный знак Oracle. Исходники OpenJDK распространяются под GPL-2.0 с Classpath Exception.
-
----
-
-<div align="center">
-
-**Сделано с ❤️ и большим количеством байткода**
-
-*Rust 🦀 × Java ☕ = ⚡*
-
-</div>

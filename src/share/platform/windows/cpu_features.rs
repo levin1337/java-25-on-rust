@@ -12,7 +12,7 @@
  * MEM_IMAGE module mappings).
  */
 
-use super::{OsWindows, MEM_COMMIT_STATE, MEM_IMAGE, MEM_PRIVATE};
+use super::{MEM_COMMIT_STATE, MEM_IMAGE, MEM_PRIVATE, OsWindows};
 use std::sync::OnceLock;
 
 #[cfg(target_arch = "x86_64")]
@@ -94,6 +94,10 @@ pub struct CpuFeatures {
     // leaf 0x80000001 ecx/edx
     pub lzcnt: bool,
     pub abm: bool,
+    // leaf 0x80000006 cache geometry (bytes)
+    pub l1_data_cache_line_bytes: u32,
+    pub l1_instruction_cache_line_bytes: u32,
+    pub l2_cache_line_bytes: u32,
     // OS-enabled XCR0 state
     pub xcr0_sse: bool,
     pub xcr0_ymm: bool,
@@ -156,6 +160,9 @@ impl CpuFeatures {
             avx512vp2intersect: false,
             lzcnt: false,
             abm: false,
+            l1_data_cache_line_bytes: 0,
+            l1_instruction_cache_line_bytes: 0,
+            l2_cache_line_bytes: 0,
             xcr0_sse: false,
             xcr0_ymm: false,
             xcr0_opmask: false,
@@ -239,6 +246,14 @@ impl CpuFeatures {
             f.abm = f.lzcnt;
         }
 
+        // leaf 0x80000006: cache line geometry (bits 15:8 of each reg)
+        if max_ext >= 0x8000_0006 {
+            let cache = __cpuid(0x8000_0006);
+            f.l1_data_cache_line_bytes = (cache.ebx >> 8) & 0xFF;
+            f.l1_instruction_cache_line_bytes = (cache.ecx >> 8) & 0xFF;
+            f.l2_cache_line_bytes = (cache.edx >> 8) & 0xFF;
+        }
+
         // XCR0: which state components the OS has enabled.
         if f.xsave && f.osxsave {
             // SAFETY: XSAVE+OSXSAVE verified above.
@@ -250,10 +265,7 @@ impl CpuFeatures {
             f.xcr0_hi16_zmm = xcr0 & (1 << 7) != 0;
             f.avx = f.avx && f.xcr0_sse && f.xcr0_ymm;
             f.avx2 = f.avx2 && f.avx && f.xcr0_sse && f.xcr0_ymm;
-            f.avx512f = f.avx512f
-                && f.xcr0_opmask
-                && f.xcr0_zmm_hi256
-                && f.xcr0_hi16_zmm;
+            f.avx512f = f.avx512f && f.xcr0_opmask && f.xcr0_zmm_hi256 && f.xcr0_hi16_zmm;
             f.avx512_any = f.avx512f
                 || f.avx512dq
                 || f.avx512cd
@@ -346,6 +358,9 @@ impl CpuFeatures {
             avx512vp2intersect: false,
             lzcnt: false,
             abm: false,
+            l1_data_cache_line_bytes: 0,
+            l1_instruction_cache_line_bytes: 0,
+            l2_cache_line_bytes: 0,
             xcr0_sse: false,
             xcr0_ymm: false,
             xcr0_opmask: false,
@@ -357,6 +372,24 @@ impl CpuFeatures {
 }
 
 impl CpuFeatures {
+    /// os_cpu::L1_data_cache_line_size — JITs use this for alignment.
+    /// Falls back to 64 (the universal x86-64 line size) when CPUID
+    /// reports 0 (some virtualized CPUs).
+    pub fn l1_data_cache_line_size(&self) -> usize {
+        let v = self.l1_data_cache_line_bytes;
+        if v == 0 { 64 } else { v as usize }
+    }
+
+    /// os_cpu::L2 cache line size, same fallback.
+    pub fn l2_cache_line_size(&self) -> usize {
+        let v = self.l2_cache_line_bytes;
+        if v == 0 {
+            self.l1_data_cache_line_size()
+        } else {
+            v as usize
+        }
+    }
+
     /// os_cpu-equivalent ISA level summary for JIT dispatch tables.
     pub fn isa_level(&self) -> &'static str {
         if self.avx512_any {
@@ -459,7 +492,9 @@ mod tests {
     fn isa_level_is_ordered() {
         let f = OsWindows::cpu_features();
         let level = f.isa_level();
-        let rank = ["baseline", "sse", "sse3", "ssse3", "sse4.1", "sse4.2", "avx", "avx2", "avx512"];
+        let rank = [
+            "baseline", "sse", "sse3", "ssse3", "sse4.1", "sse4.2", "avx", "avx2", "avx512",
+        ];
         let idx = rank.iter().position(|&r| r == level).unwrap_or(0);
         assert!(idx >= 1, "isa_level={level} must be at least sse on x86_64");
     }

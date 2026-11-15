@@ -67,6 +67,9 @@ impl<'a> AdlParser<'a> {
 
     fn parse_err(&mut self, flag: i32, fmt: &str) {
         let line = self.linenum();
+        self.parse_err_at(flag, line, fmt);
+    }
+    fn parse_err_at(&mut self, flag: i32, line: i32, fmt: &str) {
         // skip to end of current line, like C++ parse_err
         let mut p = self.ptr;
         while self.byte_at(p) != b'\n' && self.byte_at(p) != 0 {
@@ -470,7 +473,7 @@ impl<'a> AdlParser<'a> {
             }
         }
         if start == end {
-            self.synerr(&format!("integer expected at {}\n", c as char));
+            self.synerr(&format!("integer expected at {}\n", self.byte_at(end) as char));
             return 0;
         }
         self.curchar = self.byte_at(end);
@@ -663,17 +666,20 @@ impl<'a> AdlParser<'a> {
             self.add_spill_reg_class(reg.clone());
             self.add_dynamic_reg_class(reg.clone());
         } else {
-            self.parse_err(SEMERR, self.linenum(), "Did not declare 'register' definitions");
+            self.parse_err(SEMERR, "Did not declare 'register' definitions");
         }
         if self.preproc_depth != 0 {
             self.synerr("End of file inside #ifdef");
         }
         if !self.ad.global_names.contains_key(INS_COST) {
-            self.parse_err(SEMERR, self.linenum(), "Did not declare 'ins_cost' attribute");
+            self.parse_err(SEMERR, "Did not declare 'ins_cost' attribute");
         }
         if !self.ad.global_names.contains_key(OP_COST) {
-            self.parse_err(SEMERR, self.linenum(), "Did not declare 'op_cost' attribute");
+            self.parse_err(SEMERR, "Did not declare 'op_cost' attribute");
         }
+        // Post-parse inspection: build components, chain rules and the
+        // DFA match lists (ArchDesc::generateMatchLists in the C++ adlc).
+        self.ad.generate_match_lists();
     }
 
     fn instr_parse(&mut self) {
@@ -757,7 +763,7 @@ impl<'a> AdlParser<'a> {
                                 if is_control {
                                     let nm = nrb.m.name.clone().unwrap_or_default();
                                     drop(nrb);
-                                    self.parse_err(SYNERR, self.linenum(),
+                                    self.parse_err(SYNERR,
                                         &format!("unique match rule expected for {}\n", nm));
                                     continue;
                                 }
@@ -876,12 +882,12 @@ impl<'a> AdlParser<'a> {
             let b = instr.borrow();
             if b.expands() || b.postalloc_expands() {
                 if b.ins_pipe.is_some() {
-                    self.parse_err(WARN, self.linum(), &format!(
+                    self.parse_err(WARN, &format!(
                         "ins_pipe and expand rule both specified for instruction \"{}\"; ins_pipe will be unused\n",
                         b.ident));
                 }
             } else if b.ins_pipe.is_none() {
-                self.parse_err(WARN, self.linum(), &format!(
+                self.parse_err(WARN, &format!(
                     "No ins_pipe specified for instruction \"{}\"\n", b.ident));
             }
         }
@@ -889,13 +895,14 @@ impl<'a> AdlParser<'a> {
         // create clone instruction forms for additional match rules
         let mut rule = instr.borrow().matrule.clone();
         if let Some(mut r) = rule.take() {
-            r = match r.borrow().next.clone() {
-                Some(n) => n,
+            let next = r.borrow().next.clone();
+            match next {
+                Some(n) => r = n,
                 None => {
                     self.finish_instr_parse();
                     return;
                 }
-            };
+            }
             loop {
                 let ident2 = r.borrow().m.result.clone().unwrap_or_default();
                 let clone = self.clone_instruct_form(&instr, &ident2, r.clone());
@@ -1671,7 +1678,7 @@ impl<'a> AdlParser<'a> {
                     | "interpreter_method_reg" | "in_preserve_stack_slots"
                     | "out_preserve_stack_slots" | "calling_convention"
                     | "c_calling_convention" => {
-                        self.parse_err(WARN, self.linenum(), &format!("Using obsolete Token, {}", token));
+                        self.parse_err(WARN, &format!("Using obsolete Token, {}", token));
                         self.skipws();
                     }
                     "cisc_spilling_operand_name" => {
@@ -1718,23 +1725,23 @@ impl<'a> AdlParser<'a> {
         {
             let mut b = frame.borrow_mut();
             if b.frame_pointer.is_none() {
-                self.parse_err(SYNERR, self.linenum(), "missing frame pointer definition in frame section.\n");
+                self.parse_err(SYNERR, "missing frame pointer definition in frame section.\n");
                 return;
             }
             if b.alignment_str.is_none() {
-                self.parse_err(SYNERR, self.linenum(), "missing alignment definition in frame section.\n");
+                self.parse_err(SYNERR, "missing alignment definition in frame section.\n");
                 return;
             }
             if b.return_addr.is_none() {
-                self.parse_err(SYNERR, self.linenum(), "missing return address location in frame section.\n");
+                self.parse_err(SYNERR, "missing return address location in frame section.\n");
                 return;
             }
             if b.varargs_c_out_slots_killed.is_none() {
-                self.parse_err(SYNERR, self.linenum(), "missing varargs C out slots killed definition in frame section.\n");
+                self.parse_err(SYNERR, "missing varargs C out slots killed definition in frame section.\n");
                 return;
             }
             if b.return_value.is_none() {
-                self.parse_err(SYNERR, self.linenum(), "missing return value definition in frame section.\n");
+                self.parse_err(SYNERR, "missing return value definition in frame section.\n");
                 return;
             }
             if b.c_frame_pointer.is_none() {
@@ -1886,7 +1893,7 @@ impl<'a> AdlParser<'a> {
     fn pipe_define_parse(&mut self, pipeline: &FormRef) {
         self.skipws();
         if !(self.curchar == b'%' && self.byte(1) == b'{') {
-            self.synerr("expected '%%{'\n");
+            self.synerr("expected '%{{'\n");
             return;
         }
         self.next_char();
@@ -1913,7 +1920,7 @@ impl<'a> AdlParser<'a> {
         self.next_char();
         self.skipws();
         if !(self.curchar == b'%' && self.byte(1) == b'}') {
-            self.synerr(&format!("expected '%%}', found \"{}\"\n", self.curchar as char));
+            self.synerr(&format!("expected '%}}', found \"{}\"\n", self.curchar as char));
             return;
         }
         self.next_char();
@@ -1935,7 +1942,7 @@ impl<'a> AdlParser<'a> {
     fn pipe_attributes_parse(&mut self, pipeline: &FormRef) {
         self.skipws();
         if !(self.curchar == b'%' && self.byte(1) == b'{') {
-            self.synerr("expected '%%{'\n");
+            self.synerr("expected '%{{'\n");
             return;
         }
         self.next_char();
@@ -2047,7 +2054,7 @@ impl<'a> AdlParser<'a> {
             }
         }
         if !(self.curchar == b'%' && self.byte(1) == b'}') {
-            self.synerr(&format!("expected '%%}}', found \"{}\"\n", self.curchar as char));
+            self.synerr(&format!("expected '%}}}}', found \"{}\"\n", self.curchar as char));
             return;
         }
         self.next_char();
@@ -2197,12 +2204,14 @@ impl<'a> AdlParser<'a> {
         if self.curchar != b'(' {
             self.synerr("missing \"(\" in pipe_class definition\n");
         } else {
-            let (params, locals) = {
+            {
                 let mut b = pipe_class.borrow_mut();
-                (std::mem::take(&mut b.parameters), std::mem::take(&mut b.local_names))
-            };
-            let _ = (params, locals);
-            self.get_oplist_pipe(&pipe_class);
+                let mut params = std::mem::take(&mut b.parameters);
+                let mut names = std::mem::take(&mut b.local_names);
+                self.get_oplist(&mut params, &mut names);
+                b.parameters = params;
+                b.local_names = names;
+            }
         }
         self.skipws();
         if !(self.curchar == b'%' && self.byte(1) == b'{') {
@@ -2403,56 +2412,6 @@ impl<'a> AdlParser<'a> {
         self.next_char();
     }
 
-    fn get_oplist_pipe(&mut self, pipe_class: &FormRef) {
-        // like get_oplist but local names may be operands OR opclasses AND
-        // must not collide with global operand names? C++ uses same get_oplist
-        // which requires type be operand/opclass in _globalNames.
-        loop {
-            self.next_char();
-            self.skipws();
-            if self.curchar == b')' {
-                break;
-            }
-            let Some(ty) = self.get_ident() else {
-                self.synerr(&format!("optype identifier expected at {}\n", self.curchar as char));
-                return;
-            };
-            let form = self.ad.global_names.get(&ty).cloned();
-            let ok = form.as_ref().map_or(false, |f| {
-                let f = f.borrow();
-                f.kind == FormKind::Operand || f.kind == FormKind::OpClass
-            });
-            if !ok {
-                self.synerr(&format!("undefined operand type {}\n", ty));
-                return;
-            }
-            let Some(name) = self.get_ident() else {
-                self.synerr(&format!("operand name expected at {}\n", self.curchar as char));
-                return;
-            };
-            if self.ad.global_names.contains_key(&name) {
-                self.synerr(&format!("Reuse of global name {} as operand.\n", name));
-                return;
-            }
-            {
-                let mut b = pipe_class.borrow_mut();
-                if let Some(f) = form {
-                    b.local_names.insert(name.clone(), f);
-                }
-                b.parameters.push(name);
-            }
-            self.skipws();
-            if self.curchar != b',' {
-                break;
-            }
-        }
-        if self.curchar != b')' {
-            self.synerr("missing ')'\n");
-        } else {
-            self.next_char();
-        }
-    }
-
     fn pipe_class_operand_parse(&mut self, pipe_class: &FormRef, _pipeline: &FormRef, ident: &str) {
         self.skipws();
         if self.curchar != b':' {
@@ -2543,7 +2502,7 @@ impl<'a> AdlParser<'a> {
         f.use_def = cyclecnt as i32;
         let r = Rc::new(RefCell::new(f));
         {
-            let stagenum = pipeline.borrow().stages.iter().position(|s| s == &stage).unwrap_or(-1) as i64;
+            let stagenum = pipeline.borrow().stages.iter().position(|s| s == &stage).map(|p| p as i64).unwrap_or(-1);
             let mut pb = pipeline.borrow_mut();
             if pb.maxcycleused < (stagenum + cyclecnt) as i32 {
                 pb.maxcycleused = (stagenum + cyclecnt) as i32;
@@ -2595,36 +2554,6 @@ impl<'a> AdlParser<'a> {
         }
         self.next_char();
         self.next_char();
-        // attach peep to root instruction if it has a match
-        if let Some(root) = self.peep_root_instruct(&peep) {
-            let mut b = root.borrow_mut();
-            // append to peephole list of instruction
-            match b.peephole.take() {
-                None => b.peephole = Some(peep.clone()),
-                Some(head) => {
-                    // find tail
-                    let mut cur = head;
-                    loop {
-                        let nxt = cur.borrow().next_peephole.clone();
-                        match nxt {
-                            Some(n) => cur = n,
-                            None => break,
-                        }
-                    }
-                    cur.borrow_mut().next_peephole = Some(peep.clone());
-                    b.peephole = Some(head);
-                }
-            }
-        }
-    }
-
-    fn peep_root_instruct(&self, peep: &FormRef) -> Option<FormRef> {
-        let pb = peep.borrow();
-        // peepmatch stores instr names in peep_match_instrs; root is the first
-        // entry with parent == -1? Actually root is first added instruction.
-        let name = pb.peep_match_instrs.first().map(|e| e.2.clone())?;
-        drop(pb);
-        self.ad.global_names.get(&name).cloned()
     }
 
     fn peep_predicate_parse(&mut self, peep: &FormRef) {
@@ -2644,15 +2573,17 @@ impl<'a> AdlParser<'a> {
 
     fn peep_match_parse(&mut self, peep: &FormRef) {
         self.skipws();
+        // Check the structure of the rule
         if self.curchar != b'(' {
             self.synerr("missing '(' at start of peepmatch rule.\n");
             return;
         }
-        self.next_char();
-        let mut parent: i32 = -1;
+        self.next_char();   // skip '('
+        let parent: i32 = -1;
         let mut position: i32 = 0;
-        let mut input: i32 = 0;
-        let root = self.peep_match_child_parse(peep, parent, &mut position, input);
+        let input: i32 = 0;
+        let mut match_list: Vec<(i32, i32, String, i32)> = Vec::new();
+        let root = self.peep_match_child_parse(&mut match_list, parent, &mut position, input);
         if root.is_none() {
             self.synerr("missing instruction-name at start of peepmatch.\n");
             return;
@@ -2661,40 +2592,61 @@ impl<'a> AdlParser<'a> {
             self.synerr("missing ')' at end of peepmatch.\n");
             return;
         }
-        self.next_char();
+        self.next_char();   // skip ')'
         self.skipws();
         if self.curchar != b';' {
             self.synerr("missing ';' at end of peepmatch.\n");
             return;
         }
-        self.next_char();
+        self.next_char();   // skip ';'
+        {
+            let mut b = peep.borrow_mut();
+            b.peep_match_instrs = match_list;
+        }
+        // Store match into peep, and store peep into instruction
+        if let Some(root) = root {
+            let mut rb = root.borrow_mut();
+            match rb.peephole.take() {
+                None => rb.peephole = Some(peep.clone()),
+                Some(head) => {
+                    let mut cur = head.clone();
+                    loop {
+                        let nxt = cur.borrow().next_peephole.clone();
+                        match nxt {
+                            Some(n) => cur = n,
+                            None => break,
+                        }
+                    }
+                    cur.borrow_mut().next_peephole = Some(peep.clone());
+                    rb.peephole = Some(head);
+                }
+            }
+        }
     }
 
-    // Returns the root InstructForm seen (first instruction at this level)
-    fn peep_match_child_parse(&mut self, peep: &FormRef, parent: i32,
-                              position: &mut i32, input: i32) -> Option<FormRef> {
+    // Port of peep_match_child_parse.  `position` is shared by reference
+    // through the recursion; `parent` and `input` are by value.
+    // match_list collects (parent, position, instr_name, input) tuples.
+    fn peep_match_child_parse(&mut self, match_list: &mut Vec<(i32, i32, String, i32)>,
+                              mut parent: i32, position: &mut i32, input: i32) -> Option<FormRef> {
         let mut lparen: i32 = 0;
         let mut rparen: i32 = 0;
         let mut inst_seen: Option<FormRef> = None;
-        loop {
-            if lparen < rparen {
-                break;
-            }
+        let mut max_pos = 0i32;
+        while lparen >= rparen {
             self.skipws();
             if self.curchar == b'(' {
                 lparen += 1;
                 self.next_char();
-                self.peep_match_child_parse(peep, parent, position, rparen);
+                self.peep_match_child_parse(match_list, parent, position, rparen);
             } else if self.curchar == b')' {
                 rparen += 1;
                 if rparen == lparen {
                     self.next_char();
                 } else {
+                    // leave ')' for parent
                     if inst_seen.is_none() {
-                        {
-                            let mut b = peep.borrow_mut();
-                            b.peep_match_instrs.push((parent, *position, SIGNAL.to_string(), input));
-                        }
+                        match_list.push((parent, *position, SIGNAL.to_string(), input));
                         *position += 1;
                     }
                     return inst_seen;
@@ -2702,36 +2654,21 @@ impl<'a> AdlParser<'a> {
             } else if let Some(token) = self.get_ident_dup() {
                 let form = self.ad.global_names.get(&token).cloned();
                 if let Some(form) = form {
-                    let is_inst = form.borrow().kind == FormKind::Instruct;
+                    let inst = if form.borrow().kind == FormKind::Instruct {
+                        Some(form.clone())
+                    } else {
+                        None
+                    };
                     if inst_seen.is_none() {
-                        inst_seen = Some(form.clone());
+                        inst_seen = inst.clone();
                     }
-                    if is_inst {
-                        {
-                            let mut b = peep.borrow_mut();
-                            if *position as i32 > b.peep_match_max_position {
-                                b.peep_match_max_position = *position;
-                            }
-                            b.peep_match_instrs.push((parent, *position, token.clone(), input));
+                    if let Some(_inst) = inst {
+                        if *position > max_pos {
+                            max_pos = *position;
                         }
-                        // parent = position for children
-                        // (C++ uses local 'parent' var; emulate via recursion param)
-                        // We handle by recursion below through a wrapper.
-                        // For simplicity, children get parent = *position before increment.
-                        // Implemented via peep_match_child_parse_parented.
+                        match_list.push((parent, *position, token, input));
+                        parent = *position;
                         *position += 1;
-                        // recurse manually is complex; C++ continues loop with parent=position
-                        // We emulate by continuing the loop with updated parent via a stack:
-                        // Simplest faithful approach: recurse is already handled for '('.
-                        // For non-paren children the C++ loop just continues; the 'parent'
-                        // variable was updated. We track it via a local shadow:
-                        // -> handled by caller passing updated parent on subsequent calls is
-                        //    not possible; instead we store pending parent in peep? No:
-                        // C++ parent var is per-call. The update `parent = position` affects
-                        // subsequent add_instruction calls in THIS call's loop. Emulate:
-                        // (we saved old parent in 'parent' param shadow below)
-                        // NOTE: see peep_match_child_parse2 for full fidelity.
-                        let _ = parent;
                     } else {
                         self.synerr(&format!("instruction name expected at identifier {}.\n", token));
                         return inst_seen;
@@ -2745,6 +2682,7 @@ impl<'a> AdlParser<'a> {
                 return None;
             }
         }
+        let _ = max_pos;
         None
     }
 
@@ -3756,7 +3694,7 @@ impl<'a> AdlParser<'a> {
                     let end = self.ptr;
                     let s = String::from_utf8_lossy(&self.buf.buf[start..end]).into_owned();
                     self.buf.buf[end] = 0;
-                    **fmt_slot = Some(s);
+                    *fmt_slot = Some(s);
                 }
                 self.next_char();
                 self.skipws();
@@ -3956,7 +3894,8 @@ impl<'a> AdlParser<'a> {
     fn ins_encode_parse_block(&mut self, inst: &FormRef) {
         let prefix = "__ins_encode_";
         let ec_name = format!("{}{}", prefix, inst.borrow().ident);
-        let encoding = self.add_enc_class(self.ad.encode.as_ref().unwrap(), &ec_name);
+        let enc = self.ad.encode.as_ref().unwrap().clone();
+        let encoding = self.add_enc_class(&enc, &ec_name);
         encoding.borrow_mut().linenum = self.linenum();
         // synthesize parameters from instruct's parameters
         {
@@ -4159,7 +4098,8 @@ impl<'a> AdlParser<'a> {
     fn constant_parse(&mut self, inst: &FormRef) {
         let prefix = "__constant_";
         let ec_name = format!("{}{}", prefix, inst.borrow().ident);
-        let encoding = self.add_enc_class(self.ad.encode.as_ref().unwrap(), &ec_name);
+        let enc = self.ad.encode.as_ref().unwrap().clone();
+        let encoding = self.add_enc_class(&enc, &ec_name);
         encoding.borrow_mut().linenum = self.linenum();
         {
             let b = inst.borrow();
@@ -4713,7 +4653,8 @@ impl<'a> AdlParser<'a> {
 
     //------------------------------utilities----------------------------------
     fn get_unique_ident_local(&mut self, desc: &str) -> Option<String> {
-        self.get_unique_ident(&self.ad.global_names, desc)
+        let names = self.ad.global_names.clone();
+        self.get_unique_ident(&names, desc)
     }
     fn get_unique_ident_local_in(&mut self, desc: &str, dict: &HashMap<String, FormRef>) -> Option<String> {
         let ident = self.get_ident()?;

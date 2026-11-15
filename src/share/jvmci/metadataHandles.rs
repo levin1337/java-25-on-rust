@@ -197,11 +197,9 @@ impl MetadataHandles {
         }
         // Strip tag bits when actually consuming (kept for parity with
         // the C++ tagged free list).
-        self.free_list.retain(|h| {
-            let stripped = h & !PTR_TAG;
-            *h = stripped;
-            true
-        });
+        for h in self.free_list.iter_mut() {
+            *h &= !PTR_TAG;
+        }
         self.num_free_handles = self.free_list.len();
     }
 

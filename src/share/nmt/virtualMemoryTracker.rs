@@ -603,7 +603,6 @@ impl ReservedMemoryRegion {
         let rgn = self.committed.get(&key)?;
         debug_assert!(rgn.contain_region(addr, sz), "Has to be contained");
         debug_assert!(!rgn.same_region(addr, sz), "Can not be the same region");
-        let top = rgn.end();
         if rgn.base() == addr || rgn.end() == addr + sz {
             self.committed.get_mut(&key).unwrap().exclude_region(addr, sz);
             None
@@ -807,7 +806,7 @@ impl VirtualMemoryTracker {
         let mut regions = self.reserved_regions.lock().unwrap();
         let rgn = ReservedMemoryRegion::new(base_addr, size, stack, mem_tag);
 
-        if let Some(&key) = Self::find_overlapping_in(&regions, base_addr, size) {
+        if let Some(key) = Self::find_overlapping_in(&regions, base_addr, size) {
             let reserved_rgn = regions.get(&key).unwrap();
             // Deal with recursive reservation
             // (os::reserve_memory -> pd_reserve_memory -> os::reserve_memory).
@@ -1146,6 +1145,45 @@ impl VirtualMemoryTracker {
         }
     }
 
+    /// Render the detail "virtual memory allocation site" section used
+    /// by reports: regions aggregated by (call stack, tag), address order.
+    pub fn site_section(&self) -> String {
+        let mut out = String::new();
+        let mut sites: Vec<(NativeCallStack, MemTag, usize, usize)> = Vec::new();
+        let regions = self.reserved_regions.lock().unwrap();
+        for rgn in regions.values() {
+            if rgn.size() == 0 {
+                continue;
+            }
+            let stack = *rgn.call_stack();
+            let tag = rgn.mem_tag();
+            if let Some(e) = sites
+                .iter_mut()
+                .find(|(s, t, _, _)| *s == stack && *t == tag)
+            {
+                e.2 += rgn.size();
+                e.3 += rgn.committed_size();
+            } else {
+                sites.push((stack, tag, rgn.size(), rgn.committed_size()));
+            }
+        }
+        sites.sort_by(|a, b| a.0.compare(&b.0));
+        if sites.is_empty() {
+            out.push_str("  (no virtual memory allocations recorded)\n");
+            return out;
+        }
+        for (stack, tag, reserved, committed) in sites {
+            out.push_str(&format!(
+                "  {}: reserved={} committed={}\n",
+                tag.name(),
+                reserved,
+                committed
+            ));
+            out.push_str(&stack.print_on());
+        }
+        out
+    }
+
     /// Release all tracked state (tests / shutdown).
     pub fn reset(&self) {
         self.reserved_regions.lock().unwrap().clear();
@@ -1213,4 +1251,102 @@ pub fn committed_in_range(start: usize, size: usize, out: &mut Vec<(usize, usize
 #[cfg(not(windows))]
 pub fn committed_in_range(_start: usize, _size: usize, _out: &mut Vec<(usize, usize)>) -> bool {
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stack() -> NativeCallStack {
+        NativeCallStack::from_frames(&[0x1000, 0x2000])
+    }
+
+    #[test]
+    fn reserve_commit_uncommit_release_totals() {
+        let _g = crate::share::nmt::nmtCommon::NMT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let t = VirtualMemoryTracker::global();
+        t.reset();
+        let s = stack();
+        assert!(t.add_reserved_region(0x10000, 0x4000, s, MemTag::MtMetaspace));
+        let totals = t.totals_for(MemTag::MtMetaspace);
+        assert_eq!(totals.reserved, 0x4000);
+        assert_eq!(totals.committed, 0);
+
+        assert!(t.add_committed_region(0x10000, 0x2000, s));
+        assert!(t.add_committed_region(0x12000, 0x1000, s));
+        let totals = t.totals_for(MemTag::MtMetaspace);
+        assert_eq!(totals.committed, 0x3000);
+
+        assert!(t.remove_uncommitted_region(0x10000, 0x2000));
+        assert_eq!(t.totals_for(MemTag::MtMetaspace).committed, 0x1000);
+
+        assert!(t.remove_released_region(0x10000, 0x4000));
+        let totals = t.totals_for(MemTag::MtMetaspace);
+        assert_eq!(totals.reserved, 0);
+        assert_eq!(totals.committed, 0);
+        assert_eq!(t.total_reserved(), 0);
+        assert_eq!(t.total_committed(), 0);
+    }
+
+    #[test]
+    fn partial_release_splits_region() {
+        let _g = crate::share::nmt::nmtCommon::NMT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let t = VirtualMemoryTracker::global();
+        t.reset();
+        let s = stack();
+        assert!(t.add_reserved_region(0x20000, 0x8000, s, MemTag::MtCode));
+        assert!(t.add_committed_region(0x20000, 0x8000, s));
+
+        // Release the middle third: [0x22000, 0x24000).
+        assert!(t.remove_released_region(0x22000, 0x2000));
+        let totals = t.totals_for(MemTag::MtCode);
+        assert_eq!(totals.reserved, 0x6000);
+        assert_eq!(totals.committed, 0x6000);
+
+        let mut count = 0;
+        t.walk(|r| {
+            count += 1;
+            true
+        });
+        assert_eq!(count, 2, "interior release must split into two regions");
+
+        // Head release shrinks the lower region.
+        assert!(t.remove_released_region(0x20000, 0x2000));
+        assert_eq!(t.totals_for(MemTag::MtCode).reserved, 0x4000);
+        t.reset();
+    }
+
+    #[test]
+    fn retag_region() {
+        let _g = crate::share::nmt::nmtCommon::NMT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let t = VirtualMemoryTracker::global();
+        t.reset();
+        let s = stack();
+        assert!(t.add_reserved_region(0x30000, 0x1000, s, MemTag::MtNone));
+        assert!(t.add_committed_region(0x30000, 0x1000, s));
+        assert!(t.set_reserved_region_type(0x30000, 0x1000, MemTag::MtClassShared));
+        assert_eq!(t.totals_for(MemTag::MtNone).reserved, 0);
+        assert_eq!(t.totals_for(MemTag::MtClassShared).reserved, 0x1000);
+        assert_eq!(t.totals_for(MemTag::MtClassShared).committed, 0x1000);
+        t.reset();
+    }
+
+    #[test]
+    fn snapshot_and_reset() {
+        let _g = crate::share::nmt::nmtCommon::NMT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let t = VirtualMemoryTracker::global();
+        t.reset();
+        let s = stack();
+        assert!(t.add_reserved_region(0x40000, 0x2000, s, MemTag::MtGC));
+        assert!(t.add_committed_region(0x40000, 0x1000, s));
+
+        let mut snap = VirtualMemorySnapshot::new();
+        VirtualMemorySummary::global().snapshot(&mut snap);
+        assert_eq!(snap.by_tag(MemTag::MtGC).reserved(), 0x2000);
+        assert_eq!(snap.by_tag(MemTag::MtGC).committed(), 0x1000);
+
+        t.reset();
+        assert_eq!(t.total_reserved(), 0);
+        assert_eq!(t.total_committed(), 0);
+    }
 }

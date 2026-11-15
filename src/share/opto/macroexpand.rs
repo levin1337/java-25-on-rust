@@ -13,7 +13,7 @@
 
 use super::builder::CON_P_NULL;
 use super::gvn::PhaseGVN;
-use super::node::{NodeId, Opcode, NONE};
+use super::node::{NONE, NodeId, Opcode};
 use super::r#type::Type;
 use crate::share::opto::ci_shim::{CiEnv, CiMethodTable, CiTypeTable, MissingCiData};
 use std::collections::HashMap;
@@ -92,8 +92,8 @@ impl<'a> PhaseMacroExpand<'a> {
                 }
                 None
             }
-            Opcode::Call(cp) => {
-                let cp = *cp;
+            Opcode::Call(payload) => {
+                let cp = super::node::call_unpack(*payload).0;
                 let intrinsic = self.expander.as_mut().and_then(|e| e.intrinsic_id(cp));
                 if let (Some(e), Some(intr)) = (self.expander.as_mut(), intrinsic) {
                     return e.expand_intrinsic(gvn, id, intr);

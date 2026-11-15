@@ -3,6 +3,7 @@
  */
 
 pub mod dcmd;
+pub mod jfr;
 pub mod instrumentation;
 pub mod jni;
 pub mod leakprofiler;

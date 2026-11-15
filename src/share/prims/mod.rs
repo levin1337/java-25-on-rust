@@ -1,5 +1,6 @@
 pub(crate) mod arrayCopy;
 pub(crate) mod classNatives;
+pub(crate) mod constantPoolNatives;
 pub(crate) mod fileNatives;
 pub mod jni;
 pub mod jniInvocation;
@@ -35,3 +36,4 @@ pub(crate) mod nioBitsNatives;
 pub(crate) mod selectorNatives;
 pub(crate) mod perfNatives;
 pub(crate) mod processNatives;
+pub(crate) mod osServicesNatives;

@@ -12,7 +12,7 @@
  */
 
 use super::gvn::PhaseGVN;
-use super::node::{NodeId, Opcode, NONE};
+use super::node::{CallResult, NONE, NodeId, Opcode};
 use super::r#type::{self, Type};
 use crate::share::opto::builder::CON_P_NULL;
 
@@ -89,16 +89,26 @@ pub fn node_value_type(gvn: &PhaseGVN, id: NodeId, types: &[Type]) -> Type {
         Opcode::I2B => Type::byte_(),
         Opcode::I2C => Type::char_(),
         Opcode::I2S => Type::short_(),
-        Opcode::AddI | Opcode::SubI | Opcode::MulI | Opcode::AndI | Opcode::OrI
-        | Opcode::XorI | Opcode::LShiftI | Opcode::RShiftI | Opcode::URShiftI => {
-            int_arith_type(&t(0), &t(1), node.op.clone())
-        }
+        Opcode::AddI
+        | Opcode::SubI
+        | Opcode::MulI
+        | Opcode::AndI
+        | Opcode::OrI
+        | Opcode::XorI
+        | Opcode::LShiftI
+        | Opcode::RShiftI
+        | Opcode::URShiftI => int_arith_type(&t(0), &t(1), node.op.clone()),
         Opcode::NegI => int_arith_type(&t(0), &t(0), node.op.clone()),
         Opcode::DivI | Opcode::RemI => int_arith_type(&t(0), &t(1), node.op.clone()),
-        Opcode::AddL | Opcode::SubL | Opcode::MulL | Opcode::AndL | Opcode::OrL
-        | Opcode::XorL | Opcode::LShiftL | Opcode::RShiftL | Opcode::URShiftL => {
-            long_arith_type(&t(0), &t(1), node.op.clone())
-        }
+        Opcode::AddL
+        | Opcode::SubL
+        | Opcode::MulL
+        | Opcode::AndL
+        | Opcode::OrL
+        | Opcode::XorL
+        | Opcode::LShiftL
+        | Opcode::RShiftL
+        | Opcode::URShiftL => long_arith_type(&t(0), &t(1), node.op.clone()),
         Opcode::NegL => long_arith_type(&t(0), &t(0), node.op.clone()),
         Opcode::DivL | Opcode::RemL => long_arith_type(&t(0), &t(1), node.op.clone()),
         Opcode::AddF | Opcode::SubF | Opcode::MulF | Opcode::DivF | Opcode::RemF | Opcode::NegF => {
@@ -107,7 +117,9 @@ pub fn node_value_type(gvn: &PhaseGVN, id: NodeId, types: &[Type]) -> Type {
         Opcode::AddD | Opcode::SubD | Opcode::MulD | Opcode::DivD | Opcode::RemD | Opcode::NegD => {
             Type::double()
         }
-        Opcode::CmpI | Opcode::CmpL | Opcode::CmpF(_) | Opcode::CmpD(_) => Type::Int(r#type::I32Range::new(-1, 1, r#type::WIDEN_MIN)),
+        Opcode::CmpI | Opcode::CmpL | Opcode::CmpF(_) | Opcode::CmpD(_) => {
+            Type::Int(r#type::I32Range::new(-1, 1, r#type::WIDEN_MIN))
+        }
         Opcode::BoolCmp(_) => Type::bool_(),
         Opcode::LoadI => Type::int(),
         Opcode::LoadL => Type::long(),
@@ -126,12 +138,22 @@ pub fn node_value_type(gvn: &PhaseGVN, id: NodeId, types: &[Type]) -> Type {
         | Opcode::StoreC
         | Opcode::StoreS => Type::Memory,
         Opcode::New(_) => Type::inst_ptr(None),
-        Opcode::NewArray(_) | Opcode::NewArrayRef(_) => Type::inst_ptr(None),
+        Opcode::NewArray(_) | Opcode::NewArrayRef(_) | Opcode::MultianewArray => {
+            Type::inst_ptr(None)
+        }
+        Opcode::SitePtr(_) => Type::Bottom,
         Opcode::ArrayLength => Type::pos(),
         Opcode::CheckCast(_) => t(2),
         Opcode::InstanceOf(_) => Type::bool_(),
         Opcode::MonitorEnter | Opcode::MonitorExit => Type::Control,
-        Opcode::Call(_) => Type::Bottom,
+        Opcode::Call(p) => match crate::share::opto::node::call_unpack(*p).2 {
+            CallResult::Void => Type::Memory,
+            CallResult::I32 => Type::int(),
+            CallResult::I64 => Type::long(),
+            CallResult::F32 => Type::float(),
+            CallResult::F64 => Type::double(),
+            CallResult::Ref => Type::inst_ptr(None),
+        },
     }
 }
 
@@ -170,14 +192,8 @@ fn int_arith_type(a: &Type, b: &Type, op: Opcode) -> Type {
         return Type::int_const(ra.get_con().wrapping_neg());
     }
     let (lo, hi) = match op {
-        Opcode::AddI => (
-            ra.lo as i64 + rb.lo as i64,
-            ra.hi as i64 + rb.hi as i64,
-        ),
-        Opcode::SubI => (
-            ra.lo as i64 - rb.hi as i64,
-            ra.hi as i64 - rb.lo as i64,
-        ),
+        Opcode::AddI => (ra.lo as i64 + rb.lo as i64, ra.hi as i64 + rb.hi as i64),
+        Opcode::SubI => (ra.lo as i64 - rb.hi as i64, ra.hi as i64 - rb.lo as i64),
         Opcode::MulI => {
             let vals = [
                 ra.lo as i64 * rb.lo as i64,
@@ -201,9 +217,7 @@ fn int_arith_type(a: &Type, b: &Type, op: Opcode) -> Type {
                 (i32::MIN as i64, i32::MAX as i64)
             }
         }
-        Opcode::LShiftI | Opcode::RShiftI | Opcode::URShiftI => {
-            (i32::MIN as i64, i32::MAX as i64)
-        }
+        Opcode::LShiftI | Opcode::RShiftI | Opcode::URShiftI => (i32::MIN as i64, i32::MAX as i64),
         Opcode::DivI | Opcode::RemI | Opcode::NegI => (i32::MIN as i64, i32::MAX as i64),
         _ => return Type::int(),
     };

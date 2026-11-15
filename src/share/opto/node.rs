@@ -226,8 +226,7 @@ impl Opcode {
         use Opcode::*;
         matches!(
             self,
-            Root
-                | Start
+            Root | Start
                 | Halt
                 | Return
                 | If
@@ -279,10 +278,42 @@ impl Opcode {
         use Opcode::*;
         matches!(
             self,
-            AddI | SubI | MulI | DivI | RemI | AndI | OrI | XorI | LShiftI | RShiftI | URShiftI
-                | AddL | SubL | MulL | DivL | RemL | AndL | OrL | XorL | LShiftL | RShiftL
-                | URShiftL | AddF | SubF | MulF | DivF | RemF | AddD | SubD | MulD | DivD | RemD
-                | CmpI | CmpL | CmpF(_) | CmpD(_) | BoolCmp(_)
+            AddI | SubI
+                | MulI
+                | DivI
+                | RemI
+                | AndI
+                | OrI
+                | XorI
+                | LShiftI
+                | RShiftI
+                | URShiftI
+                | AddL
+                | SubL
+                | MulL
+                | DivL
+                | RemL
+                | AndL
+                | OrL
+                | XorL
+                | LShiftL
+                | RShiftL
+                | URShiftL
+                | AddF
+                | SubF
+                | MulF
+                | DivF
+                | RemF
+                | AddD
+                | SubD
+                | MulD
+                | DivD
+                | RemD
+                | CmpI
+                | CmpL
+                | CmpF(_)
+                | CmpD(_)
+                | BoolCmp(_)
         )
     }
 
@@ -290,8 +321,19 @@ impl Opcode {
         use Opcode::*;
         matches!(
             self,
-            AddI | MulI | AndI | OrI | XorI | AddL | MulL | AndL | OrL | XorL | AddF | MulF
-                | AddD | MulD
+            AddI | MulI
+                | AndI
+                | OrI
+                | XorI
+                | AddL
+                | MulL
+                | AndL
+                | OrL
+                | XorL
+                | AddF
+                | MulF
+                | AddD
+                | MulD
         )
     }
 
@@ -299,8 +341,21 @@ impl Opcode {
         use Opcode::*;
         matches!(
             self,
-            ConI(_) | AddI | SubI | MulI | DivI | RemI | NegI | AndI | OrI | XorI | LShiftI
-                | RShiftI | URShiftI | CmpI | BoolCmp(_)
+            ConI(_)
+                | AddI
+                | SubI
+                | MulI
+                | DivI
+                | RemI
+                | NegI
+                | AndI
+                | OrI
+                | XorI
+                | LShiftI
+                | RShiftI
+                | URShiftI
+                | CmpI
+                | BoolCmp(_)
         )
     }
 }
@@ -478,15 +533,24 @@ impl Node {
 fn compute_type(op: &Opcode) -> Type {
     use Opcode::*;
     match op {
-        ConI(_) | CmpI | CmpL | CmpF(_) | CmpD(_) | InstanceOf(_) | ArrayLength | LoadI
-        | LoadB | LoadC | LoadS | I2B | I2C | I2S => Type::Int,
+        ConI(_) | CmpI | CmpL | CmpF(_) | CmpD(_) | InstanceOf(_) | ArrayLength | LoadI | LoadB
+        | LoadC | LoadS | I2B | I2C | I2S => Type::Int,
         ConL(_) | LoadL => Type::Long,
         ConF(_) | LoadF => Type::Float,
         ConD(_) | LoadD => Type::Double,
-        ConP(_) | LoadP | CheckCast(_) | New(_) | NewArray(_) | NewArrayRef(_)
-        | MultianewArray => Type::Ref,
+        ConP(_) | LoadP | CheckCast(_) | New(_) | NewArray(_) | NewArrayRef(_) | MultianewArray => {
+            Type::Ref
+        }
         Bool(_) | BoolCmp(_) => Type::Bool,
-        Parm(_) | Call(_) => Type::Any,
+        Parm(_) => Type::Any,
+        Call(p) => match call_unpack(*p).2 {
+            CallResult::Void => Type::None,
+            CallResult::I32 => Type::Int,
+            CallResult::I64 => Type::Long,
+            CallResult::F32 => Type::Float,
+            CallResult::F64 => Type::Double,
+            CallResult::Ref => Type::Ref,
+        },
         L2I => Type::Int,
         L2F => Type::Float,
         L2D => Type::Double,

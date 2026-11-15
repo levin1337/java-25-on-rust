@@ -159,7 +159,11 @@ impl VtableStub {
         let _ = writeln!(
             f,
             "{} stub (index = {}, receiver_location = {}, code = [{:#x}, {:#x}))",
-            if self.is_vtable_stub() { "vtable" } else { "itable" },
+            if self.is_vtable_stub() {
+                "vtable"
+            } else {
+                "itable"
+            },
             self.index,
             self.receiver_location,
             self.code_begin,
@@ -261,11 +265,11 @@ pub fn emit_stub_code(stub_type: StubType, index: i32) -> (Vec<u8>, usize, Vec<u
             exception_points.push(ame_pc);
             code.extend_from_slice(&[0x0F, 0x0B]);
             // Patch jz to land on AME.
-            code[jz_pos + 1] = (ame_pc - (jz_pos + 2)) as u8;
+            code[jz_pos + 1] = (ame_pc as i32 - (jz_pos as i32 + 2)) as i8 as u8;
             // found:
             let found = code.len();
-            code[je_pos + 1] = (found - (je_pos + 2)) as u8;
-            code[jnz_pos + 1] = (loop_start - (jnz_pos + 2)) as u8;
+            code[je_pos + 1] = (found as i32 - (je_pos as i32 + 2)) as i8 as u8;
+            code[jnz_pos + 1] = (loop_start as i32 - (jnz_pos as i32 + 2)) as i8 as u8;
             // mov r10, [rdx + 8]  -> 4C 8B 52 08? use [rdx]: 49 8B 52 08 (mov rdx? keep simple)
             // Load the vtable offset then dispatch: mov r10,[rdx+8]
             code.extend_from_slice(&[0x49, 0x8B, 0x52, 0x08]);
@@ -294,7 +298,6 @@ pub struct VtableStubs {
     /// insertion order = HotSpot's prepend list semantics reversed;
     /// lookup scans the whole bucket so order is irrelevant).
     table: Vec<RwLock<Vec<VtableStub>>>,
-    mask: usize,
     /// Next stub allocation address (VtableBlob chunk analogue).
     next_stub_addr: RwLock<usize>,
     /// Estimated code size limits (`_vtab_stub_size`/`_itab_stub_size`,
@@ -314,7 +317,6 @@ impl VtableStubs {
     pub fn new() -> Self {
         Self {
             table: (0..N_BUCKETS).map(|_| RwLock::new(Vec::new())).collect(),
-            mask: N_BUCKETS - 1,
             next_stub_addr: RwLock::new(Self::BASE_STUB_ADDR),
             vtab_stub_size: RwLock::new(0),
             itab_stub_size: RwLock::new(0),
@@ -562,7 +564,10 @@ mod tests {
     #[test]
     fn size_limit_grows() {
         let stubs = VtableStubs::new();
-        assert_eq!(stubs.code_size_limit(true), VtableStubs::FIRST_VTABLE_STUB_SIZE);
+        assert_eq!(
+            stubs.code_size_limit(true),
+            VtableStubs::FIRST_VTABLE_STUB_SIZE
+        );
         stubs.check_and_set_size_limit(true, 100, 8);
         assert_eq!(stubs.code_size_limit(true), 108);
     }

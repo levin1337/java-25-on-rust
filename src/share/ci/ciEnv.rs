@@ -10,28 +10,30 @@
  * so compiler threads can each hold a CiEnv over the same ClassLoader.
  */
 
+use super::ciDependencies::{CiDependency, CiMethodKey};
 use super::ciField::CiField;
 use super::ciInstanceKlass::CiInstanceKlass;
+use super::ciKlassCache::CiKlassCache;
 use super::ciMethod::CiMethod;
 use super::ciType::CIType;
 use crate::share::classfile::classLoader::ClassLoader;
 use crate::share::oops::instanceKlass::InstanceKlass;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct CiEnv<'a> {
     loader: Arc<ClassLoader<'a>>,
-    /// ciObjectFactory analogue: one ciInstanceKlass per loaded Klass*.
-    klass_cache: Arc<Mutex<HashMap<Vec<u8>, CiInstanceKlass<'a>>>>,
+    /// ciObjectFactory/ciKlassCache analogue: resolved klasses keyed
+    /// by internal name, shared by all CiEnv clones.
+    klass_cache: Arc<CiKlassCache<'a>>,
 }
 
 impl<'a> CiEnv<'a> {
     /// `ciEnv` construction over an explicit class loader.
     pub fn new(loader: Arc<ClassLoader<'a>>) -> Self {
         Self {
+            klass_cache: Arc::new(CiKlassCache::new(Arc::clone(&loader))),
             loader,
-            klass_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -61,16 +63,8 @@ impl<'a> CiEnv<'a> {
     /// name (`java/lang/Object`, no `L...;` wrapper) to a ci klass.
     /// Loads the class through the loader when not yet cached.
     pub fn get_klass(&self, name: &[u8]) -> Option<CiInstanceKlass<'a>> {
-        if let Some(k) = self.klass_cache.lock().unwrap().get(name) {
-            return Some(k.clone());
-        }
-        let klass = self.loader.load(name).ok()?;
-        let ci = CiInstanceKlass::new(self.clone(), Arc::clone(&klass));
-        self.klass_cache
-            .lock()
-            .unwrap()
-            .insert(name.to_vec(), ci.clone());
-        Some(ci)
+        let klass = self.klass_cache.get_or_load(name).ok()?;
+        Some(CiInstanceKlass::new(self.clone(), klass))
     }
 
     /// `ciEnv::get_klass_or_null`.
@@ -83,12 +77,20 @@ impl<'a> CiEnv<'a> {
     /// loader's class table (no load attempted).
     pub fn is_loaded(&self, name: &[u8]) -> bool {
         self.loader.classes.borrow().contains_key(name)
+            || self.klass_cache.is_cached(name)
+    }
+
+    /// The shared `ciKlassCache` (name -> resolved InstanceKlass).
+    #[inline]
+    pub fn klass_cache(&self) -> &Arc<CiKlassCache<'a>> {
+        &self.klass_cache
     }
 
     /// Wrap an already-resolved `Arc<InstanceKlass>` without going
     /// through the name cache (used when the caller holds the klass,
     /// e.g. from `ClassLoader::classes`).
     pub fn get_klass_from_instance(&self, klass: Arc<InstanceKlass<'a>>) -> CiInstanceKlass<'a> {
+        self.klass_cache.insert(klass.class.name, Arc::clone(&klass));
         CiInstanceKlass::new(self.clone(), klass)
     }
 
@@ -164,6 +166,61 @@ impl<'a> CiEnv<'a> {
             current = klass.super_klass();
         }
         None
+    }
+
+    /// `ciEnv::get_method` with constant-pool resolution:
+    /// `holder` is the klass owning the constant pool, `index` a
+    /// `CONSTANT_Methodref`/`InterfaceMethodref` index.  Resolves the
+    /// referenced `(owner, name, descriptor)` through the loader —
+    /// the parser's `ciEnv::get_method` analogue.
+    pub fn resolve_method_at(
+        &self,
+        holder: &CiInstanceKlass<'a>,
+        index: u16,
+    ) -> Option<CiMethod<'a>> {
+        let [owner, name, signature] = holder.instance_klass().memberRef(index, false).ok()?;
+        let owner_klass = self.get_klass(owner)?;
+        self.lookup_method(&owner_klass, name, signature)
+    }
+
+    /// `ciEnv::get_field` with constant-pool resolution:
+    /// `index` a `CONSTANT_Fieldref` index.
+    pub fn resolve_field_at(
+        &self,
+        holder: &CiInstanceKlass<'a>,
+        index: u16,
+    ) -> Option<CiField<'a>> {
+        let [owner, name, signature] = holder.instance_klass().memberRef(index, true).ok()?;
+        let owner_klass = self.get_klass(owner)?;
+        self.get_field(&owner_klass, name, signature, false)
+            .or_else(|| self.get_field(&owner_klass, name, signature, true))
+    }
+
+    /// `ciEnv::register_method`-style dependency factory: returns the
+    /// dependency records a compilation should register for `method`
+    /// (stability + uniqueness) so deopt can re-validate them.
+    pub fn method_dependencies(&self, method: &CiMethod<'a>) -> Vec<CiDependency<'a>> {
+        let mut deps = Vec::new();
+        let key = CiMethodKey::new(method);
+        if method.can_be_statically_bound() {
+            deps.push(CiDependency::MethodStable { method: key.clone() });
+        }
+        deps.push(CiDependency::UniqueMethod { method: key });
+        deps
+    }
+
+    /// `ciEnv::register_field`-style dependency factory.
+    pub fn field_dependency(&self, field: &CiField<'a>) -> Option<CiDependency<'a>> {
+        (field.constant_value().is_some() || field.is_final()).then(|| {
+            CiDependency::FieldConst { field: field.clone() }
+        })
+    }
+
+    /// `ciEnv::register_leaf_type`-style dependency factory.
+    pub fn leaf_klass_dependency(&self, klass: &CiInstanceKlass<'a>) -> CiDependency<'a> {
+        CiDependency::LeafKlass {
+            klass: klass.clone(),
+        }
     }
 
     /// Resolve a field/method descriptor to a `CIType` through this env.

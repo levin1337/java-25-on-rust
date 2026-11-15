@@ -1,8 +1,17 @@
-/*
- * OpenJDK 25 HotSpot ZGC (share/gc/z/)
- */
-
-pub mod zBarrierSet;
-pub mod zCollectedHeap;
-pub mod zPage;
-pub mod zPointer;
+pub mod z_address;
+pub mod z_barrier;
+pub mod z_bitmap;
+pub mod z_collected_heap;
+pub mod z_forwarding;
+pub mod z_generation;
+pub mod z_generation_id;
+pub mod z_granule_map;
+pub mod z_heap;
+pub mod z_live_map;
+pub mod z_mark;
+pub mod z_page;
+pub mod z_page_table;
+pub mod z_relocation_set;
+pub mod z_remembered_set;
+pub mod z_statistics;
+pub mod z_workers;

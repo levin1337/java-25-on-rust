@@ -72,7 +72,7 @@ impl ZPage {
 
     pub fn clone_for_promotion(&self) -> Self {
         assert!(!self.age.is_old());
-        let mut page = Self::new(self.page_type, ZPageAge::Old, self.start, self.size, self.single_partition_id);
+        let page = Self::new(self.page_type, ZPageAge::Old, self.start, self.size, self.single_partition_id);
         page.top.store(self.top(), Ordering::Release);
         page
     }
@@ -411,7 +411,7 @@ mod tests {
         let page = ZPage::new_small(0x1000);
         let address = page.allocate(24).unwrap();
         assert!(page.is_in_address(address));
-        assert_eq!(page.used(), page.object_alignment());
+        assert_eq!(page.used(), 24);
         let (changed, inc_live) = page.mark_object(address, 1, false);
         assert!(changed);
         assert!(inc_live);

@@ -133,7 +133,7 @@ impl CiSignature {
             Some(b'J') => CiSignatureKind::Long,
             Some(b'F') => CiSignatureKind::Float,
             Some(b'D') => CiSignatureKind::Double,
-            Some(b'L') => CiSignatureKind::Object,
+            Some(b'L') | Some(b'[') => CiSignatureKind::Object,
             _ => CiSignatureKind::Int,
         };
         Some(Self {
@@ -250,7 +250,10 @@ mod tests {
         assert_eq!(s.args.len(), 3);
         assert_eq!(s.ret, CiSignatureKind::Object);
         assert_eq!(s.args[2], CiSignatureKind::Long);
-        assert_eq!(CiSignature::parse("()V").unwrap().ret, CiSignatureKind::Void);
+        assert_eq!(
+            CiSignature::parse("()V").unwrap().ret,
+            CiSignatureKind::Void
+        );
         assert!(CiSignature::parse("garbage").is_none());
     }
 

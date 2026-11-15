@@ -203,6 +203,31 @@ impl PcDesc {
         code_begin.saturating_add_signed(self.pc_offset as isize)
     }
 
+    /// `PcDesc::print_on` analogue.
+    pub fn print_on(&self, f: &mut dyn std::fmt::Write) {
+        let _ = writeln!(
+            f,
+            "pc={} scope_off={} obj_off={} flags=0x{:02x} bci={}",
+            self.pc_offset, self.scope_decode_offset, self.obj_decode_offset, self.flags, self.bci,
+        );
+    }
+
+    /// XML dump for compiler-log tooling.
+    pub fn as_xml(&self) -> String {
+        format!(
+            "<pc_desc pc=\"{}\" scope=\"{}\" obj=\"{}\" flags=\"{}\" bci=\"{}\"/>",
+            self.pc_offset, self.scope_decode_offset, self.obj_decode_offset, self.flags, self.bci,
+        )
+    }
+
+    /// HTML table row.
+    pub fn as_html(&self) -> String {
+        format!(
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>0x{:02x}</td><td>{}</td></tr>",
+            self.pc_offset, self.scope_decode_offset, self.obj_decode_offset, self.flags, self.bci,
+        )
+    }
+
     #[inline]
     pub fn is_same_info(&self, other: &PcDesc) -> bool {
         self.scope_decode_offset == other.scope_decode_offset
@@ -328,7 +353,12 @@ impl PcDescContainer {
     /// Quasi-linear search ported from
     /// PcDescContainer::find_pc_desc_internal: giant steps of
     /// 4096 -> 256 -> 16 -> 1 then a linear pass (~16 elements).
-    fn quasi_search(&mut self, descs: &[PcDesc], pc_offset: i32, approximate: bool) -> Option<usize> {
+    fn quasi_search(
+        &mut self,
+        descs: &[PcDesc],
+        pc_offset: i32,
+        approximate: bool,
+    ) -> Option<usize> {
         if descs.len() < 2 {
             return None;
         }
@@ -391,9 +421,7 @@ impl PcDescContainer {
         let d = &descs[cand];
         let ok = if approximate {
             // approximate: pc_offset <= d.pc_offset() && previous < pc_offset
-            d.pc_offset() >= pc_offset
-                && cand > 0
-                && descs[cand - 1].pc_offset() < pc_offset
+            d.pc_offset() >= pc_offset && cand > 0 && descs[cand - 1].pc_offset() < pc_offset
         } else {
             d.pc_offset() == pc_offset
         };
@@ -419,9 +447,7 @@ impl PcDescContainer {
             }
             let d = &descs[idx];
             let ok = if approximate {
-                d.pc_offset() >= pc_offset
-                    && idx > 0
-                    && descs[idx - 1].pc_offset() < pc_offset
+                d.pc_offset() >= pc_offset && idx > 0 && descs[idx - 1].pc_offset() < pc_offset
             } else {
                 d.pc_offset() == pc_offset
             };
@@ -437,6 +463,58 @@ impl PcDescContainer {
 impl Default for PcDescCache {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl PcDescContainer {
+    /// `PcDescSet::print_on` analogue: dump every descriptor in sorted
+    /// order with an optional code base for absolute pcs.
+    pub fn print_on(&self, descs: &[PcDesc], f: &mut dyn std::fmt::Write, base: usize) {
+        let _ = writeln!(
+            f,
+            "pc descriptors ({} entries, base={:#x}):",
+            descs.len(),
+            base
+        );
+        for d in descs {
+            let _ = writeln!(
+                f,
+                "  pc={} (abs={:#x}) scope={} obj={} flags=0x{:02x} bci={}",
+                d.pc_offset(),
+                base.wrapping_add(d.pc_offset().max(0) as usize),
+                d.scope_decode_offset(),
+                d.obj_decode_offset(),
+                d.flags(),
+                d.bci(),
+            );
+        }
+    }
+
+    /// XML dump of the whole set (compiler log / `-XX:+PrintCompilation`
+    /// tooling parity).
+    pub fn as_xml(&self, descs: &[PcDesc]) -> String {
+        let mut s = String::from("<pc_descs>\n");
+        for d in descs {
+            s.push_str("  ");
+            s.push_str(&d.as_xml());
+            s.push('\n');
+        }
+        s.push_str("</pc_descs>\n");
+        s
+    }
+
+    /// HTML table dump.
+    pub fn as_html(&self, descs: &[PcDesc]) -> String {
+        let mut s = String::from(
+            "<table><tr><th>pc</th><th>scope</th><th>obj</th><th>flags</th><th>bci</th></tr>\n",
+        );
+        for d in descs {
+            s.push_str("  ");
+            s.push_str(&d.as_html());
+            s.push('\n');
+        }
+        s.push_str("</table>\n");
+        s
     }
 }
 
@@ -509,12 +587,30 @@ mod tests {
         cache.add_pc_desc(a);
         cache.add_pc_desc(b);
         assert_eq!(cache.last_pc_desc().unwrap().pc_offset(), 2);
-        assert_eq!(
-            cache.find_pc_desc(1, false).map(|d| d.pc_offset()),
-            Some(1)
-        );
+        assert_eq!(cache.find_pc_desc(1, false).map(|d| d.pc_offset()), Some(1));
         assert_eq!(cache.find_pc_desc(9, false), None);
         assert_eq!(cache.find_pc_desc(9, true), None);
     }
-}
 
+    #[test]
+    fn print_and_markup_output() {
+        let descs = sample_descs();
+        let c = PcDescContainer::new(&descs);
+        let mut s = String::new();
+        c.print_on(&descs, &mut s, 0x1000);
+        assert!(s.contains("pc descriptors"));
+        assert!(s.contains("pc="));
+        let xml = c.as_xml(&descs);
+        assert!(xml.contains("<pc_descs>"));
+        assert!(xml.contains("<pc_desc"));
+        let html = c.as_html(&descs);
+        assert!(html.contains("<table>"));
+        assert!(html.contains("<tr>"));
+        let d = &descs[2];
+        let mut one = String::new();
+        d.print_on(&mut one);
+        assert!(one.contains("flags="));
+        assert!(d.as_xml().contains("<pc_desc"));
+        assert!(d.as_html().contains("<tr>"));
+    }
+}

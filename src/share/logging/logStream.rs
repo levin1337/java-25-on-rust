@@ -1,147 +1,133 @@
 /*
- * Port of OpenJDK 25 HotSpot logStream (share/logging/logStream.hpp)
+ * Port of OpenJDK 25 HotSpot logStream (share/logging/logStream.hpp/.cpp)
  *
- * logStream is a buffered, formatted output stream used by the unified
- * logging framework. Lines are assembled with print/print_cr/vprint-style
- * helpers and flushed through a LogOutput sink.
+ * LogStream is a line-buffered RAII output stream bound to a (level,
+ * tagset) pair. Text ending in '\n' is flushed immediately as one log
+ * record; any partial line is flushed on drop. is_enabled() mirrors
+ * log_is_enabled so callers can skip expensive formatting.
  */
 
-use super::logDecorations::Decorations;
 use super::logLevel::LogLevel;
-use super::logOutput::LogOutput;
 use super::logTag::LogTag;
+use super::logTagSet::LogTagSet;
+use super::logConfiguration::LogConfiguration;
 use std::fmt::Write as _;
 
-/// Buffered log stream for one log record.
+/// RAII log stream for one (level, tag set) pair.
 pub struct LogStream {
-    buffer: String,
-    tag: LogTag,
+    tagset: LogTagSet,
     level: LogLevel,
+    line: String,
+    enabled: bool,
 }
 
 impl LogStream {
-    pub fn new(tag: LogTag, level: LogLevel) -> Self {
+    /// LogStream(level, tagset) constructor.
+    pub fn new(tagset: LogTagSet, level: LogLevel) -> Self {
+        let enabled = LogConfiguration::global().is_level_enabled(&tagset, level);
         Self {
-            buffer: String::with_capacity(256),
-            tag,
+            tagset,
             level,
+            line: String::with_capacity(256),
+            enabled,
         }
     }
 
-    /// logStream::print
+    /// Convenience constructor for a single-tag set.
+    pub fn for_tag(tag: LogTag, level: LogLevel) -> Self {
+        Self::new(LogTagSet::for_tag(tag), level)
+    }
+
+    /// logStream::is_enabled / LogTargetHandle::is_enabled.
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// logStream::print — append text; embedded '\n' flushes complete
+    /// lines as separate log records.
     pub fn print(&mut self, s: &str) -> &mut Self {
-        self.buffer.push_str(s);
+        if !self.enabled {
+            return self;
+        }
+        let mut rest = s;
+        while let Some(pos) = rest.find('\n') {
+            self.line.push_str(&rest[..pos]);
+            self.flush_line();
+            rest = &rest[pos + 1..];
+        }
+        self.line.push_str(rest);
         self
     }
 
-    /// logStream::print_cr — newline.
-    pub fn print_cr(&mut self) -> &mut Self {
-        self.buffer.push('\n');
+    /// outputStream::print_cr — append text followed by a newline.
+    pub fn print_cr(&mut self, s: &str) -> &mut Self {
+        self.print(s);
+        self.print("\n");
         self
     }
 
-    /// logStream::vprint-style formatted write.
+    /// print-style formatted write (like `*stream << args`).
     pub fn print_fmt(&mut self, args: std::fmt::Arguments) -> &mut Self {
-        let _ = write!(self.buffer, "{}", args);
-        self
+        let mut s = String::new();
+        let _ = write!(s, "{}", args);
+        self.print(&s)
     }
 
-    /// Borrow the accumulated buffer.
-    pub fn as_str(&self) -> &str {
-        &self.buffer
+    /// Borrow the pending (unterminated) line.
+    pub fn pending(&self) -> &str {
+        &self.line
     }
 
-    /// Consume the stream and return the buffered text.
-    pub fn into_string(self) -> String {
-        self.buffer
-    }
-
-    /// Convenience: formatted print with args (like `*stream << args`).
-    pub fn print_args(&mut self, args: std::fmt::Arguments) -> &mut Self {
-        self.print_fmt(args)
-    }
-
-    /// Commit the buffered record through `output` with decorations applied.
-    /// Multi-line messages get each line decorated (logDecorators behavior).
-    pub fn commit(self, output: &dyn LogOutput, deco: &Decorations) {
-        emit_lines(
-            self.tag,
-            self.level,
-            &self.buffer,
-            output,
-            deco,
-        );
-    }
-
-    /// Convenience: build prefix + message in one call without a stream.
-    pub fn emit(
-        tag: LogTag,
-        level: LogLevel,
-        message: &str,
-        output: &dyn LogOutput,
-        deco: &Decorations,
-    ) {
-        emit_lines(tag, level, message, output, deco);
+    /// Flush the pending partial line as a record (if any).
+    pub fn flush_line(&mut self) {
+        if !self.line.is_empty() {
+            let msg = std::mem::take(&mut self.line);
+            super::log::Log::write_tagset(&self.tagset, self.level, &msg);
+        }
     }
 }
 
-impl Default for LogStream {
-    fn default() -> Self {
-        Self::new(LogTag::All, LogLevel::Info)
+impl Drop for LogStream {
+    /// ~LogStreamImpl — writes any unfinished output left in the buffer.
+    fn drop(&mut self) {
+        self.flush_line();
     }
 }
 
-fn emit_lines(
-    tag: LogTag,
-    level: LogLevel,
-    message: &str,
-    output: &dyn LogOutput,
-    deco: &Decorations,
-) {
-    let uptime = crate::share::runtime::os::Os::elapsed_time();
-    #[cfg(windows)]
-    let pid = crate::share::platform::windows::OsWindows::current_process_id();
-    #[cfg(not(windows))]
-    let pid = std::process::id();
-    #[cfg(windows)]
-    let tid = crate::share::platform::windows::OsWindows::current_thread_id() as u64;
-    #[cfg(not(windows))]
-    let tid = 0u64;
-
-    let mut wrote_any = false;
-    for line in message.lines() {
-        let prefix = deco.decorate(level.name(), tag, uptime, pid, tid);
-        let _ = output.write(&format!("{}{}", prefix, line));
-        wrote_any = true;
-    }
-    if !wrote_any {
-        let prefix = deco.decorate(level.name(), tag, uptime, pid, tid);
-        let _ = output.write(&prefix);
+impl std::fmt::Write for LogStream {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        self.print(s);
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::share::logging::logOutput::NullOutput;
 
     #[test]
-    fn stream_buffers() {
-        let mut s = LogStream::new(LogTag::Gc, LogLevel::Info);
-        s.print("hello ").print("world");
-        assert_eq!(s.buffer, "hello world");
-        s.print_cr();
-        assert!(s.buffer.ends_with('\n'));
+    fn stream_line_splitting() {
+        super::super::logConfiguration::LogConfiguration::global().reset();
+        // Warning is enabled by the default stdout configuration.
+        let mut s = LogStream::new(LogTagSet::new(&[LogTag::Logging]), LogLevel::Warning);
+        assert!(s.is_enabled());
+        s.print("hello\nwor");
+        assert_eq!(s.pending(), "wor");
+        s.print("ld\n");
+        assert_eq!(s.pending(), "");
+        drop(s);
     }
 
     #[test]
-    fn emit_to_null() {
-        LogStream::emit(
-            LogTag::Init,
-            LogLevel::Info,
-            "boot complete",
-            &NullOutput,
-            &Decorations::none(),
-        );
+    fn stream_disabled_skips_buffering() {
+        super::super::logConfiguration::LogConfiguration::global().reset();
+        super::super::logConfiguration::LogConfiguration::global()
+            .parse_xlog("all=off")
+            .unwrap();
+        let mut s = LogStream::new(LogTagSet::new(&[LogTag::Gc]), LogLevel::Warning);
+        assert!(!s.is_enabled());
+        s.print("x\n");
+        assert_eq!(s.pending(), "");
+        super::super::logConfiguration::LogConfiguration::global().reset();
     }
 }

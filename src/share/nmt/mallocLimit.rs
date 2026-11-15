@@ -232,7 +232,8 @@ impl MallocLimitHandler {
         if !Self::have_limit() {
             return None;
         }
-        let l = Self::limits().lock().unwrap().global_limit();
+        let limits = Self::limits().lock().unwrap();
+        let l = limits.global_limit();
         if l.sz > 0 { Some(*l) } else { None }
     }
 
@@ -240,7 +241,8 @@ impl MallocLimitHandler {
         if !Self::have_limit() {
             return None;
         }
-        let l = Self::limits().lock().unwrap().category_limit(mem_tag);
+        let limits = Self::limits().lock().unwrap();
+        let l = limits.category_limit(mem_tag);
         if l.sz > 0 { Some(*l) } else { None }
     }
 

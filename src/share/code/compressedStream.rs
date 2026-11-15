@@ -249,8 +249,25 @@ mod tests {
     #[test]
     fn uint_round_trip() {
         for v in [
-            0u32, 1, 2, 63, 64, 100, 190, 191, 192, 193, 255, 256, 1000, 4096,
-            65535, 65536, 1_000_000, 70_000, u32::MAX,
+            0u32,
+            1,
+            2,
+            63,
+            64,
+            100,
+            190,
+            191,
+            192,
+            193,
+            255,
+            256,
+            1000,
+            4096,
+            65535,
+            65536,
+            1_000_000,
+            70_000,
+            u32::MAX,
         ] {
             let mut buf = Vec::new();
             write_uint(v, &mut buf);
@@ -264,7 +281,19 @@ mod tests {
 
     #[test]
     fn sign_round_trip() {
-        for v in [0i32, 1, -1, 63, -64, 1000, -1000, i32::MAX, i32::MIN, 12345, -12345] {
+        for v in [
+            0i32,
+            1,
+            -1,
+            63,
+            -64,
+            1000,
+            -1000,
+            i32::MAX,
+            i32::MIN,
+            12345,
+            -12345,
+        ] {
             let enc = encode_sign(v);
             assert_eq!(decode_sign(enc), v);
         }
@@ -326,22 +355,20 @@ mod tests {
     }
 
     #[test]
-    fn boundary_191_192() {
-        // 191 is the single-byte ceiling; 192 is the first multibyte.
-        for v in [190u32, 191] {
+    fn boundary_190_191() {
+        // UNSIGNED5: values < L (191) fit in one byte (stored +1);
+        // 191 is the first two-byte value.
+        for v in [189u32, 190] {
             let mut buf = Vec::new();
             write_uint(v, &mut buf);
             assert_eq!(buf.len(), 1, "value {} must be single-byte", v);
         }
         let mut buf = Vec::new();
-        write_uint(192, &mut buf);
+        write_uint(191, &mut buf);
         assert_eq!(buf.len(), 2);
-        assert_eq!(buf[0], 192);
         let mut pos = 0usize;
-        assert_eq!(read_uint(&buf, &mut pos), Some(192));
-        // Just below and above the 2-byte ceiling (8191/8192 per the
-        // 7-bits-per-continuation-byte layout).
-        for v in [8190u32, 8191, 8192, 1 << 20, u32::MAX] {
+        assert_eq!(read_uint(&buf, &mut pos), Some(191));
+        for v in [192u32, 1000, 1 << 20, u32::MAX] {
             let mut buf = Vec::new();
             write_uint(v, &mut buf);
             let mut pos = 0usize;
@@ -352,29 +379,37 @@ mod tests {
 
     #[test]
     fn encoded_length_boundaries() {
-        assert_eq!(encoded_length(191), 1);
-        assert_eq!(encoded_length(192), 2);
-        assert_eq!(encoded_length(8191), 2);
-        assert_eq!(encoded_length(8192), 3);
-        assert_eq!(encoded_length(u32::MAX), 5);
+        assert_eq!(encoded_length(0), 1);
+        assert_eq!(encoded_length(190), 1);
+        assert_eq!(encoded_length(191), 2);
+        assert_eq!(encoded_length(u32::MAX), MAX_LENGTH);
+        // Length is monotonic in value.
+        let mut prev = 0usize;
+        for v in [1u32, 100, 190, 191, 500, 5000, 100_000, u32::MAX] {
+            let l = encoded_length(v);
+            assert!(l >= prev);
+            prev = l;
+        }
     }
 
     #[test]
     fn malformed_continuations() {
-        // Marker byte promises continuation bytes; a truncated or
-        // zero-containing sequence must be rejected.
+        // A lone high-marker byte (>= 192) always promises continuation
+        // bytes; truncation must be rejected.
         for first in [192u8, 200, 255] {
             assert_eq!(read_uint(&[first], &mut 0), None, "byte {}", first);
-            assert_eq!(read_uint(&[first, 1], &mut 0), None, "byte {}+1", first);
         }
-        // Zero continuation byte is excluded.
+        // 255 needs four continuation bytes (MAX_LENGTH - 1); two is
+        // still truncated.
+        assert_eq!(read_uint(&[255u8, 255, 255], &mut 0), None);
+        // A zero byte anywhere is excluded.
+        assert_eq!(read_uint(&[0u8], &mut 0), None);
         let mut buf = Vec::new();
         write_uint(1000, &mut buf);
-        // Corrupt a continuation byte to 0.
-        if buf.len() >= 3 {
-            buf[2] = 0;
-            assert_eq!(read_uint(&buf, &mut 0), None);
-        }
+        buf.push(0);
+        let mut pos = 0usize;
+        assert_eq!(read_uint(&buf, &mut pos), Some(1000));
+        assert_eq!(read_uint(&buf, &mut pos), None);
     }
 
     #[test]
@@ -401,7 +436,7 @@ mod tests {
         // Record the offset of the second value by streaming.
         let mut probe = CompressedReadStream::new(&data);
         assert_eq!(probe.read_int(), Some(42));
-        let off2 = probe.position();
+        let off2 = probe.pos;
         let mut r = CompressedReadStream::new_at(&data, off2);
         assert_eq!(r.read_int(), Some(5000));
     }

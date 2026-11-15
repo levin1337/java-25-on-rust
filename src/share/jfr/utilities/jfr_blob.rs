@@ -19,6 +19,10 @@ pub struct JfrBlobHandle {
 }
 
 impl JfrBlobHandle {
+    pub fn make(data: &[u8]) -> JfrBlobHandle {
+        JfrBlob::make(data)
+    }
+
     pub fn size(&self) -> usize {
         self.inner.data.len()
     }

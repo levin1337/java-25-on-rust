@@ -45,6 +45,20 @@ impl Threads {
         guard.iter().any(|t| t.id() == id)
     }
 
+    /// Returns a clone of the thread registered under `id`, if any —
+    /// the `ThreadSMR::get_java_thread` analogue for callers that need
+    /// live thread state rather than a `ThreadSnapshot`.
+    pub fn get(&self, id: u64) -> Option<JavaThread> {
+        let guard = self.threads.lock().unwrap();
+        guard.iter().find(|t| t.id() == id).cloned()
+    }
+
+    /// Clones of all registered threads; used by `ThreadSMR::java_threads`
+    /// and handshake-style traversals that need mutable thread state.
+    pub fn all(&self) -> Vec<JavaThread> {
+        self.threads.lock().unwrap().clone()
+    }
+
     pub fn number_of_threads(&self) -> usize {
         self.threads.lock().unwrap().len()
     }

@@ -2,7 +2,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub type BitMapIndex = usize;
 
-#[derive(Clone)]
 pub struct ZBitMap {
     words: Vec<AtomicU64>,
     size_in_bits: usize,

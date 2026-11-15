@@ -1,28 +1,17 @@
-/*
- * Port of OpenJDK 25 HotSpot JfrJavaSupport
- * (share/jfr/jni/jfrJavaSupport.hpp / jfrJavaSupport.cpp)
- *
- * Java-side support routines used across the JFR subsystem: object and
- * string construction, field access, exception raising, jdk.jfr module
- * availability checks and thread (ex)clusion bookkeeping.
- *
- * In this port "jobject"/"oop" handles are `Value`s produced by the
- * interpreter heap; there is no JNI handle table, so local/global JNI
- * handle helpers collapse to identity conversions while keeping the
- * same call shapes as the C++ original.
- */
+
 
 use crate::share::{
     classfile::classLoader::ClassLoader,
     interpreter::{
         bytecodeInterpreter::{self, Value},
-        javaThrowable::JavaThrowable,
+        bytecodeInterpreter::JavaThrowable,
     },
     oops::{instanceKlass::InstanceKlass, instanceOop::InstanceOop},
     runtime::javaCalls::JavaValue,
-    jfr::jni::java_call::{JfrJavaArguments, JfrJavaCall},
+    jfr::jni::java_call::JfrJavaArguments,
 };
 use std::{
+    borrow::Cow,
     collections::HashSet,
     io::{self, Write},
     sync::{Arc, Mutex},
@@ -31,22 +20,12 @@ use std::{
 const JDK_JFR_MODULE_NAME: &str = "jdk.jfr";
 const JDK_JFR_PACKAGE_NAME: &[u8] = b"jdk/jfr";
 
-// ---------------------------------------------------------------------------
-// Thread exclusion registry
-// (JfrThreadLocal exclusion flags live in the recorder core; until it lands
-// we keep the same exclusion semantics in a process-wide registry keyed by
-// the thread object identity used by JfrJavaSupport::jfr_thread_id.)
-// ---------------------------------------------------------------------------
-
 static EXCLUDED_THREADS: Mutex<Option<HashSet<u64>>> = Mutex::new(None);
 
 fn excluded_set() -> std::sync::MutexGuard<'static, Option<HashSet<u64>>> {
     EXCLUDED_THREADS.lock().unwrap()
 }
 
-/// `JfrJavaSupport::jfr_thread_id` analogue: stable trace id for a
-/// `java.lang.Thread` object. Prefers the thread's `tid` field and falls
-/// back to the object handle identity.
 pub fn jfr_thread_id<'a>(
     loader: &ClassLoader<'a>,
     thread: Value<'a>,
@@ -66,7 +45,6 @@ pub fn jfr_thread_id<'a>(
     Ok(handle as i64)
 }
 
-/// `JfrJavaSupport::exclude`.
 pub fn exclude_thread<'a>(loader: &ClassLoader<'a>, thread: Value<'a>) -> io::Result<()> {
     let id = jfr_thread_id(loader, thread)?;
     if id != 0 {
@@ -75,7 +53,6 @@ pub fn exclude_thread<'a>(loader: &ClassLoader<'a>, thread: Value<'a>) -> io::Re
     Ok(())
 }
 
-/// `JfrJavaSupport::include`.
 pub fn include_thread<'a>(loader: &ClassLoader<'a>, thread: Value<'a>) -> io::Result<()> {
     let id = jfr_thread_id(loader, thread)?;
     if id != 0 && let Some(set) = excluded_set().as_mut() {
@@ -84,24 +61,15 @@ pub fn include_thread<'a>(loader: &ClassLoader<'a>, thread: Value<'a>) -> io::Re
     Ok(())
 }
 
-/// `JfrJavaSupport::is_excluded(jobject)`.
 pub fn is_thread_excluded<'a>(loader: &ClassLoader<'a>, thread: Value<'a>) -> io::Result<bool> {
     let id = jfr_thread_id(loader, thread)?;
     Ok(id != 0 && excluded_set().as_ref().is_some_and(|set| set.contains(&(id as u64))))
 }
 
-/// `JfrJavaSupport::on_thread_start`: true when the thread may be
-/// instrumented (i.e. is not excluded).
 pub fn on_thread_start<'a>(loader: &ClassLoader<'a>, thread: Value<'a>) -> io::Result<bool> {
     Ok(!is_thread_excluded(loader, thread)?)
 }
 
-// ---------------------------------------------------------------------------
-// Object / string construction
-// ---------------------------------------------------------------------------
-
-/// `java_lang_String::create_oop_from_str` + local JNI handle. Creates a
-/// real `java.lang.String` instance.
 pub fn new_string<'a>(
     loader: &ClassLoader<'a>,
     text: &str,
@@ -130,7 +98,6 @@ pub fn new_string<'a>(
     Ok(Value::Object(loader.alloc_object(object)))
 }
 
-/// `JfrJavaSupport::c_str`: decode a string-ish `Value` to owned text.
 pub fn c_str<'a>(loader: &ClassLoader<'a>, value: Value<'a>) -> Option<String> {
     crate::share::prims::stringNatives::string(loader, value)
         .ok()
@@ -138,13 +105,10 @@ pub fn c_str<'a>(loader: &ClassLoader<'a>, value: Value<'a>) -> Option<String> {
         .map(Cow::into_owned)
 }
 
-/// `JfrJavaSupport::c_str(jstring)` accepting only real string objects.
 pub fn c_str_object<'a>(loader: &ClassLoader<'a>, value: Value<'a>) -> Option<String> {
     c_str(loader, value)
 }
 
-/// `object_construction` + `create_object`: allocate an instance and run
-/// its no-arg constructor.
 pub fn new_object<'a>(
     loader: &ClassLoader<'a>,
     klass_name: &[u8],
@@ -165,7 +129,6 @@ pub fn new_object<'a>(
     Ok(Value::Object(handle))
 }
 
-/// `JfrJavaSupport::new_java_lang_Boolean`.
 pub fn new_java_lang_boolean<'a>(
     loader: &ClassLoader<'a>,
     value: bool,
@@ -187,7 +150,6 @@ pub fn new_java_lang_boolean<'a>(
     Ok(Value::Object(handle))
 }
 
-/// `JfrJavaSupport::new_java_lang_Integer`.
 pub fn new_java_lang_integer<'a>(
     loader: &ClassLoader<'a>,
     value: i32,
@@ -209,7 +171,6 @@ pub fn new_java_lang_integer<'a>(
     Ok(Value::Object(handle))
 }
 
-/// `JfrJavaSupport::new_java_lang_Long`.
 pub fn new_java_lang_long<'a>(
     loader: &ClassLoader<'a>,
     value: i64,
@@ -231,7 +192,6 @@ pub fn new_java_lang_long<'a>(
     Ok(Value::Object(handle))
 }
 
-/// `JfrJavaSupport::set_array_element`.
 pub fn set_array_element<'a>(
     loader: &ClassLoader<'a>,
     array: Value<'a>,
@@ -248,12 +208,6 @@ pub fn set_array_element<'a>(
     array.obj_at_put(index, element)
 }
 
-// ---------------------------------------------------------------------------
-// Field access
-// ---------------------------------------------------------------------------
-
-/// `read_specialized_field`/`write_specialized_field` adapted to the
-/// interpreter heap where fields are stored as `Value`s.
 fn field_slot<'a>(
     loader: &ClassLoader<'a>,
     receiver: Option<Value<'a>>,
@@ -277,8 +231,6 @@ fn field_slot<'a>(
     }
 }
 
-/// `JfrJavaSupport::get_field`: read an instance or static field and
-/// return it as a `JavaValue`.
 pub fn get_field<'a>(
     loader: &ClassLoader<'a>,
     klass_name: &[u8],
@@ -309,7 +261,6 @@ pub fn get_field<'a>(
     }
 }
 
-/// `JfrJavaSupport::set_field`.
 pub fn set_field<'a>(
     loader: &ClassLoader<'a>,
     klass_name: &[u8],
@@ -341,10 +292,6 @@ pub fn set_field<'a>(
     }
 }
 
-/// Convenience wrappers matching `get_field`/`set_field` on a
-/// `JfrJavaArguments`-style call site are provided by the callers; these
-/// two helpers cover the common read path used by dcmd argument
-/// descriptors.
 pub fn get_string_field<'a>(
     loader: &ClassLoader<'a>,
     object: Value<'a>,
@@ -384,10 +331,6 @@ pub fn get_boolean_field<'a>(
     Ok(matches!(value, JavaValue::Value(Value::Int(v)) if v != 0))
 }
 
-// ---------------------------------------------------------------------------
-// Exceptions and errors
-// ---------------------------------------------------------------------------
-
 fn throw_java<'a>(loader: &ClassLoader<'a>, class_name: &[u8], message: Option<&str>) -> io::Error {
     let result = (|| -> io::Result<usize> {
         match message {
@@ -405,8 +348,6 @@ fn throw_java<'a>(loader: &ClassLoader<'a>, class_name: &[u8], message: Option<&
     }
 }
 
-/// `new_throwable` adapted from the interpreter helpers: allocates the
-/// throwable and invokes a matching constructor when present.
 fn new_throwable<'a>(
     loader: &ClassLoader<'a>,
     class_name: &[u8],
@@ -457,37 +398,30 @@ fn new_throwable<'a>(
     Ok(handle)
 }
 
-/// `JfrJavaSupport::throw_illegal_state_exception`.
 pub fn throw_illegal_state_exception<'a>(loader: &ClassLoader<'a>, message: &str) -> io::Error {
     throw_java(loader, b"java/lang/IllegalStateException", Some(message))
 }
 
-/// `JfrJavaSupport::throw_internal_error`.
 pub fn throw_internal_error<'a>(loader: &ClassLoader<'a>, message: &str) -> io::Error {
     throw_java(loader, b"java/lang/InternalError", Some(message))
 }
 
-/// `JfrJavaSupport::throw_illegal_argument_exception`.
 pub fn throw_illegal_argument_exception<'a>(loader: &ClassLoader<'a>, message: &str) -> io::Error {
     throw_java(loader, b"java/lang/IllegalArgumentException", Some(message))
 }
 
-/// `JfrJavaSupport::throw_out_of_memory_error`.
 pub fn throw_out_of_memory_error<'a>(loader: &ClassLoader<'a>, message: &str) -> io::Error {
     throw_java(loader, b"java/lang/OutOfMemoryError", Some(message))
 }
 
-/// `JfrJavaSupport::throw_class_format_error`.
 pub fn throw_class_format_error<'a>(loader: &ClassLoader<'a>, message: &str) -> io::Error {
     throw_java(loader, b"java/lang/ClassFormatError", Some(message))
 }
 
-/// `JfrJavaSupport::throw_runtime_exception`.
 pub fn throw_runtime_exception<'a>(loader: &ClassLoader<'a>, message: &str) -> io::Error {
     throw_java(loader, b"java/lang/RuntimeException", Some(message))
 }
 
-/// `JfrJavaSupport::uncaught_exception` cause classification.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Cause {
     VmError,
@@ -521,7 +455,6 @@ fn is_subclass_of<'a>(
     false
 }
 
-/// `JfrJavaSupport::uncaught_exception(jthrowable, thread)`.
 pub fn uncaught_exception<'a>(loader: &ClassLoader<'a>, throwable: Value<'a>) {
     let cause = if is_subclass_of(loader, throwable, b"java/lang/OutOfMemoryError") {
         Cause::OutOfMemory
@@ -539,12 +472,10 @@ pub fn uncaught_exception<'a>(loader: &ClassLoader<'a>, throwable: Value<'a>) {
     *UNCAUGHT_CAUSE.lock().unwrap() = cause;
 }
 
-/// `JfrJavaSupport::cause()`.
 pub fn cause() -> Cause {
     *UNCAUGHT_CAUSE.lock().unwrap()
 }
 
-/// `JfrJavaSupport::abort`.
 pub fn abort(message: Option<&str>, dump_core: bool) {
     if let Some(message) = message {
         eprintln!("[jfr] {message}");
@@ -554,25 +485,17 @@ pub fn abort(message: Option<&str>, dump_core: bool) {
     std::process::exit(134);
 }
 
-// ---------------------------------------------------------------------------
-// jdk.jfr module availability
-// ---------------------------------------------------------------------------
-
-/// `JfrJavaSupport::load_jdk_jfr_module`: force resolution of the module
-/// by loading a representative class through the loader.
 pub fn load_jdk_jfr_module<'a>(loader: &ClassLoader<'a>, output: &mut dyn Write) -> io::Result<()> {
     let _ = loader.load(b"jdk/jfr/FlightRecorder")?;
-    bytecodeInterpreter::initialize(loader, &loader.load(b"jdk/jfr/internal/JVM")?, output, 0)?;
+    let jvm_klass = loader.load(b"jdk/jfr/internal/JVM")?;
+    bytecodeInterpreter::initialize(loader, &jvm_klass, output, 0)?;
     Ok(())
 }
 
-/// `is_jdk_jfr_module_in_readability_graph` analogue: the module is
-/// available when its classes resolve through the loader.
 pub fn is_jdk_jfr_module_available<'a>(loader: &ClassLoader<'a>) -> bool {
     loader.load(b"jdk/jfr/internal/JVM").is_ok()
 }
 
-/// `JfrJavaSupport::is_jdk_jfr_module_available(out, THREAD)`.
 pub fn is_jdk_jfr_module_available_out<'a>(
     loader: &ClassLoader<'a>,
     output: &mut dyn Write,
@@ -587,13 +510,6 @@ pub fn is_jdk_jfr_module_available_out<'a>(
     true
 }
 
-// ---------------------------------------------------------------------------
-// EventConfiguration field access on class mirrors
-// ---------------------------------------------------------------------------
-
-/// `get_configuration_field_descriptor` analogue: locate the
-/// `eventConfiguration` static field on the event class, typed or
-/// untyped (`Ljava/lang/Object;`).
 fn configuration_field<'a>(
     _loader: &ClassLoader<'a>,
     klass: &Arc<InstanceKlass<'a>>,
@@ -616,7 +532,6 @@ fn configuration_field<'a>(
     Err(io::Error::other("Missing eventConfiguration field"))
 }
 
-/// `JfrJavaSupport::get_configuration`.
 pub fn get_configuration<'a>(
     loader: &ClassLoader<'a>,
     clazz: Value<'a>,
@@ -631,7 +546,6 @@ pub fn get_configuration<'a>(
     Ok(if matches!(value, Value::Null) { None } else { Some(value) })
 }
 
-/// `JfrJavaSupport::set_configuration`.
 pub fn set_configuration<'a>(
     loader: &ClassLoader<'a>,
     clazz: Value<'a>,
@@ -647,9 +561,6 @@ pub fn set_configuration<'a>(
     Ok(true)
 }
 
-/// `JfrJavaSupport::is_instrumented`: true when the class mirror denotes
-/// an instrumented jdk.jfr.Event subclass. Delegates to the
-/// instrumentation module.
 pub fn is_instrumented<'a>(
     loader: &ClassLoader<'a>,
     clazz: Value<'a>,
@@ -658,8 +569,6 @@ pub fn is_instrumented<'a>(
     Ok(crate::share::jfr::instrumentation::event_class_transformer::is_instrumented(&klass))
 }
 
-/// Resolves a `jclass` argument (`Value::ClassMirror` or a real
-/// `java.lang.Class` object) to its `InstanceKlass`.
 pub fn resolve_mirror_klass<'a>(
     loader: &ClassLoader<'a>,
     clazz: Value<'a>,
@@ -674,8 +583,7 @@ pub fn resolve_mirror_klass<'a>(
             if object.klass.class.name != b"java/lang/Class" {
                 return Err(io::Error::other("Expected java.lang.Class object"));
             }
-            // In this port class objects are mirrors; recover the name
-            // from the `name` field when present.
+
             if let Ok(slot) = object.klass.instanceField(b"name", b"Ljava/lang/String;") {
                 if let Some(value) = object.fields.get(slot).copied() {
                     if let Some(text) = c_str(loader, value) {
@@ -690,9 +598,8 @@ pub fn resolve_mirror_klass<'a>(
     }
 }
 
-/// `JfrJavaSupport::compute_field_offset`.
 pub fn compute_field_offset<'a>(
-    loader: &ClassLoader<'a>,
+    _loader: &ClassLoader<'a>,
     klass: &Arc<InstanceKlass<'a>>,
     name: &[u8],
     descriptor: &[u8],
@@ -705,7 +612,6 @@ pub fn compute_field_offset<'a>(
     klass.instanceField(name, descriptor)
 }
 
-/// `JfrJavaSupport::create_long_array`.
 pub fn create_long_array<'a>(
     loader: &ClassLoader<'a>,
     values: &[i64],
@@ -714,7 +620,3 @@ pub fn create_long_array<'a>(
     Ok(Value::PrimitiveArray(loader.alloc_type_array(array)))
 }
 
-/// `JfrJavaSupport::notify_all` analogue is intentionally absent: object
-/// monitors in this port do not expose a Java-level notify path; callers
-/// that need it must go through `java.lang.Object.notifyAll` via
-/// `JfrJavaCall`.

@@ -1,13 +1,4 @@
-/*
- * Port of OpenJDK 25 HotSpot JfrJavaArguments / JfrJavaCall
- * (share/jfr/jni/jfrJavaCall.hpp / jfrJavaCall.cpp)
- *
- * Call argument marshalling for VM->Java invocations used by the JFR
- * subsystem. Mirrors the HotSpot design: a JfrJavaArguments collects a
- * klass, method name/signature, an optional receiver and a bounded
- * parameter list; JfrJavaCall translates it into the runtime
- * JavaCallArguments and dispatches static/special/virtual calls.
- */
+
 
 use crate::share::{
     classfile::classLoader::ClassLoader,
@@ -20,12 +11,8 @@ use std::{
     sync::Arc,
 };
 
-/// Mirrors `JfrJavaArguments::Parameters::SIZE` in HotSpot.
 pub const MAX_PARAMETERS: usize = 16;
 
-/// Port of `JfrJavaArguments`. Owns the method coordinates (klass, name,
-/// signature) plus the receiver and parameters of a pending Java call.
-/// The `result` slot receives the call outcome.
 pub struct JfrJavaArguments<'a> {
     klass: Option<Arc<InstanceKlass<'a>>>,
     klass_name: Vec<u8>,
@@ -37,7 +24,7 @@ pub struct JfrJavaArguments<'a> {
 }
 
 impl<'a> JfrJavaArguments<'a> {
-    /// `JfrJavaArguments(JavaValue* result)`.
+
     pub fn new(result: JavaValue<'a>) -> Self {
         Self {
             klass: None,
@@ -50,7 +37,6 @@ impl<'a> JfrJavaArguments<'a> {
         }
     }
 
-    /// `JfrJavaArguments(result, klass_name, name, signature, TRAPS)`.
     pub fn with_coordinates(
         result: JavaValue<'a>,
         klass_name: &[u8],
@@ -64,8 +50,6 @@ impl<'a> JfrJavaArguments<'a> {
         args
     }
 
-    /// `JfrJavaArguments(result, klass, name, signature)` variant taking
-    /// an already resolved klass.
     pub fn with_klass(
         result: JavaValue<'a>,
         klass: Arc<InstanceKlass<'a>>,
@@ -132,7 +116,6 @@ impl<'a> JfrJavaArguments<'a> {
         self.params.push(obj);
     }
 
-    /// `push_jobject`: JNI handles in this port are plain `Value`s.
     pub fn push_jobject(&mut self, handle: Value<'a>) {
         self.params.push(handle);
     }
@@ -166,9 +149,6 @@ impl<'a> JfrJavaArguments<'a> {
         }
     }
 
-    /// `Parameters::copy`: translate into a runtime `JavaCallArguments`,
-    /// with the receiver occupying slot 0 (mirroring HotSpot where the
-    /// receiver is `_storage[0]`).
     pub fn copy(&self) -> JavaCallArguments<'a> {
         let mut args = JavaCallArguments::new();
         if let Some(receiver) = self.receiver {
@@ -186,8 +166,6 @@ impl<'a> JfrJavaArguments<'a> {
         args
     }
 
-    /// Resolves the target klass through the loader when only a name was
-    /// supplied (`SystemDictionary::resolve_or_fail`).
     fn resolve_klass(&self, loader: &ClassLoader<'a>) -> io::Result<Arc<InstanceKlass<'a>>> {
         if let Some(klass) = &self.klass {
             return Ok(Arc::clone(klass));
@@ -198,7 +176,6 @@ impl<'a> JfrJavaArguments<'a> {
         loader.load(&self.klass_name)
     }
 
-    /// `JfrJavaCall::call_static`.
     pub fn call_static(
         &mut self,
         loader: &ClassLoader<'a>,
@@ -218,7 +195,6 @@ impl<'a> JfrJavaArguments<'a> {
         Ok(())
     }
 
-    /// `JfrJavaCall::call_special`.
     pub fn call_special(
         &mut self,
         loader: &ClassLoader<'a>,
@@ -238,7 +214,6 @@ impl<'a> JfrJavaArguments<'a> {
         Ok(())
     }
 
-    /// `JfrJavaCall::call_virtual`.
     pub fn call_virtual(
         &mut self,
         loader: &ClassLoader<'a>,
@@ -259,8 +234,6 @@ impl<'a> JfrJavaArguments<'a> {
     }
 }
 
-/// Port of `JfrJavaCall` (static dispatch helpers kept for parity with
-/// the C++ layout; the arguments object carries the call site).
 pub struct JfrJavaCall;
 
 impl JfrJavaCall {

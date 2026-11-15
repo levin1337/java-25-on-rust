@@ -2,10 +2,11 @@
  * x86_64 instruction encodings for the share-level Assembler.
  * Mirrors cpu/x86/vm/assembler_x86.hpp emit helpers, restricted to the
  * integer/control subset used by MacroAssembler share operations.
+ *
+ * Emission order is always: [operand-size prefix] [REX] opcode modrm sib disp.
  */
 
 use crate::share::asm::assembler::{Assembler, AssemblerError, LabelId, PatchKind, RelocSpec};
-use crate::share::asm::code_buffer::SectionId;
 use crate::share::asm::register::{ConditionCode, FloatRegister, NOREG, OperandSize, Register, Scale};
 use crate::share::asm::reloc::{RelocType, RelocWidth, RelocValue};
 
@@ -102,8 +103,6 @@ pub enum ShiftCount {
 }
 
 impl Assembler {
-    // ---- inst mark --------------------------------------------------------
-
     /// Mark current position as instruction start (used by relocate()).
     pub fn mark_inst(&mut self) {
         self.set_inst_mark();
@@ -115,13 +114,33 @@ impl Assembler {
 
     // ---- REX / modrm / sib / disp -----------------------------------------
 
-    /// Emit REX + modrm + sib + disp for a memory operand.
-    /// `reg_bits`: full 4-bit encoding of the register in the modrm.reg
-    /// field (bit3 -> REX.R).  Returns bytes after opcode.
-    fn emit_modrm_mem(&mut self, reg_bits: u8, addr: Address, w: bool) -> Result<(), AssemblerError> {
+    fn rex_of_mem(&self, reg_bits: u8, addr: &Address, w: bool) -> Rex {
         if addr.rip_relative {
-            let rex = Rex { w, r: (reg_bits & 8) != 0, x: false, b: false };
-            rex.emit(self);
+            return Rex { w, r: (reg_bits & 8) != 0, x: false, b: false };
+        }
+        let base_enc = if addr.base.is_valid() { Some(addr.base.encoding() as usize) } else { None };
+        let index_enc = if addr.index.is_valid() { Some(addr.index.encoding() as usize) } else { None };
+        Rex {
+            w,
+            r: (reg_bits & 8) != 0,
+            x: index_enc.map_or(false, |i| i >= 8),
+            // SIB base=101 / index=100 with mod=00 mean "absent"; do not set bits.
+            b: base_enc.map_or(false, |b| b >= 8),
+        }
+    }
+
+    fn rex_of_reg(&self, reg_bits: u8, rm: Register, w: bool) -> Rex {
+        Rex {
+            w,
+            r: (reg_bits & 8) != 0,
+            x: false,
+            b: rm.encoding() >= 8,
+        }
+    }
+
+    /// Emit modrm + sib + disp for a memory operand (no REX, no opcode).
+    fn modrm_mem_tail(&mut self, reg_bits: u8, addr: &Address) -> Result<(), AssemblerError> {
+        if addr.rip_relative {
             self.emit_byte(0x05 | ((reg_bits & 7) << 3));
             if !Assembler::is_simm(addr.disp, 32) {
                 return Err(AssemblerError::InvalidOperand("rip displacement out of range".into()));
@@ -140,9 +159,7 @@ impl Assembler {
             || (base_enc.is_none() && index_enc.is_none());
 
         let disp = addr.disp;
-        let (mod_bits, disp_size): (u8, usize) = if base_enc.is_none() && index_enc.is_none() {
-            (0, 4)
-        } else if base_enc.is_none() {
+        let (mod_bits, disp_size): (u8, usize) = if base_enc.is_none() {
             (0, 4)
         } else {
             let b = base_enc.unwrap();
@@ -159,14 +176,6 @@ impl Assembler {
                 )));
             }
         };
-
-        // REX.B: set only for a real base register >= r8.  The SIB
-        // base=101 / index=100 encodings with mod=00 mean "no base/index"
-        // and must not set REX bits.
-        let rex_b = base_enc.map_or(false, |b| b >= 8);
-        let rex_x = index_enc.map_or(false, |i| i >= 8);
-        let rex = Rex { w, r: (reg_bits & 8) != 0, x: rex_x, b: rex_b };
-        rex.emit(self);
 
         let rm_bits: u8 = if need_sib { 4 } else { (base_enc.unwrap() & 7) as u8 };
         self.emit_byte((mod_bits << 6) | ((reg_bits & 7) << 3) | rm_bits);
@@ -187,16 +196,36 @@ impl Assembler {
         Ok(())
     }
 
-    /// Emit REX + modrm (mod=11) for register-direct operand.
-    fn emit_modrm_reg(&mut self, reg_bits: u8, rm_reg: Register, w: bool) {
-        let rex = Rex {
-            w,
-            r: (reg_bits & 8) != 0,
-            x: false,
-            b: rm_reg.encoding() >= 8,
-        };
-        rex.emit(self);
+    /// Emit modrm (mod=11) for register-direct operand (no REX, no opcode).
+    fn modrm_reg_tail(&mut self, reg_bits: u8, rm_reg: Register) {
         self.emit_byte(0xC0 | ((reg_bits & 7) << 3) | (rm_reg.encoding() & 7));
+    }
+
+    /// Emit REX + opcode bytes + modrm/sib/disp for "op ..., r/m=mem".
+    /// `op` is the full opcode sequence after any prefixes (e.g. [0x89] or
+    /// [0x0F, 0xAF]).
+    fn emit_rm_mem(&mut self, op: &[u8], reg_bits: u8, addr: Address, w: bool) -> Result<(), AssemblerError> {
+        self.rex_of_mem(reg_bits, &addr, w).emit(self);
+        self.emit_bytes(op);
+        self.modrm_mem_tail(reg_bits, &addr)
+    }
+
+    /// Emit REX + opcode bytes + modrm (mod=11) for "op ..., r/m=reg".
+    fn emit_rm_reg(&mut self, op: &[u8], reg_bits: u8, rm: Register, w: bool) {
+        self.rex_of_reg(reg_bits, rm, w).emit(self);
+        self.emit_bytes(op);
+        self.modrm_reg_tail(reg_bits, rm);
+    }
+
+    /// Convenience: pick mem or reg variant.
+    fn emit_rm(&mut self, op: &[u8], reg_bits: u8, rm: RmOperand, w: bool) -> Result<(), AssemblerError> {
+        match rm {
+            RmOperand::Reg(r) => {
+                self.emit_rm_reg(op, reg_bits, r, w);
+                Ok(())
+            }
+            RmOperand::Mem(a) => self.emit_rm_mem(op, reg_bits, a, w),
+        }
     }
 
     /// Emit REX prefix for B8+r style (reg in opcode low bits).
@@ -214,7 +243,7 @@ impl Assembler {
 
     // ---- mov family ---------------------------------------------------------
 
-    /// mov r, imm (size-aware).  64-bit uses movabs (B8+r imm64).
+    /// mov r, imm (size-aware).  64-bit uses movabs (REX.W B8+r imm64).
     pub fn mov_imm_reg(&mut self, size: OperandSize, imm: u64, reg: Register) -> Result<(), AssemblerError> {
         self.inst_begin();
         self.emit_opsz(size);
@@ -244,26 +273,20 @@ impl Assembler {
         Ok(())
     }
 
-    /// mov r/m, r  (88/89 /r) and mov r, r/m (8A/8B /r) combined:
-    /// dst in reg field when dst_is_reg, else rm.
+    /// mov dst, src for two registers (88/89 /r).
     pub fn mov_reg_reg(&mut self, size: OperandSize, dst: Register, src: Register) -> Result<(), AssemblerError> {
         self.inst_begin();
         self.emit_opsz(size);
-        self.emit_byte(if size == OperandSize::Size1 { 0x88 } else { 0x89 });
-        self.emit_modrm_reg(src.encoding(), dst, w_bit(size));
+        let op = if size == OperandSize::Size1 { [0x88u8] } else { [0x89u8] };
+        self.emit_rm_reg(&op, src.encoding(), dst, w_bit(size));
         Ok(())
     }
 
-    /// mov r64, imm32 sign-extended (C7 /0).
+    /// mov r64, imm32 sign-extended (REX.W C7 /0).
     pub fn mov_imm_reg_sext(&mut self, size: OperandSize, imm: i32, reg: Register) -> Result<(), AssemblerError> {
         self.inst_begin();
         self.emit_opsz(size);
-        self.emit_byte(0xC7);
-        let w = w_bit(size);
-        // reg-direct: modrm reg=/0 rm=reg
-        let rex = Rex { w, r: false, x: false, b: reg.encoding() >= 8 };
-        rex.emit(self);
-        self.emit_byte(0xC0 | (reg.encoding() & 7));
+        self.emit_rm_reg(&[0xC7], 0, reg, w_bit(size));
         self.emit_dword(imm as u32);
         Ok(())
     }
@@ -272,60 +295,42 @@ impl Assembler {
     pub fn mov_reg_rm(&mut self, size: OperandSize, dst: Register, src: RmOperand) -> Result<(), AssemblerError> {
         self.inst_begin();
         self.emit_opsz(size);
-        self.emit_byte(if size == OperandSize::Size1 { 0x8A } else { 0x8B });
-        let w = w_bit(size);
-        match src {
-            RmOperand::Reg(r) => self.emit_modrm_reg(dst.encoding(), r, w),
-            RmOperand::Mem(a) => self.emit_modrm_mem(dst.encoding(), a, w)?,
-        }
-        Ok(())
+        let op = if size == OperandSize::Size1 { [0x8Au8] } else { [0x8Bu8] };
+        self.emit_rm(&op, dst.encoding(), src, w_bit(size))
     }
 
     /// mov r/m, r (88/89 /r).
     pub fn mov_rm_reg(&mut self, size: OperandSize, dst: RmOperand, src: Register) -> Result<(), AssemblerError> {
         self.inst_begin();
         self.emit_opsz(size);
-        self.emit_byte(if size == OperandSize::Size1 { 0x88 } else { 0x89 });
-        let w = w_bit(size);
-        match dst {
-            RmOperand::Reg(r) => self.emit_modrm_reg(src.encoding(), r, w),
-            RmOperand::Mem(a) => self.emit_modrm_mem(src.encoding(), a, w)?,
-        }
-        Ok(())
+        let op = if size == OperandSize::Size1 { [0x88u8] } else { [0x89u8] };
+        self.emit_rm(&op, src.encoding(), dst, w_bit(size))
     }
 
-    /// movq r64, r/m64 (REX.W 89/8B).
+    /// movq r64, r/m64.
     pub fn movq(&mut self, dst: Register, src: RmOperand) -> Result<(), AssemblerError> {
-        match src {
-            RmOperand::Reg(r) => self.mov_reg_reg(OperandSize::Size8, dst, r),
-            RmOperand::Mem(a) => self.mov_reg_rm(OperandSize::Size8, dst, RmOperand::Mem(a)),
-        }
+        self.mov_reg_rm(OperandSize::Size8, dst, src)
     }
 
-    /// movq r/m64, r64 (REX.W 89).
+    /// movq r/m64, r64.
     pub fn movq_store(&mut self, dst: RmOperand, src: Register) -> Result<(), AssemblerError> {
         self.mov_rm_reg(OperandSize::Size8, dst, src)
     }
 
     pub fn movl(&mut self, dst: Register, src: RmOperand) -> Result<(), AssemblerError> {
-        match src {
-            RmOperand::Reg(r) => self.mov_reg_reg(OperandSize::Size4, dst, r),
-            RmOperand::Mem(a) => self.mov_reg_rm(OperandSize::Size4, dst, RmOperand::Mem(a)),
-        }
+        self.mov_reg_rm(OperandSize::Size4, dst, src)
+    }
+
+    pub fn movl_store(&mut self, dst: RmOperand, src: Register) -> Result<(), AssemblerError> {
+        self.mov_rm_reg(OperandSize::Size4, dst, src)
     }
 
     pub fn movw(&mut self, dst: Register, src: RmOperand) -> Result<(), AssemblerError> {
-        match src {
-            RmOperand::Reg(r) => self.mov_reg_reg(OperandSize::Size2, dst, r),
-            RmOperand::Mem(a) => self.mov_reg_rm(OperandSize::Size2, dst, RmOperand::Mem(a)),
-        }
+        self.mov_reg_rm(OperandSize::Size2, dst, src)
     }
 
     pub fn movb(&mut self, dst: Register, src: RmOperand) -> Result<(), AssemblerError> {
-        match src {
-            RmOperand::Reg(r) => self.mov_reg_reg(OperandSize::Size1, dst, r),
-            RmOperand::Mem(a) => self.mov_reg_rm(OperandSize::Size1, dst, RmOperand::Mem(a)),
-        }
+        self.mov_reg_rm(OperandSize::Size1, dst, src)
     }
 
     /// mov m, imm (C6/C7 /0).
@@ -334,32 +339,14 @@ impl Assembler {
         self.emit_opsz(size);
         match size {
             OperandSize::Size1 => {
-                self.emit_byte(0xC6);
-                let w = false;
+                self.emit_rm(&[0xC6], 0, dst, false)?;
                 match dst {
-                    RmOperand::Reg(r) => {
-                        self.emit_modrm_reg(0, r, w);
-                        self.emit_byte(imm as u8);
-                    }
-                    RmOperand::Mem(a) => {
-                        self.emit_modrm_mem(0, a, w)?;
-                        self.emit_byte(imm as u8);
-                    }
+                    RmOperand::Reg(_) | RmOperand::Mem(_) => self.emit_byte(imm as u8),
                 }
             }
             _ => {
-                self.emit_byte(0xC7);
-                let w = w_bit(size);
-                match dst {
-                    RmOperand::Reg(r) => {
-                        self.emit_modrm_reg(0, r, w);
-                        self.emit_dword(imm as i32 as u32);
-                    }
-                    RmOperand::Mem(a) => {
-                        self.emit_modrm_mem(0, a, w)?;
-                        self.emit_dword(imm as i32 as u32);
-                    }
-                }
+                self.emit_rm(&[0xC7], 0, dst, w_bit(size))?;
+                self.emit_dword(imm as i32 as u32);
             }
         }
         Ok(())
@@ -368,71 +355,46 @@ impl Assembler {
     /// lea r, m (8D /r, always 64-bit dest).
     pub fn lea(&mut self, dst: Register, addr: Address) -> Result<(), AssemblerError> {
         self.inst_begin();
-        self.emit_byte(0x8D);
-        self.emit_modrm_mem(dst.encoding(), addr, true)?;
-        Ok(())
+        self.emit_rm_mem(&[0x8D], dst.encoding(), addr, true)
     }
 
-    /// movzx: 0F B6 (byte->), B7 (word->), BE (byte->64), BF (word->64).
+    /// movzx: 0F B6 (byte->32), B7 (word->32).
     pub fn movzx(&mut self, dst: Register, src: RmOperand, src_size: OperandSize) -> Result<(), AssemblerError> {
         self.inst_begin();
-        self.emit_byte(0x0F);
-        let (op, w) = match src_size {
-            OperandSize::Size1 => (0xB6u8, false),
-            OperandSize::Size2 => (0xB7u8, false),
+        let op = match src_size {
+            OperandSize::Size1 => [0x0F, 0xB6u8],
+            OperandSize::Size2 => [0x0F, 0xB7u8],
             _ => return Err(AssemblerError::InvalidOperand("movzx src size".into())),
         };
-        self.emit_byte(op);
-        match src {
-            RmOperand::Reg(r) => self.emit_modrm_reg(dst.encoding(), r, w),
-            RmOperand::Mem(a) => self.emit_modrm_mem(dst.encoding(), a, w)?,
-        }
-        Ok(())
+        self.emit_rm(&op, dst.encoding(), src, false)
     }
 
-    /// movzx to 64-bit register (REX.W variants BE/BF).
+    /// movzx to 64-bit register (0F BE/BF, REX.W).
     pub fn movzxq(&mut self, dst: Register, src: RmOperand, src_size: OperandSize) -> Result<(), AssemblerError> {
         self.inst_begin();
-        self.emit_byte(0x0F);
         let op = match src_size {
-            OperandSize::Size1 => 0xBEu8,
-            OperandSize::Size2 => 0xBFu8,
+            OperandSize::Size1 => [0x0F, 0xBEu8],
+            OperandSize::Size2 => [0x0F, 0xBFu8],
             _ => return Err(AssemblerError::InvalidOperand("movzxq src size".into())),
         };
-        self.emit_byte(op);
-        match src {
-            RmOperand::Reg(r) => self.emit_modrm_reg(dst.encoding(), r, true),
-            RmOperand::Mem(a) => self.emit_modrm_mem(dst.encoding(), a, true)?,
-        }
-        Ok(())
+        self.emit_rm(&op, dst.encoding(), src, true)
     }
 
-    /// movsx: 0F BE/BF (to 32/64 via REX.W), 0F BF for word.
+    /// movsx: 0F BE/BF with optional REX.W.
     pub fn movsx(&mut self, dst: Register, src: RmOperand, src_size: OperandSize, to64: bool) -> Result<(), AssemblerError> {
         self.inst_begin();
-        self.emit_byte(0x0F);
         let op = match src_size {
-            OperandSize::Size1 => 0xBEu8,
-            OperandSize::Size2 => 0xBFu8,
+            OperandSize::Size1 => [0x0F, 0xBEu8],
+            OperandSize::Size2 => [0x0F, 0xBFu8],
             _ => return Err(AssemblerError::InvalidOperand("movsx src size".into())),
         };
-        self.emit_byte(op);
-        match src {
-            RmOperand::Reg(r) => self.emit_modrm_reg(dst.encoding(), r, to64),
-            RmOperand::Mem(a) => self.emit_modrm_mem(dst.encoding(), a, to64)?,
-        }
-        Ok(())
+        self.emit_rm(&op, dst.encoding(), src, to64)
     }
 
     /// movsxd r64, r/m32 (63 /r, REX.W).
     pub fn movsxd(&mut self, dst: Register, src: RmOperand) -> Result<(), AssemblerError> {
         self.inst_begin();
-        self.emit_byte(0x63);
-        match src {
-            RmOperand::Reg(r) => self.emit_modrm_reg(dst.encoding(), r, true),
-            RmOperand::Mem(a) => self.emit_modrm_mem(dst.encoding(), a, true)?,
-        }
-        Ok(())
+        self.emit_rm(&[0x63], dst.encoding(), src, true)
     }
 
     /// cbw/cwde/cdqe family and cwd/cdq/cqo.
@@ -443,7 +405,7 @@ impl Assembler {
     pub fn cdq(&mut self) { self.inst_begin(); self.emit_byte(0x99); }
     pub fn cqo(&mut self) { self.inst_begin(); self.emit_byte(0x48); self.emit_byte(0x99); }
 
-    /// bswap r (0F C8+r).
+    /// bswap r (REX.W 0F C8+r).
     pub fn bswap(&mut self, reg: Register) -> Result<(), AssemblerError> {
         self.inst_begin();
         self.emit_byte(0x0F);
@@ -475,13 +437,6 @@ impl Assembler {
         self.emit_dword(imm as u32);
     }
 
-    pub fn push_mem(&mut self, addr: Address) -> Result<(), AssemblerError> {
-        self.inst_begin();
-        self.emit_byte(0xFF);
-        self.emit_modrm_mem(6, addr, false)?;
-        Ok(())
-    }
-
     pub fn pop(&mut self, reg: Register) -> Result<(), AssemblerError> {
         self.inst_begin();
         let rex = Rex { w: false, r: false, x: false, b: reg.encoding() >= 8 };
@@ -490,19 +445,22 @@ impl Assembler {
         Ok(())
     }
 
+    pub fn push_mem(&mut self, addr: Address) -> Result<(), AssemblerError> {
+        self.inst_begin();
+        self.emit_rm_mem(&[0xFF], 6, addr, false)
+    }
+
     pub fn pop_mem(&mut self, addr: Address) -> Result<(), AssemblerError> {
         self.inst_begin();
-        self.emit_byte(0xFF);
-        self.emit_modrm_mem(0, addr, false)?;
-        Ok(())
+        self.emit_rm_mem(&[0xFF], 0, addr, false)
     }
 
     pub fn popfq(&mut self) { self.inst_begin(); self.emit_byte(0x9D); }
     pub fn pushfq(&mut self) { self.inst_begin(); self.emit_byte(0x9C); }
 
-    // ---- ALU: add/or/adc/sbb/and/sub/xor/cmp -------------------------------
+    // ---- ALU -----------------------------------------------------------------
 
-    /// rm <- rm OP imm  (81 /ext id or 83 /ext ib).
+    /// rm <- rm OP imm  (80/81/83 /ext).
     fn alu_op_rm_imm(
         &mut self,
         ext: u8,
@@ -514,117 +472,25 @@ impl Assembler {
         self.emit_opsz(size);
         let w = w_bit(size);
         if size == OperandSize::Size1 {
-            // 80 /ext ib for byte
-            self.emit_byte(0x80);
-            match dst {
-                RmOperand::Reg(r) => {
-                    self.emit_modrm_reg(ext, r, w);
-                    self.emit_byte(imm as u8);
-                }
-                RmOperand::Mem(a) => {
-                    self.emit_modrm_mem(ext, a, w)?;
-                    self.emit_byte(imm as u8);
-                }
-            }
+            self.emit_rm(&[0x80], ext, dst, w)?;
+            self.emit_byte(imm as u8);
             return Ok(());
         }
         if Assembler::is_simm(imm, 8) {
-            self.emit_byte(0x83);
-            match dst {
-                RmOperand::Reg(r) => {
-                    self.emit_modrm_reg(ext, r, w);
-                    self.emit_byte(imm as i8 as u8);
-                }
-                RmOperand::Mem(a) => {
-                    self.emit_modrm_mem(ext, a, w)?;
-                    self.emit_byte(imm as i8 as u8);
-                }
-            }
+            self.emit_rm(&[0x83], ext, dst, w)?;
+            self.emit_byte(imm as i8 as u8);
         } else {
             if !Assembler::is_simm(imm, 32) {
                 return Err(AssemblerError::InvalidOperand("imm32 out of range".into()));
             }
-            self.emit_byte(0x81);
-            match dst {
-                RmOperand::Reg(r) => {
-                    self.emit_modrm_reg(ext, r, w);
-                    self.emit_dword(imm as i32 as u32);
-                }
-                RmOperand::Mem(a) => {
-                    self.emit_modrm_mem(ext, a, w)?;
-                    self.emit_dword(imm as i32 as u32);
-                }
-            }
+            self.emit_rm(&[0x81], ext, dst, w)?;
+            self.emit_dword(imm as i32 as u32);
         }
         Ok(())
     }
 
-    /// reg <- reg OP imm via C7-like path not needed; use alu_op_rm_imm with Reg.
-
-    pub fn add(&mut self, dst: RmOperand, src: RmOperand, size: OperandSize) -> Result<(), AssemblerError> {
-        self.alu_generic(0x01, 0x03, dst, src, size)
-    }
-
-    pub fn add_imm(&mut self, dst: RmOperand, imm: i64, size: OperandSize) -> Result<(), AssemblerError> {
-        self.alu_op_rm_imm(0, dst, imm, size)
-    }
-
-    pub fn or_op(&mut self, dst: RmOperand, src: RmOperand, size: OperandSize) -> Result<(), AssemblerError> {
-        self.alu_generic(0x09, 0x0B, dst, src, size)
-    }
-
-    pub fn or_imm(&mut self, dst: RmOperand, imm: i64, size: OperandSize) -> Result<(), AssemblerError> {
-        self.alu_op_rm_imm(1, dst, imm, size)
-    }
-
-    pub fn adc(&mut self, dst: RmOperand, src: RmOperand, size: OperandSize) -> Result<(), AssemblerError> {
-        self.alu_generic(0x11, 0x13, dst, src, size)
-    }
-
-    pub fn adc_imm(&mut self, dst: RmOperand, imm: i64, size: OperandSize) -> Result<(), AssemblerError> {
-        self.alu_op_rm_imm(2, dst, imm, size)
-    }
-
-    pub fn sbb(&mut self, dst: RmOperand, src: RmOperand, size: OperandSize) -> Result<(), AssemblerError> {
-        self.alu_generic(0x19, 0x1B, dst, src, size)
-    }
-
-    pub fn sbb_imm(&mut self, dst: RmOperand, imm: i64, size: OperandSize) -> Result<(), AssemblerError> {
-        self.alu_op_rm_imm(3, dst, imm, size)
-    }
-
-    pub fn and_op(&mut self, dst: RmOperand, src: RmOperand, size: OperandSize) -> Result<(), AssemblerError> {
-        self.alu_generic(0x21, 0x23, dst, src, size)
-    }
-
-    pub fn and_imm(&mut self, dst: RmOperand, imm: i64, size: OperandSize) -> Result<(), AssemblerError> {
-        self.alu_op_rm_imm(4, dst, imm, size)
-    }
-
-    pub fn sub(&mut self, dst: RmOperand, src: RmOperand, size: OperandSize) -> Result<(), AssemblerError> {
-        self.alu_generic(0x29, 0x2B, dst, src, size)
-    }
-
-    pub fn sub_imm(&mut self, dst: RmOperand, imm: i64, size: OperandSize) -> Result<(), AssemblerError> {
-        self.alu_op_rm_imm(5, dst, imm, size)
-    }
-
-    pub fn xor_op(&mut self, dst: RmOperand, src: RmOperand, size: OperandSize) -> Result<(), AssemblerError> {
-        self.alu_generic(0x31, 0x33, dst, src, size)
-    }
-
-    pub fn xor_imm(&mut self, dst: RmOperand, imm: i64, size: OperandSize) -> Result<(), AssemblerError> {
-        self.alu_op_rm_imm(6, dst, imm, size)
-    }
-
-    pub fn cmp_op(&mut self, dst: RmOperand, src: RmOperand, size: OperandSize) -> Result<(), AssemblerError> {
-        self.alu_generic(0x39, 0x3B, dst, src, size)
-    }
-
-    pub fn cmp_imm(&mut self, dst: RmOperand, imm: i64, size: OperandSize) -> Result<(), AssemblerError> {
-        self.alu_op_rm_imm(7, dst, imm, size)
-    }
-
+    /// Generic ALU op: opcode_rm_r = "op r/m, r" form, opcode_r_rm =
+    /// "op r, r/m" form.  Byte forms are one less.
     fn alu_generic(
         &mut self,
         opcode_rm_r: u8,
@@ -633,30 +499,21 @@ impl Assembler {
         src: RmOperand,
         size: OperandSize,
     ) -> Result<(), AssemblerError> {
-        // Byte forms are one less than the word/dword/qword forms.
         let adj = if size == OperandSize::Size1 { 1u8 } else { 0u8 };
         let (op_rm_r, op_r_rm) = (opcode_rm_r - adj, opcode_r_rm - adj);
+        self.inst_begin();
+        self.emit_opsz(size);
+        let w = w_bit(size);
         match (dst, src) {
             (RmOperand::Reg(d), RmOperand::Reg(s)) => {
-                self.inst_begin();
-                self.emit_opsz(size);
-                self.emit_byte(op_r_rm);
-                self.emit_modrm_reg(d.encoding(), s, w_bit(size));
+                self.emit_rm_reg(&[op_r_rm], d.encoding(), s, w);
                 Ok(())
             }
             (RmOperand::Reg(d), RmOperand::Mem(a)) => {
-                self.inst_begin();
-                self.emit_opsz(size);
-                self.emit_byte(op_r_rm);
-                self.emit_modrm_mem(d.encoding(), a, w_bit(size))?;
-                Ok(())
+                self.emit_rm_mem(&[op_r_rm], d.encoding(), a, w)
             }
             (RmOperand::Mem(a), RmOperand::Reg(s)) => {
-                self.inst_begin();
-                self.emit_opsz(size);
-                self.emit_byte(op_rm_r);
-                self.emit_modrm_mem(s.encoding(), a, w_bit(size))?;
-                Ok(())
+                self.emit_rm_mem(&[op_rm_r], s.encoding(), a, w)
             }
             (RmOperand::Mem(_), RmOperand::Mem(_)) => {
                 Err(AssemblerError::InvalidOperand("mem,mem alu".into()))
@@ -664,31 +521,68 @@ impl Assembler {
         }
     }
 
+    pub fn add(&mut self, dst: RmOperand, src: RmOperand, size: OperandSize) -> Result<(), AssemblerError> {
+        self.alu_generic(0x01, 0x03, dst, src, size)
+    }
+    pub fn add_imm(&mut self, dst: RmOperand, imm: i64, size: OperandSize) -> Result<(), AssemblerError> {
+        self.alu_op_rm_imm(0, dst, imm, size)
+    }
+    pub fn or_op(&mut self, dst: RmOperand, src: RmOperand, size: OperandSize) -> Result<(), AssemblerError> {
+        self.alu_generic(0x09, 0x0B, dst, src, size)
+    }
+    pub fn or_imm(&mut self, dst: RmOperand, imm: i64, size: OperandSize) -> Result<(), AssemblerError> {
+        self.alu_op_rm_imm(1, dst, imm, size)
+    }
+    pub fn adc(&mut self, dst: RmOperand, src: RmOperand, size: OperandSize) -> Result<(), AssemblerError> {
+        self.alu_generic(0x11, 0x13, dst, src, size)
+    }
+    pub fn adc_imm(&mut self, dst: RmOperand, imm: i64, size: OperandSize) -> Result<(), AssemblerError> {
+        self.alu_op_rm_imm(2, dst, imm, size)
+    }
+    pub fn sbb(&mut self, dst: RmOperand, src: RmOperand, size: OperandSize) -> Result<(), AssemblerError> {
+        self.alu_generic(0x19, 0x1B, dst, src, size)
+    }
+    pub fn sbb_imm(&mut self, dst: RmOperand, imm: i64, size: OperandSize) -> Result<(), AssemblerError> {
+        self.alu_op_rm_imm(3, dst, imm, size)
+    }
+    pub fn and_op(&mut self, dst: RmOperand, src: RmOperand, size: OperandSize) -> Result<(), AssemblerError> {
+        self.alu_generic(0x21, 0x23, dst, src, size)
+    }
+    pub fn and_imm(&mut self, dst: RmOperand, imm: i64, size: OperandSize) -> Result<(), AssemblerError> {
+        self.alu_op_rm_imm(4, dst, imm, size)
+    }
+    pub fn sub(&mut self, dst: RmOperand, src: RmOperand, size: OperandSize) -> Result<(), AssemblerError> {
+        self.alu_generic(0x29, 0x2B, dst, src, size)
+    }
+    pub fn sub_imm(&mut self, dst: RmOperand, imm: i64, size: OperandSize) -> Result<(), AssemblerError> {
+        self.alu_op_rm_imm(5, dst, imm, size)
+    }
+    pub fn xor_op(&mut self, dst: RmOperand, src: RmOperand, size: OperandSize) -> Result<(), AssemblerError> {
+        self.alu_generic(0x31, 0x33, dst, src, size)
+    }
+    pub fn xor_imm(&mut self, dst: RmOperand, imm: i64, size: OperandSize) -> Result<(), AssemblerError> {
+        self.alu_op_rm_imm(6, dst, imm, size)
+    }
+    pub fn cmp_op(&mut self, dst: RmOperand, src: RmOperand, size: OperandSize) -> Result<(), AssemblerError> {
+        self.alu_generic(0x39, 0x3B, dst, src, size)
+    }
+    pub fn cmp_imm(&mut self, dst: RmOperand, imm: i64, size: OperandSize) -> Result<(), AssemblerError> {
+        self.alu_op_rm_imm(7, dst, imm, size)
+    }
+
     /// test r/m, r (84/85 /r).
     pub fn test_op(&mut self, dst: RmOperand, src: RmOperand, size: OperandSize) -> Result<(), AssemblerError> {
         let opcode = if size == OperandSize::Size1 { 0x84u8 } else { 0x85u8 };
+        self.inst_begin();
+        self.emit_opsz(size);
+        let w = w_bit(size);
         match (dst, src) {
             (RmOperand::Reg(d), RmOperand::Reg(s)) => {
-                self.inst_begin();
-                self.emit_opsz(size);
-                self.emit_byte(opcode);
-                self.emit_modrm_reg(d.encoding(), s, w_bit(size));
+                self.emit_rm_reg(&[opcode], d.encoding(), s, w);
                 Ok(())
             }
-            (RmOperand::Reg(d), RmOperand::Mem(a)) => {
-                self.inst_begin();
-                self.emit_opsz(size);
-                self.emit_byte(opcode);
-                self.emit_modrm_mem(d.encoding(), a, w_bit(size))?;
-                Ok(())
-            }
-            (RmOperand::Mem(a), RmOperand::Reg(s)) => {
-                self.inst_begin();
-                self.emit_opsz(size);
-                self.emit_byte(opcode);
-                self.emit_modrm_mem(s.encoding(), a, w_bit(size))?;
-                Ok(())
-            }
+            (RmOperand::Reg(d), RmOperand::Mem(a)) => self.emit_rm_mem(&[opcode], d.encoding(), a, w),
+            (RmOperand::Mem(a), RmOperand::Reg(s)) => self.emit_rm_mem(&[opcode], s.encoding(), a, w),
             (RmOperand::Mem(_), RmOperand::Mem(_)) => {
                 Err(AssemblerError::InvalidOperand("mem,mem test".into()))
             }
@@ -699,26 +593,15 @@ impl Assembler {
     pub fn test_imm(&mut self, dst: RmOperand, imm: i64, size: OperandSize) -> Result<(), AssemblerError> {
         self.inst_begin();
         self.emit_opsz(size);
+        let w = w_bit(size);
         match size {
             OperandSize::Size1 => {
-                self.emit_byte(0xF6);
-                match dst {
-                    RmOperand::Reg(r) => { self.emit_modrm_reg(0, r, false); self.emit_byte(imm as u8); }
-                    RmOperand::Mem(a) => { self.emit_modrm_mem(0, a, false)?; self.emit_byte(imm as u8); }
-                }
+                self.emit_rm(&[0xF6], 0, dst, w)?;
+                self.emit_byte(imm as u8);
             }
             _ => {
-                self.emit_byte(0xF7);
-                match dst {
-                    RmOperand::Reg(r) => {
-                        self.emit_modrm_reg(0, r, w_bit(size));
-                        self.emit_dword(imm as i32 as u32);
-                    }
-                    RmOperand::Mem(a) => {
-                        self.emit_modrm_mem(0, a, w_bit(size))?;
-                        self.emit_dword(imm as i32 as u32);
-                    }
-                }
+                self.emit_rm(&[0xF7], 0, dst, w)?;
+                self.emit_dword(imm as i32 as u32);
             }
         }
         Ok(())
@@ -729,108 +612,74 @@ impl Assembler {
     fn group1(&mut self, ext: u8, dst: RmOperand, size: OperandSize) -> Result<(), AssemblerError> {
         self.inst_begin();
         self.emit_opsz(size);
-        match size {
-            OperandSize::Size1 => {
-                self.emit_byte(0xFE);
-            }
-            _ => {
-                self.emit_byte(0xFF);
-            }
-        }
         let w = w_bit(size);
-        match dst {
-            RmOperand::Reg(r) => self.emit_modrm_reg(ext, r, w),
-            RmOperand::Mem(a) => self.emit_modrm_mem(ext, a, w)?,
-        }
-        Ok(())
+        let op = if size == OperandSize::Size1 { 0xFEu8 } else { 0xFFu8 };
+        self.emit_rm(&[op], ext, dst, w)
     }
 
     pub fn inc(&mut self, dst: RmOperand, size: OperandSize) -> Result<(), AssemblerError> {
         self.group1(0, dst, size)
     }
-
     pub fn dec(&mut self, dst: RmOperand, size: OperandSize) -> Result<(), AssemblerError> {
         self.group1(1, dst, size)
     }
 
-    pub fn call_rm_indirect(&mut self, dst: RmOperand) -> Result<(), AssemblerError> {
+    /// call r/m (FF /2).
+    pub fn call_rm(&mut self, dst: RmOperand) -> Result<(), AssemblerError> {
         self.inst_begin();
-        self.emit_byte(0xFF);
-        match dst {
-            RmOperand::Reg(r) => self.emit_modrm_reg(2, r, false),
-            RmOperand::Mem(a) => self.emit_modrm_mem(2, a, false)?,
-        }
-        Ok(())
+        self.emit_rm(&[0xFF], 2, dst, false)
     }
 
-    pub fn jmp_rm_indirect(&mut self, dst: RmOperand) -> Result<(), AssemblerError> {
+    /// jmp r/m (FF /4).
+    pub fn jmp_rm(&mut self, dst: RmOperand) -> Result<(), AssemblerError> {
         self.inst_begin();
-        self.emit_byte(0xFF);
-        match dst {
-            RmOperand::Reg(r) => self.emit_modrm_reg(4, r, false),
-            RmOperand::Mem(a) => self.emit_modrm_mem(4, a, false)?,
-        }
-        Ok(())
+        self.emit_rm(&[0xFF], 4, dst, false)
     }
 
+    /// push r/m (FF /6).
     pub fn push_rm(&mut self, dst: RmOperand) -> Result<(), AssemblerError> {
         self.inst_begin();
-        self.emit_byte(0xFF);
-        match dst {
-            RmOperand::Reg(r) => self.emit_modrm_reg(6, r, false),
-            RmOperand::Mem(a) => self.emit_modrm_mem(6, a, false)?,
-        }
-        Ok(())
+        self.emit_rm(&[0xFF], 6, dst, false)
     }
 
-    pub fn neg(&mut self, dst: RmOperand, size: OperandSize) -> Result<(), AssemblerError> {
-        self.group2_f7(3, dst, size)
-    }
-
-    pub fn not(&mut self, dst: RmOperand, size: OperandSize) -> Result<(), AssemblerError> {
-        self.group2_f7(2, dst, size)
-    }
-
-    pub fn mul(&mut self, dst: RmOperand, size: OperandSize) -> Result<(), AssemblerError> {
-        self.group2_f7(4, dst, size)
-    }
-
-    pub fn imul_one(&mut self, dst: RmOperand, size: OperandSize) -> Result<(), AssemblerError> {
-        self.group2_f7(5, dst, size)
-    }
-
-    pub fn div(&mut self, dst: RmOperand, size: OperandSize) -> Result<(), AssemblerError> {
-        self.group2_f7(6, dst, size)
-    }
-
-    pub fn idiv(&mut self, dst: RmOperand, size: OperandSize) -> Result<(), AssemblerError> {
-        self.group2_f7(7, dst, size)
+    /// pop r/m (8F /0).
+    pub fn pop_rm(&mut self, dst: RmOperand) -> Result<(), AssemblerError> {
+        self.inst_begin();
+        self.emit_rm(&[0x8F], 0, dst, false)
     }
 
     fn group2_f7(&mut self, ext: u8, dst: RmOperand, size: OperandSize) -> Result<(), AssemblerError> {
         self.inst_begin();
         self.emit_opsz(size);
-        self.emit_byte(if size == OperandSize::Size1 { 0xF6 } else { 0xF7 });
         let w = w_bit(size);
-        match dst {
-            RmOperand::Reg(r) => self.emit_modrm_reg(ext, r, w),
-            RmOperand::Mem(a) => self.emit_modrm_mem(ext, a, w)?,
-        }
-        Ok(())
+        let op = if size == OperandSize::Size1 { 0xF6u8 } else { 0xF7u8 };
+        self.emit_rm(&[op], ext, dst, w)
+    }
+
+    pub fn neg(&mut self, dst: RmOperand, size: OperandSize) -> Result<(), AssemblerError> {
+        self.group2_f7(3, dst, size)
+    }
+    pub fn not(&mut self, dst: RmOperand, size: OperandSize) -> Result<(), AssemblerError> {
+        self.group2_f7(2, dst, size)
+    }
+    pub fn mul(&mut self, dst: RmOperand, size: OperandSize) -> Result<(), AssemblerError> {
+        self.group2_f7(4, dst, size)
+    }
+    pub fn imul_one(&mut self, dst: RmOperand, size: OperandSize) -> Result<(), AssemblerError> {
+        self.group2_f7(5, dst, size)
+    }
+    pub fn div(&mut self, dst: RmOperand, size: OperandSize) -> Result<(), AssemblerError> {
+        self.group2_f7(6, dst, size)
+    }
+    pub fn idiv(&mut self, dst: RmOperand, size: OperandSize) -> Result<(), AssemblerError> {
+        self.group2_f7(7, dst, size)
     }
 
     /// imul r, r/m (0F AF /r).
     pub fn imul_reg(&mut self, dst: Register, src: RmOperand, size: OperandSize) -> Result<(), AssemblerError> {
         self.inst_begin();
         self.emit_opsz(size);
-        self.emit_byte(0x0F);
-        self.emit_byte(0xAF);
-        let w = w_bit(size);
-        match src {
-            RmOperand::Reg(r) => self.emit_modrm_reg(dst.encoding(), r, w),
-            RmOperand::Mem(a) => self.emit_modrm_mem(dst.encoding(), a, w)?,
-        }
-        Ok(())
+        self.emit_rm(&[0x0F, 0xAF], dst.encoding(), src, w_bit(size))
     }
 
     /// imul r, r/m, imm (69 id / 6B ib /r).
@@ -838,27 +687,15 @@ impl Assembler {
         self.inst_begin();
         self.emit_opsz(size);
         let w = w_bit(size);
-        let rm_is_mem = matches!(src, RmOperand::Mem(_));
-        if Assembler::is_simm(imm, 8) && size != OperandSize::Size1 {
-            self.emit_byte(0x6B);
+        let use_imm8 = Assembler::is_simm(imm, 8) && size != OperandSize::Size1;
+        if use_imm8 {
+            self.emit_rm(&[0x6B], dst.encoding(), src, w)?;
+            self.emit_byte(imm as i8 as u8);
         } else {
             if !Assembler::is_simm(imm, 32) {
                 return Err(AssemblerError::InvalidOperand("imul imm32 out of range".into()));
             }
-            self.emit_byte(0x69);
-        }
-        let _ = rm_is_mem;
-        match src {
-            RmOperand::Reg(r) => {
-                self.emit_modrm_reg(dst.encoding(), r, w);
-            }
-            RmOperand::Mem(a) => {
-                self.emit_modrm_mem(dst.encoding(), a, w)?;
-            }
-        }
-        if Assembler::is_simm(imm, 8) && size != OperandSize::Size1 {
-            self.emit_byte(imm as i8 as u8);
-        } else {
+            self.emit_rm(&[0x69], dst.encoding(), src, w)?;
             self.emit_dword(imm as i32 as u32);
         }
         Ok(())
@@ -872,19 +709,11 @@ impl Assembler {
         let w = w_bit(size);
         match count {
             ShiftCount::Imm(n) => {
-                self.emit_byte(0xC1);
-                match dst {
-                    RmOperand::Reg(r) => self.emit_modrm_reg(ext, r, w),
-                    RmOperand::Mem(a) => self.emit_modrm_mem(ext, a, w)?,
-                }
+                self.emit_rm(&[0xC1], ext, dst, w)?;
                 self.emit_byte(n as u8);
             }
             ShiftCount::Cl => {
-                self.emit_byte(0xD3);
-                match dst {
-                    RmOperand::Reg(r) => self.emit_modrm_reg(ext, r, w),
-                    RmOperand::Mem(a) => self.emit_modrm_mem(ext, a, w)?,
-                }
+                self.emit_rm(&[0xD3], ext, dst, w)?;
             }
             ShiftCount::Reg(_) => {
                 return Err(AssemblerError::InvalidOperand("shift by register other than cl".into()));
@@ -911,7 +740,7 @@ impl Assembler {
 
     // ---- branches -------------------------------------------------------------
 
-    /// jmp rel8 (EB cb) to label; label must be bound and in range.
+    /// jmp rel8 (EB cb) to label.
     pub fn jmp_short(&mut self, label: LabelId) -> Result<(), AssemblerError> {
         self.inst_begin();
         if let Some(target) = self.labels.loc(label) {
@@ -1013,7 +842,6 @@ impl Assembler {
         self.jcc_near(cond, label)
     }
 
-    /// loop/loope/loopne/jrcxz rel8.
     fn loop_jcc(&mut self, opcode: u8, label: LabelId) -> Result<(), AssemblerError> {
         self.inst_begin();
         if let Some(target) = self.labels.loc(label) {
@@ -1061,12 +889,7 @@ impl Assembler {
     /// call r/m (FF /2).
     pub fn call(&mut self, dst: RmOperand) -> Result<(), AssemblerError> {
         self.inst_begin();
-        self.emit_byte(0xFF);
-        match dst {
-            RmOperand::Reg(r) => self.emit_modrm_reg(2, r, false),
-            RmOperand::Mem(a) => self.emit_modrm_mem(2, a, false)?,
-        }
-        Ok(())
+        self.emit_rm(&[0xFF], 2, dst, false)
     }
 
     /// ret [imm16].
@@ -1104,30 +927,19 @@ impl Assembler {
         self.emit_byte(nesting);
     }
 
-    /// setcc: 0F 90+cc /r on r/m8.
+    /// setcc: 0F 90+cc /r on r/m8 (modrm.reg unused = 0).
     pub fn setcc(&mut self, cond: ConditionCode, dst: RmOperand) -> Result<(), AssemblerError> {
         self.inst_begin();
-        self.emit_byte(0x0F);
-        self.emit_byte(0x90 | (cond.encoding() & 0xF));
-        match dst {
-            RmOperand::Reg(r) => self.emit_modrm_reg(0, r, false),
-            RmOperand::Mem(a) => self.emit_modrm_mem(0, a, false)?,
-        }
-        Ok(())
+        let op = [0x0F, 0x90u8 | (cond.encoding() & 0xF)];
+        self.emit_rm(&op, 0, dst, false)
     }
 
-    /// cmovcc: 0F 40+cc /r.
+    /// cmovcc: 0F 40+cc /r, reg field = dst.
     pub fn cmov(&mut self, cond: ConditionCode, dst: Register, src: RmOperand, size: OperandSize) -> Result<(), AssemblerError> {
         self.inst_begin();
         self.emit_opsz(size);
-        self.emit_byte(0x0F);
-        self.emit_byte(0x40 | (cond.encoding() & 0xF));
-        let w = w_bit(size);
-        match src {
-            RmOperand::Reg(r) => self.emit_modrm_reg(dst.encoding(), r, w),
-            RmOperand::Mem(a) => self.emit_modrm_mem(dst.encoding(), a, w)?,
-        }
-        Ok(())
+        let op = [0x0F, 0x40u8 | (cond.encoding() & 0xF)];
+        self.emit_rm(&op, dst.encoding(), src, w_bit(size))
     }
 
     /// xchg r/m, r (87 /r) and xchg rax, r (90+r).
@@ -1145,171 +957,115 @@ impl Assembler {
         }
         self.inst_begin();
         self.emit_opsz(size);
-        self.emit_byte(0x87);
         match (a, b) {
-            (RmOperand::Reg(d), RmOperand::Reg(s)) => self.emit_modrm_reg(d.encoding(), s, w_bit(size)),
-            (RmOperand::Mem(m), RmOperand::Reg(s)) => self.emit_modrm_mem(s.encoding(), m, w_bit(size))?,
-            (RmOperand::Reg(d), RmOperand::Mem(m)) => self.emit_modrm_mem(d.encoding(), m, w_bit(size))?,
+            (RmOperand::Reg(d), RmOperand::Reg(s)) => {
+                self.emit_rm_reg(&[0x87], d.encoding(), s, w_bit(size));
+                Ok(())
+            }
+            (RmOperand::Mem(m), RmOperand::Reg(s)) => self.emit_rm_mem(&[0x87], s.encoding(), m, w_bit(size)),
+            (RmOperand::Reg(d), RmOperand::Mem(m)) => self.emit_rm_mem(&[0x87], d.encoding(), m, w_bit(size)),
             (RmOperand::Mem(_), RmOperand::Mem(_)) => {
-                return Err(AssemblerError::InvalidOperand("xchg mem,mem".into()));
+                Err(AssemblerError::InvalidOperand("xchg mem,mem".into()))
             }
         }
-        Ok(())
     }
 
     /// cmpxchg r/m, r (0F B0/B1).
     pub fn cmpxchg(&mut self, dst: RmOperand, src: RmOperand, size: OperandSize) -> Result<(), AssemblerError> {
         self.inst_begin();
         self.emit_opsz(size);
-        self.emit_byte(0x0F);
-        let w = w_bit(size);
+        let op = [0x0F, if size == OperandSize::Size1 { 0xB0u8 } else { 0xB1u8 }];
         match (dst, src) {
             (RmOperand::Reg(d), RmOperand::Reg(s)) => {
-                self.emit_byte(if size == OperandSize::Size1 { 0xB0 } else { 0xB1 });
-                self.emit_modrm_reg(d.encoding(), s, w);
+                self.emit_rm_reg(&op, d.encoding(), s, w_bit(size));
+                Ok(())
             }
-            (RmOperand::Mem(m), RmOperand::Reg(s)) => {
-                self.emit_byte(if size == OperandSize::Size1 { 0xB0 } else { 0xB1 });
-                self.emit_modrm_mem(s.encoding(), m, w)?;
-            }
-            _ => return Err(AssemblerError::InvalidOperand("cmpxchg operands".into())),
+            (RmOperand::Mem(m), RmOperand::Reg(s)) => self.emit_rm_mem(&op, s.encoding(), m, w_bit(size)),
+            _ => Err(AssemblerError::InvalidOperand("cmpxchg operands".into())),
         }
-        Ok(())
     }
 
     /// xadd r/m, r (0F C0/C1).
     pub fn xadd(&mut self, dst: RmOperand, src: RmOperand, size: OperandSize) -> Result<(), AssemblerError> {
         self.inst_begin();
         self.emit_opsz(size);
-        self.emit_byte(0x0F);
-        let w = w_bit(size);
+        let op = [0x0F, if size == OperandSize::Size1 { 0xC0u8 } else { 0xC1u8 }];
         match (dst, src) {
             (RmOperand::Reg(d), RmOperand::Reg(s)) => {
-                self.emit_byte(if size == OperandSize::Size1 { 0xC0 } else { 0xC1 });
-                self.emit_modrm_reg(d.encoding(), s, w);
+                self.emit_rm_reg(&op, d.encoding(), s, w_bit(size));
+                Ok(())
             }
-            (RmOperand::Mem(m), RmOperand::Reg(s)) => {
-                self.emit_byte(if size == OperandSize::Size1 { 0xC0 } else { 0xC1 });
-                self.emit_modrm_mem(s.encoding(), m, w)?;
-            }
-            _ => return Err(AssemblerError::InvalidOperand("xadd operands".into())),
+            (RmOperand::Mem(m), RmOperand::Reg(s)) => self.emit_rm_mem(&op, s.encoding(), m, w_bit(size)),
+            _ => Err(AssemblerError::InvalidOperand("xadd operands".into())),
         }
-        Ok(())
     }
 
-    // ---- SSE moves (minimal, for MacroAssembler float helpers) -------------------
+    // ---- SSE moves (minimal) ---------------------------------------------------
 
     /// movsd xmm, xmm/m64 (F2 0F 10 /r).
     pub fn movsd(&mut self, dst: FloatRegister, src: RmOperand) -> Result<(), AssemblerError> {
         self.inst_begin();
         self.emit_byte(0xF2);
-        self.emit_byte(0x0F);
-        self.emit_byte(0x10);
-        match src {
-            RmOperand::Reg(r) => self.emit_modrm_reg_f(dst, r),
-            RmOperand::Mem(a) => self.emit_modrm_mem_f(dst, a)?,
-        }
-        Ok(())
+        self.emit_rm(&[0x0F, 0x10], dst.encoding(), src, false)
     }
 
-    /// movsd xmm/m64, xmm (F2 0F 11 /r).
+    /// movsd xmm/m64, xmm (F2 0F 11 /r, reg field = src xmm).
     pub fn movsd_store(&mut self, dst: RmOperand, src: FloatRegister) -> Result<(), AssemblerError> {
         self.inst_begin();
         self.emit_byte(0xF2);
-        self.emit_byte(0x0F);
-        self.emit_byte(0x11);
-        match dst {
-            RmOperand::Reg(r) => self.emit_modrm_reg_f_rev(src, r),
-            RmOperand::Mem(a) => self.emit_modrm_mem_f_rev(src, a)?,
-        }
-        Ok(())
+        self.emit_rm(&[0x0F, 0x11], src.encoding(), dst, false)
     }
 
     /// movss xmm, xmm/m32 (F3 0F 10 /r).
     pub fn movss(&mut self, dst: FloatRegister, src: RmOperand) -> Result<(), AssemblerError> {
         self.inst_begin();
         self.emit_byte(0xF3);
-        self.emit_byte(0x0F);
-        self.emit_byte(0x10);
-        match src {
-            RmOperand::Reg(r) => self.emit_modrm_reg_f(dst, r),
-            RmOperand::Mem(a) => self.emit_modrm_mem_f(dst, a)?,
-        }
-        Ok(())
+        self.emit_rm(&[0x0F, 0x10], dst.encoding(), src, false)
     }
 
     /// movss xmm/m32, xmm (F3 0F 11 /r).
     pub fn movss_store(&mut self, dst: RmOperand, src: FloatRegister) -> Result<(), AssemblerError> {
         self.inst_begin();
         self.emit_byte(0xF3);
-        self.emit_byte(0x0F);
-        self.emit_byte(0x11);
-        match dst {
-            RmOperand::Reg(r) => self.emit_modrm_reg_f_rev(src, r),
-            RmOperand::Mem(a) => self.emit_modrm_mem_f_rev(src, a)?,
-        }
-        Ok(())
+        self.emit_rm(&[0x0F, 0x11], src.encoding(), dst, false)
     }
 
-    /// movq xmm, r/m64 (66 REX.W 0F 6E /r) and movq r/m64, xmm (66 REX.W 0F 7E /r).
+    /// movq xmm, r/m64 (66 REX.W 0F 6E /r).
     pub fn movq_xmm_gpr(&mut self, xmm: FloatRegister, src: RmOperand) -> Result<(), AssemblerError> {
         self.inst_begin();
         self.emit_byte(0x66);
-        self.emit_byte(0x0F);
-        self.emit_byte(0x6E);
-        match src {
-            RmOperand::Reg(r) => self.emit_modrm_reg_f(xmm, r),
-            RmOperand::Mem(a) => self.emit_modrm_mem_f(xmm, a)?,
-        }
-        Ok(())
+        self.emit_rm_w(&[0x0F, 0x6E], xmm.encoding(), src)
     }
 
+    /// movq r/m64, xmm (66 REX.W 0F 7E /r).
     pub fn movq_gpr_xmm(&mut self, dst: RmOperand, xmm: FloatRegister) -> Result<(), AssemblerError> {
         self.inst_begin();
         self.emit_byte(0x66);
-        self.emit_byte(0x0F);
-        self.emit_byte(0x7E);
-        match dst {
-            RmOperand::Reg(r) => self.emit_modrm_reg_f_rev(xmm, r),
-            RmOperand::Mem(a) => self.emit_modrm_mem_f_rev(xmm, a)?,
+        self.emit_rm_w(&[0x0F, 0x7E], xmm.encoding(), dst)
+    }
+
+    /// emit_rm variant with REX.W forced (for movq xmm<->gpr).
+    fn emit_rm_w(&mut self, op: &[u8], reg_bits: u8, rm: RmOperand) -> Result<(), AssemblerError> {
+        match rm {
+            RmOperand::Reg(r) => {
+                self.rex_of_reg(reg_bits, r, true).emit(self);
+                self.emit_bytes(op);
+                self.modrm_reg_tail(reg_bits, r);
+                Ok(())
+            }
+            RmOperand::Mem(a) => self.emit_rm_mem_w(op, reg_bits, a),
         }
-        Ok(())
     }
 
-    fn emit_modrm_reg_f(&mut self, freg: FloatRegister, rm: Register) {
-        let rex = Rex {
-            w: false,
-            r: freg.encoding() >= 8,
-            x: false,
-            b: rm.encoding() >= 8,
-        };
-        rex.emit(self);
-        self.emit_byte(0xC0 | ((freg.encoding() & 7) << 3) | (rm.encoding() & 7));
-    }
-
-    fn emit_modrm_reg_f_rev(&mut self, freg: FloatRegister, rm_reg_field: Register) {
-        // For "mov r/m, xmm": xmm is in rm field? No — opcode 11 /r has
-        // reg=xmm? Actually F2 0F 11 /r: MOVSD xmm2/m64, xmm1 -> reg field
-        // is xmm1 (source), rm is dest.  So freg goes in reg field.
-        self.emit_modrm_reg_f(freg, rm_reg_field);
-    }
-
-    fn emit_modrm_mem_f(&mut self, freg: FloatRegister, addr: Address) -> Result<(), AssemblerError> {
-        self.emit_modrm_mem_x(freg.encoding(), addr, false)
-    }
-
-    fn emit_modrm_mem_f_rev(&mut self, freg: FloatRegister, addr: Address) -> Result<(), AssemblerError> {
-        self.emit_modrm_mem_x(freg.encoding(), addr, false)
-    }
-
-    fn emit_modrm_mem_x(&mut self, reg_bits: u8, addr: Address, w: bool) -> Result<(), AssemblerError> {
-        self.emit_modrm_mem(reg_bits, addr, w)
+    fn emit_rm_mem_w(&mut self, op: &[u8], reg_bits: u8, addr: Address) -> Result<(), AssemblerError> {
+        self.rex_of_mem(reg_bits, &addr, true).emit(self);
+        self.emit_bytes(op);
+        self.modrm_mem_tail(reg_bits, &addr)
     }
 
     // ---- reloc-recording call helpers -----------------------------------------
 
     /// call rel32 with external_word relocation (fixed runtime address).
-    /// Emits E8 00000000 then records reloc at the disp field.
     pub fn call_external(&mut self, name: &str, addend: i32) -> Result<(), AssemblerError> {
         self.inst_begin();
         self.emit_byte(0xE8);
@@ -1327,7 +1083,6 @@ impl Assembler {
     }
 
     /// call rel32 with internal_word relocation (target inside blob).
-    /// target_pc is a pc offset within the insts section.
     pub fn call_internal(&mut self, target_pc: u64, addend: i32) -> Result<(), AssemblerError> {
         self.inst_begin();
         self.emit_byte(0xE8);
@@ -1407,10 +1162,9 @@ impl Assembler {
         );
     }
 
-    /// Patch a previously emitted 32-bit field with a label target
-    /// (Abs32 patch for bound labels / pending otherwise).
-    pub fn patch_label_abs32(&mut self, label: LabelId, inst_offset: usize, field_offset: usize) -> Result<(), AssemblerError> {
-        self.patch_label(label, inst_offset, field_offset, PatchKind::Abs32)
+    /// Patch a previously emitted field with a label target.
+    pub fn patch_label_abs32(&mut self, label: LabelId, _inst_offset: usize, field_offset: usize) -> Result<(), AssemblerError> {
+        self.patch_label(label, _inst_offset, field_offset, PatchKind::Abs32)
     }
 
     /// RelocSpec helper for label-carried relocs.

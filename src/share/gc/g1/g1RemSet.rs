@@ -122,7 +122,7 @@ impl G1RemSet {
     /// `region_to_card`: absolute card index of `addr`.
     #[inline]
     pub fn to_card(&self, addr: usize) -> u32 {
-        addr.saturating_sub(self.heap_base) >> self.card_shift
+        (addr.saturating_sub(self.heap_base) >> self.card_shift) as u32
     }
 
     /// `to_region_card`: card index within the region containing
@@ -130,7 +130,7 @@ impl G1RemSet {
     #[inline]
     pub fn to_region_card(&self, addr: usize, region_index: usize) -> u32 {
         let region_base = self.heap_base + region_index * self.region_size;
-        addr.saturating_sub(region_base) / self.card_size
+        (addr.saturating_sub(region_base) / self.card_size) as u32
     }
 
     /// Post-write barrier fast path: `add_reference(from_region,
@@ -202,7 +202,7 @@ impl G1RemSet {
         &self,
         region_index: usize,
         cards_per_region: u32,
-        mut f: F,
+        f: F,
     ) {
         if let Some(remset) = self.remsets.get(region_index) {
             remset.iterate_own_cards(region_index, cards_per_region, f);
@@ -234,5 +234,70 @@ impl G1RemSet {
     /// Number of tracked (non-untracked) regions.
     pub fn tracked_regions(&self) -> usize {
         self.remsets.iter().filter(|r| r.is_tracked()).count()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::g1CardSet::G1CardSetConfiguration;
+
+    #[test]
+    fn add_reference_and_cards() {
+        let mut remset = G1RemSet::new(4, 0, 1024 * 1024, 9);
+        let groups = remset.assign_candidate_groups(
+            &[1],
+            4,
+            G1CardSetConfiguration::default_for_region(1024 * 1024, 512),
+        );
+        assert_eq!(groups, 1);
+        // region 1 starts at 1 MiB; addr = base + 3*512 -> card 3 in region
+        let addr = 1024 * 1024 + 512 * 3;
+        assert!(remset.add_reference_uncached(1, addr));
+        // same card again -> already present
+        assert!(!remset.add_reference_uncached(1, addr + 100));
+        let mut cards = Vec::new();
+        remset.for_each_region_card(1, 2048, |c| cards.push(c));
+        // absolute card index = (1MiB + 1536) >> 9 = 2048 + 3
+        assert_eq!(cards, vec![2051]);
+    }
+
+    #[test]
+    fn from_card_cache_dedup() {
+        let mut remset = G1RemSet::new(2, 0, 4096, 9);
+        let a = 100usize;
+        let first = remset.from_card_cache_mut().add(0, (a / 512) as u32);
+        let second = remset.from_card_cache_mut().add(0, (a / 512) as u32);
+        assert!(first);
+        assert!(!second);
+    }
+
+    #[test]
+    fn add_reference_uses_from_card_cache() {
+        let mut remset = G1RemSet::new(2, 0, 4096, 9);
+        remset.assign_candidate_groups(
+            &[0],
+            2,
+            G1CardSetConfiguration::default_for_region(4096, 512),
+        );
+        // region_size=4096 -> only 8 cards per region
+        let addr = 256usize; // card 0 of region 0
+        assert!(remset.add_reference(0, addr));
+        assert!(!remset.add_reference(0, addr + 64)); // same card, cached
+        let addr2 = 512usize; // card 1
+        assert!(remset.add_reference(0, addr2));
+    }
+
+    #[test]
+    fn clear_region() {
+        let mut remset = G1RemSet::new(2, 0, 4096, 9);
+        remset.assign_candidate_groups(
+            &[0],
+            2,
+            G1CardSetConfiguration::default_for_region(4096, 512),
+        );
+        remset.add_reference_uncached(0, 256);
+        remset.clear_region(0);
+        assert_eq!(remset.from_card_cache().count(0), 0);
     }
 }

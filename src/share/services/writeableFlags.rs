@@ -142,6 +142,7 @@ impl JvmFlagValue {
     }
 }
 
+#[derive(Clone)]
 pub struct JvmFlag {
     pub name: &'static str,
     pub kind: JvmFlagType,
@@ -507,7 +508,7 @@ impl WriteableFlags {
                 origin,
                 "flag value must be an unsigned 64-bit integer",
                 |s| s.trim().parse::<u64>().ok().map(|v| v as i64),
-                JvmFlagValue::Uint64,
+                |v| JvmFlagValue::Uint64(v as u64),
             );
         } else if flag.is_size_t() {
             return WriteableFlags::set_int_like(

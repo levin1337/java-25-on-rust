@@ -10,12 +10,12 @@
  */
 
 use crate::share::jvmci::jvmci::JVMCI;
-use crate::share::jvmci::jvmciEnv::{JvmciEnv, JvmciResult as EnvResult};
+use crate::share::jvmci::jvmciEnv::JvmciEnv;
+use crate::share::jvmci::jvmciExceptions::JvmciResult as EnvResult;
 use crate::share::jvmci::jvmciExceptions::{JvmciException, JvmciResult, ThrowKind};
 use crate::share::jvmci::jvmciGlobals;
 use crate::share::jvmci::jvmciObject::{self, JvmciHeapValue, JvmciObject, JvmciValue};
 use crate::share::jvmci::metadataHandles::{JMetadata, MetadataHandles, MetadataTarget};
-use crate::share::jvmci::vmSymbolsJvmci;
 use crate::share::oops::oop::Oop;
 use crate::share::runtime::handles::Handle;
 use std::collections::{BTreeMap, HashMap};
@@ -223,7 +223,7 @@ impl JvmciRuntime {
     /// Without a JVMCI shared library there is nothing to attach to,
     /// so this reports an honest error instead of fabricating a VM.
     pub fn init_shared_library_javavm(&self) -> Result<Option<u64>, String> {
-        let mut state = self.state.lock().unwrap();
+        let state = self.state.lock().unwrap();
         if state.shared_library_javavm.is_some() {
             return Ok(None);
         }
@@ -470,7 +470,7 @@ impl JvmciRuntime {
         runtime_obj: JvmciObject,
         method: &str,
     ) -> EnvResult<JvmciObject> {
-        let _ = (env, runtime_obj, method);
+        let _ = (runtime_obj, method);
         Err(env.raise(JvmciException::unsupported(
             "JVMCIRuntime downcall requires the JVMCI Java runtime",
         )))
@@ -563,50 +563,127 @@ impl JvmciRuntime {
     }
 
     /// `register_method`: install a compiled method produced by the
-    /// CodeInstaller.  `request` carries everything decoded from the
-    /// HotSpotCompiledCode stream.
-    #[allow(clippy::too_many_arguments)]
+    /// CodeInstaller into the code cache.  `request` carries everything
+    /// decoded from the HotSpotCompiledCode stream; the install mirrors
+    /// the broker path in `compileBroker::install_method` (sentinel
+    /// pc_descs are already present, scope_data/handler tables/oop maps
+    /// are attached to the installed nmethod's shared state).
     pub fn register_method(
         &self,
         env: &mut JvmciEnv,
         request: crate::share::jvmci::jvmciCodeInstaller::CodeInstallRequest,
     ) -> JvmciResult<crate::share::jvmci::jvmci::CodeInstallResult> {
         use crate::share::jvmci::jvmci::CodeInstallResult;
+        use crate::share::jvmci::jvmciCodeInstaller::split_method_key;
         env.check_init()?;
 
-        let method_key = request.method_key.clone();
+        // Runtime stub path (`install_runtime_stub` analogue): a
+        // non-nmethod HotSpotCompiledCode installs a CodeBlob, not an
+        // nmethod.
+        if request.is_stub {
+            let name = request
+                .stub_name
+                .clone()
+                .unwrap_or_else(|| "jvmci-stub".to_string());
+            let cache = crate::share::code::codeCache::CodeCache::global();
+            let total = request.code_bytes.len() + request.metadata_size;
+            return match cache.allocate_blob(
+                name,
+                crate::share::code::codeBlob::CodeBlobType::NonNMethod,
+                total,
+                crate::share::code::codeBlob::CodeBlobKind::BufferBlob,
+            ) {
+                Ok(addr) => {
+                    let _ = crate::share::jitruntime::publish_executable(
+                        &request.code_bytes,
+                        total,
+                    );
+                    let _ = addr;
+                    Ok(CodeInstallResult::Ok)
+                }
+                Err(_) => Ok(CodeInstallResult::CacheFull),
+            };
+        }
+
+        let (holder, name, sig) = split_method_key(&request.method_key);
         let entry_bci = request.entry_bci;
-        let is_osr = entry_bci != crate::share::compiler::compileTask::CompileTask::INVOCATION_ENTRY_BCI;
 
-        // Build the nmethod and install it into the code cache —
-        // the same endpoint HotSpot reaches through nmethod::new_nmethod
-        // + make_in_use.  JVMCI-specific metadata (mirror index,
-        // entry patch offset, failed speculations) is recorded in a
-        // JvmciNmethodData side record.
-        let holder = method_key
-            .rsplit_once('.')
-            .map(|(h, _)| h.to_string())
-            .unwrap_or_else(|| method_key.clone());
-        let (name, sig) = method_key
-            .rsplit_once('.')
-            .map(|(_, rest)| {
-                let sig_start = rest.find('(').unwrap_or(rest.len());
-                (rest[..sig_start].to_string(), rest[sig_start..].to_string())
-            })
-            .unwrap_or_else(|| (method_key.clone(), String::new()));
+        // Normalize pc_descs (sort + dedup by pc_offset; sentinels are
+        // already present from the installer).
+        let mut pc_descs = request.pc_descs.clone();
+        pc_descs.sort_by_key(|d| d.pc_offset());
+        pc_descs.dedup_by_key(|d| d.pc_offset());
+        // When no scope-data blob was produced, normalize the deopt bci
+        // carried in the scope_decode_offset slot (C1 convention).
+        if request.scope_data.is_empty() {
+            for d in &mut pc_descs {
+                if d.bci() == crate::share::code::pcDesc::PcDesc::UNKNOWN_BCI {
+                    let bci = d.scope_decode_offset();
+                    d.set_bci(if bci >= 0 {
+                        bci
+                    } else {
+                        crate::share::code::pcDesc::PcDesc::UNKNOWN_BCI
+                    });
+                }
+            }
+        }
 
-        let mut nm = crate::share::code::nmethod::NMethod::new(
+        let code_size = request.code_bytes.len();
+        let nm = crate::share::code::nmethod::NMethod::with_entry_points(
             holder,
             name,
             sig,
             crate::share::compiler::compilerDefinitions::CompLevel::FullOptimization,
             entry_bci,
             0,
-            request.code_bytes.len(),
-            request.pc_descs.clone(),
+            code_size,
+            request.offsets.entry.max(0) as usize,
+            request.offsets.verified_entry.max(0) as usize,
+            request.offsets.osr_entry.max(0) as usize,
+            pc_descs,
             request.scopes.clone(),
         );
-        // Attach the JVMCI metadata side record through the shared state.
+
+        let cache = crate::share::code::codeCache::CodeCache::global();
+        let addr = match cache.install_nmethod(nm, request.code_bytes.clone(), request.metadata_size)
+        {
+            Ok(addr) => addr,
+            Err(_) => return Ok(CodeInstallResult::CacheFull),
+        };
+
+        // Fill the installed nmethod's shared metadata (same steps the
+        // broker performs after install_nmethod).
+        let method_key = request.method_key.clone();
+        let installed = if entry_bci
+            != crate::share::compiler::compileTask::CompileTask::INVOCATION_ENTRY_BCI
+        {
+            cache.find_osr_nmethod_by_key(&method_key, entry_bci)
+        } else {
+            cache.find_nmethod_by_key(&method_key)
+        };
+        if let Some(installed) = installed {
+            installed.set_scope_data(request.scope_data.clone());
+            installed.set_handler_table(request.exception_table.clone());
+            installed.set_pc_handlers(request.pc_handlers.clone());
+            installed.set_frame_size(request.total_frame_size.max(0) as usize);
+            installed.set_live_maps(request.live_maps.clone());
+            installed.set_has_unsafe_access(request.has_unsafe_access);
+            installed.set_has_scoped_access(request.has_scoped_access);
+            installed.set_has_monitors(request.has_monitors);
+            installed.set_has_wide_vectors(request.has_wide_vector);
+            let mut maps: Vec<_> = request.oop_maps.maps().to_vec();
+            maps.sort_by_key(|m| m.offset());
+            for map in maps {
+                installed.add_oop_map(map.offset(), map);
+            }
+            for dep in request.dependencies.iter() {
+                installed.add_dependency(dep.clone());
+            }
+        }
+
+        // JVMCINMethodData side record (HotSpot inlines it into the
+        // nmethod; the shared nmethod type has no JVMCI field, so the
+        // data is kept in the jvmci side table).
         let mut jvmci_data = JvmciNmethodData::create(
             request.nmethod_mirror_index,
             request.nmethod_entry_patch_offset,
@@ -615,26 +692,13 @@ impl JvmciRuntime {
         for fs in &request.failed_speculations {
             jvmci_data.add_failed_speculation(fs.method_key.clone(), fs.bci, fs.speculation);
         }
-        // JVMCINMethodData is inlined into the nmethod in HotSpot; this
-        // port records it in a side table keyed by method key since the
-        // nmethod type lives outside the jvmci module.
         record_jvmci_nmethod_data(&method_key, jvmci_data);
 
-        let code_bytes = request.code_bytes.clone();
-        let metadata_size = request.metadata_size;
-        match crate::share::code::codeCache::CodeCache::global()
-            .install_nmethod(nm, code_bytes, metadata_size)
-        {
-            Ok(addr) => {
-                if let Some(cs) = env.compile_state() {
-                    cs.borrow_mut().inc_compilation_ticks();
-                }
-                let _ = is_osr;
-                let _ = addr;
-                Ok(CodeInstallResult::Ok)
-            }
-            Err(_) => Ok(CodeInstallResult::CacheFull),
+        if let Some(cs) = env.compile_state() {
+            cs.borrow_mut().inc_compilation_ticks();
         }
+        let _ = addr;
+        Ok(CodeInstallResult::Ok)
     }
 
     // ---- runtime stubs called from JVMCI-compiled code -------------------
@@ -834,16 +898,18 @@ impl JvmciRuntime {
     /// `post_compile`.
     pub fn post_compile(&self, thread_id: u64) {
         let flags = jvmciGlobals::snapshot();
-        if flags.use_jvmci_native_library
-            && JVMCI::one_shared_library_javavm_per_compilation()
-        {
+        // `JVMCI::one_shared_library_javavm_per_compilation()` analogue:
+        // true only when the native libjvmci path is in use and each
+        // compilation owns its JavaVM.
+        let single_use = flags.use_jvmci_native_library;
+        if single_use {
             JVMCI::detach_thread(thread_id, "single use JavaVM");
         }
     }
 }
 
 /// Re-exported symbol names used by runtime initialization logging.
-pub use vmSymbolsJvmci as symbols;
+pub use crate::share::jvmci::vmSymbolsJvmci as symbols;
 
 /// HotSpot heap object factory used by `JVMCIEnv::get_object_constant`.
 pub fn wrap_hotspot_oop(oop: Oop) -> JvmciObject {

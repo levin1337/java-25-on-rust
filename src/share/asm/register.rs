@@ -74,7 +74,7 @@ impl Register {
     }
 
     #[inline]
-    pub fn is_valid(self) -> bool {
+    pub const fn is_valid(self) -> bool {
         self.code < Self::NUMBER_OF_REGISTERS as u8
     }
 
@@ -160,7 +160,7 @@ impl Register {
     }
 
     /// HotSpot-style RegSet: bitmask over all registers plus noreg slot.
-    pub fn bit(self) -> u64 {
+    pub const fn bit(self) -> u64 {
         if self.is_valid() {
             1u64 << self.code
         } else {
@@ -217,7 +217,7 @@ impl RegSet {
     /// Iterate set registers in encoding order.
     pub fn regs(self) -> impl Iterator<Item = Register> {
         let bits = self.bits;
-        (0..16u8).filter_map(|c| {
+        (0..16u8).filter_map(move |c| {
             if (bits >> c) & 1 != 0 {
                 Some(Register { code: c })
             } else {

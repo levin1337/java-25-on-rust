@@ -172,25 +172,23 @@ impl MetaChunk {
         // Merge with the previous block if adjacent.
         let mut start = offset;
         let mut end = offset + size;
-        if let Some((&prev_off, &prev_size)) = self
-            .free_blocks
-            .range(..offset)
-            .next_back()
-            .filter(|(&prev_off, &prev_size)| prev_off + prev_size == offset)
-        {
-            self.free_blocks.remove(&prev_off);
-            start = prev_off;
-            end = prev_off + prev_size + size;
+        if let Some((&prev_off, &prev_size)) = self.free_blocks.range(..offset).next_back() {
+            if prev_off + prev_size == offset {
+                self.free_blocks.remove(&prev_off);
+                start = prev_off;
+                end = prev_off + prev_size + size;
+            }
         }
         // Merge with the next block if adjacent.
         if let Some((&next_off, &next_size)) = self
             .free_blocks
             .range((std::ops::Bound::Excluded(end), std::ops::Bound::Unbounded))
             .next()
-            .filter(|(&next_off, _)| end == next_off)
         {
-            self.free_blocks.remove(&next_off);
-            end = next_off + next_size;
+            if end == next_off {
+                self.free_blocks.remove(&next_off);
+                end = next_off + next_size;
+            }
         }
         self.free_blocks.remove(&offset);
         self.free_blocks.insert(start, end - start);

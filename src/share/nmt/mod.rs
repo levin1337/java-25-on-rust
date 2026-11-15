@@ -9,5 +9,8 @@ pub mod memTracker;
 pub mod memoryFileTracker;
 pub mod nativeCallStack;
 pub mod nmtCommon;
+pub mod nmtDCmd;
+pub mod nmtPreInit;
+pub mod nmtUsage;
 pub mod threadStackTracker;
 pub mod virtualMemoryTracker;

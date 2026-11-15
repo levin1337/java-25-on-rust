@@ -1,6 +1,6 @@
-use super::z_address::{ZAddress, ZOffset, address_to_offset, offset_to_address};
+use super::z_address::{ZAddress, ZOffset};
 use super::z_forwarding::{ZForwarding, ZForwardingTable};
-use super::z_generation_id::{ZPageAge, ZPageType};
+use super::z_generation_id::ZPageAge;
 use super::z_page::{ZPage, Z_PAGE_SIZE_SMALL};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -21,11 +21,20 @@ pub struct ZRelocationSetSelector {
 }
 
 impl ZRelocationSetSelector {
-    pub fn select(pages: &[ZPage], generation_seqnum: u32, tenuring_threshold: u8, max_selected: usize) -> Self {
+    pub fn select(
+        pages: &[ZPage],
+        generation_seqnum: u32,
+        tenuring_threshold: u8,
+        max_selected: usize,
+        generation: Option<super::z_generation_id::ZGenerationId>,
+    ) -> Self {
         let mut selected = Vec::new();
         let mut stats = ZRelocationSetSelectorStats::default();
         for (index, page) in pages.iter().enumerate() {
             if !page.is_relocatable(generation_seqnum) {
+                continue;
+            }
+            if generation.is_some_and(|id| page.generation_id() != id) {
                 continue;
             }
             stats.pages_candidates += 1;
@@ -200,14 +209,15 @@ pub fn compute_to_age(from_age: ZPageAge, tenuring_threshold: u8) -> ZPageAge {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::share::gc::z::z_address::offset_to_address;
 
     #[test]
     fn selector_selects_sparse_pages() {
-        let mut page = ZPage::new_small(0);
+        let page = ZPage::new_small(0);
         let address = page.allocate(64).unwrap();
         page.mark_object(address, 1, false);
         page.live_objects();
-        let selector = ZRelocationSetSelector::select(&[page], 2, 14, 4);
+        let selector = ZRelocationSetSelector::select(&[page], 2, 14, 4, Some(super::super::z_generation_id::ZGenerationId::Young));
         assert_eq!(selector.selected.len(), 1);
     }
 

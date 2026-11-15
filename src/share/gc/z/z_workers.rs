@@ -46,6 +46,10 @@ impl<T> ZGCThread<T> {
         Self { thread: Some(thread), state, running, name }
     }
 
+    pub fn name(&self) -> &'static str {
+        self.name
+    }
+
     pub fn state(&self) -> &Arc<Mutex<T>> {
         &self.state
     }

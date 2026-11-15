@@ -148,13 +148,6 @@ impl<'a> ObjArrayOop<'a> {
         ArrayOopDesc::length_offset_in_bytes(mode)
     }
 
-    /// Byte offset of element `index` for the given layout mode
-    /// (compressed-oop elements).
-    #[inline]
-    pub fn obj_at_offset(mode: ObjLayoutMode, index: usize) -> usize {
-        Self::base_offset_in_bytes(mode) + index * mode.narrow_oop_size()
-    }
-
     /// Fills every element with `value` (HotSpot `ObjArrayOop::fill`).
     pub fn fill(&mut self, value: Value<'a>) {
         self.elements.fill(value);

@@ -39,19 +39,79 @@ impl NativeCallStack {
     }
 
     /// Capture the current call stack, skipping `to_skip` frames
-    /// (C++ NativeCallStack(int toSkip)).
+    /// (C++ NativeCallStack(int toSkip) -> os::get_native_stack).
+    /// On Windows the OS unwind (RtlCaptureStackBackTrace) is tried
+    /// first; when it yields no frames (restricted environments) the
+    /// capture falls back to stable per-frame hashes of the
+    /// std::backtrace rendering, which still distinguishes call sites.
+    #[cfg(windows)]
     pub fn capture(to_skip: usize) -> Self {
-        let backtrace = std::backtrace::Backtrace::force_capture();
+        use std::ffi::c_void;
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn RtlCaptureStackBackTrace(
+                frames_to_skip: u32,
+                flags: u32,
+                buffer: *mut *mut c_void,
+                hash: *mut u32,
+            ) -> u16;
+        }
         let mut pcs = [0usize; NMT_TRACKING_STACK_DEPTH];
-        let mut idx = 0;
-        for (i, frame) in backtrace.frames().iter().enumerate() {
-            if i < to_skip {
+        let mut frames: [*mut c_void; NMT_TRACKING_STACK_DEPTH] =
+            [std::ptr::null_mut(); NMT_TRACKING_STACK_DEPTH];
+        let n = unsafe {
+            RtlCaptureStackBackTrace(
+                to_skip as u32 + 1, // +1 skips capture() itself
+                0,
+                frames.as_mut_ptr(),
+                std::ptr::null_mut(),
+            ) as usize
+        };
+        if n == 0 {
+            return Self::capture_from_backtrace(to_skip + 1);
+        }
+        for i in 0..n.min(NMT_TRACKING_STACK_DEPTH) {
+            pcs[i] = frames[i] as usize;
+        }
+        Self { pcs }
+    }
+
+    #[cfg(not(windows))]
+    pub fn capture(to_skip: usize) -> Self {
+        Self::capture_from_backtrace(to_skip + 1)
+    }
+
+    /// Fallback capture: hash each rendered frame line of
+    /// std::backtrace::Backtrace into a stable pseudo-PC. Distinct call
+    /// paths produce distinct stacks; the values are not real PCs.
+    fn capture_from_backtrace(to_skip: usize) -> Self {
+        let text = std::backtrace::Backtrace::force_capture().to_string();
+        let mut pcs = [0usize; NMT_TRACKING_STACK_DEPTH];
+        let mut idx = 0usize;
+        for line in text.lines() {
+            let t = line.trim_start();
+            let b = t.as_bytes();
+            let is_frame = b.first().is_some_and(|c| c.is_ascii_digit())
+                && t.contains(':')
+                && !t.starts_with("stack backtrace");
+            if !is_frame {
                 continue;
             }
-            if idx >= NMT_TRACKING_STACK_DEPTH {
+            if idx < to_skip {
+                idx += 1;
+                continue;
+            }
+            let slot = idx - to_skip;
+            if slot >= NMT_TRACKING_STACK_DEPTH {
                 break;
             }
-            pcs[idx] = frame.ip() as usize;
+            // FNV-1a over the frame description; |1 keeps it nonzero.
+            let mut h: usize = 0xcbf2_9ce4_8422_2325;
+            for &c in t.as_bytes() {
+                h ^= c as usize;
+                h = h.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            pcs[slot] = h | 1;
             idx += 1;
         }
         Self { pcs }

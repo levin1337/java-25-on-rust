@@ -15,16 +15,18 @@
  *   - callee-saved GP regs used by the allocator are saved in the prologue.
  */
 
-use super::gvn::PhaseGVN;
-use super::node::{ArrayElemKind, CmpCondition, NodeId, Opcode, Type, NONE};
-use super::regalloc::{Allocation, Loc, TEMP_SLOTS};
-use super::scheduler::{phis_of_region, region_pred_index, Schedule, TermKind};
-use crate::share::oops::objLayout::ObjLayoutMode;
 use super::asm::code_buffer::{CodeBuffer, CodeBufferError, DEFAULT_BUFFER_SIZE};
 use super::asm::register::{Condition as XCond, Register, Scale, XMMRegister};
 use super::asm::x64::{AluOp, ShiftOp, X64Asm};
+use super::gvn::PhaseGVN;
+use super::node::{
+    ArrayElemKind, CallResult, CmpCondition, NONE, NodeId, Opcode, Type, call_unpack,
+};
+use super::regalloc::{Allocation, Loc, TEMP_SLOTS};
+use super::scheduler::{Schedule, TermKind, phis_of_region, region_pred_index};
 use crate::share::c1::c1_LIR::RuntimeStub;
 use crate::share::code::pcDesc::PcDesc;
+use crate::share::oops::objLayout::ObjLayoutMode;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 
@@ -207,7 +209,9 @@ impl<'a> X86Emitter<'a> {
 
     fn alloc_temp(&mut self) -> Result<usize, BackendError> {
         if self.temp_sp >= TEMP_SLOTS {
-            return Err(BackendError::Unsupported("operand temp stack overflow".into()));
+            return Err(BackendError::Unsupported(
+                "operand temp stack overflow".into(),
+            ));
         }
         let i = self.temp_sp;
         self.temp_sp += 1;
@@ -305,7 +309,14 @@ impl<'a> X86Emitter<'a> {
                     }
                     self.emit_epilogue()
                 }
-                TermKind::Athrow => Err(BackendError::Unsupported("athrow".into())),
+                TermKind::Athrow => {
+                    let inputs = self.gvn.node(t.node).inputs.clone();
+                    let obj = inputs.get(2).copied().unwrap_or(NONE);
+                    self.emit_gp_to(obj, Register::RCX)?;
+                    self.emit_runtime_call_addr(RuntimeStub::Throw)?;
+                    self.buf.write(&[0x0f, 0x0b])?;
+                    Ok(())
+                }
                 TermKind::Halt => {
                     self.buf.write(&[0x0f, 0x0b])?;
                     Ok(())
@@ -342,7 +353,9 @@ impl<'a> X86Emitter<'a> {
             }
         }
         if true_t == NONE || false_t == NONE {
-            return Err(BackendError::InvalidGraph("If without IfTrue/IfFalse".into()));
+            return Err(BackendError::InvalidGraph(
+                "If without IfTrue/IfFalse".into(),
+            ));
         }
         self.emit_cond_branch(test, true_t, false_t)
     }
@@ -358,9 +371,11 @@ impl<'a> X86Emitter<'a> {
         }
         if let Some(v) = self.gvn.node(test).as_bool() {
             return if v {
-                self.emit_jmp_block(true_t).and_then(|_| self.emit_jmp_block(false_t))
+                self.emit_jmp_block(true_t)
+                    .and_then(|_| self.emit_jmp_block(false_t))
             } else {
-                self.emit_jmp_block(false_t).and_then(|_| self.emit_jmp_block(true_t))
+                self.emit_jmp_block(false_t)
+                    .and_then(|_| self.emit_jmp_block(true_t))
             };
         }
         if let Opcode::BoolCmp(cond) = self.gvn.node(test).op {
@@ -386,7 +401,9 @@ impl<'a> X86Emitter<'a> {
         self.emit_gp_to(b, Register::RCX)?;
         self.load_gp_from_temp(t, Register::RAX, wide)?;
         self.free_temp();
-        self.asm.cmp_rr(Register::RAX, Register::RCX, wide).map_err(BackendError::from)
+        self.asm
+            .cmp_rr(Register::RAX, Register::RCX, wide)
+            .map_err(BackendError::from)
     }
 
     fn xcond_for(&self, c: CmpCondition) -> XCond {
@@ -402,7 +419,12 @@ impl<'a> X86Emitter<'a> {
 
     // ---- phi copies --------------------------------------------------------
 
-    fn emit_phi_moves(&mut self, _from: usize, to: usize, edge_ctrl: NodeId) -> Result<(), BackendError> {
+    fn emit_phi_moves(
+        &mut self,
+        _from: usize,
+        to: usize,
+        edge_ctrl: NodeId,
+    ) -> Result<(), BackendError> {
         let succ_entry = self.schedule.blocks[to].entry;
         if self.gvn.node(succ_entry).op != Opcode::Region {
             return Ok(());
@@ -420,7 +442,9 @@ impl<'a> X86Emitter<'a> {
         let mut moves: Vec<(NodeId, NodeId)> = Vec::new();
         for phi in phis {
             let inputs = self.gvn.node(phi).inputs.clone();
-            let Some(&src) = inputs.get(pred_idx) else { continue };
+            let Some(&src) = inputs.get(pred_idx) else {
+                continue;
+            };
             if src == NONE {
                 continue;
             }
@@ -449,20 +473,39 @@ impl<'a> X86Emitter<'a> {
         let disp = self.temp_disp(slot);
         if self.move_kind_xmm(dst) {
             self.emit_xmm_to(src, XMMRegister::XMM15)?;
-            self.asm.sse_store_mem(XMMRegister::XMM15, Register::FP, disp, true).map_err(BackendError::from)
+            self.asm
+                .sse_store_mem(XMMRegister::XMM15, Register::FP, disp, true)
+                .map_err(BackendError::from)
         } else {
             self.emit_gp(src, Register::R11)?;
-            self.asm.mov_mem_reg(Some(Register::FP), None, Scale::S1, disp, Register::R11, true).map_err(BackendError::from)
+            self.asm
+                .mov_mem_reg(
+                    Some(Register::FP),
+                    None,
+                    Scale::S1,
+                    disp,
+                    Register::R11,
+                    true,
+                )
+                .map_err(BackendError::from)
         }
     }
 
     fn store_move_dst(&mut self, dst: NodeId, slot: usize) -> Result<(), BackendError> {
         let disp = self.temp_disp(slot);
         if self.move_kind_xmm(dst) {
-            self.asm.sse_load_mem(XMMRegister::XMM15, Register::FP, disp, true)?;
+            self.asm
+                .sse_load_mem(XMMRegister::XMM15, Register::FP, disp, true)?;
             self.store_xmm_loc(dst, XMMRegister::XMM15)
         } else {
-            self.asm.mov_reg_mem(Register::R11, Some(Register::FP), None, Scale::S1, disp, true)?;
+            self.asm.mov_reg_mem(
+                Register::R11,
+                Some(Register::FP),
+                None,
+                Scale::S1,
+                disp,
+                true,
+            )?;
             self.store_gp_loc(dst, Register::R11, self.is_wide_gp(dst))
         }
     }
@@ -473,21 +516,67 @@ impl<'a> X86Emitter<'a> {
         }
         matches!(
             self.gvn.node(node).op,
-            Opcode::AddI | Opcode::SubI | Opcode::MulI | Opcode::DivI | Opcode::RemI
-                | Opcode::AndI | Opcode::OrI | Opcode::XorI
-                | Opcode::LShiftI | Opcode::RShiftI | Opcode::URShiftI | Opcode::NegI
-                | Opcode::AddL | Opcode::SubL | Opcode::MulL | Opcode::DivL | Opcode::RemL
-                | Opcode::AndL | Opcode::OrL
-                | Opcode::XorL | Opcode::LShiftL | Opcode::RShiftL | Opcode::URShiftL | Opcode::NegL
-                | Opcode::AddF | Opcode::SubF | Opcode::MulF | Opcode::DivF | Opcode::NegF
-                | Opcode::AddD | Opcode::SubD | Opcode::MulD | Opcode::DivD | Opcode::NegD
-                | Opcode::CmpI | Opcode::CmpL | Opcode::CmpF(_) | Opcode::CmpD(_)
+            Opcode::AddI
+                | Opcode::SubI
+                | Opcode::MulI
+                | Opcode::DivI
+                | Opcode::RemI
+                | Opcode::AndI
+                | Opcode::OrI
+                | Opcode::XorI
+                | Opcode::LShiftI
+                | Opcode::RShiftI
+                | Opcode::URShiftI
+                | Opcode::NegI
+                | Opcode::AddL
+                | Opcode::SubL
+                | Opcode::MulL
+                | Opcode::DivL
+                | Opcode::RemL
+                | Opcode::AndL
+                | Opcode::OrL
+                | Opcode::XorL
+                | Opcode::LShiftL
+                | Opcode::RShiftL
+                | Opcode::URShiftL
+                | Opcode::NegL
+                | Opcode::AddF
+                | Opcode::SubF
+                | Opcode::MulF
+                | Opcode::DivF
+                | Opcode::NegF
+                | Opcode::AddD
+                | Opcode::SubD
+                | Opcode::MulD
+                | Opcode::DivD
+                | Opcode::NegD
+                | Opcode::CmpI
+                | Opcode::CmpL
+                | Opcode::CmpF(_)
+                | Opcode::CmpD(_)
                 | Opcode::BoolCmp(_)
-                | Opcode::I2L | Opcode::I2F | Opcode::I2D | Opcode::L2I | Opcode::L2F | Opcode::L2D
-                | Opcode::F2I | Opcode::F2L | Opcode::F2D | Opcode::D2I | Opcode::D2L | Opcode::D2F
-                | Opcode::I2B | Opcode::I2C | Opcode::I2S
-                | Opcode::ConI(_) | Opcode::ConL(_) | Opcode::ConF(_) | Opcode::ConD(_)
-                | Opcode::ConP(_) | Opcode::Bool(_) | Opcode::Parm(_)
+                | Opcode::I2L
+                | Opcode::I2F
+                | Opcode::I2D
+                | Opcode::L2I
+                | Opcode::L2F
+                | Opcode::L2D
+                | Opcode::F2I
+                | Opcode::F2L
+                | Opcode::F2D
+                | Opcode::D2I
+                | Opcode::D2L
+                | Opcode::D2F
+                | Opcode::I2B
+                | Opcode::I2C
+                | Opcode::I2S
+                | Opcode::ConI(_)
+                | Opcode::ConL(_)
+                | Opcode::ConF(_)
+                | Opcode::ConD(_)
+                | Opcode::ConP(_)
+                | Opcode::Bool(_)
+                | Opcode::Parm(_)
         )
     }
 
@@ -496,15 +585,208 @@ impl<'a> X86Emitter<'a> {
     fn emit_effect(&mut self, node: NodeId) -> Result<(), BackendError> {
         let op = self.gvn.node(node).op.clone();
         match op {
-            Opcode::LoadI | Opcode::LoadL | Opcode::LoadF | Opcode::LoadD | Opcode::LoadB
-            | Opcode::LoadC | Opcode::LoadS => self.emit_load(node),
-            Opcode::StoreI | Opcode::StoreL | Opcode::StoreF | Opcode::StoreD
-            | Opcode::StoreB | Opcode::StoreC | Opcode::StoreS => self.emit_store(node),
+            Opcode::LoadI
+            | Opcode::LoadL
+            | Opcode::LoadF
+            | Opcode::LoadD
+            | Opcode::LoadP
+            | Opcode::LoadB
+            | Opcode::LoadC
+            | Opcode::LoadS => self.emit_load(node),
+            Opcode::StoreI
+            | Opcode::StoreL
+            | Opcode::StoreF
+            | Opcode::StoreD
+            | Opcode::StoreP
+            | Opcode::StoreB
+            | Opcode::StoreC
+            | Opcode::StoreS => self.emit_store(node),
             Opcode::ArrayLength => self.emit_array_length(node),
+            Opcode::New(cp) => self.emit_new_instance(node, cp as u32),
+            Opcode::NewArray(kind) => self.emit_new_array(node, kind as u32),
+            Opcode::NewArrayRef(cp) => self.emit_anew_array(node, cp as u32),
+            Opcode::MultianewArray => {
+                self.emit_runtime_call_addr(RuntimeStub::MultianewArray)?;
+                self.store_gp_loc(node, Register::RAX, true)
+            }
+            Opcode::Call(payload) => self.emit_call(node, payload),
+            Opcode::CheckCast(cp) => self.emit_cast(node, cp as u32, RuntimeStub::CheckCast, true),
+            Opcode::InstanceOf(cp) => {
+                self.emit_cast(node, cp as u32, RuntimeStub::InstanceOf, false)
+            }
+            Opcode::MonitorEnter => self.emit_monitor(node, RuntimeStub::MonitorEnter),
+            Opcode::MonitorExit => self.emit_monitor(node, RuntimeStub::MonitorExit),
             _ => Err(BackendError::Unsupported(format!(
                 "scheduled effect {:?} is outside the executable subset",
                 op
             ))),
+        }
+    }
+
+    fn last_input_is_site(&self, inputs: &[NodeId]) -> bool {
+        inputs
+            .last()
+            .map(|&n| matches!(self.gvn.node(n).op, Opcode::SitePtr(_)))
+            .unwrap_or(false)
+    }
+
+    fn emit_field_load(&mut self, node: NodeId, inputs: &[NodeId]) -> Result<(), BackendError> {
+        let site = *inputs
+            .last()
+            .ok_or_else(|| BackendError::InvalidGraph("field load missing site".into()))?;
+        if inputs.len() == 3 {
+            self.emit_gp_to(site, Register::RCX)?;
+            self.emit_runtime_call_addr(RuntimeStub::GetStatic)?;
+        } else {
+            self.emit_gp_to(inputs[2], Register::RCX)?;
+            self.emit_gp_to(site, Register::RDX)?;
+            self.emit_runtime_call_addr(RuntimeStub::GetField)?;
+        }
+        match self.gvn.node(node).op {
+            Opcode::LoadF | Opcode::LoadD => self.store_xmm_loc(node, XMMRegister::XMM0),
+            Opcode::LoadL | Opcode::LoadP => self.store_gp_loc(node, Register::RAX, true),
+            _ => self.store_gp_loc(node, Register::RAX, false),
+        }
+    }
+
+    fn stage_field_value(&mut self, value: NodeId) -> Result<usize, BackendError> {
+        let t = self.alloc_temp()?;
+        if self.is_xmm(value) {
+            self.emit_xmm_to(value, XMMRegister::XMM0)?;
+            self.asm.movq_xmm_to_gp(Register::RAX, XMMRegister::XMM0)?;
+            self.store_gp_to_temp(t, Register::RAX, true)?;
+        } else {
+            self.emit_gp_to(value, Register::RAX)?;
+            self.store_gp_to_temp(t, Register::RAX, self.is_wide_gp(value))?;
+        }
+        Ok(t)
+    }
+
+    fn emit_field_store(&mut self, inputs: &[NodeId]) -> Result<(), BackendError> {
+        let is_static = inputs.len() == 4;
+        let site = *inputs
+            .last()
+            .ok_or_else(|| BackendError::InvalidGraph("field store missing site".into()))?;
+        let (obj, value) = if is_static {
+            (NONE, inputs[2])
+        } else {
+            (inputs[2], inputs[4])
+        };
+        let tv = self.stage_field_value(value)?;
+        if is_static {
+            self.emit_gp_to(site, Register::RCX)?;
+            self.load_gp_from_temp(tv, Register::RDX, true)?;
+        } else {
+            self.emit_gp_to(obj, Register::RCX)?;
+            self.emit_gp_to(site, Register::RDX)?;
+            self.load_gp_from_temp(tv, Register::R8, true)?;
+        }
+        self.free_temp();
+        self.emit_runtime_call_addr(if is_static {
+            RuntimeStub::PutStatic
+        } else {
+            RuntimeStub::PutField
+        })
+    }
+
+    fn emit_new_instance(&mut self, node: NodeId, _cp: u32) -> Result<(), BackendError> {
+        let inputs = self.gvn.node(node).inputs.clone();
+        let site = inputs.get(2).copied().unwrap_or(NONE);
+        self.emit_gp_to(site, Register::RCX)?;
+        self.emit_runtime_call_addr(RuntimeStub::NewInstance)?;
+        self.store_gp_loc(node, Register::RAX, true)
+    }
+
+    fn emit_new_array(&mut self, node: NodeId, kind: u32) -> Result<(), BackendError> {
+        let inputs = self.gvn.node(node).inputs.clone();
+        let size = inputs.get(2).copied().unwrap_or(NONE);
+        self.emit_gp_to(size, Register::RCX)?;
+        self.asm.mov_imm32(Register::RDX, kind as i32)?;
+        self.emit_runtime_call_addr(RuntimeStub::NewArray)?;
+        self.store_gp_loc(node, Register::RAX, true)
+    }
+
+    fn emit_anew_array(&mut self, node: NodeId, _cp: u32) -> Result<(), BackendError> {
+        let inputs = self.gvn.node(node).inputs.clone();
+        let site = inputs.get(3).copied().unwrap_or(NONE);
+        let size = inputs.get(2).copied().unwrap_or(NONE);
+        self.emit_gp_to(site, Register::RCX)?;
+        self.emit_gp_to(size, Register::RDX)?;
+        self.emit_runtime_call_addr(RuntimeStub::AnewArray)?;
+        self.store_gp_loc(node, Register::RAX, true)
+    }
+
+    fn emit_cast(
+        &mut self,
+        node: NodeId,
+        _cp: u32,
+        stub: RuntimeStub,
+        wide: bool,
+    ) -> Result<(), BackendError> {
+        let inputs = self.gvn.node(node).inputs.clone();
+        let obj = inputs.get(2).copied().unwrap_or(NONE);
+        let site = inputs.get(3).copied().unwrap_or(NONE);
+        self.emit_gp_to(obj, Register::RCX)?;
+        self.emit_gp_to(site, Register::RDX)?;
+        self.emit_runtime_call_addr(stub)?;
+        if wide {
+            self.store_gp_loc(node, Register::RAX, true)
+        } else {
+            self.store_gp_loc(node, Register::RAX, false)
+        }
+    }
+
+    fn emit_monitor(&mut self, node: NodeId, stub: RuntimeStub) -> Result<(), BackendError> {
+        let inputs = self.gvn.node(node).inputs.clone();
+        let obj = inputs.get(2).copied().unwrap_or(NONE);
+        self.emit_gp_to(obj, Register::RCX)?;
+        self.emit_runtime_call_addr(stub)
+    }
+
+    fn emit_call(&mut self, node: NodeId, payload: u64) -> Result<(), BackendError> {
+        let (_cp, invoke_op, result) = call_unpack(payload);
+        let inputs = self.gvn.node(node).inputs.clone();
+        let site = inputs.last().copied().unwrap_or(NONE);
+        let end = inputs.len().saturating_sub(1).max(2);
+        let words = &inputs[2..end];
+        let n = words.len();
+        if n > TEMP_SLOTS {
+            return Err(BackendError::Unsupported(format!(
+                "call with {} arguments exceeds temp slots",
+                n
+            )));
+        }
+        let base = self.temp_sp;
+        self.temp_sp += n;
+        for (i, &w) in words.iter().enumerate() {
+            let t = base + (n - 1 - i);
+            if self.is_xmm(w) {
+                self.emit_xmm_to(w, XMMRegister::XMM0)?;
+                self.asm.movq_xmm_to_gp(Register::RAX, XMMRegister::XMM0)?;
+                self.store_gp_to_temp(t, Register::RAX, true)?;
+            } else {
+                self.emit_gp_to(w, Register::RAX)?;
+                self.store_gp_to_temp(t, Register::RAX, self.is_wide_gp(w))?;
+            }
+        }
+        self.emit_gp_to(site, Register::RCX)?;
+        if n == 0 {
+            self.asm.mov_imm32(Register::RDX, 0)?;
+        } else {
+            let disp = self.temp_disp(base + n - 1);
+            self.asm.emit_rex(true, false, false, false);
+            self.buf.write(&[0x8d, 0x95])?;
+            self.buf.write_i32(disp)?;
+        }
+        self.asm.mov_imm32(Register::R8, n as i32)?;
+        self.asm.mov_imm32(Register::R9, invoke_op as i32)?;
+        self.emit_runtime_call_addr(RuntimeStub::UnresolvedCall)?;
+        self.temp_sp = base;
+        match result {
+            CallResult::Void => Ok(()),
+            CallResult::I32 => self.store_gp_loc(node, Register::RAX, false),
+            CallResult::I64 | CallResult::Ref => self.store_gp_loc(node, Register::RAX, true),
+            CallResult::F32 | CallResult::F64 => self.store_xmm_loc(node, XMMRegister::XMM0),
         }
     }
 
@@ -548,8 +830,7 @@ impl<'a> X86Emitter<'a> {
         let t = self.alloc_temp()?;
         if ek.is_xmm() {
             self.emit_xmm_to(value, XMMRegister::XMM0)?;
-            self.asm
-                .movq_xmm_to_gp(Register::RAX, XMMRegister::XMM0)?;
+            self.asm.movq_xmm_to_gp(Register::RAX, XMMRegister::XMM0)?;
             self.store_gp_to_temp(t, Register::RAX, true)?;
         } else {
             self.emit_gp_to(value, Register::RAX)?;
@@ -561,9 +842,6 @@ impl<'a> X86Emitter<'a> {
     fn emit_array_load(&mut self, node: NodeId, inputs: &[NodeId]) -> Result<(), BackendError> {
         let (arr, idx) = (inputs[2], inputs[3]);
         let ek = self.array_elem(inputs)?;
-        if ek == ArrayElemKind::Ref {
-            return Err(BackendError::Unsupported("ref array load".into()));
-        }
         let addr = self
             .options
             .stubs
@@ -578,14 +856,18 @@ impl<'a> X86Emitter<'a> {
         self.asm.emit_abs_call(addr)?;
         match ek {
             ArrayElemKind::Float => {
-                self.asm.movd_xmm_from_gp(XMMRegister::XMM0, Register::RAX)?;
+                self.asm
+                    .movd_xmm_from_gp(XMMRegister::XMM0, Register::RAX)?;
                 self.store_xmm_loc(node, XMMRegister::XMM0)
             }
             ArrayElemKind::Double => {
-                self.asm.movq_xmm_from_gp(XMMRegister::XMM0, Register::RAX)?;
+                self.asm
+                    .movq_xmm_from_gp(XMMRegister::XMM0, Register::RAX)?;
                 self.store_xmm_loc(node, XMMRegister::XMM0)
             }
-            ArrayElemKind::Long => self.store_gp_loc(node, Register::RAX, true),
+            ArrayElemKind::Long | ArrayElemKind::Ref => {
+                self.store_gp_loc(node, Register::RAX, true)
+            }
             _ => self.store_gp_loc(node, Register::RAX, false),
         }
     }
@@ -593,9 +875,6 @@ impl<'a> X86Emitter<'a> {
     fn emit_array_store(&mut self, _node: NodeId, inputs: &[NodeId]) -> Result<(), BackendError> {
         let (arr, idx, value) = (inputs[2], inputs[3], inputs[4]);
         let ek = self.array_elem(inputs)?;
-        if ek == ArrayElemKind::Ref {
-            return Err(BackendError::Unsupported("ref array store".into()));
-        }
         let addr = self
             .options
             .stubs
@@ -616,22 +895,28 @@ impl<'a> X86Emitter<'a> {
 
     fn emit_load(&mut self, node: NodeId) -> Result<(), BackendError> {
         let inputs = self.gvn.node(node).inputs.clone();
+        if self.last_input_is_site(&inputs) {
+            return self.emit_field_load(node, &inputs);
+        }
         if inputs.len() >= 5 {
             return self.emit_array_load(node, &inputs);
         }
         Err(BackendError::Unsupported(format!(
-            "field load node {} requires a resolved StubSite",
+            "load node {} has no resolved site or element kind",
             node
         )))
     }
 
     fn emit_store(&mut self, node: NodeId) -> Result<(), BackendError> {
         let inputs = self.gvn.node(node).inputs.clone();
+        if self.last_input_is_site(&inputs) {
+            return self.emit_field_store(&inputs);
+        }
         if inputs.len() >= 6 {
             return self.emit_array_store(node, &inputs);
         }
         Err(BackendError::Unsupported(format!(
-            "field store node {} requires a resolved StubSite",
+            "store node {} has no resolved site or element kind",
             node
         )))
     }
@@ -660,10 +945,26 @@ impl<'a> X86Emitter<'a> {
         matches!(n.ty, Type::Float | Type::Double)
             || matches!(
                 n.op,
-                Opcode::ConF(_) | Opcode::ConD(_) | Opcode::LoadF | Opcode::LoadD
-                    | Opcode::AddF | Opcode::SubF | Opcode::MulF | Opcode::DivF | Opcode::NegF
-                    | Opcode::AddD | Opcode::SubD | Opcode::MulD | Opcode::DivD | Opcode::NegD
-                    | Opcode::I2F | Opcode::I2D | Opcode::L2F | Opcode::L2D | Opcode::F2D | Opcode::D2F
+                Opcode::ConF(_)
+                    | Opcode::ConD(_)
+                    | Opcode::LoadF
+                    | Opcode::LoadD
+                    | Opcode::AddF
+                    | Opcode::SubF
+                    | Opcode::MulF
+                    | Opcode::DivF
+                    | Opcode::NegF
+                    | Opcode::AddD
+                    | Opcode::SubD
+                    | Opcode::MulD
+                    | Opcode::DivD
+                    | Opcode::NegD
+                    | Opcode::I2F
+                    | Opcode::I2D
+                    | Opcode::L2F
+                    | Opcode::L2D
+                    | Opcode::F2D
+                    | Opcode::D2F
             )
     }
 
@@ -679,8 +980,7 @@ impl<'a> X86Emitter<'a> {
                 .map(|k| k.is_wide())
                 .unwrap_or(false);
         }
-        matches!(n.ty, Type::Long | Type::Ref)
-            || matches!(n.op, Opcode::ConL(_) | Opcode::ConP(_))
+        matches!(n.ty, Type::Long | Type::Ref) || matches!(n.op, Opcode::ConL(_) | Opcode::ConP(_))
     }
 
     fn emit_value(&mut self, node: NodeId) -> Result<(), BackendError> {
@@ -698,10 +998,23 @@ impl<'a> X86Emitter<'a> {
         }
         let n = self.gvn.node(node);
         match n.op {
-            Opcode::ConI(v) => return self.asm.mov_imm32(dst, v as u32 as i32).map_err(BackendError::from),
+            Opcode::ConI(v) => {
+                return self
+                    .asm
+                    .mov_imm32(dst, v as u32 as i32)
+                    .map_err(BackendError::from);
+            }
             Opcode::ConL(v) => return self.asm.mov_imm(dst, v).map_err(BackendError::from),
             Opcode::ConP(v) => return self.asm.mov_imm(dst, v as i64).map_err(BackendError::from),
-            Opcode::Bool(v) => return self.asm.mov_imm32(dst, if v { 1 } else { 0 }).map_err(BackendError::from),
+            Opcode::SitePtr(v) => {
+                return self.asm.mov_imm(dst, v as i64).map_err(BackendError::from);
+            }
+            Opcode::Bool(v) => {
+                return self
+                    .asm
+                    .mov_imm32(dst, if v { 1 } else { 0 })
+                    .map_err(BackendError::from);
+            }
             Opcode::Parm(slot) => return self.emit_parm_gp(slot as usize, dst),
             _ => {}
         }
@@ -721,7 +1034,14 @@ impl<'a> X86Emitter<'a> {
             }
             Loc::Spill(ord) => {
                 let disp = self.spill_slot_disp(ord);
-                self.asm.mov_reg_mem(dst, Some(Register::FP), None, Scale::S1, disp, self.is_wide_gp(node))?;
+                self.asm.mov_reg_mem(
+                    dst,
+                    Some(Register::FP),
+                    None,
+                    Scale::S1,
+                    disp,
+                    self.is_wide_gp(node),
+                )?;
             }
             Loc::Xmm(_) => return Err(BackendError::InvalidGraph("gp/xmm mismatch".into())),
         }
@@ -753,7 +1073,8 @@ impl<'a> X86Emitter<'a> {
         if self.is_pure(node) {
             self.emit_pure_xmm(node)?;
             if dst != XMMRegister::XMM0 {
-                self.asm.mov_xmm_xmm(dst, XMMRegister::XMM0, self.is_double_node(node))?;
+                self.asm
+                    .mov_xmm_xmm(dst, XMMRegister::XMM0, self.is_double_node(node))?;
             }
             return Ok(());
         }
@@ -784,7 +1105,9 @@ impl<'a> X86Emitter<'a> {
             .get(&slot)
             .map(|k| k.is_wide())
             .unwrap_or(false);
-        self.asm.mov_reg_mem(dst, Some(Register::FP), None, Scale::S1, disp, wide).map_err(BackendError::from)
+        self.asm
+            .mov_reg_mem(dst, Some(Register::FP), None, Scale::S1, disp, wide)
+            .map_err(BackendError::from)
     }
 
     fn loc_of(&self, node: NodeId) -> Result<Loc, BackendError> {
@@ -795,7 +1118,12 @@ impl<'a> X86Emitter<'a> {
             .ok_or_else(|| BackendError::InvalidGraph(format!("no location for node {}", node)))
     }
 
-    fn store_gp_loc(&mut self, node: NodeId, reg: Register, wide: bool) -> Result<(), BackendError> {
+    fn store_gp_loc(
+        &mut self,
+        node: NodeId,
+        reg: Register,
+        wide: bool,
+    ) -> Result<(), BackendError> {
         let loc = self.loc_of(node)?;
         match loc {
             Loc::Gp(r) => {
@@ -806,7 +1134,9 @@ impl<'a> X86Emitter<'a> {
             }
             Loc::Spill(ord) => {
                 let disp = self.spill_slot_disp(ord);
-                self.asm.mov_mem_reg(Some(Register::FP), None, Scale::S1, disp, reg, wide).map_err(BackendError::from)
+                self.asm
+                    .mov_mem_reg(Some(Register::FP), None, Scale::S1, disp, reg, wide)
+                    .map_err(BackendError::from)
             }
             Loc::Xmm(_) => Err(BackendError::InvalidGraph("gp/xmm mismatch".into())),
         }
@@ -824,9 +1154,13 @@ impl<'a> X86Emitter<'a> {
             Loc::Spill(ord) => {
                 let disp = self.spill_slot_disp(ord);
                 if self.is_double_node(node) {
-                    self.asm.sse_store_mem(xmm, Register::FP, disp, true).map_err(BackendError::from)
+                    self.asm
+                        .sse_store_mem(xmm, Register::FP, disp, true)
+                        .map_err(BackendError::from)
                 } else {
-                    self.asm.sse_store_mem(xmm, Register::FP, disp, false).map_err(BackendError::from)
+                    self.asm
+                        .sse_store_mem(xmm, Register::FP, disp, false)
+                        .map_err(BackendError::from)
                 }
             }
             Loc::Gp(_) => Err(BackendError::InvalidGraph("xmm/gp mismatch".into())),
@@ -850,12 +1184,31 @@ impl<'a> X86Emitter<'a> {
                 self.buf.write(&[0xf7, 0xd8])?; // neg rax/eax
                 Ok(())
             }
-            Opcode::AddI | Opcode::SubI | Opcode::MulI | Opcode::AndI | Opcode::OrI | Opcode::XorI
-            | Opcode::AddL | Opcode::SubL | Opcode::MulL | Opcode::AndL | Opcode::OrL
-            | Opcode::XorL | Opcode::LShiftI | Opcode::RShiftI | Opcode::URShiftI
-            | Opcode::LShiftL | Opcode::RShiftL | Opcode::URShiftL
-            | Opcode::DivI | Opcode::RemI | Opcode::DivL | Opcode::RemL
-            | Opcode::CmpI | Opcode::CmpL | Opcode::BoolCmp(_) => {
+            Opcode::AddI
+            | Opcode::SubI
+            | Opcode::MulI
+            | Opcode::AndI
+            | Opcode::OrI
+            | Opcode::XorI
+            | Opcode::AddL
+            | Opcode::SubL
+            | Opcode::MulL
+            | Opcode::AndL
+            | Opcode::OrL
+            | Opcode::XorL
+            | Opcode::LShiftI
+            | Opcode::RShiftI
+            | Opcode::URShiftI
+            | Opcode::LShiftL
+            | Opcode::RShiftL
+            | Opcode::URShiftL
+            | Opcode::DivI
+            | Opcode::RemI
+            | Opcode::DivL
+            | Opcode::RemL
+            | Opcode::CmpI
+            | Opcode::CmpL
+            | Opcode::BoolCmp(_) => {
                 let wide = self.is_wide_gp(node)
                     || self.is_wide_gp(inputs[0])
                     || self.is_wide_gp(inputs[1]);
@@ -869,7 +1222,9 @@ impl<'a> X86Emitter<'a> {
             }
             Opcode::I2L => {
                 self.emit_gp(inputs[0], Register::RAX)?;
-                self.asm.movsxd(Register::RAX, Register::RAX).map_err(BackendError::from)
+                self.asm
+                    .movsxd(Register::RAX, Register::RAX)
+                    .map_err(BackendError::from)
             }
             Opcode::L2I => {
                 self.emit_gp(inputs[0], Register::RAX)?;
@@ -906,15 +1261,60 @@ impl<'a> X86Emitter<'a> {
     fn emit_gp_op(&mut self, op: &Opcode, wide: bool) -> Result<(), BackendError> {
         use Opcode::*;
         match op {
-            AddI | AddL => return self.asm.alu_rr(AluOp::Add, Register::RAX, Register::RCX, wide).map_err(BackendError::from),
-            SubI | SubL => return self.asm.alu_rr(AluOp::Sub, Register::RAX, Register::RCX, wide).map_err(BackendError::from),
-            MulI | MulL => return self.asm.alu_rr(AluOp::Mul, Register::RAX, Register::RCX, wide).map_err(BackendError::from),
-            AndI | AndL => return self.asm.alu_rr(AluOp::And, Register::RAX, Register::RCX, wide).map_err(BackendError::from),
-            OrI | OrL => return self.asm.alu_rr(AluOp::Or, Register::RAX, Register::RCX, wide).map_err(BackendError::from),
-            XorI | XorL => return self.asm.alu_rr(AluOp::Xor, Register::RAX, Register::RCX, wide).map_err(BackendError::from),
-            LShiftI | LShiftL => return self.asm.shift_op(ShiftOp::Shl, wide).map_err(BackendError::from),
-            RShiftI | RShiftL => return self.asm.shift_op(ShiftOp::Sar, wide).map_err(BackendError::from),
-            URShiftI | URShiftL => return self.asm.shift_op(ShiftOp::Shr, wide).map_err(BackendError::from),
+            AddI | AddL => {
+                return self
+                    .asm
+                    .alu_rr(AluOp::Add, Register::RAX, Register::RCX, wide)
+                    .map_err(BackendError::from);
+            }
+            SubI | SubL => {
+                return self
+                    .asm
+                    .alu_rr(AluOp::Sub, Register::RAX, Register::RCX, wide)
+                    .map_err(BackendError::from);
+            }
+            MulI | MulL => {
+                return self
+                    .asm
+                    .alu_rr(AluOp::Mul, Register::RAX, Register::RCX, wide)
+                    .map_err(BackendError::from);
+            }
+            AndI | AndL => {
+                return self
+                    .asm
+                    .alu_rr(AluOp::And, Register::RAX, Register::RCX, wide)
+                    .map_err(BackendError::from);
+            }
+            OrI | OrL => {
+                return self
+                    .asm
+                    .alu_rr(AluOp::Or, Register::RAX, Register::RCX, wide)
+                    .map_err(BackendError::from);
+            }
+            XorI | XorL => {
+                return self
+                    .asm
+                    .alu_rr(AluOp::Xor, Register::RAX, Register::RCX, wide)
+                    .map_err(BackendError::from);
+            }
+            LShiftI | LShiftL => {
+                return self
+                    .asm
+                    .shift_op(ShiftOp::Shl, wide)
+                    .map_err(BackendError::from);
+            }
+            RShiftI | RShiftL => {
+                return self
+                    .asm
+                    .shift_op(ShiftOp::Sar, wide)
+                    .map_err(BackendError::from);
+            }
+            URShiftI | URShiftL => {
+                return self
+                    .asm
+                    .shift_op(ShiftOp::Shr, wide)
+                    .map_err(BackendError::from);
+            }
             CmpI | CmpL => {
                 self.asm.cmp_rr(Register::RAX, Register::RCX, wide)?;
                 self.cmp_to_int()
@@ -968,8 +1368,14 @@ impl<'a> X86Emitter<'a> {
         let op = self.gvn.node(node).op.clone();
         let inputs = self.gvn.node(node).inputs.clone();
         match op {
-            Opcode::AddF | Opcode::SubF | Opcode::MulF | Opcode::DivF
-            | Opcode::AddD | Opcode::SubD | Opcode::MulD | Opcode::DivD => {
+            Opcode::AddF
+            | Opcode::SubF
+            | Opcode::MulF
+            | Opcode::DivF
+            | Opcode::AddD
+            | Opcode::SubD
+            | Opcode::MulD
+            | Opcode::DivD => {
                 let double = self.is_double_node(node);
                 let alu = match op {
                     Opcode::AddF | Opcode::AddD => AluOp::Add,
@@ -979,9 +1385,19 @@ impl<'a> X86Emitter<'a> {
                 };
                 let t = self.alloc_temp()?;
                 self.emit_xmm_to(inputs[0], XMMRegister::XMM0)?;
-                self.asm.sse_store_mem(XMMRegister::XMM0, Register::FP, self.temp_disp(t), double)?;
+                self.asm.sse_store_mem(
+                    XMMRegister::XMM0,
+                    Register::FP,
+                    self.temp_disp(t),
+                    double,
+                )?;
                 self.emit_xmm_to(inputs[1], XMMRegister::XMM0)?;
-                self.asm.sse_load_mem(XMMRegister::XMM1, Register::FP, self.temp_disp(t), double)?;
+                self.asm.sse_load_mem(
+                    XMMRegister::XMM1,
+                    Register::FP,
+                    self.temp_disp(t),
+                    double,
+                )?;
                 self.free_temp();
                 self.asm.sse_arith(alu, double).map_err(BackendError::from)
             }
@@ -989,13 +1405,16 @@ impl<'a> X86Emitter<'a> {
                 let double = matches!(op, Opcode::NegD);
                 self.emit_xmm_to(inputs[0], XMMRegister::XMM0)?;
                 if double {
-                    self.asm.mov_imm(Register::RAX, 0x8000_0000_0000_0000u64 as i64)?;
-                    self.asm.movq_xmm_from_gp(XMMRegister::XMM1, Register::RAX)?;
+                    self.asm
+                        .mov_imm(Register::RAX, 0x8000_0000_0000_0000u64 as i64)?;
+                    self.asm
+                        .movq_xmm_from_gp(XMMRegister::XMM1, Register::RAX)?;
                     self.asm.emit_rex(true, false, false, false);
                     self.buf.write(&[0x66, 0x0f, 0x57, 0xc1])?; // xorpd xmm0,xmm1
                 } else {
                     self.asm.mov_imm32(Register::RAX, 0x8000_0000u32 as i32)?;
-                    self.asm.movd_xmm_from_gp(XMMRegister::XMM1, Register::RAX)?;
+                    self.asm
+                        .movd_xmm_from_gp(XMMRegister::XMM1, Register::RAX)?;
                     self.buf.write(&[0x0f, 0x57, 0xc1])?; // xorps xmm0,xmm1
                 }
                 Ok(())
@@ -1003,20 +1422,28 @@ impl<'a> X86Emitter<'a> {
             Opcode::I2F | Opcode::L2F => {
                 let wide = matches!(op, Opcode::L2F);
                 self.emit_gp(inputs[0], Register::RAX)?;
-                self.asm.cvtsi2ss(XMMRegister::XMM0, Register::RAX, wide).map_err(BackendError::from)
+                self.asm
+                    .cvtsi2ss(XMMRegister::XMM0, Register::RAX, wide)
+                    .map_err(BackendError::from)
             }
             Opcode::I2D | Opcode::L2D => {
                 let wide = matches!(op, Opcode::L2D);
                 self.emit_gp(inputs[0], Register::RAX)?;
-                self.asm.cvtsi2sd(XMMRegister::XMM0, Register::RAX, wide).map_err(BackendError::from)
+                self.asm
+                    .cvtsi2sd(XMMRegister::XMM0, Register::RAX, wide)
+                    .map_err(BackendError::from)
             }
             Opcode::F2D => {
                 self.emit_xmm_to(inputs[0], XMMRegister::XMM0)?;
-                self.asm.cvtss2sd(XMMRegister::XMM0, XMMRegister::XMM0).map_err(BackendError::from)
+                self.asm
+                    .cvtss2sd(XMMRegister::XMM0, XMMRegister::XMM0)
+                    .map_err(BackendError::from)
             }
             Opcode::D2F => {
                 self.emit_xmm_to(inputs[0], XMMRegister::XMM0)?;
-                self.asm.cvtsd2ss(XMMRegister::XMM0, XMMRegister::XMM0).map_err(BackendError::from)
+                self.asm
+                    .cvtsd2ss(XMMRegister::XMM0, XMMRegister::XMM0)
+                    .map_err(BackendError::from)
             }
             _ => Err(BackendError::Unsupported(format!("pure xmm op {:?}", op))),
         }
@@ -1033,13 +1460,16 @@ impl<'a> X86Emitter<'a> {
     ) -> Result<(), BackendError> {
         let t = self.alloc_temp()?;
         self.emit_xmm_to(a, XMMRegister::XMM0)?;
-        self.asm.sse_store_mem(XMMRegister::XMM0, Register::FP, self.temp_disp(t), double)?;
+        self.asm
+            .sse_store_mem(XMMRegister::XMM0, Register::FP, self.temp_disp(t), double)?;
         self.emit_xmm_to(b, XMMRegister::XMM0)?;
-        self.asm.sse_load_mem(XMMRegister::XMM1, Register::FP, self.temp_disp(t), double)?;
+        self.asm
+            .sse_load_mem(XMMRegister::XMM1, Register::FP, self.temp_disp(t), double)?;
         self.free_temp();
         // ucomiss/ucomisd xmm0,xmm1
         self.asm.emit_rex(double, false, false, false);
-        self.buf.write(&[if double { 0x66 } else { 0x0f }, 0x2e, 0xc1])?;
+        self.buf
+            .write(&[if double { 0x66 } else { 0x0f }, 0x2e, 0xc1])?;
         // NaN -> greater_nan ? 1 : -1 ; else CF->-1, ZF->0, else 1
         let start = self.pos();
         let nan_jp = self.emit_jmp_local_cc(XCond::P)?;
@@ -1055,7 +1485,8 @@ impl<'a> X86Emitter<'a> {
         self.buf.write(&[0x31, 0xc0])?; // xor eax,eax
         let end3 = self.emit_jmp_local()?;
         self.patch_local(nan_jp, self.pos())?;
-        self.asm.mov_imm32(Register::RAX, if greater_nan { 1 } else { -1 })?;
+        self.asm
+            .mov_imm32(Register::RAX, if greater_nan { 1 } else { -1 })?;
         self.patch_local(end_jmp, self.pos())?;
         self.patch_local(end2, self.pos())?;
         self.patch_local(end3, self.pos())?;
@@ -1087,7 +1518,8 @@ impl<'a> X86Emitter<'a> {
             self.asm.sse_store_mem(*r, Register::FP, disp, true)?;
         }
         self.asm.emit_abs_call(addr)?;
-        self.pc_descs.push(PcDesc::new(self.pos() as i32, 0, PcDesc::PCDESC_REEXECUTE));
+        self.pc_descs
+            .push(PcDesc::new(self.pos() as i32, 0, PcDesc::PCDESC_REEXECUTE));
         for r in &xmm_locs {
             let slot = self.alloc.xmm_save_slot(*r);
             let disp = self.slot_disp(slot);
@@ -1118,7 +1550,10 @@ impl<'a> X86Emitter<'a> {
         let patches = self.patches.clone();
         for p in patches {
             let Some(&target_pos) = self.block_offsets.get(&p.target) else {
-                return Err(BackendError::InvalidGraph(format!("missing block {}", p.target)));
+                return Err(BackendError::InvalidGraph(format!(
+                    "missing block {}",
+                    p.target
+                )));
             };
             let rel = target_pos as i64 - (p.disp as i64 + 4);
             self.buf.patch_i32(p.disp, rel as i32)?;
@@ -1145,7 +1580,6 @@ impl<'a> X86Emitter<'a> {
         self.buf.patch_i32(disp, rel as i32).map_err(Into::into)
     }
 
-
     fn cmp_to_int(&mut self) -> Result<(), BackendError> {
         // result = (a > b) - (a < b) in {-1,0,1}
         self.asm.emit_rex(false, false, false, false);
@@ -1157,7 +1591,9 @@ impl<'a> X86Emitter<'a> {
         self.asm.movzx_reg(Register::R8)?;
         self.asm.movzx_reg(Register::R9)?;
         self.asm.mov_reg_reg(Register::RAX, Register::R9, false)?;
-        self.asm.alu_rr(AluOp::Sub, Register::RAX, Register::R8, false).map_err(BackendError::from)
+        self.asm
+            .alu_rr(AluOp::Sub, Register::RAX, Register::R8, false)
+            .map_err(BackendError::from)
     }
 
     fn setcc_bool(&mut self, cond: CmpCondition) -> Result<(), BackendError> {
@@ -1170,14 +1606,41 @@ impl<'a> X86Emitter<'a> {
         Ok(())
     }
 
-    fn store_gp_to_temp(&mut self, idx: usize, reg: Register, wide: bool) -> Result<(), BackendError> {
-        self.asm.mov_mem_reg(Some(Register::FP), None, Scale::S1, self.temp_disp(idx), reg, wide).map_err(BackendError::from)
+    fn store_gp_to_temp(
+        &mut self,
+        idx: usize,
+        reg: Register,
+        wide: bool,
+    ) -> Result<(), BackendError> {
+        self.asm
+            .mov_mem_reg(
+                Some(Register::FP),
+                None,
+                Scale::S1,
+                self.temp_disp(idx),
+                reg,
+                wide,
+            )
+            .map_err(BackendError::from)
     }
 
-    fn load_gp_from_temp(&mut self, idx: usize, reg: Register, wide: bool) -> Result<(), BackendError> {
-        self.asm.mov_reg_mem(reg, Some(Register::FP), None, Scale::S1, self.temp_disp(idx), wide).map_err(BackendError::from)
+    fn load_gp_from_temp(
+        &mut self,
+        idx: usize,
+        reg: Register,
+        wide: bool,
+    ) -> Result<(), BackendError> {
+        self.asm
+            .mov_reg_mem(
+                reg,
+                Some(Register::FP),
+                None,
+                Scale::S1,
+                self.temp_disp(idx),
+                wide,
+            )
+            .map_err(BackendError::from)
     }
-
 }
 
 pub fn compile_schedule(
@@ -1197,15 +1660,41 @@ pub fn compile_schedule(
 /// rejected instead of emitting incorrect code.
 pub fn validate_supported(gvn: &PhaseGVN) -> Result<(), BackendError> {
     for n in &gvn.nodes {
+        let last_is_site = n
+            .inputs
+            .last()
+            .map(|&i| matches!(gvn.node(i).op, Opcode::SitePtr(_)))
+            .unwrap_or(false);
         let bad = match n.op {
-            Opcode::LoadP | Opcode::StoreP | Opcode::New(_) | Opcode::NewArray(_)
-            | Opcode::NewArrayRef(_) | Opcode::Call(_) | Opcode::CheckCast(_)
-            | Opcode::InstanceOf(_) | Opcode::MonitorEnter | Opcode::MonitorExit
-            | Opcode::Athrow | Opcode::IfException | Opcode::Proj(_) => true,
-            Opcode::LoadI | Opcode::LoadL | Opcode::LoadF | Opcode::LoadD | Opcode::LoadB
-            | Opcode::LoadC | Opcode::LoadS => n.inputs.len() == 4,
-            Opcode::StoreI | Opcode::StoreL | Opcode::StoreF | Opcode::StoreD
-            | Opcode::StoreB | Opcode::StoreC | Opcode::StoreS => n.inputs.len() == 5,
+            Opcode::IfException | Opcode::Proj(_) => true,
+            Opcode::LoadI
+            | Opcode::LoadL
+            | Opcode::LoadF
+            | Opcode::LoadD
+            | Opcode::LoadP
+            | Opcode::LoadB
+            | Opcode::LoadC
+            | Opcode::LoadS => {
+                if last_is_site {
+                    !(n.inputs.len() == 3 || n.inputs.len() == 5)
+                } else {
+                    n.inputs.len() != 5
+                }
+            }
+            Opcode::StoreI
+            | Opcode::StoreL
+            | Opcode::StoreF
+            | Opcode::StoreD
+            | Opcode::StoreP
+            | Opcode::StoreB
+            | Opcode::StoreC
+            | Opcode::StoreS => {
+                if last_is_site {
+                    !(n.inputs.len() == 4 || n.inputs.len() == 6)
+                } else {
+                    n.inputs.len() != 6
+                }
+            }
             Opcode::RemF | Opcode::RemD => true,
             Opcode::ConP(v) => v != 0,
             _ => false,

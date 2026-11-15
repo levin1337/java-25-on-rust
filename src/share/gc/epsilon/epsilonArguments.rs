@@ -89,12 +89,12 @@ impl EpsilonArguments {
             self.config.print_heap_steps = v;
             return true;
         }
-        if let Some(v) = parse_kv(flag, "-XX:EpsilonTLABDecayTime=") {
-            self.config.tlab_decay_time_ms = v as u64;
+        if let Some(v) = parse_kv::<u64>(flag, "-XX:EpsilonTLABDecayTime=") {
+            self.config.tlab_decay_time_ms = v;
             return true;
         }
-        if let Some(v) = parse_kv(flag, "-XX:EpsilonTLABElasticity=") {
-            self.config.tlab_elasticity = v as f64;
+        if let Some(v) = parse_kv::<f64>(flag, "-XX:EpsilonTLABElasticity=") {
+            self.config.tlab_elasticity = v;
             return true;
         }
         false
@@ -159,13 +159,7 @@ fn parse_size(flag: &str, prefix: &str) -> Option<usize> {
 
 fn parse_kv<T: std::str::FromStr>(flag: &str, prefix: &str) -> Option<T> {
     let rest = flag.strip_prefix(prefix)?;
-    let (num, mult) = if let Some(r) = rest.strip_suffix('m') {
-        (r, 1usize)
-    } else {
-        (rest, 1usize)
-    };
-    let _ = mult;
-    num.trim().parse().ok()
+    rest.trim().parse().ok()
 }
 
 #[cfg(test)]

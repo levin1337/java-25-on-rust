@@ -304,72 +304,83 @@ impl JvmciGlobals {
         // the guard flag is off.  `is_set` records whether the flag
         // differs from its HotSpot default.
         let not_set_checks: &[(&str, &str, bool, bool)] = &[
-            ("BootstrapJVMCI", "UseJVMCICompiler", f.bootstrap_jvmci && !f.use_jvmci_compiler),
-            ("PrintBootstrap", "UseJVMCICompiler", !f.print_bootstrap && !f.use_jvmci_compiler),
-            ("JVMCIThreads", "UseJVMCICompiler", f.jvmci_threads != 1 && !f.use_jvmci_compiler),
+            ("BootstrapJVMCI", "UseJVMCICompiler", f.bootstrap_jvmci && !f.use_jvmci_compiler, false),
+            ("PrintBootstrap", "UseJVMCICompiler", !f.print_bootstrap && !f.use_jvmci_compiler, false),
+            ("JVMCIThreads", "UseJVMCICompiler", f.jvmci_threads != 1 && !f.use_jvmci_compiler, false),
             (
                 "JVMCIHostThreads",
                 "UseJVMCICompiler",
                 f.jvmci_host_threads != 1 && !f.use_jvmci_compiler,
+                false,
             ),
             (
                 "LibJVMCICompilerThreadHidden",
                 "UseJVMCICompiler",
                 !f.libjvmci_compiler_thread_hidden && !f.use_jvmci_compiler,
+                false,
             ),
-            ("JVMCIEventLogLevel", "EnableJVMCI", f.jvmci_event_log_level != 1 && !f.enable_jvmci),
-            ("JVMCITraceLevel", "EnableJVMCI", f.jvmci_trace_level != 0 && !f.enable_jvmci),
-            ("JVMCICounterSize", "EnableJVMCI", f.jvmci_counter_size != 0 && !f.enable_jvmci),
+            ("JVMCIEventLogLevel", "EnableJVMCI", f.jvmci_event_log_level != 1 && !f.enable_jvmci, false),
+            ("JVMCITraceLevel", "EnableJVMCI", f.jvmci_trace_level != 0 && !f.enable_jvmci, false),
+            ("JVMCICounterSize", "EnableJVMCI", f.jvmci_counter_size != 0 && !f.enable_jvmci, false),
             (
                 "JVMCICountersExcludeCompiler",
                 "EnableJVMCI",
                 !f.jvmci_counters_exclude_compiler && !f.enable_jvmci,
+                false,
             ),
             (
                 "JVMCINMethodSizeLimit",
                 "EnableJVMCI",
                 f.jvmci_nmethod_size_limit != 80 * 1024 * WORD_SIZE && !f.enable_jvmci,
+                false,
             ),
             (
                 "JVMCIPrintProperties",
                 "EnableJVMCI",
                 f.jvmci_print_properties && !f.enable_jvmci,
+                false,
             ),
             (
                 "JVMCIThreadsPerNativeLibraryRuntime",
                 "EnableJVMCI",
                 f.jvmci_threads_per_native_library_runtime != 1 && !f.enable_jvmci,
+                false,
             ),
             (
                 "JVMCICompilerIdleDelay",
                 "EnableJVMCI",
                 f.jvmci_compiler_idle_delay != DEFAULT_COMPILER_IDLE_DELAY && !f.enable_jvmci,
+                false,
             ),
             (
                 "UseJVMCINativeLibrary",
                 "EnableJVMCI",
                 f.use_jvmci_native_library && !f.enable_jvmci,
+                false,
             ),
             (
                 "JVMCINativeLibraryThreadFraction",
                 "EnableJVMCI",
                 (f.jvmci_native_library_thread_fraction - 0.66).abs() > f64::EPSILON
                     && !f.enable_jvmci,
+                false,
             ),
             (
                 "JVMCINativeLibraryErrorFile",
                 "EnableJVMCI",
                 f.jvmci_native_library_error_file.is_some() && !f.enable_jvmci,
+                false,
             ),
-            ("JVMCILibPath", "EnableJVMCI", f.jvmci_lib_path.is_some() && !f.enable_jvmci),
+            ("JVMCILibPath", "EnableJVMCI", f.jvmci_lib_path.is_some() && !f.enable_jvmci, false),
             (
                 "JVMCILibDumpJNIConfig",
                 "EnableJVMCI",
                 f.jvmci_lib_dump_jni_config.is_some() && !f.enable_jvmci,
+                false,
             ),
         ];
-        for (flag, guard, violated) in not_set_checks {
-            if violated {
+        for (flag, guard, violated, _is_default) in not_set_checks {
+            if *violated {
                 return Err(format!(
                     "Improperly specified VM option '{flag}': '{guard}' must be enabled"
                 ));

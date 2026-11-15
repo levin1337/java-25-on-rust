@@ -446,6 +446,7 @@ mod tests {
         assert!(a.append_if_missing(&9));
         assert!(!a.append_if_missing(&9));
         a.swap(&mut b);
-        assert_eq!(a.len(), 4);
+        assert_eq!(a.as_slice(), &[3, 4]);
+        assert_eq!(b.as_slice(), &[1, 2, 3, 4, 9]);
     }
 }

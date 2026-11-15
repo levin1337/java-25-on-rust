@@ -1380,7 +1380,7 @@ fn java_error_throwable<'a>(
 /// Builds an `io::Error` carrying a real throwable object for `class_name`.
 /// Falls back to a plain linkage-style error when the class cannot be
 /// loaded or instantiated (e.g. minimal bootstrap environments).
-fn jex<'a>(
+pub(crate) fn jex<'a>(
     loader: &ClassLoader<'a>,
     output: &mut dyn Write,
     depth: usize,
@@ -1522,7 +1522,7 @@ pub(crate) fn monitorKey(value: Value<'_>) -> Option<u64> {
     }
 }
 
-fn monitorEnter<'a>(
+pub(crate) fn monitorEnter<'a>(
     loader: &ClassLoader<'a>,
     output: &mut dyn Write,
     depth: usize,
@@ -1557,7 +1557,7 @@ fn monitorEnter<'a>(
     Ok(key)
 }
 
-fn monitorExit<'a>(
+pub(crate) fn monitorExit<'a>(
     loader: &ClassLoader<'a>,
     output: &mut dyn Write,
     depth: usize,

@@ -52,21 +52,21 @@ pub enum AnyDecoder {
 
 pub struct Decoder {
     kind: AnyDecoder,
-    amd64: decoder_amd64::Amd64Decoder,
+    amd64: crate::share::utilities::decoder_amd64::Amd64Decoder,
 }
 
 impl Decoder {
     pub fn new() -> Self {
         Self {
             kind: AnyDecoder::Amd64,
-            amd64: decoder_amd64::Amd64Decoder::new(),
+            amd64: crate::share::utilities::decoder_amd64::Amd64Decoder::new(),
         }
     }
 
     pub fn null() -> Self {
         Self {
             kind: AnyDecoder::Null,
-            amd64: decoder_amd64::Amd64Decoder::new(),
+            amd64: crate::share::utilities::decoder_amd64::Amd64Decoder::new(),
         }
     }
 
@@ -91,7 +91,7 @@ impl Decoder {
     }
 
     pub fn instruction_length(code: &[u8]) -> Option<usize> {
-        decoder_amd64::instruction_length(code)
+        crate::share::utilities::decoder_amd64::instruction_length(code)
     }
 }
 

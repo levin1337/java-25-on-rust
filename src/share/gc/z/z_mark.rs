@@ -25,7 +25,7 @@ impl ZMarkStackEntry {
         Self(entry)
     }
 
-    pub fn partial_array(offset: usize, length: usize, finalizable: bool) -> Self {
+    pub fn partial_array_entry(offset: usize, length: usize, finalizable: bool) -> Self {
         let mut entry = Self::PARTIAL_ARRAY | ((finalizable as u64) & Self::FINALIZABLE);
         entry |= ((length as u64) << Self::PARTIAL_ARRAY_LENGTH_SHIFT) & Self::PARTIAL_ARRAY_LENGTH_MASK;
         entry |= (offset as u64) << Self::PARTIAL_ARRAY_OFFSET_SHIFT;
@@ -36,7 +36,7 @@ impl ZMarkStackEntry {
         (self.0 & Self::FINALIZABLE) != 0
     }
 
-    pub fn partial_array(self) -> bool {
+    pub fn is_partial_array(self) -> bool {
         (self.0 & Self::PARTIAL_ARRAY) != 0
     }
 
@@ -251,13 +251,25 @@ impl ZMarkThreadLocalStacks {
     }
 
     pub fn pop(&mut self, stripe_index: usize) -> Option<ZMarkStackEntry> {
-        self.stacks[stripe_index].as_mut().and_then(ZMarkStack::pop)
+        let (entry, empty) = match self.stacks[stripe_index].as_mut() {
+            Some(stack) => {
+                let entry = stack.pop();
+                (entry, stack.is_empty())
+            }
+            None => (None, false),
+        };
+        if empty {
+            self.stacks[stripe_index] = None;
+        }
+        entry
     }
 
     pub fn flush(&mut self, stripes: &ZMarkStripeSet) {
         for (index, stack) in self.stacks.iter_mut().enumerate() {
             if let Some(stack) = stack.take() {
-                stripes.stripe_at(index).publish_stack(stack, true);
+                if !stack.is_empty() {
+                    stripes.stripe_at(index).publish_stack(stack, true);
+                }
             }
         }
     }
@@ -364,7 +376,7 @@ impl ZMark {
     }
 
     pub fn push_partial_array(&mut self, offset: usize, length: usize, finalizable: bool) {
-        self.roots.push(ZMarkStackEntry::partial_array(offset, length, finalizable));
+        self.roots.push(ZMarkStackEntry::partial_array_entry(offset, length, finalizable));
     }
 
     pub fn mark_young_roots<I>(&mut self, roots: I)
@@ -394,7 +406,7 @@ impl ZMark {
         let mut did_work = false;
         while let Some(entry) = self.stacks.pop(stripe) {
             did_work = true;
-            let children = if entry.partial_array() {
+            let children = if entry.is_partial_array() {
                 hooks.follow_partial_array(entry.partial_array_offset(), entry.partial_array_length(), entry.finalizable())
             } else {
                 let address = entry.object_address_raw();
@@ -458,6 +470,10 @@ impl ZMark {
 
     pub fn stripes(&self) -> &ZMarkStripeSet {
         &self.stripes
+    }
+
+    pub fn cache(&self) -> &ZMarkCache {
+        &self.cache
     }
 }
 

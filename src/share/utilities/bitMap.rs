@@ -54,10 +54,6 @@ impl BitMap {
         debug_assert!(bit < self.size, "bit index out of bounds");
     }
 
-    fn verify_limit(&self, bit: idx_t) {
-        debug_assert!(bit <= self.size, "bit limit out of bounds");
-    }
-
     fn verify_range(&self, beg: idx_t, end: idx_t) {
         debug_assert!(beg <= end, "invalid range");
         debug_assert!(end <= self.size, "range end out of bounds");
@@ -210,6 +206,20 @@ impl BitMap {
         count
     }
 
+    fn word_range_mask(lo_bit: idx_t, hi_bit: idx_t) -> u64 {
+        // mask of bit positions p with lo_bit <= p < hi_bit, both within one word
+        let lo = Self::bit_in_word(lo_bit) as u32;
+        let hi = Self::bit_in_word(hi_bit) as u32;
+        let hi_mask = if hi == 0 && hi_bit % BITS_PER_WORD == 0 && hi_bit > lo_bit {
+            u64::MAX
+        } else if hi == 0 {
+            0
+        } else {
+            (1u64 << hi) - 1
+        };
+        (!0u64 << lo) & hi_mask
+    }
+
     fn find_first_bit(&self, beg: idx_t, end: idx_t, want_one: bool) -> Option<idx_t> {
         self.verify_range(beg, end);
         if beg >= end {
@@ -220,36 +230,12 @@ impl BitMap {
             let w = Self::word_index(bit);
             let word_end_bit = (w + 1) * BITS_PER_WORD;
             let limit = word_end_bit.min(end);
-            let mut word = self.map[w];
-            let in_word_beg = Self::bit_in_word(bit);
-            let in_word_end = Self::bit_in_word(limit);
-            if in_word_beg > 0 {
-                word &= !0u64 << in_word_beg;
-            }
-            if in_word_end > 0 || limit == end {
-                if in_word_end > 0 {
-                    word &= (1u64 << in_word_end) - 1;
-                }
-            }
-            let found = if want_one {
-                if word != 0 {
-                    Some(word.trailing_zeros() as usize)
-                } else {
-                    None
-                }
-            } else {
-                let inv = !word;
-                if inv != 0 {
-                    Some(inv.trailing_zeros() as usize)
-                } else {
-                    None
-                }
-            };
-            if let Some(off) = found {
-                let idx = w * BITS_PER_WORD + off;
-                if idx >= beg && idx < end {
-                    return Some(idx);
-                }
+            let valid = Self::word_range_mask(bit, limit);
+            let word = self.map[w];
+            let cand = if want_one { word & valid } else { !word & valid };
+            if cand != 0 {
+                let off = cand.trailing_zeros() as usize;
+                return Some(w * BITS_PER_WORD + off);
             }
             bit = word_end_bit;
         }
@@ -270,36 +256,12 @@ impl BitMap {
             let limit_beg = word_beg_bit.max(beg);
             let limit_end = word_end_bit.min(end);
             if limit_beg < limit_end {
-                let mut word = self.map[w];
-                let lo = Self::bit_in_word(limit_beg);
-                let hi = Self::bit_in_word(limit_end);
-                if lo > 0 {
-                    word &= !0u64 << lo;
-                }
-                if hi > 0 {
-                    word &= (1u64 << hi) - 1;
-                } else if limit_end < word_end_bit {
-                    word &= (1u64 << BITS_PER_WORD) - 1;
-                }
-                let found = if want_one {
-                    if word != 0 {
-                        Some(63 - word.leading_zeros() as usize)
-                    } else {
-                        None
-                    }
-                } else {
-                    let inv = !word;
-                    if inv != 0 {
-                        Some(63 - inv.leading_zeros() as usize)
-                    } else {
-                        None
-                    }
-                };
-                if let Some(off) = found {
-                    let idx = w * BITS_PER_WORD + off;
-                    if idx >= beg && idx < end {
-                        return Some(idx);
-                    }
+                let valid = Self::word_range_mask(limit_beg, limit_end);
+                let word = self.map[w];
+                let cand = if want_one { word & valid } else { !word & valid };
+                if cand != 0 {
+                    let off = (63 - cand.leading_zeros()) as usize;
+                    return Some(w * BITS_PER_WORD + off);
                 }
             }
             if w == beg_word {
@@ -522,7 +484,7 @@ impl BitMap {
             }
             let mut v = self.map[src_word] >> shift;
             if shift > 0 && src_word + 1 <= src_end_word && src_word + 1 < self.map.len() {
-                v |= self.map[src_word + 1] << (BITS_PER_WORD - shift);
+                v |= self.map[src_word + 1] << (BITS_PER_WORD - shift as usize);
             }
             new_map[i] = v;
         }

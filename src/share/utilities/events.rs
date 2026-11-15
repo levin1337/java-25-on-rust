@@ -126,36 +126,12 @@ pub type StringEventLog = EventLogBase;
 pub type FormatStringEventLog = EventLogBase;
 
 pub struct EventsState {
-    logs: Vec<Box<dyn EventLog + Send>>,
-    messages: Option<Box<EventLogBase>>,
-    memprotect_messages: Option<Box<EventLogBase>>,
-    nmethod_flush_messages: Option<Box<EventLogBase>>,
-    vm_operations: Option<Box<EventLogBase>>,
-    zgc_phase_switch: Option<Box<EventLogBase>>,
-    exceptions: Option<Box<EventLogBase>>,
-    redefinitions: Option<Box<EventLogBase>>,
-    class_unloading: Option<Box<EventLogBase>>,
-    class_loading: Option<Box<EventLogBase>>,
-    deopt_messages: Option<Box<EventLogBase>>,
-    dll_messages: Option<Box<EventLogBase>>,
+    logs: Vec<Box<EventLogBase>>,
 }
 
 impl EventsState {
     fn new() -> Self {
-        Self {
-            logs: Vec::new(),
-            messages: None,
-            memprotect_messages: None,
-            nmethod_flush_messages: None,
-            vm_operations: None,
-            zgc_phase_switch: None,
-            exceptions: None,
-            redefinitions: None,
-            class_unloading: None,
-            class_loading: None,
-            deopt_messages: None,
-            dll_messages: None,
-        }
+        Self { logs: Vec::new() }
     }
 
     fn register(&mut self, log: Box<EventLogBase>) {
@@ -171,23 +147,9 @@ fn state() -> &'static Mutex<EventsState> {
 
 pub fn events_init(enabled: bool) {
     let mut st = state().lock().unwrap();
-    if !enabled || st.messages.is_some() {
+    if !enabled || !st.logs.is_empty() {
         return;
     }
-    let mut add = |name: &str, handle: &str| -> Box<EventLogBase> {
-        Box::new(EventLogBase::new(name, handle, LOG_EVENTS_BUFFER_ENTRIES))
-    };
-    st.messages = Some(add("Events", "events"));
-    st.nmethod_flush_messages = Some(add("Nmethod flushes", "nmethodflushes"));
-    st.memprotect_messages = Some(add("Memory protections", "memprotects"));
-    st.vm_operations = Some(add("VM Operations", "vmops"));
-    st.zgc_phase_switch = Some(add("ZGC Phase Switch", "zgcps"));
-    st.exceptions = Some(add("Internal exceptions", "exc"));
-    st.redefinitions = Some(add("Classes redefined", "redef"));
-    st.class_unloading = Some(add("Classes unloaded", "unload"));
-    st.class_loading = Some(add("Classes loaded", "load"));
-    st.deopt_messages = Some(add("Deoptimization events", "deopt"));
-    st.dll_messages = Some(add("Dll operation events", "dll"));
     let names: Vec<(&str, &str)> = vec![
         ("Events", "events"),
         ("Nmethod flushes", "nmethodflushes"),
@@ -207,56 +169,56 @@ pub fn events_init(enabled: bool) {
 }
 
 macro_rules! log_to {
-    ($field:ident, $thread:expr, $fmt:expr, $args:expr) => {{
+    ($handle:expr, $thread:expr, $fmt:expr, $args:expr) => {{
         let mut st = state().lock().unwrap();
-        if let Some(log) = st.$field.as_mut() {
+        if let Some(log) = st.logs.iter_mut().find(|l| l.handle == $handle) {
             log.log($thread, $fmt, $args);
         }
     }};
 }
 
 pub fn log(thread: Option<&str>, fmt: &str, args: &[FormatArg]) {
-    log_to!(messages, thread, fmt, args);
+    log_to!("events", thread, fmt, args);
 }
 
 pub fn log_memprotect(thread: Option<&str>, fmt: &str, args: &[FormatArg]) {
-    log_to!(memprotect_messages, thread, fmt, args);
+    log_to!("memprotects", thread, fmt, args);
 }
 
 pub fn log_nmethod_flush(thread: Option<&str>, fmt: &str, args: &[FormatArg]) {
-    log_to!(nmethod_flush_messages, thread, fmt, args);
+    log_to!("nmethodflushes", thread, fmt, args);
 }
 
 pub fn log_vm_operation(thread: Option<&str>, fmt: &str, args: &[FormatArg]) {
-    log_to!(vm_operations, thread, fmt, args);
+    log_to!("vmops", thread, fmt, args);
 }
 
 pub fn log_zgc_phase_switch(fmt: &str, args: &[FormatArg]) {
-    log_to!(zgc_phase_switch, None, fmt, args);
+    log_to!("zgcps", None, fmt, args);
 }
 
 pub fn log_exception(thread: Option<&str>, fmt: &str, args: &[FormatArg]) {
-    log_to!(exceptions, thread, fmt, args);
+    log_to!("exc", thread, fmt, args);
 }
 
 pub fn log_redefinition(thread: Option<&str>, fmt: &str, args: &[FormatArg]) {
-    log_to!(redefinitions, thread, fmt, args);
+    log_to!("redef", thread, fmt, args);
 }
 
 pub fn log_class_unloading(thread: Option<&str>, message: &str) {
-    log_to!(class_unloading, thread, "%s", &[FormatArg::string(message.to_string())]);
+    log_to!("unload", thread, "%s", &[FormatArg::string(message.to_string())]);
 }
 
 pub fn log_class_loading(thread: Option<&str>, fmt: &str, args: &[FormatArg]) {
-    log_to!(class_loading, thread, fmt, args);
+    log_to!("load", thread, fmt, args);
 }
 
 pub fn log_deopt(thread: Option<&str>, fmt: &str, args: &[FormatArg]) {
-    log_to!(deopt_messages, thread, fmt, args);
+    log_to!("deopt", thread, fmt, args);
 }
 
 pub fn log_dll(thread: Option<&str>, fmt: &str, args: &[FormatArg]) {
-    log_to!(dll_messages, thread, fmt, args);
+    log_to!("dll", thread, fmt, args);
 }
 
 pub fn print_all(out: &mut dyn Write, max: isize) -> io::Result<()> {

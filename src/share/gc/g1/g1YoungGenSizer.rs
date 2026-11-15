@@ -114,7 +114,7 @@ impl G1YoungGenSizer {
         &self,
         num_heap_regions: u32,
     ) -> (u32, u32) {
-        let (mut min_len, mut max_len) = match self.sizer_kind {
+        let (mut min_len, max_len) = match self.sizer_kind {
             SizerKind::Defaults => (
                 self.calculate_default_min_length(num_heap_regions),
                 self.calculate_default_max_length(num_heap_regions),
@@ -177,5 +177,40 @@ impl G1YoungGenSizer {
     #[inline]
     pub fn use_adaptive_sizing(&self) -> bool {
         self.use_adaptive_sizing
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_bounds() {
+        let sizer = G1YoungGenSizer::new(YoungGenSizingParams::default(), 1024 * 1024);
+        let (min, max) = sizer.recalculate_min_max_young_length(200);
+        // 5% and 60% of 200 regions
+        assert_eq!(min, 10);
+        assert_eq!(max, 120);
+    }
+
+    #[test]
+    fn new_size_only() {
+        let params = YoungGenSizingParams { new_size: 50 * 1024 * 1024, max_new_size: 0, new_ratio: 0 };
+        let mut sizer = G1YoungGenSizer::new(params, 1024 * 1024);
+        // 50 MiB / 1 MiB = 50 regions min
+        sizer.heap_size_changed(200);
+        let (min, max) = sizer.recalculate_min_max_young_length(200);
+        assert_eq!(min, 50);
+        assert_eq!(max, 120); // default max 60%
+    }
+
+    #[test]
+    fn new_ratio() {
+        let params = YoungGenSizingParams { new_size: 0, max_new_size: 0, new_ratio: 3 };
+        let sizer = G1YoungGenSizer::new(params, 1024 * 1024);
+        let (min, max) = sizer.recalculate_min_max_young_length(200);
+        assert_eq!(min, 50); // 200/(3+1)
+        assert_eq!(max, 50);
+        assert!(!sizer.use_adaptive_sizing());
     }
 }

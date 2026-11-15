@@ -67,7 +67,7 @@ fn hash_from_index(from_index: usize) -> usize {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ZPublishState {
+pub enum ZPublishState {
     None,
     Published,
     Reject,
@@ -377,6 +377,10 @@ impl ZForwarding {
             3 => ZPublishState::Accept,
             _ => ZPublishState::None,
         }
+    }
+
+    pub fn relocated_remembered_fields_publish_young_seqnum(&self) -> u32 {
+        self.relocated_remembered_fields_publish_young_seqnum.load(Ordering::Acquire)
     }
 
     pub fn relocated_remembered_fields_apply<F>(&self, mut function: F)

@@ -9,11 +9,11 @@
 use super::dependencies::DependencySet;
 use super::exceptionHandlerTable::{ExceptionHandlerTable, PcRangeHandlerTable};
 use super::pcDesc::{PcDesc, PcDescContainer};
-use super::scopeDesc::{decode_scope_chain_with_objects, ScopeDesc};
+use super::scopeDesc::{ScopeDesc, decode_scope_chain_with_objects};
 use crate::share::compiler::compilerDefinitions::CompLevel;
 use crate::share::compiler::oopMap::OopMapSet;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Per-bci live-reference map for deoptimization (`ScopeValue`-level
 /// detail lives in the scope-data blob; this is the conservative
@@ -59,11 +59,7 @@ impl DeoptLiveMap {
     }
 
     /// Build from explicit reference-slot sets (locals + operand stack).
-    pub fn from_ref_slots(
-        bci: i32,
-        local_ref_slots: Vec<u16>,
-        stack_ref_slots: Vec<u16>,
-    ) -> Self {
+    pub fn from_ref_slots(bci: i32, local_ref_slots: Vec<u16>, stack_ref_slots: Vec<u16>) -> Self {
         Self {
             bci,
             local_ref_slots,
@@ -196,7 +192,7 @@ pub struct NMethodSections {
 /// machinery and stack walking update concurrently.
 #[derive(Debug)]
 pub struct NMethodShared {
-    state: AtomicU64, // NMethodState as u64
+    state: AtomicU64,        // NMethodState as u64
     deopt_status: AtomicU64, // DeoptimizationStatus as u64
     lock_count: AtomicU64,
     stack_traversal_mark: AtomicU64,
@@ -610,7 +606,9 @@ impl NMethod {
 
     #[inline]
     pub fn consts_size(&self) -> usize {
-        self.sections.consts_end.saturating_sub(self.sections.consts_begin)
+        self.sections
+            .consts_end
+            .saturating_sub(self.sections.consts_begin)
     }
 
     #[inline]
@@ -631,7 +629,9 @@ impl NMethod {
 
     #[inline]
     pub fn metadata_size(&self) -> usize {
-        self.sections.metadata_end.saturating_sub(self.sections.metadata_begin)
+        self.sections
+            .metadata_end
+            .saturating_sub(self.sections.metadata_begin)
     }
 
     /// Dependencies occupy the head of the immutable data section
@@ -665,7 +665,9 @@ impl NMethod {
 
     #[inline]
     pub fn scopes_pcs_size(&self) -> usize {
-        self.sections.scopes_pcs_end.saturating_sub(self.sections.scopes_pcs_begin)
+        self.sections
+            .scopes_pcs_end
+            .saturating_sub(self.sections.scopes_pcs_begin)
     }
 
     #[inline]
@@ -681,7 +683,9 @@ impl NMethod {
     }
 
     pub fn set_has_monitors(&self, val: bool) {
-        self.shared.has_monitors.store(val as u64, Ordering::Release);
+        self.shared
+            .has_monitors
+            .store(val as u64, Ordering::Release);
     }
 
     #[inline]
@@ -701,12 +705,17 @@ impl NMethod {
     }
 
     pub fn set_has_wide_vectors(&self, val: bool) {
-        self.shared.has_wide_vectors.store(val as u64, Ordering::Release);
+        self.shared
+            .has_wide_vectors
+            .store(val as u64, Ordering::Release);
     }
 
     #[inline]
     pub fn has_method_handle_invokes(&self) -> bool {
-        self.shared.has_method_handle_invokes.load(Ordering::Acquire) != 0
+        self.shared
+            .has_method_handle_invokes
+            .load(Ordering::Acquire)
+            != 0
     }
 
     pub fn set_has_method_handle_invokes(&self, val: bool) {
@@ -783,8 +792,7 @@ impl NMethod {
             let off = pd.pc_offset() as i64;
             // Sentinel records bracket the array and legitimately sit
             // outside the code stream.
-            if off == PcDesc::LOWER_OFFSET_LIMIT as i64
-                || off == PcDesc::UPPER_OFFSET_LIMIT as i64
+            if off == PcDesc::LOWER_OFFSET_LIMIT as i64 || off == PcDesc::UPPER_OFFSET_LIMIT as i64
             {
                 continue;
             }
@@ -795,10 +803,7 @@ impl NMethod {
                 ));
             }
             if i > 0 && off < prev {
-                return Err(format!(
-                    "pc_desc[{}] out of order: {} < {}",
-                    i, off, prev
-                ));
+                return Err(format!("pc_desc[{}] out of order: {} < {}", i, off, prev));
             }
             prev = off;
             let sdo = pd.scope_decode_offset() as i64;
@@ -1053,8 +1058,11 @@ impl NMethod {
             return Vec::new();
         }
         if let Some(pd) = self.pc_desc_at(pc) {
-            let mut chain =
-                decode_scope_chain_with_objects(&data, pd.scope_decode_offset(), pd.obj_decode_offset());
+            let mut chain = decode_scope_chain_with_objects(
+                &data,
+                pd.scope_decode_offset(),
+                pd.obj_decode_offset(),
+            );
             if let Some(top) = chain.first_mut() {
                 top.apply_pc_desc_flags(
                     pd.should_reexecute(),
@@ -1161,7 +1169,11 @@ impl NMethod {
     }
 
     pub fn add_oop_map(&self, pc_offset: i32, map: crate::share::compiler::oopMap::OopMap) {
-        self.shared.oop_maps.lock().unwrap().add_gc_map(pc_offset, map);
+        self.shared
+            .oop_maps
+            .lock()
+            .unwrap()
+            .add_gc_map(pc_offset, map);
     }
 
     // ---- deoptimization data -----------------------------------------
@@ -1225,7 +1237,8 @@ impl NMethod {
         let pd = self.pc_desc_near(pc)?;
         let bci = pd.bci();
         let map = if bci != PcDesc::UNKNOWN_BCI {
-            self.live_map_for_bci(bci).or_else(|| self.live_map_near_bci(bci))
+            self.live_map_for_bci(bci)
+                .or_else(|| self.live_map_near_bci(bci))
         } else {
             None
         };
@@ -1235,7 +1248,12 @@ impl NMethod {
     /// Conservative live map covering the whole frame when the compiler
     /// produced none: every local slot and a caller-provided operand
     /// depth are treated as live references.
-    pub fn conservative_live_map(&self, bci: i32, local_count: usize, stack_depth: usize) -> DeoptLiveMap {
+    pub fn conservative_live_map(
+        &self,
+        bci: i32,
+        local_count: usize,
+        stack_depth: usize,
+    ) -> DeoptLiveMap {
         DeoptLiveMap::conservative(bci, local_count, stack_depth)
     }
 
@@ -1302,11 +1320,7 @@ impl NMethod {
             ("method_handle_invokes", self.has_method_handle_invokes()),
             ("unsafe_access", self.has_unsafe_access()),
         ];
-        let active: Vec<&str> = flags
-            .iter()
-            .filter(|(_, v)| *v)
-            .map(|(n, _)| *n)
-            .collect();
+        let active: Vec<&str> = flags.iter().filter(|(_, v)| *v).map(|(n, _)| *n).collect();
         if !active.is_empty() {
             let _ = writeln!(f, "  flags: {}", active.join(", "));
         }
@@ -1481,15 +1495,15 @@ mod tests {
         assert_eq!(nm.metadata_size(), 0x100);
         assert_eq!(nm.scopes_pcs_size(), 0x60);
         assert_eq!(nm.dependencies_begin(), 0x900);
-        nm.add_dependency(super::dependencies::Dependency::new(
-            super::dependencies::DepType::LeafType,
-            vec![super::dependencies::DependencyArgument::Klass(
+        nm.add_dependency(crate::share::code::dependencies::Dependency::new(
+            crate::share::code::dependencies::DepType::LeafType,
+            vec![crate::share::code::dependencies::DependencyArgument::Klass(
                 "pkg/Base".to_string(),
             )],
         ));
         assert!(nm.has_dependencies());
         assert!(nm.dependencies_affected_by("pkg/Base", |a, b| a == b));
-        assert!(nm.dependencies_affected_by("pkg/Sub", |a, b| b == "pkg/Base"));
+        assert!(nm.dependencies_affected_by("pkg/Sub", |_, b| b == "pkg/Base"));
         assert!(!nm.dependencies_affected_by("pkg/Other", |_, _| false));
         let deps = nm.dependencies();
         assert_eq!(deps.len(), 1);
@@ -1547,8 +1561,18 @@ mod tests {
         assert!(nm.is_entrant());
         assert!(nm.can_be_deoptimized());
         let osr_nm = NMethod::with_entry_points(
-            "O".to_string(), "osr".to_string(), "()V".to_string(),
-            CompLevel::Simple, 7, 0, 0, 0, 0, 0, vec![], vec![],
+            "O".to_string(),
+            "osr".to_string(),
+            "()V".to_string(),
+            CompLevel::Simple,
+            7,
+            0,
+            0,
+            0,
+            0,
+            0,
+            vec![],
+            vec![],
         );
         assert_eq!(osr_nm.osr_entry_bci(), 7);
         assert!(osr_nm.is_osr_method());

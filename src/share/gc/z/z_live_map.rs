@@ -1,12 +1,11 @@
 use super::z_bitmap::ZBitMap;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU64 as _AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 const NUM_SEGMENTS: usize = 64;
 const BITS_PER_OBJECT: usize = 2;
 const SEGMENT_LIVE_BITS: u64 = 0;
 const SEGMENT_CLAIM_BITS: u64 = 0;
 
-#[derive(Clone)]
 pub struct ZLiveMap {
     segment_size: usize,
     segment_shift: u32,

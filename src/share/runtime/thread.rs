@@ -15,7 +15,7 @@ pub enum ThreadType {
     WatcherThread,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Thread {
     id: u64,
     os_thread_id: u64,

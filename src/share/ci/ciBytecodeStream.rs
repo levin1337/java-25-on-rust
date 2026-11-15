@@ -153,36 +153,29 @@ impl<'m, 'a> CiBytecodeStream<'m, 'a> {
         self.code()
     }
 
-    /// Operand kind for the current instruction.
+    /// Operand kind for the current instruction, decoded by raw
+    /// opcode byte (covers the `_N` and `wide` forms uniformly).
     pub fn operand_kind(&self) -> CiOperandKind {
-        let Some(code) = self.code() else {
-            return CiOperandKind::None;
-        };
         use CiOperandKind::*;
-        use Code::*;
-        match code {
-            Iload | Lload | Fload | Dload | Aload | Iload0..=Iload3 | Lload0..=Lload3
-            | Fload0..=Fload3 | Dload0..=Dload3 | Aload0..=Aload3 | Istore | Lstore | Fstore
-            | Dstore | Astore | Istore0..=Istore3 | Lstore0..=Lstore3 | Fstore0..=Fstore3
-            | Dstore0..=Dstore3 | Astore0..=Astore3 | Ret => LocalU1,
-            Iinc => Iinc,
-            Ifeq | Ifne | Iflt | Ifge | Ifgt | Ifle | IfIcmpeq | IfIcmpne | IfIcmplt
-            | IfIcmpge | IfIcmpgt | IfIcmple | IfAcmpeq | IfAcmpne | Ifnull | Ifnonnull | Goto => {
-                BranchS2
-            }
-            GotoW | JsrW => BranchS4,
-            Jsr => BranchS2,
-            Ldc => ConstantPool,
-            LdcW | Ldc2W => ConstantPool,
-            Getstatic | Putstatic | Getfield | Putfield | Invokevirtual | Invokespecial
-            | Invokestatic => MemberRef,
-            Invokeinterface => InvokeInterface,
-            Invokedynamic => MemberRef,
-            New | Checkcast | Instanceof | Anewarray => ClassRef,
-            Newarray => NewArrayType,
-            Multianewarray => MultiANewArray,
-            Tableswitch => Tableswitch,
-            Lookupswitch => Lookupswitch,
+        let Some(code) = self.code() else {
+            return None;
+        };
+        let op = code as u8;
+        if (0x15..=0x4e).contains(&op) || op == 0x84 || op == 0xa9 {
+            // iload..astore incl. _N forms, iinc, ret
+            return LocalU1;
+        }
+        match op {
+            0x99..=0xa8 | 0xc6 | 0xc7 => BranchS2, // if*, goto, jsr, ifnull, ifnonnull
+            0xc8 | 0xc9 => BranchS4,             // goto_w, jsr_w
+            0x12..=0x14 => ConstantPool,         // ldc, ldc_w, ldc2_w
+            0xb2..=0xb5 | 0xb6..=0xb8 | 0xba => MemberRef, // field/invoke (non-interface)
+            0xb9 => InvokeInterface,
+            0xbb | 0xbd | 0xc0 | 0xc1 => ClassRef, // new, anewarray, checkcast, instanceof
+            0xbc => NewArrayType,
+            0xaa => Tableswitch,
+            0xab => Lookupswitch,
+            0xc5 => MultiANewArray,
             _ => None,
         }
     }

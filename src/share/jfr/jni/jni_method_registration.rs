@@ -1,0 +1,91 @@
+
+
+pub struct JniMethodSpec {
+    pub name: &'static [u8],
+    pub signature: &'static [u8],
+}
+
+pub const JNI_METHODS: &[JniMethodSpec] = &[
+    spec(b"beginRecording", b"()V"),
+    spec(b"isRecording", b"()Z"),
+    spec(b"endRecording", b"()V"),
+    spec(b"markChunkFinal", b"()V"),
+    spec(b"counterTime", b"()J"),
+    spec(b"createJFR", b"(Z)Z"),
+    spec(b"destroyJFR", b"()Z"),
+    spec(b"emitEvent", b"(JJJ)Z"),
+    spec(b"getAllEventClasses", b"()Ljava/util/List;"),
+    spec(b"getClassId", b"(Ljava/lang/Class;)J"),
+    spec(b"getPid", b"()Ljava/lang/String;"),
+    spec(b"getStackTraceId", b"(IJ)J"),
+    spec(b"getThreadId", b"(Ljava/lang/Thread;)J"),
+    spec(b"getTicksFrequency", b"()J"),
+    spec(b"subscribeLogLevel", b"(Ljdk/jfr/internal/LogTag;I)V"),
+    spec(b"log", b"(IILjava/lang/String;)V"),
+    spec(b"logEvent", b"(I[Ljava/lang/String;Z)V"),
+    spec(b"retransformClasses", b"([Ljava/lang/Class;)V"),
+    spec(b"setEnabled", b"(JZ)V"),
+    spec(b"setFileNotification", b"(J)V"),
+    spec(b"setGlobalBufferCount", b"(J)V"),
+    spec(b"setGlobalBufferSize", b"(J)V"),
+    spec(b"setMethodSamplingPeriod", b"(JJ)V"),
+    spec(b"setOutput", b"(Ljava/lang/String;)V"),
+    spec(b"setStackDepth", b"(I)V"),
+    spec(b"setStackTraceEnabled", b"(JZ)V"),
+    spec(b"setThreadBufferSize", b"(J)V"),
+    spec(b"setMemorySize", b"(J)V"),
+    spec(b"setThreshold", b"(JJ)Z"),
+    spec(b"storeMetadataDescriptor", b"([B)V"),
+    spec(b"getAllowedToDoEventRetransforms", b"()Z"),
+    spec(b"isAvailable", b"()Z"),
+    spec(b"getTimeConversionFactor", b"()D"),
+    spec(b"getTypeId", b"(Ljava/lang/Class;)J"),
+    spec(b"getTypeId", b"(Ljava/lang/String;)J"),
+    spec(b"getEventWriter", b"()Ljdk/jfr/internal/event/EventWriter;"),
+    spec(b"newEventWriter", b"()Ljdk/jfr/internal/event/EventWriter;"),
+    spec(b"flush", b"(Ljdk/jfr/internal/event/EventWriter;II)V"),
+    spec(b"flush", b"()V"),
+    spec(b"commit", b"(J)J"),
+    spec(b"setRepositoryLocation", b"(Ljava/lang/String;)V"),
+    spec(b"setDumpPath", b"(Ljava/lang/String;)V"),
+    spec(b"getDumpPath", b"()Ljava/lang/String;"),
+    spec(b"abort", b"(Ljava/lang/String;)V"),
+    spec(b"addStringConstant", b"(JLjava/lang/String;)Z"),
+    spec(b"uncaughtException", b"(Ljava/lang/Thread;Ljava/lang/Throwable;)V"),
+    spec(b"setForceInstrumentation", b"(Z)V"),
+    spec(b"getUnloadedEventClassCount", b"()J"),
+    spec(b"setMiscellaneous", b"(JJ)V"),
+    spec(b"setThrottle", b"(JJJ)Z"),
+    spec(b"setCPURate", b"(D)V"),
+    spec(b"setCPUPeriod", b"(J)V"),
+    spec(b"emitOldObjectSamples", b"(JZZ)V"),
+    spec(b"shouldRotateDisk", b"()Z"),
+    spec(b"exclude", b"(Ljava/lang/Thread;)V"),
+    spec(b"include", b"(Ljava/lang/Thread;)V"),
+    spec(b"isExcluded", b"(Ljava/lang/Thread;)Z"),
+    spec(b"isExcluded", b"(Ljava/lang/Class;)Z"),
+    spec(b"getChunkStartNanos", b"()J"),
+    spec(b"getConfiguration", b"(Ljava/lang/Class;)Ljava/lang/Object;"),
+    spec(b"setConfiguration", b"(Ljava/lang/Class;Ljdk/jfr/internal/event/EventConfiguration;)Z"),
+    spec(b"isInstrumented", b"(Ljava/lang/Class;)Z"),
+    spec(b"isContainerized", b"()Z"),
+    spec(b"hostTotalMemory", b"()J"),
+    spec(b"hostTotalSwapMemory", b"()J"),
+    spec(b"emitDataLoss", b"(J)V"),
+    spec(b"registerStackFilter", b"([Ljava/lang/String;[Ljava/lang/String;)J"),
+    spec(b"unregisterStackFilter", b"(J)V"),
+    spec(b"nanosNow", b"()J"),
+    spec(b"isProduct", b"()Z"),
+    spec(b"setMethodTraceFilters", b"([Ljava/lang/String;[Ljava/lang/String;[Ljava/lang/String;[I)[J"),
+    spec(b"drainStaleMethodTracerIds", b"()[J"),
+];
+
+const fn spec(name: &'static [u8], signature: &'static [u8]) -> JniMethodSpec {
+    JniMethodSpec { name, signature }
+}
+
+pub fn find(name: &[u8], signature: &[u8]) -> Option<&'static JniMethodSpec> {
+    JNI_METHODS
+        .iter()
+        .find(|spec| spec.name == name && spec.signature == signature)
+}

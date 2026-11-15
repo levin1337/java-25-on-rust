@@ -14,7 +14,7 @@
  *     SetThreadGroupAffinity) — required on >64-CPU machines
  */
 
-use super::{last_error_io, GroupAffinity, Handle, OsWindows};
+use super::{GroupAffinity, Handle, OsWindows, last_error_io};
 use std::ffi::c_void;
 use std::io;
 
@@ -74,9 +74,7 @@ impl Thread {
     where
         F: FnOnce() + Send + 'static,
     {
-        let payload = Box::new(ThreadPayload {
-            f: Box::new(f),
-        });
+        let payload = Box::new(ThreadPayload { f: Box::new(f) });
         let raw = Box::into_raw(payload);
         let flags = if suspended { CREATE_SUSPENDED } else { 0 };
         let mut id: u32 = 0;
@@ -161,9 +159,7 @@ impl Thread {
     }
 
     pub fn is_finished(&self) -> bool {
-        self.exit_code()
-            .map(|c| c != STILL_ACTIVE)
-            .unwrap_or(true)
+        self.exit_code().map(|c| c != STILL_ACTIVE).unwrap_or(true)
     }
 
     /// Wait for thread exit and return its exit code.
@@ -279,13 +275,7 @@ impl OsWindows {
             let mut exited = super::FileTime::default();
             let mut kernel = super::FileTime::default();
             let mut user = super::FileTime::default();
-            if super::GetThreadTimes(
-                handle,
-                &mut created,
-                &mut exited,
-                &mut kernel,
-                &mut user,
-            ) == 0
+            if super::GetThreadTimes(handle, &mut created, &mut exited, &mut kernel, &mut user) == 0
             {
                 return Err(last_error_io("GetThreadTimes"));
             }

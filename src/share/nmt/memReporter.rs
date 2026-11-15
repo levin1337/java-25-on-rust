@@ -22,10 +22,6 @@ use super::mallocTracker::MallocMemory;
 use super::nmtCommon::{NmtUtil, SCALE_KB};
 use super::virtualMemoryTracker::VirtualMemory;
 
-fn kb(bytes: usize) -> String {
-    format!("{}KB", bytes / 1024)
-}
-
 fn scaled(bytes: usize, scale: usize) -> String {
     format!("{}{}", NmtUtil::amount_in_scale(bytes, scale), NmtUtil::scale_name(scale))
 }
@@ -55,7 +51,7 @@ impl<'a> MemReporter<'a> {
     /// Full report at the baseline's level.
     pub fn generate(&self) -> String {
         match self.baseline.baseline_type() {
-            super::memBaseline::BaselineType::Detail Baselined => self.generate_detail(),
+            super::memBaseline::BaselineType::DetailBaselined => self.generate_detail(),
             _ => self.generate_summary(),
         }
     }
@@ -92,11 +88,10 @@ impl<'a> MemReporter<'a> {
         ));
         let mm = self.baseline.malloc_memory_snapshot();
         out.push_str(&format!(
-            "-                 {} (reserved={}, committed={}{})\n",
+            "-                 {} (reserved={}, committed={})\n",
             "reserved by malloc tracking overhead",
             self.fmt(mm.malloc_overhead()),
-            self.fmt(mm.malloc_overhead()),
-            ""
+            self.fmt(mm.malloc_overhead())
         ));
         let arena = self.baseline.total_arena_memory();
         if arena > 0 {
@@ -192,10 +187,8 @@ impl<'a> MemReporter<'a> {
         }
     }
 
-    fn baseline_malloc_sites(&self) -> &[super::memBaseline::MallocSiteSnapshotView] {
-        // The baseline stores MallocSiteSnapshot directly; this helper is
-        // only used when detail baselines exist.
-        unsafe { std::mem::transmute::<&[super::mallocSiteTable::MallocSiteSnapshot], &[super::memBaseline::MallocSiteSnapshotView]>(self.baseline.malloc_sites_ref()) }
+    fn baseline_malloc_sites(&self) -> &[super::mallocSiteTable::MallocSiteSnapshot] {
+        self.baseline.malloc_sites_ref()
     }
 
     /// Metaspace section (populated by the VM; zeros omitted).
@@ -297,6 +290,7 @@ mod tests {
 
     #[test]
     fn report_contains_totals() {
+        let _g = crate::share::nmt::nmtCommon::NMT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         MemTracker::initialize(super::super::nmtCommon::NmtTrackingLevel::Summary);
         let vmt = VirtualMemoryTracker::global();
         let stack = super::super::nativeCallStack::NativeCallStack::empty();
@@ -313,6 +307,7 @@ mod tests {
 
     #[test]
     fn report_format_sections() {
+        let _g = crate::share::nmt::nmtCommon::NMT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         MemTracker::initialize(super::super::nmtCommon::NmtTrackingLevel::Summary);
         let t = MemTracker::global();
         let h = t.record_malloc(8192, MemTag::MtSymbol);

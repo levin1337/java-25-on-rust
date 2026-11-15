@@ -42,10 +42,10 @@ impl G1FromCardCache {
     /// `true` if the card was newly added (i.e. the caller should
     /// record a remembered-set entry).
     pub fn add(&mut self, region: usize, card_in_region: u32) -> bool {
+        let (word, bit) = self.bit_index(card_in_region);
         let Some(bitmap) = self.bitmaps.get_mut(region) else {
             return false;
         };
-        let (word, bit) = self.bit_index(card_in_region);
         if word >= bitmap.len() {
             return false;
         }

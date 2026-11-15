@@ -269,7 +269,7 @@ pub fn effect_lookup(name: &str) -> i32 {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Component {
     pub name: String,
     pub type_name: String,
@@ -277,11 +277,13 @@ pub struct Component {
 }
 
 impl Component {
+    // C++ Component::is - exact equality of use/def info
     pub fn is(&self, flag: i32) -> bool {
-        self.usedef & flag == flag && flag != 0
+        self.usedef == flag
     }
+    // C++ Component::isa - superset check
     pub fn isa(&self, flag: i32) -> bool {
-        self.usedef & flag != 0
+        (self.usedef & flag) == flag
     }
     pub fn usedef_name(&self) -> &'static str {
         match self.usedef {
@@ -327,92 +329,108 @@ impl ComponentList {
     pub fn num_operands(&self) -> usize {
         self.components.len()
     }
+    // Port of ComponentList::operand_position(name)
     pub fn operand_position(&self, name: &str) -> i32 {
-        self.operand_position_usedef(name, None)
-    }
-    // Port of ComponentList::operand_position(name) and (name,usedef,fm);
-    // the Form* fm parameter is only used for diagnostics, so it is dropped.
-    pub fn operand_position_usedef(&self, name: &str, usedef: Option<i32>) -> i32 {
         const NOT_IN_LIST: i32 = -1;
-        let mut position: i32 = 0;
-        let num_opnds = self.num_operands() as i32;
-        let mut num_opnds_adj = num_opnds;
-        let mut preceding_non_use: Option<&Component> = None;
-        let mut first_def: Option<&Component> = None;
+        let mut position = 0i32;
+        for component in &self.components {
+            // When the first component is not a DEF,
+            // leave space for the result operand!
+            if position == 0 && !component.isa(DEF) {
+                position += 1;
+            }
+            if component.name == name {
+                return position;
+            }
+            if component.isa(DEF) && component.isa(USE) {
+                position += 1;
+                if position != 1 {
+                    position -= 1; // only use two slots for the 1st USE_DEF
+                }
+            }
+            position += 1;
+        }
+        NOT_IN_LIST
+    }
+    // Port of ComponentList::operand_position(name, usedef, fm);
+    // the Form* fm parameter is only used for diagnostics, so it is dropped.
+    pub fn operand_position_usedef(&self, name: &str, usedef: i32) -> i32 {
+        const NOT_IN_LIST: i32 = -1;
+        let mut position = 0i32;
+        let mut num_opnds = self.components.len() as i32;
+        let mut preceding_non_use: Option<usize> = None;
+        let mut first_def: Option<usize> = None;
         for (idx, component) in self.components.iter().enumerate() {
-            let mut pos = position + idx as i32;
-            if idx == 0 && !component.is(DEF) {
-                pos += 1;
-                num_opnds_adj += 1;
+            // When the first component is not a DEF,
+            // leave space for the result operand!
+            if position == 0 && !component.isa(DEF) {
+                position += 1;
+                num_opnds += 1;
             }
-            if let Some(ud) = usedef {
-                if component.name == name && component.is(ud) {
-                    if idx == 0 && ud == USE && component.is(DEF) {
-                        return pos + 1;
+            if component.name == name && component.isa(usedef) {
+                // When the first entry in the component list is a DEF and a USE
+                // Treat them as being separate, a DEF first, then a USE
+                if position == 0 && usedef == USE && component.isa(DEF) {
+                    return position + 1;
+                } else {
+                    if let Some(p) = preceding_non_use {
+                        if self.components[p].name != component.name {
+                            // C++ prints a warning here; recorded by caller if needed
+                        }
                     }
-                    let _ = (preceding_non_use, first_def, num_opnds_adj);
-                    return pos;
-                }
-            } else if component.name == name {
-                return pos;
-            }
-            if component.is(DEF) && component.is(USE) {
-                pos += 1;
-                if pos != 1 {
-                    pos -= 1;
+                    if position >= num_opnds {
+                        // C++ prints "too late in its name list" warning
+                    }
+                    return position;
                 }
             }
-            if component.is(DEF) && first_def.is_none() {
-                first_def = Some(component);
+            if component.isa(DEF) && component.isa(USE) {
+                position += 1;
+                if position != 1 {
+                    position -= 1; // only use two slots for the 1st USE_DEF
+                }
             }
-            if !component.is(USE) && Some(component) != first_def {
-                preceding_non_use = Some(component);
+            if component.isa(DEF) && first_def.is_none() {
+                first_def = Some(idx);
+            }
+            if !component.isa(USE) && Some(idx) != first_def {
+                preceding_non_use = Some(idx);
             } else if let Some(p) = preceding_non_use {
-                if component.name == p.name {
+                if component.name == self.components[p].name {
                     preceding_non_use = None;
                 }
             }
+            position += 1;
         }
-        let _ = num_opnds_adj;
+        NOT_IN_LIST
+    }
+    fn typed_position(&self, type_name: &str) -> i32 {
+        const NOT_IN_LIST: i32 = -1;
+        let mut position = 0i32;
+        for comp in &self.components {
+            // When the first component is not a DEF,
+            // leave space for the result operand!
+            if position == 0 && !comp.isa(DEF) {
+                position += 1;
+            }
+            if comp.type_name == type_name {
+                return position;
+            }
+            if comp.isa(DEF) && comp.isa(USE) {
+                position += 1;
+                if position != 1 {
+                    position -= 1; // only use two slots for the 1st USE_DEF
+                }
+            }
+            position += 1;
+        }
         NOT_IN_LIST
     }
     pub fn label_position(&self) -> i32 {
-        let mut position = 0i32;
-        for (idx, comp) in self.components.iter().enumerate() {
-            let mut pos = position + idx as i32;
-            if idx == 0 && !comp.is(DEF) {
-                pos += 1;
-            }
-            if comp.type_name == "label" {
-                return pos;
-            }
-            if comp.is(DEF) && comp.is(USE) {
-                pos += 1;
-                if pos != 1 {
-                    pos -= 1;
-                }
-            }
-        }
-        -1
+        self.typed_position("label")
     }
     pub fn method_position(&self) -> i32 {
-        let mut position = 0i32;
-        for (idx, comp) in self.components.iter().enumerate() {
-            let mut pos = position + idx as i32;
-            if idx == 0 && !comp.is(DEF) {
-                pos += 1;
-            }
-            if comp.type_name == "method" {
-                return pos;
-            }
-            if comp.is(DEF) && comp.is(USE) {
-                pos += 1;
-                if pos != 1 {
-                    pos -= 1;
-                }
-            }
-        }
-        -1
+        self.typed_position("method")
     }
 }
 
@@ -493,7 +511,7 @@ impl MatchNode {
     pub fn leaf(result: Option<String>, name: Option<String>, op_type: String) -> MatchNode {
         MatchNode {
             result, name, op_type,
-            l_child: None, r_child: None, num_leaves: 1,
+            l_child: None, r_child: None, num_leaves: 0,
             internalop: None, commutative_id: 0,
         }
     }
@@ -557,24 +575,16 @@ impl MatchNode {
                 *position -= 1;
                 return false;
             }
-            let mut match_node: Option<&MatchNode> = None;
+            let mut match_node: Option<MatchNode> = None;
             if let Some(form) = globals.get(&self.op_type) {
                 let f = form.borrow();
-                match f.kind {
-                    FormKind::Operand => {
-                        if let Some(mr) = &f.matrule {
-                            match_node = Some(&mr.borrow().m);
-                        }
+                if matches!(f.kind, FormKind::Operand | FormKind::Instruct) {
+                    if let Some(mr) = &f.matrule {
+                        match_node = Some(mr.borrow().m.clone());
                     }
-                    FormKind::Instruct => {
-                        if let Some(mr) = &f.matrule {
-                            match_node = Some(&mr.borrow().m);
-                        }
-                    }
-                    _ => {}
                 }
             }
-            if let Some(mn) = match_node {
+            if let Some(ref mn) = match_node {
                 return mn.base_operand(position, globals, result, name, op_type);
             }
             if *position == 0 {
@@ -1063,6 +1073,7 @@ impl Form {
             effects: HashMap::new(),
             has_call: false,
             interface: None,
+            classes: Vec::new(),
             format_strings: Vec::new(),
             format_rep_vars: Vec::new(),
             expand_newopers: Vec::new(),
@@ -1199,17 +1210,30 @@ impl Form {
         matches!(self.kind, FormKind::RegClass | FormKind::CodeSnippetRegClass | FormKind::ConditionalRegClass)
     }
 
-    // interface_type for Operand forms
-    pub fn interface_type(&self, _globals: &HashMap<String, FormRef>) -> Option<InterfaceKind> {
+    // interface_type: for Operand returns its interface kind; for OpClass
+    // returns the common interface kind of all member operands (None if
+    // members disagree or have no interface), mirroring the C++ union logic.
+    pub fn interface_type(&self, globals: &HashMap<String, FormRef>) -> Option<InterfaceKind> {
         match self.kind {
             FormKind::Operand => self.interface.as_ref().map(|i| i.kind),
             FormKind::OpClass => {
-                // union of member operand interface types; simplified: first member's
+                let mut result: Option<InterfaceKind> = None;
                 for name in &self.oplst {
-                    // caller resolves; return None to be resolved by helper
-                    let _ = name;
+                    let t = globals.get(name).and_then(|of| {
+                        let f = of.borrow();
+                        if f.kind == FormKind::Operand {
+                            f.interface.as_ref().map(|i| i.kind)
+                        } else {
+                            None
+                        }
+                    });
+                    match (result, t) {
+                        (None, Some(t)) => result = Some(t),
+                        (Some(r), Some(t)) if r == t => {}
+                        _ => return None,
+                    }
                 }
-                None
+                result
             }
             _ => None,
         }
@@ -1404,7 +1428,7 @@ pub struct ArchDesc {
     pub internal_op_names: NameList,
     // internal_match maps internal name -> serialized match node is complex;
     // store the MatchNode clone.
-    pub internal_match: HashMap<String, MatchNode>,
+    pub internal_match: HashMap<String, MatchNodeRef>,
 
     pub preproc_list: NameList,
     pub preproc_table: HashMap<String, String>,
@@ -1431,8 +1455,8 @@ pub struct ArchDesc {
 pub struct MatchListEntry {
     pub opcode: String,
     pub result_str: String,
-    pub lchild: String,
-    pub rchild: String,
+    pub lchild: Option<String>,
+    pub rchild: Option<String>,
     pub pred: Option<String>,
     pub cost: String,
 }

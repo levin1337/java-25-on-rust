@@ -13,7 +13,7 @@
  */
 
 use super::gvn::PhaseGVN;
-use super::node::{NodeId, Opcode, NONE};
+use super::node::{NONE, NodeId, Opcode};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -84,10 +84,10 @@ pub fn is_control_entry(op: &Opcode) -> bool {
 pub fn mem_index(op: &Opcode) -> Option<usize> {
     use Opcode::*;
     match op {
-        LoadI | LoadL | LoadF | LoadD | LoadP | LoadB | LoadC | LoadS
-        | StoreI | StoreL | StoreF | StoreD | StoreP | StoreB | StoreC | StoreS
-        | New(_) | NewArray(_) | NewArrayRef(_) | MultianewArray | Call(_)
-        | CheckCast(_) | InstanceOf(_) | MonitorEnter | MonitorExit | Athrow => Some(0),
+        LoadI | LoadL | LoadF | LoadD | LoadP | LoadB | LoadC | LoadS | StoreI | StoreL
+        | StoreF | StoreD | StoreP | StoreB | StoreC | StoreS | New(_) | NewArray(_)
+        | NewArrayRef(_) | MultianewArray | Call(_) | CheckCast(_) | InstanceOf(_)
+        | MonitorEnter | MonitorExit | Athrow => Some(0),
         _ => None,
     }
 }
@@ -98,10 +98,10 @@ pub fn ctrl_index(op: &Opcode) -> Option<usize> {
     match op {
         If | IfTrue | IfFalse | Return => Some(0),
         Athrow => Some(1),
-        LoadI | LoadL | LoadF | LoadD | LoadP | LoadB | LoadC | LoadS
-        | StoreI | StoreL | StoreF | StoreD | StoreP | StoreB | StoreC | StoreS
-        | New(_) | NewArray(_) | NewArrayRef(_) | MultianewArray | Call(_)
-        | CheckCast(_) | InstanceOf(_) | MonitorEnter | MonitorExit | ArrayLength => Some(1),
+        LoadI | LoadL | LoadF | LoadD | LoadP | LoadB | LoadC | LoadS | StoreI | StoreL
+        | StoreF | StoreD | StoreP | StoreB | StoreC | StoreS | New(_) | NewArray(_)
+        | NewArrayRef(_) | MultianewArray | Call(_) | CheckCast(_) | InstanceOf(_)
+        | MonitorEnter | MonitorExit | ArrayLength => Some(1),
         _ => None,
     }
 }
@@ -341,11 +341,7 @@ impl<'a> Scheduler<'a> {
             // Candidates control-dependent on this block's entry control,
             // plus effects chained onto the current exit control token
             // (calls/news/monitors advance it inside the block).
-            let mut candidates = self
-                .ctrl_users
-                .get(&entry)
-                .cloned()
-                .unwrap_or_default();
+            let mut candidates = self.ctrl_users.get(&entry).cloned().unwrap_or_default();
             if exit_ctrl != entry
                 && let Some(extra) = self.ctrl_users.get(&exit_ctrl)
             {
@@ -380,7 +376,7 @@ impl<'a> Scheduler<'a> {
             let mut next_mem = NONE;
             for &n in &candidates {
                 let op = &self.gvn.node(n).op;
-                if !produces_mem(op) {
+                if !produces_mem(op) || is_terminal(op) {
                     continue;
                 }
                 if let Some(mi) = mem_index(op)
@@ -432,11 +428,7 @@ impl<'a> Scheduler<'a> {
                         if matches!(mn.op, Opcode::IfTrue | Opcode::IfFalse)
                             && mn.inputs.first().copied() == Some(if_id)
                         {
-                            if let Some(sb) = self.block_for_control_or_add(
-                                m,
-                                blocks,
-                                &mut succs,
-                            ) {
+                            if let Some(sb) = self.block_for_control_or_add(m, blocks, &mut succs) {
                                 succs.push(Edge { block: sb, ctrl: m });
                             }
                         }
@@ -454,10 +446,11 @@ impl<'a> Scheduler<'a> {
                     continue;
                 }
                 if node.inputs.contains(&exit_ctrl) {
-                    if let Some(sb) =
-                        self.block_for_control_or_add(rid, blocks, &mut succs)
-                    {
-                        succs.push(Edge { block: sb, ctrl: exit_ctrl });
+                    if let Some(sb) = self.block_for_control_or_add(rid, blocks, &mut succs) {
+                        succs.push(Edge {
+                            block: sb,
+                            ctrl: exit_ctrl,
+                        });
                         fall = true;
                     }
                 }
@@ -481,18 +474,10 @@ impl<'a> Scheduler<'a> {
     fn entry_mem(&self, entry: NodeId) -> NodeId {
         match self.gvn.node(entry).op {
             Opcode::Start => entry,
-            Opcode::IfTrue | Opcode::IfFalse => self
-                .gvn
-                .node(entry)
-                .inputs
-                .get(1)
-                .copied()
-                .unwrap_or(entry),
-            Opcode::Region => self
-                .mem_of_region
-                .get(&entry)
-                .copied()
-                .unwrap_or(entry),
+            Opcode::IfTrue | Opcode::IfFalse => {
+                self.gvn.node(entry).inputs.get(1).copied().unwrap_or(entry)
+            }
+            Opcode::Region => self.mem_of_region.get(&entry).copied().unwrap_or(entry),
             _ => entry,
         }
     }
@@ -633,10 +618,7 @@ pub fn phi_input_count(gvn: &PhaseGVN, phi: NodeId) -> usize {
 
 /// Region input index used by a given predecessor control node, if any.
 pub fn region_pred_index(gvn: &PhaseGVN, region: NodeId, ctrl: NodeId) -> Option<usize> {
-    gvn.node(region)
-        .inputs
-        .iter()
-        .position(|&c| c == ctrl)
+    gvn.node(region).inputs.iter().position(|&c| c == ctrl)
 }
 
 /// All Phi nodes whose merge region is `region`.

@@ -129,7 +129,7 @@ impl G1HeapRegionRemSet {
     /// `to_card`: absolute card index of `from`.
     #[inline]
     pub fn to_card(&self, from: usize) -> u32 {
-        from.saturating_sub(self.heap_base) >> self.card_shift
+        (from.saturating_sub(self.heap_base) >> self.card_shift) as u32
     }
 
     /// `add_reference`: records `from`'s card in the shared card set.

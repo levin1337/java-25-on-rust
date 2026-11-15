@@ -50,7 +50,8 @@ impl<T: Copy + Default> ZGranuleMap<T> {
     }
 
     pub fn addr_mut(&mut self, offset: ZOffset) -> &mut T {
-        &mut self.map[self.index_for_offset(offset)]
+        let index = self.index_for_offset(offset);
+        &mut self.map[index]
     }
 }
 

@@ -48,14 +48,11 @@ fn inspect() -> Result<(), Box<dyn Error>> {
                 return Err(io::Error::other("Empty system property name").into());
             }
             properties.push((key.to_owned(), value.to_owned()));
-        } else if (text.starts_with("-X") || text.starts_with("--"))
-            && text != "--class-path"
-        {
+        } else if (text.starts_with("-X") || text.starts_with("--")) && text != "--class-path" {
             let option = arguments.next().unwrap();
-            if option
-                .to_str()
-                .is_some_and(|arg| arg == "--add-exports" || arg == "--add-opens" || arg == "--patch-module")
-            {
+            if option.to_str().is_some_and(|arg| {
+                arg == "--add-exports" || arg == "--add-opens" || arg == "--patch-module"
+            }) {
                 let _ = arguments.next();
             }
         } else {
@@ -74,8 +71,9 @@ fn inspect() -> Result<(), Box<dyn Error>> {
         return inspectClass(Path::new(&target));
     }
 
-    let storage: &'static jvm25_rust::share::runtime::syncBump::SyncBump =
-        Box::leak(Box::new(jvm25_rust::share::runtime::syncBump::SyncBump::new()));
+    let storage: &'static jvm25_rust::share::runtime::syncBump::SyncBump = Box::leak(Box::new(
+        jvm25_rust::share::runtime::syncBump::SyncBump::new(),
+    ));
     let (mut loader, name) = if target == "-jar" {
         let path = arguments
             .next()
@@ -117,10 +115,7 @@ fn inspect() -> Result<(), Box<dyn Error>> {
         // (<java.home>/lib/modules) so JDK code that resolves files
         // relative to the runtime (conf/security/java.security, lib,
         // ...) sees a consistent layout.
-        if let Some(java_home) = Path::new(&modules)
-            .parent()
-            .and_then(|lib| lib.parent())
-        {
+        if let Some(java_home) = Path::new(&modules).parent().and_then(|lib| lib.parent()) {
             loader.setSystemProperty("java.home", &java_home.to_string_lossy())?;
         }
         loader = loader.withBootImage(Path::new(&modules))?;

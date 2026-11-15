@@ -144,7 +144,7 @@ impl ZGeneration {
     }
 
     pub fn select_relocation_set(&self, pages: &[ZPage], tenuring_threshold: u8, max_selected: usize) -> ZRelocationSetSelector {
-        ZRelocationSetSelector::select(pages, self.seqnum(), tenuring_threshold, max_selected)
+        ZRelocationSetSelector::select(pages, self.seqnum(), tenuring_threshold, max_selected, Some(self.id))
     }
 
     pub fn install_relocation_set(&self, pages: &[ZPage], selector: &ZRelocationSetSelector, tenuring_threshold: u8) {

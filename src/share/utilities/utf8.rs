@@ -26,6 +26,7 @@ pub mod utf8 {
                     (bytes[0] as u16, 1)
                 }
             }
+            _ => (bytes[0] as u16, 1),
         }
     }
 
@@ -100,7 +101,7 @@ pub mod utf8 {
     pub fn from_quoted_ascii(quoted: &str) -> Vec<u8> {
         let bytes = quoted.as_bytes();
         let mut end = 0usize;
-        while end < bytes.len() && bytes[end] >= 32 && bytes[end] < 127 {
+        while end < bytes.len() && bytes[end] != b'\\' && bytes[end] >= 32 && bytes[end] < 127 {
             end += 1;
         }
         if end == bytes.len() {
@@ -400,7 +401,7 @@ pub mod unicode {
             if (32..127).contains(&c) {
                 result.push(c as u8 as char);
             } else {
-                result.push_str(&format!("\\u{:04x}", c & 0xff));
+                result.push_str(&format!("\\u{:04x}", c as u8));
             }
         }
         result
@@ -441,8 +442,12 @@ mod tests {
         assert!(utf8::is_legal_utf8("héllo€".as_bytes(), false));
         assert!(!utf8::is_legal_utf8(&[0x80, 0x80], false));
         assert!(!utf8::is_legal_utf8(b"a\0b", false));
+        // modified UTF-8 encodes U+0000 as C0 80, which is always legal
         assert!(utf8::is_legal_utf8(&[0xC0, 0x80], true));
-        assert!(!utf8::is_legal_utf8(&[0xC0, 0x80], false));
+        assert!(utf8::is_legal_utf8(&[0xC0, 0x80], false));
+        // overlong encoding of a non-zero char is illegal for newer versions
+        assert!(!utf8::is_legal_utf8(&[0xC1, 0xBF], false));
+        assert!(utf8::is_legal_utf8(&[0xC1, 0xBF], true));
     }
 
     #[test]
@@ -464,7 +469,7 @@ mod tests {
         let back = utf8::from_quoted_ascii(&s);
         assert_eq!(back, "aéb".as_bytes());
         let q = unicode::as_quoted_ascii_jchars(&[65, 233, 66]);
-        assert_eq!(q, "a\\u00e9b");
+        assert_eq!(q, "A\\u00e9B");
     }
 
     #[test]

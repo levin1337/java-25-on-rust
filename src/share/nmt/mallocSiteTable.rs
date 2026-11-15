@@ -11,7 +11,6 @@ use super::allocationSite::AllocationSite;
 use super::mallocTracker::MemoryCounter;
 use super::memTag::MemTag;
 use super::nativeCallStack::NativeCallStack;
-use super::nmtCommon::NmtUtil;
 use std::sync::{Mutex, OnceLock};
 
 /// MallocSite — a code path that calls os::malloc(), with its counters.
@@ -139,7 +138,7 @@ impl MallocSiteTable {
             return 0;
         }
         let pos = bucket.len();
-        let mut entry = MallocSiteHashtableEntry {
+        let entry = MallocSiteHashtableEntry {
             site: MallocSite::new(*stack, mem_tag),
             hash,
         };
@@ -201,6 +200,33 @@ impl MallocSiteTable {
             true
         });
         out.sort_by(|a, b| b.size.cmp(&a.size));
+        out
+    }
+
+    /// Clear all sites (tests / shutdown).
+    pub fn reset(&self) {
+        for bucket in &self.table {
+            bucket.lock().unwrap().clear();
+        }
+    }
+
+    /// Render the detail "malloc site" section used by reports.
+    pub fn detail_section(&self) -> String {
+        let mut out = String::new();
+        let sites = self.sites_by_size();
+        if sites.is_empty() {
+            out.push_str("  (no malloc sites recorded)\n");
+            return out;
+        }
+        for site in sites {
+            out.push_str(&format!(
+                "  {}: {} bytes in {} allocations\n",
+                site.mem_tag.name(),
+                site.size,
+                site.count
+            ));
+            out.push_str(&site.stack.print_on());
+        }
         out
     }
 
@@ -289,6 +315,7 @@ mod tests {
 
     #[test]
     fn site_allocation_and_markers() {
+        let _g = crate::share::nmt::nmtCommon::NMT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let table = MallocSiteTable::global();
         let stack = NativeCallStack::from_frames(&[0xaaaa, 0xbbbb]);
         let m1 = MallocSiteTable::allocation_at(&stack, 100, MemTag::MtTest);

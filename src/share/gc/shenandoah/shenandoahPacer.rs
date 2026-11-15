@@ -114,10 +114,6 @@ impl ShenandoahPacer {
         self.epoch.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn tax_rate(&self) -> f64 {
-        f64::from_bits(self.tax_rate.load(Ordering::Relaxed))
-    }
-
     pub fn report_mark(&self, words: usize) {
         self.report_internal(words);
     }
@@ -240,7 +236,7 @@ mod tests {
 
     #[test]
     fn force_claim_when_exhausted() {
-        let pacer = ShenandoahPacer::new(1 << 20);
+        let mut pacer = ShenandoahPacer::new(1 << 20);
         pacer.setup_for_reset();
         let huge = (1usize << 40) / 8;
         assert!(!pacer.claim_for_alloc(huge, false));

@@ -138,22 +138,6 @@ impl LogTagSet {
         format!("Available tag sets: {}\n", labels.join(", "))
     }
 
-    /// Dice similarity between this tag set's label and a selection's tags,
-    /// used by suggestion heuristics (LogSelection::similarity works on
-    /// tag lists; here we expose the registered-set iteration helper).
-    pub(crate) fn similarity_to_tags(&self, tags: &[LogTag]) -> f64 {
-        let mut intersecting = 0usize;
-        for t in tags {
-            if self.contains(*t) {
-                intersecting += 1;
-            }
-        }
-        let total = self.ntags() + tags.len();
-        if total == 0 {
-            return 0.0;
-        }
-        2.0 * intersecting as f64 / total as f64
-    }
 }
 
 #[cfg(test)]

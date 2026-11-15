@@ -37,9 +37,9 @@ pub const TIME: u32 = 1 << 0;
 pub const UTCTIME: u32 = 1 << 1;
 pub const UPTIME: u32 = 1 << 2;
 pub const TIMEMILLIS: u32 = 1 << 3;
-pub const UPOTIMEMILLIS: u32 = 1 << 4;
+pub const UPTIMEMILLIS: u32 = 1 << 4;
 pub const TIMENANOS: u32 = 1 << 5;
-pub const UPOTIMENANOS: u32 = 1 << 6;
+pub const UPTIMENANOS: u32 = 1 << 6;
 pub const HOSTNAME: u32 = 1 << 7;
 pub const PID: u32 = 1 << 8;
 pub const TID: u32 = 1 << 9;
@@ -186,8 +186,8 @@ impl LogDecorations {
             || decorators.is_decorator(TIMEMILLIS);
         let needs_nanos = decorators.is_decorator(TIMENANOS);
         let needs_uptime = decorators.is_decorator(UPTIME)
-            || decorators.is_decorator(UPOTIMEMILLIS)
-            || decorators.is_decorator(UPOTIMENANOS);
+            || decorators.is_decorator(UPTIMEMILLIS)
+            || decorators.is_decorator(UPTIMENANOS);
         let needs_tid = decorators.is_decorator(TID);
         Self {
             millis: if needs_millis {
@@ -342,6 +342,7 @@ fn iso8601_time(millis: i64, utc: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::logTag::LogTag;
 
     #[test]
     fn parse_decorations() {
@@ -369,8 +370,8 @@ mod tests {
         let deco = LogDecorations::new(LogLevel::Info, &ts, &Decorations::parse("uptime,level,tags").unwrap());
         let mut padding = [0usize; N_DECORATORS];
         let s = deco.render_prefix(&mut padding);
-        assert!(s.contains("s] "));
-        assert!(s.contains("[info"));
+        assert!(s.contains("s]["));
+        assert!(s.contains("[info]"));
         assert!(s.contains("[gc]"));
         assert!(s.ends_with(' '));
 

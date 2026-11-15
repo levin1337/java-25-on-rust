@@ -1,3 +1,4 @@
+pub mod attachListener;
 pub mod diagnosticArgument;
 pub mod diagnosticCommand;
 pub mod diagnosticFramework;

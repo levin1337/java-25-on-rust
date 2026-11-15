@@ -186,12 +186,14 @@ fn decimal_exponent(value: f64) -> i32 {
 }
 
 fn format_float_exp(value: f64, precision: usize, upper: bool) -> String {
-    let exp = decimal_exponent(value);
-    let mant = value.abs() / 10f64.powi(exp);
-    let mut s = format!("{:.*}", precision, mant);
-    if precision > 0 {
-        s = s.trim_end_matches('0').trim_end_matches('.').to_string();
+    let mut exp = decimal_exponent(value);
+    let mut mant = value.abs() / 10f64.powi(exp);
+    // guard against rounding pushing the mantissa to 10.0
+    if precision > 0 && format!("{:.*}", precision, mant).parse::<f64>().unwrap_or(mant) >= 10.0 {
+        mant /= 10.0;
+        exp += 1;
     }
+    let s = format!("{:.*}", precision, mant);
     let mut out = s;
     out.push_str(&c_exponent(exp, upper));
     if upper {
@@ -527,7 +529,7 @@ mod tests {
         assert_eq!(format("%.3d", &[FormatArg::i64(5)]), "005");
         assert_eq!(format("%+d % d", &[FormatArg::i64(5), FormatArg::i64(5)]), "+5  5");
         assert_eq!(format("%c%c", &[FormatArg::char('a'), FormatArg::char('b')]), "ab");
-        assert_eq!(format("%%"), "%");
+        assert_eq!(format("%%", &[]), "%");
         assert_eq!(format("%p", &[FormatArg::ptr(0xdead)]), "0xdead");
     }
 

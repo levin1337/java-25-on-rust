@@ -1,0 +1,1320 @@
+    Blocking waiting for file lock on build directory
+    Checking jvm25-rust v0.1.0 (D:\jvm25-rust)
+error[E0433]: cannot find type `JfrTypeId` in this scope
+  --> src\share\jfr\metadata\jfr_metadata_repository.rs:48:19
+   |
+48 |         for id in JfrTypeId::all() {
+   |                   ^^^^^^^^^ use of undeclared type `JfrTypeId`
+   |
+help: consider importing this enum
+   |
+ 8 + use crate::share::jfr::utilities::jfr_types::JfrTypeId;
+   |
+
+error[E0433]: cannot find type `JfrTypeId` in this scope
+   --> src\share\jfr\metadata\jfr_metadata_repository.rs:117:26
+    |
+117 |         cw.write_type_id(JfrTypeId::MetadataType);
+    |                          ^^^^^^^^^ use of undeclared type `JfrTypeId`
+    |
+help: consider importing this enum
+    |
+  8 + use crate::share::jfr::utilities::jfr_types::JfrTypeId;
+    |
+
+warning: unused import: `ShenandoahAffiliation`
+  --> src\share\gc\shenandoah\shenandoahMarkingContext.rs:10:35
+   |
+10 | use super::shenandoahHeapRegion::{ShenandoahAffiliation, ShenandoahHeapRegion};
+   |                                   ^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `crate::share::classfile::classFileParser::Constant`
+  --> src\share\interpreter\interpreter.rs:19:5
+   |
+19 | use crate::share::classfile::classFileParser::Constant;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `std::sync::Arc`
+  --> src\share\interpreter\interpreter.rs:23:5
+   |
+23 | use std::sync::Arc;
+   |     ^^^^^^^^^^^^^^
+
+warning: unused import: `self`
+  --> src\share\interpreter\rewriter.rs:23:24
+   |
+23 | use super::bytecodes::{self, Code};
+   |                        ^^^^
+
+warning: unused imports: `TemplateTable` and `Template`
+  --> src\share\interpreter\templateInterpreter.rs:14:28
+   |
+14 | use super::templateTable::{Template, TemplateTable, TosState};
+   |                            ^^^^^^^^  ^^^^^^^^^^^^^
+
+warning: unused import: `crate::share::classfile::classFileParser::Constant`
+  --> src\share\interpreter\templateInterpreter.rs:16:5
+   |
+16 | use crate::share::classfile::classFileParser::Constant;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `std::sync::Arc`
+  --> src\share\interpreter\templateInterpreter.rs:21:5
+   |
+21 | use std::sync::Arc;
+   |     ^^^^^^^^^^^^^^
+
+warning: unused import: `DispatchTable`
+  --> src\share\interpreter\templateInterpreterGenerator.rs:16:45
+   |
+16 | use super::templateInterpreter::{CodeletId, DispatchTable, EntryPoint, TemplateInterpreter};
+   |                                             ^^^^^^^^^^^^^
+
+warning: unused import: `crate::share::interpreter::bytecodeInterpreter::Value`
+   --> src\share\jfr\dcmd\jfr_dcmd.rs:155:13
+    |
+155 |         use crate::share::interpreter::bytecodeInterpreter::Value;
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `JfrCheckpointBufferKind`
+  --> src\share\jfr\metadata\jfr_metadata_repository.rs:14:47
+   |
+14 | use crate::share::jfr::utilities::jfr_types::{JfrCheckpointBufferKind, JfrCheckpointType, EVENT_METADATA};
+   |                                               ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `VecDeque`
+  --> src\share\jfr\recorder\checkpoint\jfr_checkpoint_manager.rs:13:33
+   |
+13 | use std::collections::{HashMap, VecDeque};
+   |                                 ^^^^^^^^
+
+warning: unused import: `crate::share::jfr::utilities::jfr_time::JfrTicks`
+  --> src\share\jfr\recorder\checkpoint\jfr_checkpoint_manager.rs:18:5
+   |
+18 | use crate::share::jfr::utilities::jfr_time::JfrTicks;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `crate::share::jfr::utilities::jfr_time_converter`
+ --> src\share\jfr\recorder\repository\jfr_chunk.rs:6:5
+  |
+6 | use crate::share::jfr::utilities::jfr_time_converter;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `global_get_option` and `global_set_option`
+  --> src\share\jfr\recorder\service\jfr_recorder_service.rs:19:60
+   |
+19 | use crate::share::jfr::recorder::service::jfr_option_set::{global_get_option, global_set_option};
+   |                                                            ^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^
+
+warning: unused import: `self`
+  --> src\share\jvmci\jvmciCompilerToVM.rs:25:40
+   |
+25 | use crate::share::jvmci::jvmciObject::{self, JvmciObject, JvmciPrimitiveArray};
+   |                                        ^^^^
+
+warning: unused import: `crate::share::jvmci::jvmci::CodeInstallResult`
+   --> src\share\jvmci\jvmciCompilerToVM.rs:195:13
+    |
+195 |         use crate::share::jvmci::jvmci::CodeInstallResult;
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `JVMCI_NOT_ENABLED_ERROR_MESSAGE`
+  --> src\share\jvmci\jvmciEnv.rs:13:45
+   |
+13 |     JvmciException, JvmciResult, ThrowKind, JVMCI_NOT_ENABLED_ERROR_MESSAGE,
+   |                                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `crate::share::jvmci::vmSymbolsJvmci`
+  --> src\share\jvmci\jvmciRuntime.rs:19:5
+   |
+19 | use crate::share::jvmci::vmSymbolsJvmci;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `alloc_handle`
+  --> src\share\prims\processNatives.rs:15:43
+   |
+15 | use crate::share::prims::nioFileNatives::{alloc_handle, alloc_handle_unseekable, EntryKind};
+   |                                           ^^^^^^^^^^^^
+
+warning: unused import: `AsRawHandle`
+  --> src\share\prims\processNatives.rs:18:28
+   |
+18 | use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
+   |                            ^^^^^^^^^^^
+
+warning: unreachable expression
+    --> src\share\adlc\parser.rs:2400:13
+     |
+2226 | /             match kw.as_str() {
+2227 | |                 "fixed_latency" => {
+2228 | |                     self.skipws();
+2229 | |                     if self.curchar != b'(' {
+...    |
+2399 | |             }
+     | |_____________- any code following this `match` expression is unreachable, as all arms diverge
+2400 | /             if self.curchar == b'%' {
+2401 | |                 break;
+2402 | |             }
+     | |_____________^ unreachable expression
+     |
+     = note: `#[warn(unreachable_code)]` (part of `#[warn(unused)]`) on by default
+
+error[E0029]: only `char` and numeric types are allowed in range patterns
+    --> src\share\interpreter\bytecodeUtils.rs:1181:13
+     |
+1181 |             Code::Iconst0..=Code::Iconst5 => {
+     |             -------------^^^-------------
+     |             |               |
+     |             |               this is of type `bytecodes::Code` but it should be `char` or numeric
+     |             this is of type `bytecodes::Code` but it should be `char` or numeric
+
+error[E0599]: no associated function or constant named `Invokestatic` found for struct `method::Code<'a>` in the current scope
+   --> src\share\interpreter\interpreterRuntime.rs:481:15
+    |
+481 |         Code::Invokestatic => {
+    |               ^^^^^^^^^^^^ associated function or constant not found in `method::Code<'_>`
+    |
+   ::: src\share\oops\method.rs:26:1
+    |
+ 26 | pub struct Code<'a> {
+    | ------------------- associated function or constant `Invokestatic` not found for this struct
+
+error[E0599]: no associated function or constant named `Invokevirtual` found for struct `method::Code<'a>` in the current scope
+   --> src\share\interpreter\interpreterRuntime.rs:485:15
+    |
+485 |         Code::Invokevirtual | Code::Invokespecial => {
+    |               ^^^^^^^^^^^^^ associated function or constant not found in `method::Code<'_>`
+    |
+   ::: src\share\oops\method.rs:26:1
+    |
+ 26 | pub struct Code<'a> {
+    | ------------------- associated function or constant `Invokevirtual` not found for this struct
+
+error[E0599]: no associated function or constant named `Invokespecial` found for struct `method::Code<'a>` in the current scope
+   --> src\share\interpreter\interpreterRuntime.rs:485:37
+    |
+485 |         Code::Invokevirtual | Code::Invokespecial => {
+    |                                     ^^^^^^^^^^^^^ associated function or constant not found in `method::Code<'_>`
+    |
+   ::: src\share\oops\method.rs:26:1
+    |
+ 26 | pub struct Code<'a> {
+    | ------------------- associated function or constant `Invokespecial` not found for this struct
+
+error[E0599]: no associated function or constant named `Invokeinterface` found for struct `method::Code<'a>` in the current scope
+   --> src\share\interpreter\interpreterRuntime.rs:496:15
+    |
+496 |         Code::Invokeinterface => {
+    |               ^^^^^^^^^^^^^^^ associated function or constant not found in `method::Code<'_>`
+    |
+   ::: src\share\oops\method.rs:26:1
+    |
+ 26 | pub struct Code<'a> {
+    | ------------------- associated function or constant `Invokeinterface` not found for this struct
+
+error[E0599]: no associated function or constant named `Invokespecial` found for struct `method::Code<'a>` in the current scope
+   --> src\share\interpreter\interpreterRuntime.rs:490:32
+    |
+490 |             if opcode == Code::Invokespecial {
+    |                                ^^^^^^^^^^^^^ associated function or constant not found in `method::Code<'_>`
+    |
+   ::: src\share\oops\method.rs:26:1
+    |
+ 26 | pub struct Code<'a> {
+    | ------------------- associated function or constant `Invokespecial` not found for this struct
+
+error[E0605]: non-primitive cast: `method::Code<'_>` as `u8`
+   --> src\share\interpreter\interpreterRuntime.rs:505:29
+    |
+505 |             bytecodes::name(opcode as u8).unwrap_or("?")
+    |                             ^^^^^^^^^^^^ an `as` expression can only be used to convert between primitive types or to coerce to a specific trait object
+
+error[E0599]: no associated function or constant named `Getstatic` found for struct `method::Code<'a>` in the current scope
+   --> src\share\interpreter\interpreterRuntime.rs:525:15
+    |
+525 |         Code::Getstatic | Code::Putstatic | Code::Getfield | Code::Putfield => {
+    |               ^^^^^^^^^ associated function or constant not found in `method::Code<'_>`
+    |
+   ::: src\share\oops\method.rs:26:1
+    |
+ 26 | pub struct Code<'a> {
+    | ------------------- associated function or constant `Getstatic` not found for this struct
+
+error[E0599]: no associated function or constant named `Putstatic` found for struct `method::Code<'a>` in the current scope
+   --> src\share\interpreter\interpreterRuntime.rs:525:33
+    |
+525 |         Code::Getstatic | Code::Putstatic | Code::Getfield | Code::Putfield => {
+    |                                 ^^^^^^^^^ associated function or constant not found in `method::Code<'_>`
+    |
+   ::: src\share\oops\method.rs:26:1
+    |
+ 26 | pub struct Code<'a> {
+    | ------------------- associated function or constant `Putstatic` not found for this struct
+
+error[E0599]: no associated function or constant named `Getfield` found for struct `method::Code<'a>` in the current scope
+   --> src\share\interpreter\interpreterRuntime.rs:525:51
+    |
+525 |         Code::Getstatic | Code::Putstatic | Code::Getfield | Code::Putfield => {
+    |                                                   ^^^^^^^^ associated function or constant not found in `method::Code<'_>`
+    |
+   ::: src\share\oops\method.rs:26:1
+    |
+ 26 | pub struct Code<'a> {
+    | ------------------- associated function or constant `Getfield` not found for this struct
+
+error[E0599]: no associated function or constant named `Putfield` found for struct `method::Code<'a>` in the current scope
+   --> src\share\interpreter\interpreterRuntime.rs:525:68
+    |
+525 |         Code::Getstatic | Code::Putstatic | Code::Getfield | Code::Putfield => {
+    |                                                                    ^^^^^^^^ associated function or constant not found in `method::Code<'_>`
+    |
+   ::: src\share\oops\method.rs:26:1
+    |
+ 26 | pub struct Code<'a> {
+    | ------------------- associated function or constant `Putfield` not found for this struct
+
+error[E0599]: no associated function or constant named `Invokevirtual` found for struct `method::Code<'a>` in the current scope
+   --> src\share\interpreter\interpreterRuntime.rs:532:15
+    |
+532 |         Code::Invokevirtual | Code::Invokespecial | Code::Invokestatic
+    |               ^^^^^^^^^^^^^ associated function or constant not found in `method::Code<'_>`
+    |
+   ::: src\share\oops\method.rs:26:1
+    |
+ 26 | pub struct Code<'a> {
+    | ------------------- associated function or constant `Invokevirtual` not found for this struct
+
+error[E0599]: no associated function or constant named `Invokespecial` found for struct `method::Code<'a>` in the current scope
+   --> src\share\interpreter\interpreterRuntime.rs:532:37
+    |
+532 |         Code::Invokevirtual | Code::Invokespecial | Code::Invokestatic
+    |                                     ^^^^^^^^^^^^^ associated function or constant not found in `method::Code<'_>`
+    |
+   ::: src\share\oops\method.rs:26:1
+    |
+ 26 | pub struct Code<'a> {
+    | ------------------- associated function or constant `Invokespecial` not found for this struct
+
+error[E0599]: no associated function or constant named `Invokestatic` found for struct `method::Code<'a>` in the current scope
+   --> src\share\interpreter\interpreterRuntime.rs:532:59
+    |
+532 |         Code::Invokevirtual | Code::Invokespecial | Code::Invokestatic
+    |                                                           ^^^^^^^^^^^^ associated function or constant not found in `method::Code<'_>`
+    |
+   ::: src\share\oops\method.rs:26:1
+    |
+ 26 | pub struct Code<'a> {
+    | ------------------- associated function or constant `Invokestatic` not found for this struct
+
+error[E0599]: no associated function or constant named `Invokeinterface` found for struct `method::Code<'a>` in the current scope
+   --> src\share\interpreter\interpreterRuntime.rs:533:17
+    |
+533 |         | Code::Invokeinterface => {
+    |                 ^^^^^^^^^^^^^^^ associated function or constant not found in `method::Code<'_>`
+    |
+   ::: src\share\oops\method.rs:26:1
+    |
+ 26 | pub struct Code<'a> {
+    | ------------------- associated function or constant `Invokeinterface` not found for this struct
+
+error[E0599]: no associated function or constant named `Invokehandle` found for struct `method::Code<'a>` in the current scope
+   --> src\share\interpreter\interpreterRuntime.rs:540:15
+    |
+540 |         Code::Invokehandle | Code::Invokedynamic => {
+    |               ^^^^^^^^^^^^ associated function or constant not found in `method::Code<'_>`
+    |
+   ::: src\share\oops\method.rs:26:1
+    |
+ 26 | pub struct Code<'a> {
+    | ------------------- associated function or constant `Invokehandle` not found for this struct
+
+error[E0599]: no associated function or constant named `Invokedynamic` found for struct `method::Code<'a>` in the current scope
+   --> src\share\interpreter\interpreterRuntime.rs:540:36
+    |
+540 |         Code::Invokehandle | Code::Invokedynamic => {
+    |                                    ^^^^^^^^^^^^^ associated function or constant not found in `method::Code<'_>`
+    |
+   ::: src\share\oops\method.rs:26:1
+    |
+ 26 | pub struct Code<'a> {
+    | ------------------- associated function or constant `Invokedynamic` not found for this struct
+
+error[E0605]: non-primitive cast: `method::Code<'_>` as `u8`
+   --> src\share\interpreter\interpreterRuntime.rs:553:29
+    |
+553 |             bytecodes::name(opcode as u8).unwrap_or("?")
+    |                             ^^^^^^^^^^^^ an `as` expression can only be used to convert between primitive types or to coerce to a specific trait object
+
+error[E0433]: cannot find module or crate `bytes` in this scope
+   --> src\share\interpreter\rewriter.rs:524:33
+    |
+524 |             let mut bc_length = bytes::length_for(c);
+    |                                 ^^^^^ use of unresolved module or unlinked crate `bytes`
+    |
+    = help: if you wanted to use a crate named `bytes`, use `cargo add bytes` to add it to your `Cargo.toml`
+
+error[E0433]: cannot find module or crate `bytes` in this scope
+   --> src\share\interpreter\rewriter.rs:526:29
+    |
+526 |                 bc_length = bytes::instruction_length_at(bytes, bci);
+    |                             ^^^^^ use of unresolved module or unlinked crate `bytes`
+    |
+    = help: if you wanted to use a crate named `bytes`, use `cargo add bytes` to add it to your `Cargo.toml`
+
+error[E0433]: cannot find module or crate `bytes` in this scope
+   --> src\share\interpreter\rewriter.rs:916:15
+    |
+916 |     let len = bytes::instruction_length_at(bytes, bci);
+    |               ^^^^^ use of unresolved module or unlinked crate `bytes`
+    |
+    = help: if you wanted to use a crate named `bytes`, use `cargo add bytes` to add it to your `Cargo.toml`
+
+error[E0308]: mismatched types
+   --> src\share\interpreter\templateInterpreter.rs:123:60
+    |
+123 |         self.table[tos_state_index(state)][i & 0xff].entry(tos_state_index(state))
+    |                                                      ----- ^^^^^^^^^^^^^^^^^^^^^^ expected `TosState`, found `usize`
+    |                                                      |
+    |                                                      arguments to this method are incorrect
+    |
+note: method defined here
+   --> src\share\interpreter\templateInterpreter.rs:71:12
+    |
+ 71 |     pub fn entry(&self, state: TosState) -> usize {
+    |            ^^^^^        ---------------
+
+error[E0369]: cannot add `u8` to `bytecodes::Code`
+   --> src\share\interpreter\templateInterpreterGenerator.rs:344:34
+    |
+344 |         t.push(load(Code::Iload0 + i as u8, 0, Gen::Iload, i));
+    |                     ------------ ^ ------- u8
+    |                     |
+    |                     bytecodes::Code
+    |
+note: an implementation of `Add<u8>` might be missing for `bytecodes::Code`
+   --> src\share\interpreter\bytecodes.rs:10:1
+    |
+ 10 | pub enum Code {
+    | ^^^^^^^^^^^^^ must implement `Add<u8>`
+note: the trait `Add` must be implemented
+   --> /rustc/0ef1bc386059596dada8fb65b50425aab2ea637a/library/core\src\ops\arith.rs:76:0
+
+error[E0369]: cannot add `u8` to `bytecodes::Code`
+   --> src\share\interpreter\templateInterpreterGenerator.rs:345:34
+    |
+345 |         t.push(load(Code::Lload0 + i as u8, 0, Gen::Lload, i));
+    |                     ------------ ^ ------- u8
+    |                     |
+    |                     bytecodes::Code
+    |
+note: an implementation of `Add<u8>` might be missing for `bytecodes::Code`
+   --> src\share\interpreter\bytecodes.rs:10:1
+    |
+ 10 | pub enum Code {
+    | ^^^^^^^^^^^^^ must implement `Add<u8>`
+note: the trait `Add` must be implemented
+   --> /rustc/0ef1bc386059596dada8fb65b50425aab2ea637a/library/core\src\ops\arith.rs:76:0
+
+error[E0369]: cannot add `u8` to `bytecodes::Code`
+   --> src\share\interpreter\templateInterpreterGenerator.rs:346:34
+    |
+346 |         t.push(load(Code::Fload0 + i as u8, 0, Gen::Fload, i));
+    |                     ------------ ^ ------- u8
+    |                     |
+    |                     bytecodes::Code
+    |
+note: an implementation of `Add<u8>` might be missing for `bytecodes::Code`
+   --> src\share\interpreter\bytecodes.rs:10:1
+    |
+ 10 | pub enum Code {
+    | ^^^^^^^^^^^^^ must implement `Add<u8>`
+note: the trait `Add` must be implemented
+   --> /rustc/0ef1bc386059596dada8fb65b50425aab2ea637a/library/core\src\ops\arith.rs:76:0
+
+error[E0369]: cannot add `u8` to `bytecodes::Code`
+   --> src\share\interpreter\templateInterpreterGenerator.rs:347:34
+    |
+347 |         t.push(load(Code::Dload0 + i as u8, 0, Gen::Dload, i));
+    |                     ------------ ^ ------- u8
+    |                     |
+    |                     bytecodes::Code
+    |
+note: an implementation of `Add<u8>` might be missing for `bytecodes::Code`
+   --> src\share\interpreter\bytecodes.rs:10:1
+    |
+ 10 | pub enum Code {
+    | ^^^^^^^^^^^^^ must implement `Add<u8>`
+note: the trait `Add` must be implemented
+   --> /rustc/0ef1bc386059596dada8fb65b50425aab2ea637a/library/core\src\ops\arith.rs:76:0
+
+error[E0369]: cannot add `u8` to `bytecodes::Code`
+   --> src\share\interpreter\templateInterpreterGenerator.rs:351:38
+    |
+351 |             t.push(load(Code::Aload0 + i as u8, 0, Gen::Aload, i));
+    |                         ------------ ^ ------- u8
+    |                         |
+    |                         bytecodes::Code
+    |
+note: an implementation of `Add<u8>` might be missing for `bytecodes::Code`
+   --> src\share\interpreter\bytecodes.rs:10:1
+    |
+ 10 | pub enum Code {
+    | ^^^^^^^^^^^^^ must implement `Add<u8>`
+note: the trait `Add` must be implemented
+   --> /rustc/0ef1bc386059596dada8fb65b50425aab2ea637a/library/core\src\ops\arith.rs:76:0
+
+error[E0369]: cannot add `u8` to `bytecodes::Code`
+   --> src\share\interpreter\templateInterpreterGenerator.rs:372:36
+    |
+372 |         t.push(store(Code::Istore0 + i as u8, 0, I, Gen::Istore, i));
+    |                      ------------- ^ ------- u8
+    |                      |
+    |                      bytecodes::Code
+    |
+note: an implementation of `Add<u8>` might be missing for `bytecodes::Code`
+   --> src\share\interpreter\bytecodes.rs:10:1
+    |
+ 10 | pub enum Code {
+    | ^^^^^^^^^^^^^ must implement `Add<u8>`
+note: the trait `Add` must be implemented
+   --> /rustc/0ef1bc386059596dada8fb65b50425aab2ea637a/library/core\src\ops\arith.rs:76:0
+
+error[E0369]: cannot add `u8` to `bytecodes::Code`
+   --> src\share\interpreter\templateInterpreterGenerator.rs:373:36
+    |
+373 |         t.push(store(Code::Lstore0 + i as u8, 0, L, Gen::Lstore, i));
+    |                      ------------- ^ ------- u8
+    |                      |
+    |                      bytecodes::Code
+    |
+note: an implementation of `Add<u8>` might be missing for `bytecodes::Code`
+   --> src\share\interpreter\bytecodes.rs:10:1
+    |
+ 10 | pub enum Code {
+    | ^^^^^^^^^^^^^ must implement `Add<u8>`
+note: the trait `Add` must be implemented
+   --> /rustc/0ef1bc386059596dada8fb65b50425aab2ea637a/library/core\src\ops\arith.rs:76:0
+
+error[E0369]: cannot add `u8` to `bytecodes::Code`
+   --> src\share\interpreter\templateInterpreterGenerator.rs:374:36
+    |
+374 |         t.push(store(Code::Fstore0 + i as u8, 0, F, Gen::Fstore, i));
+    |                      ------------- ^ ------- u8
+    |                      |
+    |                      bytecodes::Code
+    |
+note: an implementation of `Add<u8>` might be missing for `bytecodes::Code`
+   --> src\share\interpreter\bytecodes.rs:10:1
+    |
+ 10 | pub enum Code {
+    | ^^^^^^^^^^^^^ must implement `Add<u8>`
+note: the trait `Add` must be implemented
+   --> /rustc/0ef1bc386059596dada8fb65b50425aab2ea637a/library/core\src\ops\arith.rs:76:0
+
+error[E0369]: cannot add `u8` to `bytecodes::Code`
+   --> src\share\interpreter\templateInterpreterGenerator.rs:375:36
+    |
+375 |         t.push(store(Code::Dstore0 + i as u8, 0, D, Gen::Dstore, i));
+    |                      ------------- ^ ------- u8
+    |                      |
+    |                      bytecodes::Code
+    |
+note: an implementation of `Add<u8>` might be missing for `bytecodes::Code`
+   --> src\share\interpreter\bytecodes.rs:10:1
+    |
+ 10 | pub enum Code {
+    | ^^^^^^^^^^^^^ must implement `Add<u8>`
+note: the trait `Add` must be implemented
+   --> /rustc/0ef1bc386059596dada8fb65b50425aab2ea637a/library/core\src\ops\arith.rs:76:0
+
+error[E0369]: cannot add `u8` to `bytecodes::Code`
+   --> src\share\interpreter\templateInterpreterGenerator.rs:376:36
+    |
+376 |         t.push(store(Code::Astore0 + i as u8, 0, V, Gen::Astore, i));
+    |                      ------------- ^ ------- u8
+    |                      |
+    |                      bytecodes::Code
+    |
+note: an implementation of `Add<u8>` might be missing for `bytecodes::Code`
+   --> src\share\interpreter\bytecodes.rs:10:1
+    |
+ 10 | pub enum Code {
+    | ^^^^^^^^^^^^^ must implement `Add<u8>`
+note: the trait `Add` must be implemented
+   --> /rustc/0ef1bc386059596dada8fb65b50425aab2ea637a/library/core\src\ops\arith.rs:76:0
+
+error[E0599]: the method `entry` exists for struct `HashMap<(Gen, i32), u16>`, but its trait bounds were not satisfied
+   --> src\share\interpreter\templateInterpreterGenerator.rs:597:35
+    |
+ 27 | pub enum Gen {
+    | ------------ doesn't satisfy `Gen: Hash`
+...
+597 |             let id = *codelet_ids.entry(key).or_insert_with(|| {
+    |                                   ^^^^^ method cannot be called on `HashMap<(Gen, i32), u16>` due to unsatisfied trait bounds
+    |
+    = note: the following trait bounds were not satisfied:
+            `Gen: Hash`
+            which is required by `(Gen, i32): Hash`
+help: consider annotating `Gen` with `#[derive(Hash)]`
+    |
+ 27 + #[derive(Hash)]
+ 28 | pub enum Gen {
+    |
+
+error[E0605]: non-primitive cast: `CodeletId` as `usize`
+   --> src\share\interpreter\templateInterpreterGenerator.rs:614:41
+    |
+614 |                 EntryPoint::new_uniform(codelet_id(generator, NO_ARG) as usize);
+    |                                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ an `as` expression can only be used to convert between primitive types or to coerce to a specific trait object
+
+error[E0605]: non-primitive cast: `CodeletId` as `usize`
+   --> src\share\interpreter\templateInterpreterGenerator.rs:619:41
+    |
+619 |                 EntryPoint::new_uniform(codelet_id(Gen::Return, NO_ARG) as usize);
+    |                                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ an `as` expression can only be used to convert between primitive types or to coerce to a specific trait object
+
+error[E0605]: non-primitive cast: `CodeletId` as `usize`
+   --> src\share\interpreter\templateInterpreterGenerator.rs:622:37
+    |
+622 |             EntryPoint::new_uniform(codelet_id(Gen::Return, NO_ARG) as usize);
+    |                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ an `as` expression can only be used to convert between primitive types or to coerce to a specific trait object
+
+error[E0605]: non-primitive cast: `CodeletId` as `usize`
+   --> src\share\interpreter\templateInterpreterGenerator.rs:625:41
+    |
+625 |                 EntryPoint::new_uniform(codelet_id(Gen::Unimplemented, NO_ARG) as usize);
+    |                                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ an `as` expression can only be used to convert between primitive types or to coerce to a specific trait object
+
+error[E0605]: non-primitive cast: `CodeletId` as `usize`
+   --> src\share\interpreter\templateInterpreterGenerator.rs:628:13
+    |
+628 |             codelet_id(Gen::Unimplemented, NO_ARG) as usize;
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ an `as` expression can only be used to convert between primitive types or to coerce to a specific trait object
+
+error[E0605]: non-primitive cast: `CodeletId` as `usize`
+   --> src\share\interpreter\templateInterpreterGenerator.rs:630:37
+    |
+630 |             EntryPoint::new_uniform(codelet_id(Gen::Nop, NO_ARG) as usize);
+    |                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ an `as` expression can only be used to convert between primitive types or to coerce to a specific trait object
+
+error[E0605]: non-primitive cast: `CodeletId` as `usize`
+   --> src\share\interpreter\templateInterpreterGenerator.rs:634:41
+    |
+634 |                 EntryPoint::new_uniform(codelet_id(Gen::Return, NO_ARG) as usize);
+    |                                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ an `as` expression can only be used to convert between primitive types or to coerce to a specific trait object
+
+error[E0605]: non-primitive cast: `CodeletId` as `usize`
+   --> src\share\interpreter\templateInterpreterGenerator.rs:636:41
+    |
+636 |                 EntryPoint::new_uniform(codelet_id(Gen::Return, NO_ARG) as usize);
+    |                                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ an `as` expression can only be used to convert between primitive types or to coerce to a specific trait object
+
+error[E0605]: non-primitive cast: `CodeletId` as `usize`
+   --> src\share\interpreter\templateInterpreterGenerator.rs:638:41
+    |
+638 |                 EntryPoint::new_uniform(codelet_id(Gen::Return, NO_ARG) as usize);
+    |                                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ an `as` expression can only be used to convert between primitive types or to coerce to a specific trait object
+
+error[E0609]: no field `max_locals` on type `method::Code<'a>`
+  --> src\share\interpreter\zero\zeroInterpreter.rs:68:62
+   |
+68 |         let mut locals = vec![Value::Empty; usize::from(code.max_locals).max(args.len() + 1)];
+   |                                                              ^^^^^^^^^^ unknown field
+   |
+help: a field with a similar name exists
+   |
+68 -         let mut locals = vec![Value::Empty; usize::from(code.max_locals).max(args.len() + 1)];
+68 +         let mut locals = vec![Value::Empty; usize::from(code.maxLocals).max(args.len() + 1)];
+   |
+
+error[E0609]: no field `max_stack` on type `method::Code<'a>`
+  --> src\share\interpreter\zero\zeroInterpreter.rs:80:56
+   |
+80 |             stack: Vec::with_capacity(usize::from(code.max_stack)),
+   |                                                        ^^^^^^^^^ unknown field
+   |
+help: a field with a similar name exists
+   |
+80 -             stack: Vec::with_capacity(usize::from(code.max_stack)),
+80 +             stack: Vec::with_capacity(usize::from(code.maxStack)),
+   |
+
+error[E0061]: this function takes 1 argument but 0 arguments were supplied
+   --> src\share\jfr\recorder\checkpoint\jfr_checkpoint_manager.rs:586:28
+    |
+586 |     pub fn on_rotation() { Self::shift_epoch(); }
+    |                            ^^^^^^^^^^^^^^^^^-- argument #1 of type `&JfrCheckpointManager` is missing
+    |
+note: method defined here
+   --> src\share\jfr\recorder\checkpoint\jfr_checkpoint_manager.rs:474:12
+    |
+474 |     pub fn shift_epoch(&self) {
+    |            ^^^^^^^^^^^ -----
+help: provide the argument
+    |
+586 |     pub fn on_rotation() { Self::shift_epoch(/* &JfrCheckpointManager */); }
+    |                                              +++++++++++++++++++++++++++
+
+error[E0599]: no method named `flush_pending` found for mutable reference `&mut JfrMetadataRepository` in the current scope
+   --> src\share\jfr\recorder\service\jfr_recorder_service.rs:96:106
+    |
+ 96 |         { let mut g = JfrMetadataRepository::instance().lock().unwrap(); if let Some(r) = g.as_mut() { r.flush_pending(); } }
+    |                                                                                                          ^^^^^^^^^^^^^ this is an associated function, not a method
+    |
+    = note: found the following associated functions; to be used as methods, functions must have a `self` parameter
+note: the candidate is defined in an impl for the type `JfrMetadataRepository`
+   --> src\share\jfr\metadata\jfr_metadata_repository.rs:138:5
+    |
+138 |     pub fn flush_pending() {}
+    |     ^^^^^^^^^^^^^^^^^^^^^^
+help: use associated function syntax instead
+    |
+ 96 -         { let mut g = JfrMetadataRepository::instance().lock().unwrap(); if let Some(r) = g.as_mut() { r.flush_pending(); } }
+ 96 +         { let mut g = JfrMetadataRepository::instance().lock().unwrap(); if let Some(r) = g.as_mut() { JfrMetadataRepository::flush_pending(); } }
+    |
+
+error[E0308]: mismatched types
+   --> src\share\jvmci\jvmciGlobals.rs:382:13
+    |
+382 |         for (flag, guard, violated) in not_set_checks {
+    |             ^^^^^^^^^^^^^^^^^^^^^^^    -------------- this is an iterator with items of type `&(&str, &str, bool, bool)`
+    |             |
+    |             expected a tuple with 4 elements, found one with 3 elements
+    |
+    = note: expected tuple `(&str, &str, bool, bool)`
+               found tuple `(_, _, _)`
+
+warning: variable does not need to be mutable
+   --> src\share\adlc\model.rs:337:13
+    |
+337 |         let mut position: i32 = 0;
+    |             ----^^^^^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: value assigned to `pos` is never read
+   --> src\share\adlc\model.rs:362:21
+    |
+362 |                     pos -= 1;
+    |                     ^^^^^^^^
+    |
+    = help: maybe it is overwritten before being read?
+    = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+   --> src\share\adlc\model.rs:380:13
+    |
+380 |         let mut position = 0i32;
+    |             ----^^^^^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: value assigned to `pos` is never read
+   --> src\share\adlc\model.rs:392:21
+    |
+392 |                     pos -= 1;
+    |                     ^^^^^^^^
+    |
+    = help: maybe it is overwritten before being read?
+
+warning: variable does not need to be mutable
+   --> src\share\adlc\model.rs:399:13
+    |
+399 |         let mut position = 0i32;
+    |             ----^^^^^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: value assigned to `pos` is never read
+   --> src\share\adlc\model.rs:411:21
+    |
+411 |                     pos -= 1;
+    |                     ^^^^^^^^
+    |
+    = help: maybe it is overwritten before being read?
+
+warning: unused variable: `globals`
+   --> src\share\adlc\model.rs:690:40
+    |
+690 |     pub fn build_internalop(&mut self, globals: &HashMap<String, FormRef>) {
+    |                                        ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_globals`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `num_leaves`
+   --> src\share\adlc\model.rs:748:69
+    |
+748 |     pub fn new(m: MatchNode, depth: i32, construct: Option<String>, num_leaves: usize) -> MatchRule {
+    |                                                                     ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_num_leaves`
+
+warning: variable does not need to be mutable
+   --> src\share\adlc\parser.rs:759:37
+    |
+759 | ...                   let mut nrb = nr.borrow_mut();
+    |                           ----^^^
+    |                           |
+    |                           help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> src\share\adlc\parser.rs:851:38
+    |
+851 | ...                   Some(mut head) => {
+    |                            ----^^^^
+    |                            |
+    |                            help: remove this `mut`
+
+warning: variable `parse_ins` is assigned to, but never used
+    --> src\share\adlc\parser.rs:3250:17
+     |
+3250 |             let mut parse_ins = false;
+     |                 ^^^^^^^^^^^^^
+     |
+     = note: consider using `_parse_ins` instead
+
+warning: value assigned to `parse_ins` is never read
+    --> src\share\adlc\parser.rs:3259:21
+     |
+3254 |                     parse_ins = true;
+     |                     ---------------- `parse_ins` is overwritten here before the previous value is read
+...
+3259 |                     parse_ins = true;
+     |                     ^^^^^^^^^^^^^^^^ this value is reassigned later and never used
+
+warning: value assigned to `parse_ins` is never read
+    --> src\share\adlc\parser.rs:3254:21
+     |
+3254 |                     parse_ins = true;
+     |                     ^^^^^^^^^^^^^^^^
+     |
+     = help: maybe it is overwritten before being read?
+
+warning: unused variable: `kind`
+   --> src\share\c1\asm\x86.rs:278:37
+    |
+278 |             LirOp::Move { dst, src, kind } => {
+    |                                     ^^^^ help: try ignoring the field: `kind: _`
+
+warning: unused variable: `dst_kind`
+   --> src\share\c1\asm\x86.rs:403:13
+    |
+403 |         let dst_kind = dst.kind();
+    |             ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_dst_kind`
+
+warning: unused variable: `array`
+   --> src\share\c1\asm\x86.rs:596:40
+    |
+596 |     fn compute_element_addr(&mut self, array: Register, index: Register, elem: ArrayElemKind) -> Result<Register, BackendError> {
+    |                                        ^^^^^ help: if this is intentional, prefix it with an underscore: `_array`
+
+warning: unused variable: `array`
+    --> src\share\c1\asm\x86.rs:1039:37
+     |
+1039 |     fn emit_bounds_check(&mut self, array: Register, index: Register) -> Result<Option<usize>, BackendError> {
+     |                                     ^^^^^ help: if this is intentional, prefix it with an underscore: `_array`
+
+warning: unused variable: `index`
+    --> src\share\c1\asm\x86.rs:1039:54
+     |
+1039 |     fn emit_bounds_check(&mut self, array: Register, index: Register) -> Result<Option<usize>, BackendError> {
+     |                                                      ^^^^^ help: if this is intentional, prefix it with an underscore: `_index`
+
+warning: unreachable pattern
+    --> src\share\c1\asm\x86.rs:1195:13
+     |
+1195 |             _ => return Err(BackendError::InvalidLir),
+     |             ^ no value can reach this
+     |
+note: multiple earlier patterns match some of the same values
+    --> src\share\c1\asm\x86.rs:1195:13
+     |
+1179 |             LirOperand::ConstF32(v) => {
+     |             ----------------------- matches some of the same values
+...
+1183 |             LirOperand::ConstF64(v) => {
+     |             ----------------------- matches some of the same values
+...
+1187 |             LirOperand::Local { slot, kind } | LirOperand::Stack { slot, kind } | LirOperand::Temp { slot, kind } => {
+     |             ----------------------------------------------------------------------------------------------------- matches some of the same values
+...
+1192 |             LirOperand::ConstI32(v) => { self.mov_reg_imm(Register::RAX, *v as i32 as u64, false)?; self.cvtsi2ss(xmm, Register::R...
+     |             ----------------------- matches some of the same values
+...
+1195 |             _ => return Err(BackendError::InvalidLir),
+     |             ^ ...and 2 other patterns collectively make this unreachable
+     = note: `#[warn(unreachable_patterns)]` (part of `#[warn(unused)]`) on by default
+
+warning: unreachable pattern
+   --> src\share\c1\c1_GraphBuilder.rs:543:17
+    |
+542 |                 0x36..=0x3a | 0x3b..=0x3e => { self.abs_pop(&mut stack); }
+    |                 ----------- matches all the relevant values
+543 |                 0x37 | 0x3f..=0x42 => { self.abs_pop(&mut stack); }
+    |                 ^^^^ no value can reach this
+
+warning: unreachable pattern
+   --> src\share\c1\c1_GraphBuilder.rs:544:17
+    |
+542 |                 0x36..=0x3a | 0x3b..=0x3e => { self.abs_pop(&mut stack); }
+    |                 ----------- matches all the relevant values
+543 |                 0x37 | 0x3f..=0x42 => { self.abs_pop(&mut stack); }
+544 |                 0x38 | 0x43..=0x46 => { self.abs_pop(&mut stack); }
+    |                 ^^^^ no value can reach this
+
+warning: unreachable pattern
+   --> src\share\c1\c1_GraphBuilder.rs:545:17
+    |
+542 |                 0x36..=0x3a | 0x3b..=0x3e => { self.abs_pop(&mut stack); }
+    |                 ----------- matches all the relevant values
+...
+545 |                 0x39 | 0x47..=0x4a => { self.abs_pop(&mut stack); }
+    |                 ^^^^ no value can reach this
+
+warning: unreachable pattern
+   --> src\share\c1\c1_GraphBuilder.rs:546:17
+    |
+542 |                 0x36..=0x3a | 0x3b..=0x3e => { self.abs_pop(&mut stack); }
+    |                 ----------- matches all the relevant values
+...
+546 |                 0x3a | 0x4b..=0x4e => { self.abs_pop(&mut stack); }
+    |                 ^^^^ no value can reach this
+
+warning: unused variable: `constants`
+   --> src\share\ci\ciMethod.rs:336:13
+    |
+336 |         let constants = &self.holder.instance_klass().class.constants;
+    |             ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_constants`
+
+warning: unused variable: `k`
+   --> src\share\ci\ciType.rs:333:29
+    |
+333 |             (Self::Instance(k), Self::Array(_)) => false,
+    |                             ^ help: if this is intentional, prefix it with an underscore: `_k`
+
+warning: variable does not need to be mutable
+    --> src\share\classfile\classLoader.rs:1414:17
+     |
+1414 |             let mut image = image.borrow_mut();
+     |                 ----^^^^^
+     |                 |
+     |                 help: remove this `mut`
+
+warning: unused variable: `loader`
+   --> src\share\classfile\verifier.rs:713:5
+    |
+713 |     loader: Option<&ClassLoader<'a>>,
+    |     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_loader`
+
+warning: unused variable: `b`
+   --> src\share\compiler\compilerOracle.rs:235:24
+    |
+235 |             Self::Bool(b) => None,
+    |                        ^ help: if this is intentional, prefix it with an underscore: `_b`
+
+warning: value assigned to `ergo_tlab` is never read
+   --> src\share\gc\epsilon\epsilonHeap.rs:223:29
+    |
+223 |         let mut ergo_tlab = requested_size;
+    |                             ^^^^^^^^^^^^^^ this value is reassigned later and never used
+...
+227 |             ergo_tlab = thread.ergo_tlab_size();
+    |             ----------------------------------- `ergo_tlab` is overwritten here before the previous value is read
+
+warning: unused variable: `num_regions`
+  --> src\share\gc\shenandoah\shenandoahCollectionSet.rs:32:51
+   |
+32 |     pub fn new(heap_base: usize, heap_end: usize, num_regions: usize) -> Self {
+   |                                                   ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_num_regions`
+
+warning: variable does not need to be mutable
+   --> src\share\gc\shenandoah\shenandoahSATBMarkQueueSet.rs:406:17
+    |
+406 |             let mut completed = self.completed.lock();
+    |                 ----^^^^^^^^^
+    |                 |
+    |                 help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> src\share\gc\shenandoah\shenandoahSimpleBitMap.rs:156:17
+    |
+156 |             let mut element_bits = self.bitmap[array_idx] >> bit_number;
+    |                 ----^^^^^^^^^^^^
+    |                 |
+    |                 help: remove this `mut`
+
+warning: unreachable pattern
+  --> src\share\interpreter\bytecodeUtils.rs:97:9
+   |
+91 |         0x15..=0x19 | 0x36..=0x3a | 0xa9 => push(1, 2), // load/store/ret: u1
+   |         -------------------------------- matches all the relevant values
+...
+97 |         0xa9 => push(1, 2),          // ret: u1
+   |         ^^^^ no value can reach this
+
+error: lifetime may not live long enough
+   --> src\share\interpreter\interpreterRuntime.rs:382:9
+    |
+361 | pub fn resolve_get_put<'a>(
+    |                        -- lifetime `'a` defined here
+...
+382 |         holder,
+    |         ^^^^^^ this usage requires that `'a` must outlive `'static`
+    |
+    = note: requirement occurs because of the type `InstanceKlass<'_>`, which makes the generic argument `'_` invariant
+    = note: the struct `InstanceKlass<'a>` is invariant over the parameter `'a`
+    = help: see <https://doc.rust-lang.org/nomicon/subtyping.html> for more information about variance
+
+error[E0507]: cannot move out of `self.code` which is behind a mutable reference
+   --> src\share\interpreter\zero\zeroInterpreter.rs:122:13
+    |
+122 |             self.code,
+    |             ^^^^^^^^^ move occurs because `self.code` has type `method::Code<'_>`, which does not implement the `Copy` trait
+    |
+help: consider cloning the value if the performance cost is acceptable
+    |
+122 |             self.code.clone(),
+    |                      ++++++++
+
+warning: unused variable: `constants`
+   --> src\share\interpreter\zero\zeroInterpreter.rs:115:9
+    |
+115 |         constants: &[Constant<'a>],
+    |         ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_constants`
+
+warning: variable does not need to be mutable
+   --> src\share\jfr\dcmd\configure.rs:146:13
+    |
+146 |         let mut opt_string = |out: &mut dyn Write, name: &str| -> DcmdResult<Option<Value<'_>>> {
+    |             ----^^^^^^^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> src\share\jfr\dcmd\configure.rs:158:13
+    |
+158 |         let mut opt_long = |out: &mut dyn Write, name: &str| -> DcmdResult<Option<Value<'_>>> {
+    |             ----^^^^^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> src\share\jfr\dcmd\configure.rs:165:13
+    |
+165 |         let mut opt_int = |out: &mut dyn Write, name: &str| -> DcmdResult<Option<Value<'_>>> {
+    |             ----^^^^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> src\share\jfr\dcmd\configure.rs:172:13
+    |
+172 |         let mut opt_bool = |out: &mut dyn Write, name: &str| -> DcmdResult<Option<Value<'_>>> {
+    |             ----^^^^^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> src\share\jfr\dcmd\configure.rs:179:13
+    |
+179 |         let mut mem_size = |out: &mut dyn Write, name: &str| -> DcmdResult<Option<Value<'_>>> {
+    |             ----^^^^^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+  --> src\share\jfr\recorder\checkpoint\jfr_checkpoint_manager.rs:74:13
+   |
+74 |         let mut buf = match buf.take() {
+   |             ----^^^
+   |             |
+   |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> src\share\jfr\recorder\checkpoint\jfr_checkpoint_manager.rs:258:21
+    |
+258 |                 let mut buf = match map.remove(&key) {
+    |                     ----^^^
+    |                     |
+    |                     help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> src\share\jfr\recorder\checkpoint\jfr_checkpoint_manager.rs:327:9
+    |
+327 |         mut old: JfrBuffer,
+    |         ----^^^
+    |         |
+    |         help: remove this `mut`
+
+error[E0503]: cannot use `self.pos` because it was mutably borrowed
+   --> src\share\jfr\recorder\checkpoint\jfr_checkpoint_writer.rs:286:29
+    |
+286 |         self.buf_mut().data[self.pos] = v as u8;
+    |         ----               -^^^^^^^^-
+    |         |                  ||
+    |         |                  |use of borrowed `*self`
+    |         |                  borrow later used here
+    |         `*self` is borrowed here
+
+error[E0507]: cannot move out of `self.time` which is behind a mutable reference
+   --> src\share\jfr\recorder\checkpoint\jfr_checkpoint_writer.rs:425:22
+    |
+425 |         let time_v = self.time.value();
+    |                      ^^^^^^^^^ ------- `self.time` moved due to this method call
+    |                      |
+    |                      move occurs because `self.time` has type `JfrTicks`, which does not implement the `Copy` trait
+    |
+note: `share::jfr::utilities::jfr_time::JfrTicks::value` takes ownership of the receiver `self`, which moves `self.time`
+   --> src\share\jfr\utilities\jfr_time.rs:31:18
+    |
+ 31 |     pub fn value(self) -> i64 {
+    |                  ^^^^
+note: if `JfrTicks` implemented `Clone`, you could clone the value
+   --> src\share\jfr\utilities\jfr_time.rs:25:1
+    |
+ 25 | pub struct JfrTicks(pub i64);
+    | ^^^^^^^^^^^^^^^^^^^ consider implementing `Clone` for this type
+    |
+   ::: src\share\jfr\recorder\checkpoint\jfr_checkpoint_writer.rs:425:22
+    |
+425 |         let time_v = self.time.value();
+    |                      --------- you could clone this value
+
+error[E0596]: cannot borrow `to.data` as mutable, as it is behind a `&` reference
+   --> src\share\jfr\recorder\storage\jfr_buffer.rs:277:13
+    |
+277 |             to.data[dst..dst + actual_size].copy_from_slice(&src);
+    |             ^^^^^^^ `to` is a `&` reference, so it cannot be borrowed as mutable
+    |
+help: consider changing this to be a mutable reference
+    |
+269 |     pub fn move_to(&self, to: &mut JfrBuffer, size: usize) {
+    |                                +++
+
+error[E0499]: cannot borrow `self` as mutable more than once at a time
+   --> src\share\jfr\writers\jfr_writer.rs:692:13
+    |
+691 |         if let Some(f) = self.file.as_mut() {
+    |                          --------- first mutable borrow occurs here
+692 |             self.flush_page();
+    |             ^^^^ second mutable borrow occurs here
+693 |             f.flush()?;
+    |             - first borrow later used here
+
+warning: variable does not need to be mutable
+    --> src\share\jvmci\jvmciCodeInstaller.rs:1270:25
+     |
+1270 |                     let mut objs_off = crate::share::code::scopeDesc::SERIALIZED_NULL;
+     |                         ----^^^^^^^^
+     |                         |
+     |                         help: remove this `mut`
+
+warning: value assigned to `frame_flags` is never read
+    --> src\share\jvmci\jvmciCodeInstaller.rs:1261:43
+     |
+1261 |                     let mut frame_flags = 0u8;
+     |                                           ^^^ this value is reassigned later and never used
+...
+1273 |                         frame_flags = stream.read_u1("flags")?;
+     |                         -------------------------------------- `frame_flags` is overwritten here before the previous value is read
+
+warning: value assigned to `locals` is never read
+    --> src\share\jvmci\jvmciCodeInstaller.rs:1264:38
+     |
+1264 |                     let mut locals = Vec::new();
+     |                                      ^^^^^^^^^^ this value is reassigned later and never used
+...
+1278 |                         locals =
+     |                         ------ `locals` is overwritten here before the previous value is read
+
+warning: value assigned to `exprs` is never read
+    --> src\share\jvmci\jvmciCodeInstaller.rs:1265:37
+     |
+1265 |                     let mut exprs = Vec::new();
+     |                                     ^^^^^^^^^^ this value is reassigned later and never used
+...
+1280 |                         exprs =
+     |                         ----- `exprs` is overwritten here before the previous value is read
+
+warning: value assigned to `monitors` is never read
+    --> src\share\jvmci\jvmciCodeInstaller.rs:1266:40
+     |
+1266 |                     let mut monitors = Vec::new();
+     |                                        ^^^^^^^^^^ this value is reassigned later and never used
+...
+1282 |                         monitors = self.read_monitor_values(stream, frame_flags)?;
+     |                         -------- `monitors` is overwritten here before the previous value is read
+
+warning: unused variable: `thread_id`
+   --> src\share\jvmci\jvmciCompilerToVM.rs:192:9
+    |
+192 |         thread_id: u64,
+    |         ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_thread_id`
+
+warning: unused variable: `file`
+   --> src\share\jvmci\jvmciEnv.rs:185:9
+    |
+185 |         file: &'static str,
+    |         ^^^^ help: if this is intentional, prefix it with an underscore: `_file`
+
+warning: unused variable: `line`
+   --> src\share\jvmci\jvmciEnv.rs:186:9
+    |
+186 |         line: u32,
+    |         ^^^^ help: if this is intentional, prefix it with an underscore: `_line`
+
+warning: variable does not need to be mutable
+   --> src\share\jvmci\jvmciRuntime.rs:227:13
+    |
+227 |         let mut state = self.state.lock().unwrap();
+    |             ----^^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: unreachable pattern
+    --> src\share\prims\netNatives.rs:1671:17
+     |
+1671 |                 _ => Ok(0),
+     |                 ^ no value can reach this
+     |
+note: multiple earlier patterns match some of the same values
+    --> src\share\prims\netNatives.rs:1671:17
+     |
+1660 |                 Sock::Connected { local, remote, .. } => {
+     |                 ------------------------------------- matches some of the same values
+...
+1663 |                 Sock::Listener { listener, .. } => {
+     |                 ------------------------------- matches some of the same values
+...
+1666 |                 Sock::Datagram { sock, bound, .. } => Ok(bound
+     |                 ---------------------------------- matches some of the same values
+...
+1670 |                 Sock::Fresh { bound, .. } => Ok(bound.map(|a| a.port()).unwrap_or(0) as i64),
+     |                 ------------------------- matches some of the same values
+1671 |                 _ => Ok(0),
+     |                 ^ collectively making this unreachable
+
+warning: unreachable pattern
+    --> src\share\prims\netNatives.rs:1699:17
+     |
+1699 |                 _ => Ok(Ipv4Addr::UNSPECIFIED),
+     |                 ^ no value can reach this
+     |
+note: multiple earlier patterns match some of the same values
+    --> src\share\prims\netNatives.rs:1699:17
+     |
+1680 |                 Sock::Connected { local, remote, .. } => {
+     |                 ------------------------------------- matches some of the same values
+...
+1684 |                 Sock::Listener { listener, .. } => Ok(match listener.local_addr().ok().map(|a| a.ip()) {
+     |                 ------------------------------- matches some of the same values
+...
+1688 |                 Sock::Datagram { sock, bound, .. } => Ok(match bound
+     |                 ---------------------------------- matches some of the same values
+...
+1695 |                 Sock::Fresh { bound, .. } => Ok(match bound.map(|a| a.ip()) {
+     |                 ------------------------- matches some of the same values
+...
+1699 |                 _ => Ok(Ipv4Addr::UNSPECIFIED),
+     |                 ^ collectively making this unreachable
+
+warning: unused variable: `b`
+    --> src\share\prims\netNatives.rs:1581:26
+     |
+1581 |                     Some(b) => TcpStream::connect(addr).map_err(|e| sock_io_err(loader, e))?,
+     |                          ^ help: if this is intentional, prefix it with an underscore: `_b`
+
+warning: variable does not need to be mutable
+   --> src\share\prims\nioFileNatives.rs:711:9
+    |
+711 |     let mut consider = |offset: u64, is_acl: bool, size: &mut usize| -> io::Result<()> {
+    |         ----^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> src\share\prims\nioFileNatives.rs:1098:17
+     |
+1098 |             let mut mapping = GenericMapping {
+     |                 ----^^^^^^^
+     |                 |
+     |                 help: remove this `mut`
+
+warning: unreachable pattern
+   --> src\share\prims\urlNatives.rs:931:9
+    |
+919 |         (b"sun/net/www/protocol/jar/JarURLConnection", b"setUseCaches", b"(Z)V") => {
+    |         ------------------------------------------------------------------------ matches all the relevant values
+...
+931 |         (b"sun/net/www/protocol/jar/JarURLConnection", b"setUseCaches", b"(Z)V") => {
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no value can reach this
+
+warning: variable does not need to be mutable
+  --> src\share\prims\vmManagementNatives.rs:27:9
+   |
+27 |     let mut daemon = 0usize;
+   |         ----^^^^^^
+   |         |
+   |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> src\share\prims\processNatives.rs:475:9
+    |
+475 |     let mut startup = StartupInfo {
+    |         ----^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+error[E0521]: borrowed data escapes outside of closure
+   --> src\share\runtime\frame.rs:361:21
+    |
+357 |         let mut collected = Vec::new();
+    |             ------------- `collected` declared here, outside of the closure body
+358 |         crate::share::interpreter::bytecodeInterpreter::for_each_active_frame(
+359 |             &mut |frame| {
+    |                   ----- `frame` is only valid in the closure body
+360 |                 if frame.threadId() == current_thread {
+361 |                     collected.push(frame);
+    |                     ^^^^^^^^^^^^^^^^^^^^^ `frame` escapes the closure body here
+    |
+    = note: requirement occurs because of a mutable reference to `Vec<&bytecodeInterpreter::Frame<'_>>`
+    = note: mutable references are invariant over their type parameter
+    = help: see <https://doc.rust-lang.org/nomicon/subtyping.html> for more information about variance
+
+warning: variable does not need to be mutable
+   --> src\share\runtime\frame.rs:387:34
+    |
+387 |     pub fn push_front(&mut self, mut frame: Frame) {
+    |                                  ----^^^^^
+    |                                  |
+    |                                  help: remove this `mut`
+
+warning: variable does not need to be mutable
+  --> src\share\runtime\threadSMR.rs:93:40
+   |
+93 |         let (mut running, mut blocked, mut waiting, mut terminated) = (0, 0, 0, 0);
+   |                                        ----^^^^^^^
+   |                                        |
+   |                                        help: remove this `mut`
+
+warning[E0133]: call to unsafe function `share::sanitizers::address::asan_poison_memory_region` is unsafe and requires unsafe block
+  --> src\share\sanitizers\address.rs:17:5
+   |
+17 |     asan_poison_memory_region(_addr, _size);
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+   |
+   = note: consult the function's documentation for information on how to avoid undefined behavior
+note: an unsafe function restricts its caller, but its body is safe by default
+  --> src\share\sanitizers\address.rs:16:1
+   |
+16 | pub unsafe fn asan_poison_memory_region_range(_addr: *mut c_void, _size: usize) {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+   = note: `#[warn(unsafe_op_in_unsafe_fn)]` (part of `#[warn(rust_2024_compatibility)]`) on by default
+
+Some errors have detailed explanations: E0029, E0061, E0133, E0308, E0369, E0433, E0499, E0503, E0507...
+For more information about an error, try `rustc --explain E0029`.
+warning: `jvm25-rust` (lib) generated 83 warnings
+error: could not compile `jvm25-rust` (lib) due to 56 previous errors; 83 warnings emitted

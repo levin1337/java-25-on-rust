@@ -389,9 +389,13 @@ mod tests {
 
     #[test]
     fn selection_list_level_for() {
-        let list = LogSelectionList::parse(Some("gc=debug,all=warning")).unwrap();
+        // Last matching selection wins (LogSelectionList::level_for).
+        let list = LogSelectionList::parse(Some("all=warning,gc=debug")).unwrap();
         assert_eq!(list.level_for(&ts(&[LogTag::Gc])), Some(LogLevel::Debug));
         assert_eq!(list.level_for(&ts(&[LogTag::Os])), Some(LogLevel::Warning));
+
+        let list = LogSelectionList::parse(Some("gc=debug,all=warning")).unwrap();
+        assert_eq!(list.level_for(&ts(&[LogTag::Gc])), Some(LogLevel::Warning));
 
         let list = LogSelectionList::parse(Some("gc=debug,gc+heap=trace")).unwrap();
         assert_eq!(list.level_for(&ts(&[LogTag::Gc, LogTag::Heap])), Some(LogLevel::Trace));

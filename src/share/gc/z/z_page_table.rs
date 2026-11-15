@@ -1,4 +1,4 @@
-use super::z_address::{ZAddress, ZOffset, address_to_offset, offset_to_address};
+use super::z_address::{ZAddress, ZOffset, address_to_offset};
 use super::z_granule_map::ZGranuleMap;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -46,6 +46,7 @@ impl ZPageTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::share::gc::z::z_address::offset_to_address;
 
     #[test]
     fn page_table_lookup() {

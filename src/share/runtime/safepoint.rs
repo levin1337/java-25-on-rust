@@ -113,6 +113,9 @@ impl SafepointSynchronize {
         self.inner
             .state
             .store(SynchronizeState::NotSynchronized as u8, Ordering::SeqCst);
+        // Wake threads parked in `SafepointMechanism::process_if_requested`
+        // now that both the poll flag and the synchronize state are clear.
+        SafepointMechanism::notify_safepoint_end();
     }
 
     pub fn tracker(&self) -> SafepointStateTracker {

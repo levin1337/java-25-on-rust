@@ -442,12 +442,22 @@ pub struct FileMapInfo {
     pub base_archive_name: Option<String>,
     /// Set after map_file_to_memory().
     pub mappings: Vec<RegionMapping>,
+    /// Single file-wide mapping created by map_file_to_memory
+    /// (base address, mapped length); unmap() releases it.
+    mapped_view: Option<(usize, usize)>,
 }
 
 impl FileMapInfo {
-    /// FileMapInfo::open_for_reading + header sanity checks.
+    /// FileMapInfo::open_for_reading + header sanity checks. The file is
+    /// opened read-write so write_header_block() can refresh region CRCs
+    /// (FileMapInfo keeps the archive fd open for the dump's second
+    /// header write as well).
     pub fn open(path: &Path) -> io::Result<Self> {
-        let mut file = File::open(path)?;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)?;
+        let mut file = file;
         let archive: CdsArchive = archive::read_header(&mut file)?;
         let header = FileMapHeader::parse_extension(&archive.extension)?;
         Ok(Self {
@@ -458,6 +468,7 @@ impl FileMapInfo {
             regions: archive.regions,
             base_archive_name: archive.base_archive_name,
             mappings: Vec::new(),
+            mapped_view: None,
         })
     }
 
@@ -476,6 +487,29 @@ impl FileMapInfo {
         let data_start =
             archive::write_header(&mut file, &generic, regions, &ext, base_name)?;
         Ok((file, data_start))
+    }
+
+    /// Adopt an open dump-side file handle into a FileMapInfo so the
+    /// header can be rewritten once region CRCs are known
+    /// (metaspaceShared::dump_inner).
+    pub(crate) fn adopt_for_header_rewrite(
+        path: &Path,
+        file: File,
+        generic: archive::GenericHeader,
+        header: FileMapHeader,
+        regions: Vec<CdsRegion>,
+        base_archive_name: Option<String>,
+    ) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            file,
+            generic,
+            header,
+            regions,
+            base_archive_name,
+            mappings: Vec::new(),
+            mapped_view: None,
+        }
     }
 
     /// Rewrite just the header block (after region CRCs are known).
@@ -513,20 +547,66 @@ impl FileMapInfo {
         self.regions.len()
     }
 
-    /// FileMapInfo::map_region for every non-empty region.
-    /// On Windows this uses CreateFileMappingW/MapViewOfFileEx through the
-    /// platform layer; elsewhere (and for small regions) the payload is read
-    /// into memory — semantically identical for CRC verification and lookup.
+    /// FileMapInfo::map_region for every non-empty region. The whole file
+    /// is mapped once (as FileMapInfo does with a single file mapping);
+    /// each region's mapped_base is view_base + file_offset. On Windows
+    /// this uses CreateFileMappingW/MapViewOfFileEx through the platform
+    /// layer; elsewhere (and on map failure) the payload is read into
+    /// memory — semantically identical for CRC verification and lookup.
     pub fn map_file_to_memory(&mut self) -> io::Result<()> {
         self.mappings.clear();
+        self.unmap_view();
+        let file_len = self.file.metadata()?.len();
+        if file_len == 0 {
+            return Ok(());
+        }
+
+        #[cfg(windows)]
+        let view = crate::share::platform::windows::OsWindows::map_file_memory(
+            &self.file, 0, file_len, 0, false,
+        )
+        .ok();
+        #[cfg(not(windows))]
+        let view: Option<usize> = None;
+
+        if let Some(base) = view {
+            self.mapped_view = Some((base, file_len as usize));
+            for (i, r) in self.regions.iter().enumerate() {
+                if r.used == 0 || r.file_offset == 0 {
+                    continue;
+                }
+                self.mappings.push(RegionMapping {
+                    region_index: i,
+                    file_offset: r.file_offset,
+                    used: r.used,
+                    read_only: r.read_only,
+                    mapped_base: base + r.file_offset as usize,
+                    data: None,
+                });
+            }
+            return Ok(());
+        }
+
+        // Fallback: read region payloads (non-Windows or map failure).
         for (i, r) in self.regions.iter().enumerate() {
             if r.used == 0 || r.file_offset == 0 {
                 continue;
             }
-            let mapping = map_region(&mut self.file, i, r)?;
+            let mapping = read_region_data(&mut self.file, i, r)?;
             self.mappings.push(mapping);
         }
         Ok(())
+    }
+
+    fn unmap_view(&mut self) {
+        #[cfg(windows)]
+        if let Some((base, len)) = self.mapped_view.take() {
+            let _ = crate::share::platform::windows::OsWindows::unmap_file_memory(base, len);
+        }
+        #[cfg(not(windows))]
+        {
+            self.mapped_view = None;
+        }
     }
 
     /// FileMapRegion::check_region_crc for all mapped regions.
@@ -559,17 +639,8 @@ impl FileMapInfo {
     }
 
     pub fn unmap(&mut self) {
-        #[cfg(windows)]
-        for m in self.mappings.drain(..) {
-            if m.mapped_base != 0 {
-                let _ = crate::share::platform::windows::OsWindows::unmap_file_memory(
-                    m.mapped_base,
-                    m.used as usize,
-                );
-            }
-        }
-        #[cfg(not(windows))]
         self.mappings.clear();
+        self.unmap_view();
     }
 }
 
@@ -579,49 +650,26 @@ impl Drop for FileMapInfo {
     }
 }
 
-fn map_region(file: &mut File, index: usize, r: &CdsRegion) -> io::Result<RegionMapping> {
-    let used = r.used;
-    #[cfg(windows)]
-    {
-        // MapViewOfFileEx requires the offset to be allocation-granularity
-        // aligned; region file_offsets already are (core_region_alignment).
-        let base = crate::share::platform::windows::OsWindows::map_file_memory(
-            file,
-            r.file_offset,
-            used,
-            0,
-            false,
-        )?;
-        return Ok(RegionMapping {
-            region_index: index,
-            file_offset: r.file_offset,
-            used,
-            read_only: r.read_only,
-            mapped_base: base,
-            data: None,
-        });
-    }
-    #[cfg(not(windows))]
-    {
-        use std::io::{Read, Seek, SeekFrom};
-        let mut data = vec![0u8; used as usize];
-        file.seek(SeekFrom::Start(r.file_offset))?;
-        file.read_exact(&mut data)?;
-        Ok(RegionMapping {
-            region_index: index,
-            file_offset: r.file_offset,
-            used,
-            read_only: r.read_only,
-            mapped_base: 0,
-            data: Some(data),
-        })
-    }
+fn read_region_data(file: &mut File, index: usize, r: &CdsRegion) -> io::Result<RegionMapping> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut data = vec![0u8; r.used as usize];
+    file.seek(SeekFrom::Start(r.file_offset))?;
+    file.read_exact(&mut data)?;
+    Ok(RegionMapping {
+        region_index: index,
+        file_offset: r.file_offset,
+        used: r.used,
+        read_only: r.read_only,
+        mapped_base: 0,
+        data: Some(data),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::share::cds::archive::{self, CdsRegion, GenericHeader};
+    use std::io::Write;
 
     fn test_archive(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!("cds_filemap_test_{}.jsa", tag))
@@ -680,11 +728,11 @@ mod tests {
             let (off, crc) = archive::append_region(&mut file, &payload_rw).unwrap();
             regions[RW_REGION].file_offset = off;
             regions[RW_REGION].used = payload_rw.len() as u64;
-            regions[RW_REGION].crc = crc as i32;
+            regions[RW_REGION].crc = crc;
             let (off2, crc2) = archive::append_region(&mut file, &payload_ro).unwrap();
             regions[RO_REGION].file_offset = off2;
             regions[RO_REGION].used = payload_ro.len() as u64;
-            regions[RO_REGION].crc = crc2 as i32;
+            regions[RO_REGION].crc = crc2;
             regions[RO_REGION].read_only = true;
             file.flush().unwrap();
         }

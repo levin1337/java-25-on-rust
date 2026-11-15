@@ -352,6 +352,11 @@ impl MetaspaceShared {
             used: payload.len() as u64,
             ..CdsRegion::default()
         };
+        regions[BM_REGION] = CdsRegion {
+            read_only: true,
+            is_bitmap_region: true,
+            ..CdsRegion::default()
+        };
 
         let (mut file, _data_start) =
             FileMapInfo::for_writing(path, generic, &regions, &header, base_name)?;
@@ -368,15 +373,14 @@ impl MetaspaceShared {
         file.flush()?;
 
         // Rewrite the header with final region CRCs.
-        let mut info = FileMapInfo {
-            path: path.to_path_buf(),
+        let mut info = FileMapInfo::adopt_for_header_rewrite(
+            path,
             file,
             generic,
             header,
-            regions: info_regions.clone(),
-            base_archive_name: base_name.map(|s| s.to_string()),
-            mappings: Vec::new(),
-        };
+            info_regions,
+            base_name.map(|s| s.to_string()),
+        );
         info.write_header_block(generic, base_name)?;
         info.file.flush()?;
         Ok(payload.len())
@@ -420,6 +424,23 @@ impl MetaspaceShared {
             Err(e) => {
                 CDSConfig::set_archive_loading_failed();
                 Err(format!("unable to use shared archive {}: {}", path.display(), e))
+            }
+        }
+    }
+
+    /// cdsConfig-aware load with -Xshare:auto fallback: when the archive is
+    /// missing or corrupt, CDS is disabled and the VM continues without
+    /// shared spaces (Ok(0)); under -Xshare:on the error is fatal.
+    pub fn restore_or_disable(&mut self, path: &Path) -> io::Result<usize> {
+        match self.try_restore_from_path(path) {
+            Ok(n) => Ok(n),
+            Err(e) => {
+                if CDSConfig::archive_error_is_fatal() {
+                    Err(io::Error::other(e))
+                } else {
+                    CDSConfig::disable_archive_after_failure();
+                    Ok(0)
+                }
             }
         }
     }
@@ -511,13 +532,13 @@ impl MetaspaceShared {
     }
 }
 
-fn read_count<R: Read>(cur: &mut Cursor<R>) -> io::Result<usize> {
+fn read_count(cur: &mut Cursor<&[u8]>) -> io::Result<usize> {
     let mut b = [0u8; 4];
     cur.read_exact(&mut b)?;
     Ok(u32::from_le_bytes(b) as usize)
 }
 
-fn read_bytes<R: Read>(cur: &mut Cursor<R>) -> io::Result<Vec<u8>> {
+fn read_bytes(cur: &mut Cursor<&[u8]>) -> io::Result<Vec<u8>> {
     let mut b = [0u8; 4];
     cur.read_exact(&mut b)?;
     let len = u32::from_le_bytes(b) as usize;

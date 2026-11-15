@@ -111,12 +111,13 @@ impl ExceptionHandlerTable {
     ) {
         debug_assert!(self.subtable_for(catch_pco).is_none());
         debug_assert_eq!(handler_bcis.len(), handler_pcos.len());
-        debug_assert!(
-            scope_depths_from_top_scope
-                .map_or(true, |s| s.len() == handler_bcis.len())
-        );
+        debug_assert!(scope_depths_from_top_scope.map_or(true, |s| s.len() == handler_bcis.len()));
         if !handler_bcis.is_empty() {
-            self.add_entry(HandlerTableEntry::new(handler_bcis.len() as i32, catch_pco, 0));
+            self.add_entry(HandlerTableEntry::new(
+                handler_bcis.len() as i32,
+                catch_pco,
+                0,
+            ));
             for (i, (&bci, &pco)) in handler_bcis.iter().zip(handler_pcos.iter()).enumerate() {
                 let scope_depth = scope_depths_from_top_scope.map_or(0, |s| s[i]);
                 self.add_entry(HandlerTableEntry::new(bci, pco, scope_depth));
@@ -130,7 +131,12 @@ impl ExceptionHandlerTable {
     }
 
     /// Find the handler entry for `(catch_pco, handler_bci, scope_depth)`.
-    pub fn entry_for(&self, catch_pco: i32, handler_bci: i32, scope_depth: i32) -> Option<&HandlerTableEntry> {
+    pub fn entry_for(
+        &self,
+        catch_pco: i32,
+        handler_bci: i32,
+        scope_depth: i32,
+    ) -> Option<&HandlerTableEntry> {
         let start = self.subtable_for(catch_pco)?;
         let header = &self.table[start];
         let mut l = header.len();
@@ -367,15 +373,21 @@ impl PcRangeHandlerTable {
     }
 
     pub fn add(&mut self, start_pc: i32, end_pc: i32, handler_pc: i32, catch_type: Option<Symbol>) {
-        self.add_entry(PcRangeHandlerEntry::new(start_pc, end_pc, handler_pc, catch_type));
+        self.add_entry(PcRangeHandlerEntry::new(
+            start_pc, end_pc, handler_pc, catch_type,
+        ));
     }
 
     /// First handler whose range covers `pc`.  `catch_type` of `None`
     /// matches any thrown type; `Some(t)` matches only that type or
     /// subtypes — subtype checks are delegated to `is_subtype` when
     /// provided.
-    pub fn lookup(&self, pc: i32, thrown_type: &Symbol, is_subtype: Option<&dyn Fn(&Symbol, &Symbol) -> bool>) -> Option<&PcRangeHandlerEntry>
-    {
+    pub fn lookup(
+        &self,
+        pc: i32,
+        thrown_type: &Symbol,
+        is_subtype: Option<&dyn Fn(&Symbol, &Symbol) -> bool>,
+    ) -> Option<&PcRangeHandlerEntry> {
         for e in &self.entries {
             if !e.covers(pc) {
                 continue;
@@ -415,7 +427,8 @@ impl PcRangeHandlerTable {
         thrown_type: &Symbol,
         is_subtype: Option<&dyn Fn(&Symbol, &Symbol) -> bool>,
     ) -> Option<i32> {
-        self.lookup(pc, thrown_type, is_subtype).map(|e| e.handler_pc)
+        self.lookup(pc, thrown_type, is_subtype)
+            .map(|e| e.handler_pc)
     }
 
     /// Whether the table is sorted by start_pc and non-overlapping in
@@ -449,7 +462,11 @@ impl PcRangeHandlerTable {
 
     /// `print_on` analogue for the pc-range table.
     pub fn print_on(&self, f: &mut dyn std::fmt::Write, base: Option<usize>) {
-        let _ = writeln!(f, "pc-range handler table ({} entries):", self.entries.len());
+        let _ = writeln!(
+            f,
+            "pc-range handler table ({} entries):",
+            self.entries.len()
+        );
         for e in &self.entries {
             let catch = e
                 .catch_type
@@ -492,10 +509,7 @@ impl PcRangeHandlerTable {
 
     /// Build a pc-range table from a `ConstMethod` exception table,
     /// translating bcis to pc offsets via `bci_to_pc`.
-    pub fn from_bci_table<F>(
-        entries: &[(u16, u16, u16, Option<Symbol>)],
-        bci_to_pc: F,
-    ) -> Self
+    pub fn from_bci_table<F>(entries: &[(u16, u16, u16, Option<Symbol>)], bci_to_pc: F) -> Self
     where
         F: Fn(u16) -> i32,
     {
@@ -589,8 +603,7 @@ mod tests {
 
     #[test]
     fn pc_range_from_bci_table() {
-        let entries: [(u16, u16, u16, Option<Symbol>); 1] =
-            [(0, 10, 20, Some(Symbol::new(b"E")))];
+        let entries: [(u16, u16, u16, Option<Symbol>); 1] = [(0, 10, 20, Some(Symbol::new(b"E")))];
         let t = PcRangeHandlerTable::from_bci_table(&entries, |bci| bci as i32 * 4);
         assert_eq!(t.entries().len(), 1);
         assert_eq!(t.entries()[0].start_pc, 0);

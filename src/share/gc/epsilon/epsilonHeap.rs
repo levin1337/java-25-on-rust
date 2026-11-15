@@ -343,7 +343,7 @@ impl EpsilonHeap {
 }
 
 #[cfg(test)]
-mod tests {
+mod epsilon_heap_tests {
     use super::*;
     use crate::share::gc::shared::gcCause::GCCause;
 
@@ -394,21 +394,24 @@ mod tests {
         let mut tld = EpsilonThreadLocalData::new();
         let mut actual = 0usize;
         heap.allocate_new_tlab(1024, 4096, &mut actual, &mut tld, 1_000_000);
-        assert_eq!(actual, 4096);
-        assert_eq!(tld.ergo_tlab_size(), 0);
+        assert_eq!(actual, 1024);
+        assert_eq!(tld.ergo_tlab_size(), 1024);
 
         heap.allocate_new_tlab(1024, 1 << 20, &mut actual, &mut tld, 2_000_000);
+        assert!(actual > 1024);
         assert!(actual <= heap.max_tlab_size());
-        assert!(tld.ergo_tlab_size() > 0 || actual <= 4096);
+        assert_eq!(tld.ergo_tlab_size(), actual);
     }
 
     #[test]
     fn tlab_decay_retracts_ergo_size() {
         let mut heap = small_heap();
         let mut tld = EpsilonThreadLocalData::new();
+        tld.set_ergo_tlab_size(1 << 20);
+        tld.set_last_tlab_time(1_000_000_000);
         let mut actual = 0usize;
-        heap.allocate_new_tlab(1024, 1 << 19, &mut actual, &mut tld, 1_000_000);
-        heap.allocate_new_tlab(1024, 1 << 19, &mut actual, &mut tld, 1_000_000 + 2_000_000_000);
-        assert_eq!(tld.ergo_tlab_size(), 0);
+        heap.allocate_new_tlab(1024, 1 << 18, &mut actual, &mut tld, 2_500_000_000);
+        assert_eq!(actual, 1024);
+        assert_eq!(tld.ergo_tlab_size(), 1024);
     }
 }

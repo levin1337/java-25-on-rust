@@ -35,7 +35,7 @@ impl G1CollectedHeap {
         Self {
             regions,
             region_size,
-            policy: G1Policy::new(),
+            policy: G1Policy::new(region_size as u64),
             current_eden_region_idx: None,
             young_collection_count: 0,
             full_collection_count: 0,

@@ -17,6 +17,7 @@ pub mod reflection;
 pub mod safepoint;
 pub mod safepointMechanism;
 pub mod shareCell;
+pub mod sharedRuntime;
 pub mod syncBump;
 pub mod signature;
 pub mod stackOverflow;

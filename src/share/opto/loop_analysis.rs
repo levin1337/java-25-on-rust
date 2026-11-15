@@ -14,7 +14,7 @@
  */
 
 use super::gvn::PhaseGVN;
-use super::node::{NodeId, Opcode, NONE};
+use super::node::{NONE, NodeId, Opcode};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 #[derive(Clone, Debug)]
@@ -84,9 +84,9 @@ fn control_input_indices(op: &Opcode, ninputs: usize) -> Vec<usize> {
             }
         }
         LoadI | LoadL | LoadF | LoadD | LoadP | LoadB | LoadC | LoadS | StoreI | StoreL
-        | StoreF | StoreD | StoreP | StoreB | StoreC | StoreS | Call(_) | New(_)
-        | NewArray(_) | NewArrayRef(_) | MultianewArray | CheckCast(_)
-        | InstanceOf(_) | ArrayLength | MonitorEnter | MonitorExit => {
+        | StoreF | StoreD | StoreP | StoreB | StoreC | StoreS | Call(_) | New(_) | NewArray(_)
+        | NewArrayRef(_) | MultianewArray | CheckCast(_) | InstanceOf(_) | ArrayLength
+        | MonitorEnter | MonitorExit => {
             if ninputs > 1 {
                 vec![1]
             } else {
@@ -317,8 +317,7 @@ fn assign_nesting(loops: &mut Vec<LoopInfo>) {
             if i == j {
                 continue;
             }
-            if loops[j].body.contains(&loops[i].header)
-                && loops[j].body.len() > loops[i].body.len()
+            if loops[j].body.contains(&loops[i].header) && loops[j].body.len() > loops[i].body.len()
             {
                 let dominated = match best {
                     None => true,
@@ -356,13 +355,19 @@ mod tests {
         gvn.start = start;
         let c0 = gvn.transform(Opcode::ConI(0), vec![]);
         let c1 = gvn.transform(Opcode::ConI(1), vec![]);
-        let test_pre = gvn.transform(Opcode::BoolCmp(crate::share::opto::node::CmpCondition::Lt), vec![c0, c1]);
+        let test_pre = gvn.transform(
+            Opcode::BoolCmp(crate::share::opto::node::CmpCondition::Lt),
+            vec![c0, c1],
+        );
         let if_pre = gvn.alloc(Opcode::If, vec![start, test_pre]);
         let body_ctrl = gvn.alloc(Opcode::IfTrue, vec![if_pre, start]);
         let header = gvn.alloc(Opcode::Region, vec![body_ctrl, NONE]);
         let phi = gvn.alloc(Opcode::Phi, vec![c0, c1, header]);
         let _ = phi;
-        let test = gvn.transform(Opcode::BoolCmp(crate::share::opto::node::CmpCondition::Lt), vec![c1, c0]);
+        let test = gvn.transform(
+            Opcode::BoolCmp(crate::share::opto::node::CmpCondition::Lt),
+            vec![c1, c0],
+        );
         let ifn = gvn.alloc(Opcode::If, vec![header, test]);
         let latch_t = gvn.alloc(Opcode::IfTrue, vec![ifn, start]);
         let latch_f = gvn.alloc(Opcode::IfFalse, vec![ifn, start]);

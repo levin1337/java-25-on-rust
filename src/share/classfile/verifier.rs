@@ -712,17 +712,17 @@ fn verify_class_structure<'a>(
     class: &ClassFile<'a>,
     loader: Option<&ClassLoader<'a>>,
 ) -> io::Result<()> {
-    const ACC_PUBLIC: u16 = 0x0001;
-    const ACC_FINAL: u16 = 0x0010;
-    const ACC_SUPER: u16 = 0x0020;
-    const ACC_INTERFACE: u16 = 0x0200;
-    const ACC_ABSTRACT: u16 = 0x0400;
-    const ACC_SYNTHETIC: u16 = 0x1000;
-    const ACC_ANNOTATION: u16 = 0x2000;
-    const ACC_ENUM: u16 = 0x4000;
-    const ACC_MODULE: u16 = 0x8000;
-    const ACC_RECORD: u16 = 0x10000;
-    const ALLOWED_CLASS_FLAGS: u16 = ACC_PUBLIC
+    const ACC_PUBLIC: u32 = 0x0001;
+    const ACC_FINAL: u32 = 0x0010;
+    const ACC_SUPER: u32 = 0x0020;
+    const ACC_INTERFACE: u32 = 0x0200;
+    const ACC_ABSTRACT: u32 = 0x0400;
+    const ACC_SYNTHETIC: u32 = 0x1000;
+    const ACC_ANNOTATION: u32 = 0x2000;
+    const ACC_ENUM: u32 = 0x4000;
+    const ACC_MODULE: u32 = 0x8000;
+    const ACC_RECORD: u32 = 0x10000;
+    const ALLOWED_CLASS_FLAGS: u32 = ACC_PUBLIC
         | ACC_FINAL
         | ACC_SUPER
         | ACC_INTERFACE
@@ -733,7 +733,7 @@ fn verify_class_structure<'a>(
         | ACC_MODULE
         | ACC_RECORD;
 
-    let flags = class.accessFlags;
+    let flags = u32::from(class.accessFlags);
     if flags & !ALLOWED_CLASS_FLAGS != 0 {
         return Err(Error::other(format!(
             "ClassFormatError: Illegal class access flags {flags:#06x}"
@@ -761,12 +761,12 @@ fn verify_class_structure<'a>(
         }
     }
     // <init> / <clinit> shape rules (JVMS 4.6 / 5.5).
-    const FIELD_FLAGS: u16 = 0x0001 | 0x0002 | 0x0004 | 0x0008 | 0x0010 | 0x0040
+    const FIELD_FLAGS: u32 = 0x0001 | 0x0002 | 0x0004 | 0x0008 | 0x0010 | 0x0040
         | 0x0080 | 0x1000 | 0x4000 | 0x8000 | 0x20000;
-    const METHOD_FLAGS: u16 = 0x0001 | 0x0002 | 0x0004 | 0x0008 | 0x0010 | 0x0020
+    const METHOD_FLAGS: u32 = 0x0001 | 0x0002 | 0x0004 | 0x0008 | 0x0010 | 0x0020
         | 0x0040 | 0x0080 | 0x0100 | 0x0400 | 0x0800 | 0x1000 | 0x8000 | 0x20000;
     for field in &class.fields {
-        if field.accessFlags & !FIELD_FLAGS != 0 {
+        if u32::from(field.accessFlags) & !FIELD_FLAGS != 0 {
             return Err(Error::other(format!(
                 "ClassFormatError: Illegal field access flags {:#06x}",
                 field.accessFlags
@@ -790,7 +790,7 @@ fn verify_class_structure<'a>(
         }
     }
     for method in &class.methods {
-        if method.accessFlags & !METHOD_FLAGS != 0 {
+        if u32::from(method.accessFlags) & !METHOD_FLAGS != 0 {
             return Err(Error::other(format!(
                 "ClassFormatError: Illegal method access flags {:#06x}",
                 method.accessFlags

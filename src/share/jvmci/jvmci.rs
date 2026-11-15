@@ -9,8 +9,7 @@
 
 use crate::share::jvmci::jvmciEnv::JvmciEnv;
 use crate::share::jvmci::jvmciExceptions::{JvmciException, JVMCI_NOT_ENABLED_ERROR_MESSAGE};
-use crate::share::jvmci::jvmciGlobals::{self, flags};
-use crate::share::jvmci::jvmciObject::JvmciObject;
+use crate::share::jvmci::jvmciGlobals;
 use crate::share::jvmci::jvmciRuntime::JvmciRuntime;
 use crate::share::runtime::thread::{Thread, ThreadType};
 use std::collections::HashMap;
@@ -152,6 +151,12 @@ impl JVMCI {
 
     // ---- shared library -------------------------------------------------
 
+    /// `JVMCI::one_shared_library_javavm_per_compilation` � the jvmci
+    /// shared library hosts a single JavaVM per compilation in this port.
+    pub fn one_shared_library_javavm_per_compilation() -> bool {
+        true
+    }
+
     /// `JVMCI::shared_library_exists`: probe for the jvmcicompiler
     /// shared library without loading it.
     pub fn shared_library_exists() -> bool {
@@ -292,13 +297,18 @@ impl JVMCI {
         // Find a runtime with spare capacity.
         {
             let runtimes = st.compiler_runtimes.lock().unwrap();
+            let mut found = None;
             for rt in runtimes.iter() {
                 if rt.num_attached() < max_per as i32 {
-                    let id = rt.id;
-                    drop(runtimes);
-                    st.thread_runtime.lock().unwrap().insert(thread_id, id);
-                    return Some(rt.clone());
+                    found = Some(rt.clone());
+                    break;
                 }
+            }
+            if let Some(rt) = found {
+                let id = rt.id;
+                drop(runtimes);
+                st.thread_runtime.lock().unwrap().insert(thread_id, id);
+                return Some(rt);
             }
         }
         if !create {
@@ -582,6 +592,11 @@ static COMPILATION_TICKS: std::sync::atomic::AtomicI64 =
 /// `JVMCI::global_compilation_ticks` analogue.
 pub fn compilation_ticks() -> i64 {
     COMPILATION_TICKS.load(Ordering::Relaxed)
+}
+
+/// Increment the global compilation tick counter.
+pub fn compilation_ticks_inc() {
+    COMPILATION_TICKS.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Fatal error helper (os::fatal analogue for JVMCI paths).

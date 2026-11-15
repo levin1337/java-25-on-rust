@@ -104,51 +104,6 @@ impl GenericHeader {
         w.write_all(&self.base_archive_name_size.to_le_bytes())?;
         Ok(())
     }
-
-    fn read_from<R: Read>(r: &mut R) -> io::Result<Self> {
-        let mut b = [0u8; 4];
-        r.read_exact(&mut b)?;
-        let magic = u32::from_le_bytes(b);
-        let header = Self {
-            magic,
-            crc: {
-                r.read_exact(&mut b)?;
-                i32::from_le_bytes(b)
-            },
-            version: {
-                r.read_exact(&mut b)?;
-                i32::from_le_bytes(b)
-            },
-            header_size: {
-                r.read_exact(&mut b)?;
-                u32::from_le_bytes(b)
-            },
-            base_archive_name_offset: {
-                r.read_exact(&mut b)?;
-                u32::from_le_bytes(b)
-            },
-            base_archive_name_size: {
-                r.read_exact(&mut b)?;
-                u32::from_le_bytes(b)
-            },
-        };
-        if header.magic != CDS_ARCHIVE_MAGIC
-            && header.magic != CDS_DYNAMIC_ARCHIVE_MAGIC
-            && header.magic != CDS_PREIMAGE_ARCHIVE_MAGIC
-        {
-            return Err(io::Error::other(format!(
-                "Not a CDS archive (magic {:#x})",
-                header.magic
-            )));
-        }
-        if !header.is_supported() {
-            return Err(io::Error::other(format!(
-                "Unsupported CDS archive version {}",
-                header.version
-            )));
-        }
-        Ok(header)
-    }
 }
 
 /// One serialized CDSFileMapRegion (share/include/cds.h layout, pointers
@@ -339,7 +294,7 @@ pub fn read_header(file: &mut File) -> io::Result<CdsArchive> {
     file.seek(SeekFrom::Start(0))?;
     file.read_exact(&mut b4)?;
     let magic = u32::from_le_bytes(b4);
-    let mut header = GenericHeader {
+    let header = GenericHeader {
         magic,
         crc: {
             file.read_exact(&mut b4)?;
@@ -464,7 +419,12 @@ pub fn write_header(
     file.seek(SeekFrom::Start(0))?;
     file.write_all(&block)?;
     let data_start = align_up(block.len() as u64, CORE_REGION_ALIGNMENT as u64);
-    file.set_len(data_start)?;
+    // Extend the file up to the first payload boundary if needed, but never
+    // truncate: the header is rewritten after region payloads are appended
+    // (FileMapInfo::write_header runs twice during a dump).
+    if file.metadata()?.len() < data_start {
+        file.set_len(data_start)?;
+    }
     file.seek(SeekFrom::Start(data_start))?;
     Ok(data_start)
 }
@@ -528,7 +488,7 @@ mod tests {
             crc: 123,
             read_only: true,
             file_offset: 65536,
-            used: 11,
+            used: 9,
             mapped_from_file: true,
             ..CdsRegion::default()
         };
@@ -552,7 +512,7 @@ mod tests {
         assert!(arch.header.is_static());
         assert!(arch.header.is_supported());
         assert_eq!(arch.regions.len(), NUM_CDS_REGIONS);
-        assert_eq!(arch.regions[0].used, 11);
+        assert_eq!(arch.regions[0].used, 9);
         assert!(arch.regions[0].read_only);
         assert_eq!(arch.regions[0].file_offset % CORE_REGION_ALIGNMENT as u64, 0);
         assert_eq!(arch.extension, b"ext-bytes");

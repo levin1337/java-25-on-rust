@@ -313,16 +313,16 @@ impl SatbMarkQueueSet {
     pub fn filter<F: Fn(u64) -> bool>(&self, thread: usize, filter_out: F) {
         let mut queues = self.queues.lock();
         if let Some(queue) = queues.get_mut(thread) {
-            Self::apply_filter(&mut queue, filter_out);
+            Self::apply_filter(queue, filter_out);
         }
     }
 
     fn apply_filter<F: Fn(u64) -> bool>(queue: &mut SatbMarkQueue, filter_out: F) {
+        let index = queue.index;
+        let capacity = queue.current_capacity();
         let Some(buf) = queue.buf.as_mut() else {
             return;
         };
-        let index = queue.index;
-        let capacity = queue.current_capacity();
         let mut src = index;
         let mut dst = capacity;
         while src < dst {
@@ -484,7 +484,7 @@ mod tests {
         for i in 1..=6u64 {
             set.enqueue_known_active(t0, i);
         }
-        set.filter(t0, |e| e % 2 == 0);
+        set.filter(t0, |e| e % 2 == 1);
         let mut entries = Vec::new();
         set.all_entries(|e| entries.push(e));
         entries.sort_unstable();

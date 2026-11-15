@@ -8,10 +8,10 @@
  * "reserved by memory file" totals; detail reports list the files.
  */
 
-use super::memTag::MemTag;
+use crate::share::nmt::memTag::MemTag;
 use super::nmtCommon::NmtTrackingLevel;
 use super::virtualMemoryTracker::VirtualMemorySnapshot;
-use parking_lot::Mutex;
+use std::sync::Mutex;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -91,7 +91,7 @@ impl MemoryFileTrackerInstance {
         if !Self::tracking_enabled() || size == 0 {
             return false;
         }
-        let mut inner = self.inner.lock();
+        let mut inner = self.inner.lock().unwrap();
         if let Some((&k, _)) = inner.files.range(..=addr).next_back() {
             let f = &inner.files[&k];
             if addr < f.addr + f.size {
@@ -104,8 +104,8 @@ impl MemoryFileTrackerInstance {
                 return false;
             }
         }
-        inner.reserved_by_tag[NmtTagIndex::of(tag)] += size;
-        inner.committed_by_tag[NmtTagIndex::of(tag)] += size;
+        inner.reserved_by_tag[tag as usize] += size;
+        inner.committed_by_tag[tag as usize] += size;
         inner.files.insert(addr, MemoryFile { addr, size, tag });
         drop(inner);
         self.active.fetch_add(1, Ordering::Relaxed);
@@ -114,8 +114,8 @@ impl MemoryFileTrackerInstance {
 
     /// Remove a file mapping.
     pub fn remove_memory_file(&self, addr: usize, size: usize) {
-        let mut inner = self.inner.lock();
-        let Some(&key) = inner.files.get_key_value(&addr).map(|(k, _)| k).or_else(|| {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(key) = inner.files.get_key_value(&addr).map(|(k, _)| *k).or_else(|| {
             inner
                 .files
                 .range(..=addr)
@@ -126,7 +126,7 @@ impl MemoryFileTrackerInstance {
             return;
         };
         let f = inner.files.remove(&key).unwrap();
-        let tag_idx = NmtTagIndex::of(f.tag);
+        let tag_idx = f.tag as usize;
         inner.reserved_by_tag[tag_idx] = inner.reserved_by_tag[tag_idx].saturating_sub(size.min(f.size));
         inner.committed_by_tag[tag_idx] = inner.committed_by_tag[tag_idx].saturating_sub(size.min(f.size));
         drop(inner);
@@ -136,9 +136,9 @@ impl MemoryFileTrackerInstance {
     /// Fold file-backed memory into a VM snapshot (reserved == committed
     /// for file mappings).
     pub fn summary_snapshot(&self, snapshot: &mut VirtualMemorySnapshot) {
-        let inner = self.inner.lock();
-        for tag in super::memTag::MemTag::all() {
-            let i = NmtTagIndex::of(tag);
+        let inner = self.inner.lock().unwrap();
+        for tag in crate::share::nmt::memTag::MemTag::all() {
+            let i = tag as usize;
             let v = snapshot.by_tag_mut(tag);
             let add = inner.reserved_by_tag[i];
             v.reserve_memory(add);
@@ -148,12 +148,12 @@ impl MemoryFileTrackerInstance {
 
     /// All tracked files (for detail reports).
     pub fn files(&self) -> Vec<MemoryFile> {
-        self.inner.lock().files.values().cloned().collect()
+        self.inner.lock().unwrap().files.values().cloned().collect()
     }
 
     /// I/O statistics for a mapped file (C++ record_mem_io_stat).
     pub fn record_io_stat(&self, addr: usize, read_ops: usize, write_ops: usize, read_bytes: usize, write_bytes: usize) {
-        let mut stats = self.io_stats.lock();
+        let mut stats = self.io_stats.lock().unwrap();
         let e = stats.entry(addr).or_default();
         e.read_ops += read_ops;
         e.write_ops += write_ops;
@@ -163,18 +163,26 @@ impl MemoryFileTrackerInstance {
 
     /// All I/O statistics.
     pub fn io_stats(&self) -> Vec<(usize, MemIoStatFunctionData)> {
-        self.io_stats.lock().iter().map(|(&k, &v)| (k, v)).collect()
+        self.io_stats.lock().unwrap().iter().map(|(&k, &v)| (k, v)).collect()
     }
 
     /// Number of tracked file mappings.
     pub fn file_count(&self) -> usize {
-        self.inner.lock().files.len()
+        self.inner.lock().unwrap().files.len()
     }
-}
 
-/// Internal helper: tag -> vector index (keeps the call sites short).
-mod NmtTagIndex {
-    pub fn of(tag: super::memTag::MemTag) -> usize {
-        tag as usize
+    /// Reset all tracked state (tests / shutdown).
+    pub fn reset(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.files.clear();
+        for v in inner.reserved_by_tag.iter_mut() {
+            *v = 0;
+        }
+        for v in inner.committed_by_tag.iter_mut() {
+            *v = 0;
+        }
+        drop(inner);
+        self.io_stats.lock().unwrap().clear();
+        self.active.store(0, Ordering::Relaxed);
     }
 }

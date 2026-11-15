@@ -1,4 +1,4 @@
-use super::{DecodedInstruction, DecoderImpl, DecoderStatus};
+use super::decoder::{DecodedInstruction, DecoderImpl, DecoderStatus};
 
 const M: u8 = 0x01;
 const I8: u8 = 0x02;
@@ -8,10 +8,6 @@ const IOS: u8 = 0x10;
 const IOS32: u8 = 0x20;
 const MOFFS: u8 = 0x40;
 const FARPTR: u8 = 0x80;
-
-const fn row(a: [u8; 16]) -> [u8; 16] {
-    a
-}
 
 const PRIMARY: [u8; 256] = [
     // 0x00
@@ -39,7 +35,7 @@ const PRIMARY: [u8; 256] = [
     // 0xB0
     I8, I8, I8, I8, I8, I8, I8, I8, IOS, IOS, IOS, IOS, IOS, IOS, IOS, IOS,
     // 0xC0
-    M | I8, M | I8, I16, 0, 0, 0, M | I8, M | IOS, 0, 0, I16, 0, 0, I8, 0, 0,
+    M | I8, M | I8, I16, 0, 0, 0, M | I8, M | IOS, I8, 0, I16, 0, 0, I8, 0, 0,
     // 0xD0
     M, M, M, M, I8, I8, 0, 0, M, M, M, M, M, M, M, M,
     // 0xE0
@@ -72,7 +68,7 @@ const OF_MAP: [u8; 256] = [
     // 0xA0
     0, 0, 0, M, M | I8, M, M, M, 0, 0, 0, M, M | I8, M, M, M,
     // 0xB0
-    M, M, M, M, M | I8, M, M, M, M, M, M, M, M, M, M, M,
+    M, M, M, M, M | I8, M, M, M, M, M, M | I8, M, M, M, M, M,
     // 0xC0
     M, M, M | I8, M, M | I8, M | I8, M, M, 0, 0, 0, 0, 0, 0, 0, 0,
     // 0xD0
@@ -207,9 +203,8 @@ fn fpu_no_modrm(opcode: u8, second: u8) -> bool {
     match opcode {
         0xD9 => {
             second == 0xD0
-                || (0xD9..=0xDF).contains(&second)
-                || (0xE0..=0xEF).contains(&second)
-                || (0xF0..=0xF7).contains(&second)
+                || (0xC0..=0xCF).contains(&second)
+                || (0xE0..=0xFF).contains(&second)
         }
         0xDB => (0xE0..=0xF7).contains(&second),
         0xDA => second == 0xE9,
@@ -255,7 +250,7 @@ pub fn instruction_length(code: &[u8]) -> Option<usize> {
     let b = code[i];
     i += 1;
 
-    let mut attr: u8;
+    let attr: u8;
 
     if b == 0x0F {
         if i >= code.len() {
@@ -295,18 +290,18 @@ pub fn instruction_length(code: &[u8]) -> Option<usize> {
                 i += 1;
             }
             2 => {
-                if i + 1 >= code.len() {
+                if i >= code.len() {
                     return None;
                 }
-                attr = OF38_MAP[code[i + 1] as usize];
-                i += 2;
+                attr = OF38_MAP[code[i] as usize];
+                i += 1;
             }
             3 => {
-                if i + 1 >= code.len() {
+                if i >= code.len() {
                     return None;
                 }
-                attr = OF3A_MAP[code[i + 1] as usize];
-                i += 2;
+                attr = OF3A_MAP[code[i] as usize];
+                i += 1;
             }
             _ => {
                 attr = 0;
@@ -337,18 +332,18 @@ pub fn instruction_length(code: &[u8]) -> Option<usize> {
                 i += 1;
             }
             2 => {
-                if i + 1 >= code.len() {
+                if i >= code.len() {
                     return None;
                 }
-                attr = OF38_MAP[code[i + 1] as usize];
-                i += 2;
+                attr = OF38_MAP[code[i] as usize];
+                i += 1;
             }
             _ => {
-                if i + 1 >= code.len() {
+                if i >= code.len() {
                     return None;
                 }
-                attr = OF3A_MAP[code[i + 1] as usize];
-                i += 2;
+                attr = OF3A_MAP[code[i] as usize];
+                i += 1;
             }
         }
     } else if b == 0x8F {
@@ -374,6 +369,8 @@ pub fn instruction_length(code: &[u8]) -> Option<usize> {
     if !matches!(b, 0xC4 | 0xC5 | 0x62 | 0x8F) && (0xD8..=0xDF).contains(&b)
     {
         if i < code.len() && fpu_no_modrm(b, code[i]) {
+            // two-byte x87 opcode (e.g. D9 E8 = fld1): consume the second byte
+            i += 1;
             has_modrm = false;
         }
     }
@@ -424,7 +421,7 @@ mod tests {
         assert_eq!(instruction_length(&[0x0F, 0x84, 1, 2, 3, 4]), Some(6));
         assert_eq!(instruction_length(&[0xB8, 1, 2, 3, 4]), Some(5));
         assert_eq!(instruction_length(&[0x48, 0xB8, 1, 2, 3, 4, 5, 6, 7, 8]), Some(10));
-        assert_eq!(instruction_length(&[0x66, 0xB8, 1, 2]), Some(3));
+        assert_eq!(instruction_length(&[0x66, 0xB8, 1, 2]), Some(4));
         assert_eq!(instruction_length(&[0x6A, 0x7F]), Some(2));
         assert_eq!(instruction_length(&[0x68, 1, 2, 3, 4]), Some(5));
         assert_eq!(instruction_length(&[0xC3]), Some(1));

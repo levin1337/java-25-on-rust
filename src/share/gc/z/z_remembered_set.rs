@@ -126,7 +126,7 @@ impl ZRememberedSet {
         ZReverseBitMapIterator::new(self.previous())
     }
 
-    pub fn iterator_limited_current<F>(&self, offset: usize, size: usize, function: F)
+    pub fn iterator_limited_current<F>(&self, offset: usize, size: usize, mut function: F)
     where
         F: FnMut(usize) -> bool,
     {
@@ -135,7 +135,7 @@ impl ZRememberedSet {
         self.current().iterate_range(start, end, |index| function(Self::to_offset(index)));
     }
 
-    pub fn iterator_limited_previous<F>(&self, offset: usize, size: usize, function: F)
+    pub fn iterator_limited_previous<F>(&self, offset: usize, size: usize, mut function: F)
     where
         F: FnMut(usize) -> bool,
     {
@@ -215,7 +215,6 @@ mod tests {
         assert!(remset.at_previous(16));
         assert!(remset.is_cleared_current());
         ZRememberedSet::flip();
-        remset.swap_remset_bitmaps();
         assert!(remset.at_current(16));
     }
 }

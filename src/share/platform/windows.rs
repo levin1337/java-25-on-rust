@@ -23,8 +23,8 @@ use std::ffi::c_void;
 use std::fs::File;
 use std::io;
 use std::os::windows::io::AsRawHandle;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 pub mod cpu_features;
 pub mod file_io;
@@ -227,8 +227,7 @@ pub struct ExceptionPointers {
     pub context_record: usize,
 }
 
-pub type TopLevelExceptionFilter =
-    unsafe extern "system" fn(*const ExceptionPointers) -> i32;
+pub type TopLevelExceptionFilter = unsafe extern "system" fn(*const ExceptionPointers) -> i32;
 
 /// LPTHREAD_START_ROUTINE (winbase.h).
 pub type ThreadStartRoutine = unsafe extern "system" fn(*mut c_void) -> u32;
@@ -333,12 +332,8 @@ unsafe extern "system" {
     fn QueryPerformanceCounter(lp_performance_count: *mut i64) -> i32;
     fn GetTickCount64() -> u64;
     fn GetSystemTimeAsFileTime(lp_system_time_as_file_time: *mut FileTime);
-    fn SystemTimeToFileTime(
-        lp_system_time: *const SystemTime,
-        lp_file_time: *mut FileTime,
-    ) -> i32;
-    fn FileTimeToSystemTime(lp_file_time: *const FileTime, lp_system_time: *mut SystemTime)
-        -> i32;
+    fn SystemTimeToFileTime(lp_system_time: *const SystemTime, lp_file_time: *mut FileTime) -> i32;
+    fn FileTimeToSystemTime(lp_file_time: *const FileTime, lp_system_time: *mut SystemTime) -> i32;
     fn GetSystemTime(lp_system_time: *mut SystemTime);
     fn GetLocalTime(lp_local_time: *mut SystemTime);
     fn GetThreadTimes(
@@ -460,11 +455,7 @@ unsafe extern "system" {
         dw_creation_flags: u32,
         lp_thread_id: *mut u32,
     ) -> Handle;
-    fn OpenThread(
-        dw_desired_access: u32,
-        b_inherit_handle: i32,
-        dw_thread_id: u32,
-    ) -> Handle;
+    fn OpenThread(dw_desired_access: u32, b_inherit_handle: i32, dw_thread_id: u32) -> Handle;
     fn SuspendThread(h_thread: Handle) -> u32;
     fn ResumeThread(h_thread: Handle) -> u32;
     fn TerminateThread(h_thread: Handle, dw_exit_code: u32) -> i32;
@@ -496,10 +487,7 @@ unsafe extern "system" {
         l_release_count: i32,
         lp_previous_count: *mut i32,
     ) -> i32;
-    fn GetThreadGroupAffinity(
-        h_thread: Handle,
-        lp_group_affinity: *mut GroupAffinity,
-    ) -> i32;
+    fn GetThreadGroupAffinity(h_thread: Handle, lp_group_affinity: *mut GroupAffinity) -> i32;
     fn SetThreadGroupAffinity(
         h_thread: Handle,
         group_affinity: *mut GroupAffinity,
@@ -917,12 +905,7 @@ impl OsWindows {
             return Ok(addr);
         }
         unsafe {
-            let p = VirtualAlloc(
-                addr as *mut c_void,
-                bytes,
-                MEM_RESERVE,
-                PAGE_READWRITE,
-            );
+            let p = VirtualAlloc(addr as *mut c_void, bytes, MEM_RESERVE, PAGE_READWRITE);
             if p.is_null() {
                 return Err(last_error_io("VirtualAlloc(MEM_RESERVE)"));
             }
@@ -979,23 +962,13 @@ impl OsWindows {
             return Ok(());
         }
         unsafe {
-            let p = VirtualAlloc(
-                addr as *mut c_void,
-                bytes,
-                MEM_COMMIT,
-                PAGE_READWRITE,
-            );
+            let p = VirtualAlloc(addr as *mut c_void, bytes, MEM_COMMIT, PAGE_READWRITE);
             if p.is_null() {
                 return Err(last_error_io("VirtualAlloc(MEM_COMMIT)"));
             }
             if exec {
                 let mut old: u32 = 0;
-                if VirtualProtect(
-                    addr as *mut c_void,
-                    bytes,
-                    PAGE_EXECUTE_READWRITE,
-                    &mut old,
-                ) == 0
+                if VirtualProtect(addr as *mut c_void, bytes, PAGE_EXECUTE_READWRITE, &mut old) == 0
                 {
                     return Err(last_error_io("VirtualProtect(PAGE_EXECUTE_READWRITE)"));
                 }
@@ -1008,7 +981,10 @@ impl OsWindows {
     pub fn commit_memory_or_exit(addr: usize, bytes: usize, exec: bool, msg: &str) {
         if let Err(e) = Self::commit_memory(addr, bytes, exec) {
             // Matches vm_exit_out_of_memory path: report and abort the process.
-            eprintln!("fatal: {}: commit_memory(0x{:x}, {}, exec={}) failed: {}", msg, addr, bytes, exec, e);
+            eprintln!(
+                "fatal: {}: commit_memory(0x{:x}, {}, exec={}) failed: {}",
+                msg, addr, bytes, exec, e
+            );
             std::process::abort();
         }
     }
@@ -1109,12 +1085,7 @@ impl OsWindows {
             } else {
                 PAGE_READWRITE
             };
-            let p = VirtualAlloc(
-                addr as *mut c_void,
-                bytes,
-                MEM_COMMIT | MEM_RESERVE,
-                prot,
-            );
+            let p = VirtualAlloc(addr as *mut c_void, bytes, MEM_COMMIT | MEM_RESERVE, prot);
             if p.is_null() {
                 return Err(last_error_io("VirtualAlloc(MEM_COMMIT|MEM_RESERVE)"));
             }
@@ -1225,15 +1196,13 @@ impl OsWindows {
             let close_err = {
                 // Mapping object handle can be closed once the view exists.
                 let r = CloseHandle(mapping);
-                if r == 0 {
-                    Some(last_error())
-                } else {
-                    None
-                }
+                if r == 0 { Some(last_error()) } else { None }
             };
             if view.is_null() {
                 return Err(match close_err {
-                    Some(e) => io::Error::new(io::ErrorKind::Other, format!("MapViewOfFileEx (err {e})")),
+                    Some(e) => {
+                        io::Error::new(io::ErrorKind::Other, format!("MapViewOfFileEx (err {e})"))
+                    }
                     None => last_error_io("MapViewOfFileEx"),
                 });
             }
@@ -1262,12 +1231,7 @@ impl OsWindows {
                     dw_size: usize,
                 ) -> i32;
             }
-            if FlushInstructionCache(
-                GetCurrentProcess(),
-                addr as *const c_void,
-                size,
-            ) == 0
-            {
+            if FlushInstructionCache(GetCurrentProcess(), addr as *const c_void, size) == 0 {
                 return Err(last_error_io("FlushInstructionCache"));
             }
         }
@@ -1389,8 +1353,7 @@ impl OsWindows {
         // Server 2022 = build 20348, Server 2025 = build 26100.
         vm_version()
             .map(|v| {
-                v.build_number >= 20348
-                    && (v.product_type == 2 || v.product_type == 3) // VER_NT_SERVER
+                v.build_number >= 20348 && (v.product_type == 2 || v.product_type == 3) // VER_NT_SERVER
             })
             .unwrap_or(false)
     }
@@ -1611,9 +1574,7 @@ impl OsWindows {
 
     /// Default unhandled-exception filter body (os::win32::topLevelExceptionFilter
     /// analogue): dump then continue search so WER/JVM handlers still run.
-    pub unsafe extern "system" fn default_exception_filter(
-        info: *const ExceptionPointers,
-    ) -> i32 {
+    pub unsafe extern "system" fn default_exception_filter(info: *const ExceptionPointers) -> i32 {
         if !info.is_null() {
             unsafe {
                 let ep = &*info;
@@ -1668,7 +1629,12 @@ fn last_error_io(context: &str) -> io::Error {
     let code = last_error();
     io::Error::new(
         io::ErrorKind::Other,
-        format!("{}: Win32 error {} ({})", context, code, format_error_message(code)),
+        format!(
+            "{}: Win32 error {} ({})",
+            context,
+            code,
+            format_error_message(code)
+        ),
     )
 }
 

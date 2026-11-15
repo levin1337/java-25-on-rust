@@ -165,7 +165,7 @@ impl<'a> CiConstantPool<'a> {
     /// The `(owner, name, descriptor)` triple of a Fieldref/Methodref
     /// constant (`ciEnv::resolve_method_at` companion).
     pub fn member_ref(&self, index: u16, is_field: bool) -> Option<[&'a [u8]; 3]> {
-        self.holder.member_ref(index, is_field)
+        self.klass.memberRef(index, is_field).ok()
     }
 
     /// `ciConstantPool::is_valid_index` analogue.

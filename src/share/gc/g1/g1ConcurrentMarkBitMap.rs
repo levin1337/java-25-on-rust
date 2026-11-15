@@ -224,3 +224,56 @@ impl MarkState {
         matches!(self, Self::Marked | Self::Pending)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mark_and_query() {
+        let mut bm = G1ConcurrentMarkBitMap::new(0, 1024, 4, 8);
+        assert!(bm.mark_bit(64));
+        assert!(!bm.mark_bit(64)); // already marked
+        assert!(bm.is_marked(64));
+        assert!(!bm.is_marked(72));
+        assert_eq!(bm.count(), 1);
+    }
+
+    #[test]
+    fn region_isolation() {
+        let mut bm = G1ConcurrentMarkBitMap::new(0, 1024, 4, 8);
+        bm.mark_bit(0);
+        bm.mark_bit(1024);
+        bm.mark_bit(2048);
+        bm.clear_region(1);
+        assert!(bm.is_marked(0));
+        assert!(!bm.is_marked(1024));
+        assert!(bm.is_marked(2048));
+    }
+
+    #[test]
+    fn iterate_marked() {
+        let mut bm = G1ConcurrentMarkBitMap::new(0, 1024, 2, 8);
+        bm.mark_bit(8);
+        bm.mark_bit(24);
+        bm.mark_bit(1032);
+        let mut addrs = Vec::new();
+        bm.for_each_marked_in_region(0, |a| addrs.push(a));
+        assert_eq!(addrs, vec![8, 24]);
+        let mut addrs1 = Vec::new();
+        bm.for_each_marked_in_region(1, |a| addrs1.push(a));
+        assert_eq!(addrs1, vec![1032]);
+    }
+
+    #[test]
+    fn next_marked() {
+        let mut bm = G1ConcurrentMarkBitMap::new(0, 1024, 1, 8);
+        bm.mark_bit(104);
+        bm.mark_bit(200);
+        assert_eq!(bm.next_marked(0), Some(104));
+        // word granularity: addr 105 is inside marked word 104..112
+        assert_eq!(bm.next_marked(105), Some(104));
+        assert_eq!(bm.next_marked(113), Some(200));
+        assert_eq!(bm.next_marked(208), None);
+    }
+}

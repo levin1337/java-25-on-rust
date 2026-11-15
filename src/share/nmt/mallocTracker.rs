@@ -250,6 +250,9 @@ impl MallocMemorySnapshot {
     /// chunks to get total free chunk size.
     pub fn make_adjustment(&mut self) {
         let arena_size = self.total_arena();
+        if arena_size == 0 {
+            return;
+        }
         let chunk_idx = NmtUtil::tag_to_index(MemTag::MtChunk);
         self.malloc[chunk_idx].record_free(arena_size);
         self.all_mallocs.deallocate(arena_size);
@@ -394,6 +397,17 @@ impl MallocMemorySummary {
         self.snapshot.lock().unwrap().by_tag(mem_tag).record_arena_size_change(size);
     }
 
+    /// Reset all counters (tests / shutdown).
+    pub fn reset(&self) {
+        let mut snap = self.snapshot.lock().unwrap();
+        for tag in MemTag::all() {
+            let m = snap.by_tag_mut(tag);
+            m.malloc_counter().reset();
+            m.arena_counter().reset();
+        }
+        snap.all_mallocs_mut().reset();
+    }
+
     /// MallocLimit: returns true if allocating s bytes under mem_tag would
     /// trigger either the global or the category limit.
     pub fn check_exceeds_limit(&self, s: usize, mem_tag: MemTag) -> bool {
@@ -449,6 +463,13 @@ impl MemoryCounter {
     fn peak_count_store(&self, v: usize) {
         self.peak_count.store(v, Ordering::Relaxed);
     }
+
+    fn reset(&self) {
+        self.count.store(0, Ordering::Relaxed);
+        self.size.store(0, Ordering::Relaxed);
+        self.peak_count.store(0, Ordering::Relaxed);
+        self.peak_size.store(0, Ordering::Relaxed);
+    }
 }
 
 /// Main class called from MemTracker to track malloc activities.
@@ -460,7 +481,7 @@ impl MallocTracker {
     pub fn initialize(level: NmtTrackingLevel) -> bool {
         if level >= NmtTrackingLevel::Summary {
             MallocMemorySummary::initialize();
-            MallocLimitHandler::initialize(std::env::var("JVMLIB_MALLOC_LIMIT").ok().as_deref());
+            let _ = MallocLimitHandler::initialize(std::env::var("JVMLIB_MALLOC_LIMIT").ok().as_deref());
         }
         if level == NmtTrackingLevel::Detail {
             return MallocSiteTable::initialize();
@@ -543,6 +564,7 @@ mod tests {
 
     #[test]
     fn summary_recording() {
+        let _g = crate::share::nmt::nmtCommon::NMT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let s = MallocMemorySummary::global();
         s.record_malloc(64, MemTag::MtTest);
         let snap = s.snapshot();

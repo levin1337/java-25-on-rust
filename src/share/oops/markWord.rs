@@ -323,3 +323,68 @@ impl Default for MarkWord {
         Self::prototype()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bit_positions_match_hotspot_layout() {
+        // lock:2 | self-fwd:1 | age:4 | gap:4 | hash:31 | klass:22
+        assert_eq!(MarkWord::LOCK_SHIFT, 0);
+        assert_eq!(MarkWord::SELF_FWD_SHIFT, 2);
+        assert_eq!(MarkWord::AGE_SHIFT, 3);
+        assert_eq!(MarkWord::HASH_SHIFT, 11);
+        assert_eq!(MarkWord::KLASS_SHIFT, 42);
+        assert_eq!(MarkWord::KLASS_SHIFT_AT_OFFSET, 10);
+    }
+
+    #[test]
+    fn hash_roundtrip_preserves_other_fields() {
+        let mut mark = MarkWord::prototype();
+        mark.set_age(7);
+        mark.set_hash(0x1234_5678);
+        assert_eq!(mark.hash(), 0x1234_5678);
+        assert_eq!(mark.age(), 7);
+        assert!(mark.is_unlocked());
+        // Hash occupies bits 11..42; klass bits 42..64 stay clear.
+        assert_eq!(mark.narrow_klass(), 0);
+    }
+
+    #[test]
+    fn lock_states() {
+        let unlocked = MarkWord::prototype();
+        assert!(unlocked.is_unlocked());
+        assert!(!unlocked.is_locked());
+        assert!(!unlocked.is_marked());
+        let locked = unlocked.set_fast_locked();
+        assert!(locked.is_fast_locked());
+        assert!(locked.is_locked());
+        let marked = unlocked.set_marked();
+        assert!(marked.is_marked());
+        assert!(marked.is_locked());
+        let monitor = unlocked.set_has_monitor();
+        assert!(monitor.is_monitored());
+        assert!(monitor.is_locked());
+        let unmarked = marked.set_unmarked();
+        assert!(unmarked.is_unlocked());
+    }
+
+    #[test]
+    fn narrow_klass_roundtrip() {
+        let mark = MarkWord::prototype().set_narrow_klass(0x3ABCD);
+        assert_eq!(mark.narrow_klass(), 0x3ABCD);
+        // Through the 4-byte high-word window used by compact headers.
+        let high = (mark.value >> 32) as u32;
+        assert_eq!(MarkWord::narrow_klass_from_high_word(high), 0x3ABCD);
+    }
+
+    #[test]
+    fn forwarding_pointer_roundtrip() {
+        let target = 0x0000_7f00_0010_0020usize;
+        let mark = MarkWord::encode_pointer_as_mark(target);
+        assert!(mark.is_marked());
+        assert_eq!(mark.forwardee(), target);
+        assert_eq!(mark.decode_pointer(), target);
+    }
+}

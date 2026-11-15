@@ -554,11 +554,7 @@ impl ScopeValue {
         self.write_on_with_pool(stream, &mut Vec::new());
     }
 
-    fn write_on_with_pool(
-        &self,
-        stream: &mut CompressedWriteStream,
-        pool: &mut Vec<ObjectValue>,
-    ) {
+    fn write_on_with_pool(&self, stream: &mut CompressedWriteStream, pool: &mut Vec<ObjectValue>) {
         match self {
             Self::Location(l) => {
                 stream.write_int(sv_code::LOCATION_CODE);
@@ -650,9 +646,7 @@ impl ScopeValue {
     ) -> Option<Self> {
         let code = stream.read_int()?;
         match code {
-            sv_code::LOCATION_CODE => {
-                Some(Self::Location(Location::read_from(stream)?))
-            }
+            sv_code::LOCATION_CODE => Some(Self::Location(Location::read_from(stream)?)),
             sv_code::CONSTANT_INT_CODE => Some(Self::ConstantInt(stream.read_signed_int()?)),
             sv_code::CONSTANT_FLOAT_CODE => Some(Self::ConstantFloat(stream.read_int()?)),
             sv_code::CONSTANT_OOP_CODE => {
@@ -661,12 +655,16 @@ impl ScopeValue {
                 for _ in 0..len {
                     bytes.push(stream.read()?);
                 }
-                Some(Self::ConstantOop(String::from_utf8_lossy(&bytes).into_owned()))
+                Some(Self::ConstantOop(
+                    String::from_utf8_lossy(&bytes).into_owned(),
+                ))
             }
             sv_code::CONSTANT_LONG_CODE => {
                 let lo = stream.read_signed_int()? as i64;
                 let hi = stream.read_signed_int()? as i64;
-                Some(Self::ConstantLong((hi << 32) | (lo as u64 & 0xFFFF_FFFF) as i64))
+                Some(Self::ConstantLong(
+                    (hi << 32) | (lo as u64 & 0xFFFF_FFFF) as i64,
+                ))
             }
             sv_code::CONSTANT_DOUBLE_CODE => {
                 let hi = stream.read_int()? as u64;
@@ -706,8 +704,7 @@ impl ScopeValue {
                 let id = stream.read_signed_int()?;
                 let mut merge = ObjectMergeValue::new(id);
                 if stream.read_bool()? {
-                    merge.selector =
-                        Some(Box::new(Self::read_from(stream, pool.as_deref_mut())?));
+                    merge.selector = Some(Box::new(Self::read_from(stream, pool.as_deref_mut())?));
                 }
                 if stream.read_bool()? {
                     merge.merge_pointer =
@@ -1102,7 +1099,11 @@ impl ScopeDesc {
         }
         for o in &self.objects {
             for (i, f) in o.field_values().iter().enumerate() {
-                self.verify_value_refs(f, &format!("object[{}].field[{}]", o.id(), i), &mut problems);
+                self.verify_value_refs(
+                    f,
+                    &format!("object[{}].field[{}]", o.id(), i),
+                    &mut problems,
+                );
             }
         }
         problems
@@ -1123,7 +1124,11 @@ impl ScopeDesc {
             ScopeValue::ObjectMerge(m) => {
                 for (i, o) in m.possible_objects().iter().enumerate() {
                     for (j, f) in o.field_values().iter().enumerate() {
-                        self.verify_value_refs(f, &format!("{}.merge[{}].field[{}]", ctx, i, j), problems);
+                        self.verify_value_refs(
+                            f,
+                            &format!("{}.merge[{}].field[{}]", ctx, i, j),
+                            problems,
+                        );
                     }
                 }
             }
@@ -1141,7 +1146,11 @@ impl ScopeDesc {
             self.bci
         );
         if self.is_inlined {
-            let _ = writeln!(f, "  inlined, sender_decode_offset={}", self.sender_decode_offset);
+            let _ = writeln!(
+                f,
+                "  inlined, sender_decode_offset={}",
+                self.sender_decode_offset
+            );
         }
         if self.reexecute {
             let _ = writeln!(f, "  reexecute");
@@ -1163,14 +1172,14 @@ impl ScopeDesc {
         if !self.monitors.is_empty() {
             let _ = writeln!(f, "  monitors:");
             for m in &self.monitors {
+                let _ = writeln!(f, "    monitor{{ owner=",);
+                m.owner.print_on(f);
                 let _ = writeln!(
                     f,
-                    "    monitor{{ owner=",
-                );
-                m.owner.print_on(f);
-                let _ = writeln!(f, ", lock={} }}{}",
+                    ", lock={} }}{}",
                     m.basic_lock.stack_offset(),
-                    if m.eliminated { " (eliminated)" } else { "" });
+                    if m.eliminated { " (eliminated)" } else { "" }
+                );
             }
         }
         if !self.objects.is_empty() {
@@ -1420,16 +1429,15 @@ impl<'a> ScopeDescReader<'a> {
 
     /// `ScopeDesc::decode_body` analogue including the serialized_null
     /// sentinel case: `fallback` supplies the nmethod's own method
-    /// identity used for the sentinel scope when the header cannot be
-    /// decoded (decode offset 0 / truncated record).
+    /// identity used for the sentinel scope.  Only an actual
+    /// serialized_null position (0) produces the sentinel — a malformed
+    /// non-zero record yields None (HotSpot asserts in this case).
     pub fn decode_body(&mut self, fallback: Option<(&str, &str, &str)>) -> Option<ScopeDesc> {
-        match self.decode_scope_header() {
-            Some(d) => Some(d),
-            None => match fallback {
-                Some((h, n, s)) => Some(ScopeDesc::sentinel(h.to_string(), n.to_string(), s.to_string())),
-                None => None,
-            },
+        if self.stream.pos as i32 == SERIALIZED_NULL {
+            return fallback
+                .map(|(h, n, s)| ScopeDesc::sentinel(h.to_string(), n.to_string(), s.to_string()));
         }
+        self.decode_scope_header()
     }
 
     /// Decode a scope-value list at `decode_offset`
@@ -1522,7 +1530,11 @@ impl<'a> ScopeDescReader<'a> {
     }
 
     /// Decode the sender scope (`ScopeDesc::sender()` analogue).
-    pub fn decode_sender(&mut self, parent: &ScopeDesc, obj_decode_offset: i32) -> Option<ScopeDesc> {
+    pub fn decode_sender(
+        &mut self,
+        parent: &ScopeDesc,
+        obj_decode_offset: i32,
+    ) -> Option<ScopeDesc> {
         if parent.sender_decode_offset == NO_SENDER_DECODE_OFFSET
             || parent.sender_decode_offset == SERIALIZED_NULL
         {
@@ -1592,9 +1604,11 @@ pub fn encode_scope_desc(desc: &ScopeDesc) -> (Vec<u8>, i32) {
         .objects
         .iter()
         .cloned()
-        .chain(desc.objects_to_rematerialize().into_iter().filter(|o| {
-            !desc.objects.iter().any(|p| p.id() == o.id())
-        }))
+        .chain(
+            desc.objects_to_rematerialize()
+                .into_iter()
+                .filter(|o| !desc.objects.iter().any(|p| p.id() == o.id())),
+        )
         .collect();
     let objs_off = if objs.is_empty() {
         SERIALIZED_NULL
@@ -1667,10 +1681,7 @@ mod tests {
         ]);
         obj.set_root(true);
         // An OBJECT_ID_CODE reference to object 1 inside locals.
-        let values = vec![
-            ScopeValue::Object(obj.clone()),
-            ScopeValue::ObjectId(1),
-        ];
+        let values = vec![ScopeValue::Object(obj.clone()), ScopeValue::ObjectId(1)];
         let mut w = ScopeDescWriter::new();
         let off = w.write_scope_values(&values);
         let data = w.finish();
@@ -1824,7 +1835,10 @@ mod tests {
             3,
             false,
             NO_SENDER_DECODE_OFFSET,
-            vec![ScopeValue::Object(root.clone()), ScopeValue::Object(nested.clone())],
+            vec![
+                ScopeValue::Object(root.clone()),
+                ScopeValue::Object(nested.clone()),
+            ],
             vec![],
             vec![],
         );
@@ -1860,7 +1874,7 @@ mod tests {
     fn sentinel_scope_decode() {
         // A blob whose first byte is 0 (serialized_null) decodes to the
         // sentinel scope at InvocationEntryBci.
-        let mut w = ScopeDescWriter::new();
+        let w = ScopeDescWriter::new();
         // Only the reserved byte 0 was written; no records follow.
         let data = w.finish();
         let mut r = ScopeDescReader::new(&data);

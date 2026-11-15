@@ -644,6 +644,18 @@ impl JfrWriter {
         });
     }
 
+    // Patch arbitrary bytes at an absolute (file) or segment-relative
+    // (memory) offset, restoring the position afterwards.
+    pub fn write_bytes_at_offset(&mut self, data: &[u8], offset: i64) {
+        if !self.is_valid() {
+            return;
+        }
+        let current = self.current_offset();
+        self.seek(offset);
+        self.write_bytes(data);
+        self.seek(current);
+    }
+
     // Direct big-endian poke used by JfrCheckpointWriter header.
     pub fn poke_be_u64(&mut self, offset: usize, value: u64) {
         if offset + 8 <= self.buf.len() {
@@ -676,8 +688,8 @@ impl JfrWriter {
     }
 
     pub fn finish_file(mut self) -> std::io::Result<()> {
+        self.flush_page();
         if let Some(f) = self.file.as_mut() {
-            self.flush_page();
             f.flush()?;
         }
         Ok(())
@@ -693,5 +705,20 @@ impl Read for JfrWriter {
         self.pos = avail - n;
         self.seg_start = self.seg_start.saturating_sub(n);
         Ok(n)
+    }
+}
+
+/// Minimal writer abstraction shared with stack-trace serialization.
+pub trait JfrWriterLike {
+    fn write_u4(&mut self, v: u32);
+    fn write_u8(&mut self, v: u64);
+}
+
+impl JfrWriterLike for JfrWriter {
+    fn write_u4(&mut self, v: u32) {
+        JfrWriter::write_u4(self, v);
+    }
+    fn write_u8(&mut self, v: u64) {
+        JfrWriter::write_u8(self, v);
     }
 }

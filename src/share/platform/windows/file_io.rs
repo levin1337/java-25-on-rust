@@ -9,7 +9,7 @@
  * paths which are converted with to_wide().
  */
 
-use super::{last_error_io, ByHandleFileInformation, Handle, OsWindows, INVALID_HANDLE_VALUE};
+use super::{ByHandleFileInformation, Handle, INVALID_HANDLE_VALUE, OsWindows, last_error_io};
 use std::io;
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
@@ -287,12 +287,7 @@ impl OsWindows {
                 file_size_high: 0,
                 file_size_low: 0,
             };
-            if GetFileAttributesExW(
-                wide.as_ptr(),
-                GET_FILEEX_INFO_STANDARD,
-                &mut fad,
-            ) == 0
-            {
+            if GetFileAttributesExW(wide.as_ptr(), GET_FILEEX_INFO_STANDARD, &mut fad) == 0 {
                 return Err(last_error_io("GetFileAttributesExW"));
             }
             Ok(FileStat {
@@ -324,8 +319,7 @@ impl OsWindows {
                 volume_serial_number: info.volume_serial_number,
                 size: ((info.file_size_high as u64) << 32) | info.file_size_low as u64,
                 number_of_links: info.number_of_links,
-                file_index: ((info.file_index_high as u64) << 32)
-                    | info.file_index_low as u64,
+                file_index: ((info.file_index_high as u64) << 32) | info.file_index_low as u64,
             })
         }
     }
@@ -389,9 +383,7 @@ impl OsWindows {
     /// os::file_exists(path): GetFileAttributesW != INVALID_FILE_ATTRIBUTES.
     pub fn file_exists(path: &Path) -> bool {
         let wide = to_wide(path);
-        unsafe {
-            super::GetFileAttributesW(wide.as_ptr()) != INVALID_FILE_ATTRIBUTES
-        }
+        unsafe { super::GetFileAttributesW(wide.as_ptr()) != INVALID_FILE_ATTRIBUTES }
     }
 
     /// os::is_directory(path).

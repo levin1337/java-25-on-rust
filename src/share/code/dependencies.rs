@@ -83,7 +83,11 @@ pub enum DependencyArgument {
     /// Klass context type (InstanceKlass identity).
     Klass(String),
     /// Method (holder.name+signature identity).
-    Method { holder: String, name: String, sig: String },
+    Method {
+        holder: String,
+        name: String,
+        sig: String,
+    },
     /// Field (holder, name, signature, offset).
     Field {
         holder: String,
@@ -172,24 +176,25 @@ impl Dependency {
             DepType::CallSiteTargetValue => false,
             DepType::EvolMethod => {
                 // Evol deps track a method; a klass change affects them
-                // only if the method's holder is involved — approximated
-                // by checking method arguments' holders.
+                // only if the changed klass is the method's holder or a
+                // subtype of it.
                 self.args.iter().any(|a| match a {
                     DependencyArgument::Method { holder, .. } => {
-                        holder == klass_name || is_subtype(holder, klass_name)
+                        holder == klass_name || is_subtype(klass_name, holder)
                     }
                     _ => false,
                 })
             }
             _ => self.args.iter().any(|a| match a {
-                DependencyArgument::Klass(k) => {
-                    k == klass_name || is_subtype(k, klass_name)
-                }
+                // The changed klass invalidates the dependency when it
+                // IS the context type or a SUBTYPE of it
+                // (Dependencies::check_klass_dependency).
+                DependencyArgument::Klass(k) => k == klass_name || is_subtype(klass_name, k),
                 DependencyArgument::Method { holder, .. } => {
-                    holder == klass_name || is_subtype(holder, klass_name)
+                    holder == klass_name || is_subtype(klass_name, holder)
                 }
                 DependencyArgument::Field { holder, .. } => {
-                    holder == klass_name || is_subtype(holder, klass_name)
+                    holder == klass_name || is_subtype(klass_name, holder)
                 }
                 DependencyArgument::CallSiteTarget(_) => false,
             }),
@@ -324,10 +329,7 @@ impl DependencySet {
 
     /// Estimated serialized size in bytes (type + arg count + args).
     pub fn size_in_bytes(&self) -> usize {
-        self.deps
-            .iter()
-            .map(|d| 8 + d.args.len() * 16)
-            .sum()
+        self.deps.iter().map(|d| 8 + d.args.len() * 16).sum()
     }
 
     pub fn print_on(&self, f: &mut dyn std::fmt::Write) {
@@ -353,11 +355,7 @@ impl DependencySet {
                         sig,
                         offset,
                     } => {
-                        let _ = write!(
-                            f,
-                            "field:{}#{}{}@{}",
-                            holder, name, sig, offset
-                        );
+                        let _ = write!(f, "field:{}#{}{}@{}", holder, name, sig, offset);
                     }
                     DependencyArgument::CallSiteTarget(t) => {
                         let _ = write!(f, "call_site_target:{}", t);
@@ -399,8 +397,7 @@ impl DependencyContext {
     }
 
     pub fn add_subtype_edge(&mut self, sub: &str, sup: &str) {
-        self.subtype_edges
-            .push((sub.to_string(), sup.to_string()));
+        self.subtype_edges.push((sub.to_string(), sup.to_string()));
     }
 
     /// Transitive subtype query over recorded edges.
@@ -432,10 +429,7 @@ impl DependencyContext {
 
     /// Find all dependencies in `set` invalidated by the recorded
     /// changes, returning (dependency, witness klass) pairs.
-    pub fn invalidated<'a>(
-        &self,
-        set: &'a DependencySet,
-    ) -> Vec<(&'a Dependency, String)> {
+    pub fn invalidated<'a>(&self, set: &'a DependencySet) -> Vec<(&'a Dependency, String)> {
         let mut out = Vec::new();
         for klass in &self.changed_klasses {
             if let Some(dep) = set.first_invalidated_by(klass, |a, b| self.is_subtype(a, b)) {

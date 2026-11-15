@@ -1,0 +1,639 @@
+    Blocking waiting for file lock on build directory
+    Checking jvm25-rust v0.1.0 (D:\jvm25-rust)
+warning: unused import: `ShenandoahAffiliation`
+  --> src\share\gc\shenandoah\shenandoahMarkingContext.rs:10:35
+   |
+10 | use super::shenandoahHeapRegion::{ShenandoahAffiliation, ShenandoahHeapRegion};
+   |                                   ^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `crate::share::classfile::classFileParser::Constant`
+  --> src\share\interpreter\interpreter.rs:19:5
+   |
+19 | use crate::share::classfile::classFileParser::Constant;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `std::sync::Arc`
+  --> src\share\interpreter\interpreter.rs:23:5
+   |
+23 | use std::sync::Arc;
+   |     ^^^^^^^^^^^^^^
+
+warning: unused imports: `TemplateTable` and `Template`
+  --> src\share\interpreter\templateInterpreter.rs:14:28
+   |
+14 | use super::templateTable::{Template, TemplateTable, TosState};
+   |                            ^^^^^^^^  ^^^^^^^^^^^^^
+
+warning: unused import: `crate::share::classfile::classFileParser::Constant`
+  --> src\share\interpreter\templateInterpreter.rs:16:5
+   |
+16 | use crate::share::classfile::classFileParser::Constant;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `std::sync::Arc`
+  --> src\share\interpreter\templateInterpreter.rs:21:5
+   |
+21 | use std::sync::Arc;
+   |     ^^^^^^^^^^^^^^
+
+warning: unused import: `DispatchTable`
+  --> src\share\interpreter\templateInterpreterGenerator.rs:16:45
+   |
+16 | use super::templateInterpreter::{CodeletId, DispatchTable, EntryPoint, TemplateInterpreter};
+   |                                             ^^^^^^^^^^^^^
+
+warning: unused import: `VecDeque`
+  --> src\share\jfr\recorder\checkpoint\jfr_checkpoint_manager.rs:13:33
+   |
+13 | use std::collections::{HashMap, VecDeque};
+   |                                 ^^^^^^^^
+
+warning: unused import: `crate::share::jfr::utilities::jfr_time::JfrTicks`
+  --> src\share\jfr\recorder\checkpoint\jfr_checkpoint_manager.rs:18:5
+   |
+18 | use crate::share::jfr::utilities::jfr_time::JfrTicks;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `crate::share::jfr::utilities::jfr_time_converter`
+ --> src\share\jfr\recorder\repository\jfr_chunk.rs:6:5
+  |
+6 | use crate::share::jfr::utilities::jfr_time_converter;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `global_get_option` and `global_set_option`
+  --> src\share\jfr\recorder\service\jfr_recorder_service.rs:19:60
+   |
+19 | use crate::share::jfr::recorder::service::jfr_option_set::{global_get_option, global_set_option};
+   |                                                            ^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^
+
+warning: unused import: `alloc_handle`
+  --> src\share\prims\processNatives.rs:15:43
+   |
+15 | use crate::share::prims::nioFileNatives::{alloc_handle, alloc_handle_unseekable, EntryKind};
+   |                                           ^^^^^^^^^^^^
+
+warning: unused import: `AsRawHandle`
+  --> src\share\prims\processNatives.rs:18:28
+   |
+18 | use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
+   |                            ^^^^^^^^^^^
+
+error[E0119]: conflicting implementations of trait `Hash` for type `Gen`
+  --> src\share\interpreter\templateInterpreterGenerator.rs:26:51
+   |
+26 | #[derive(Clone, Copy, Debug, PartialEq, Hash, Eq, Hash)]
+   |                                         ----      ^^^^ conflicting implementation for `Gen`
+   |                                         |
+   |                                         first implementation here
+
+warning: unreachable expression
+    --> src\share\adlc\parser.rs:2403:13
+     |
+2229 | /             match kw.as_str() {
+2230 | |                 "fixed_latency" => {
+2231 | |                     self.skipws();
+2232 | |                     if self.curchar != b'(' {
+...    |
+2402 | |             }
+     | |_____________- any code following this `match` expression is unreachable, as all arms diverge
+2403 | /             if self.curchar == b'%' {
+2404 | |                 break;
+2405 | |             }
+     | |_____________^ unreachable expression
+     |
+     = note: `#[warn(unreachable_code)]` (part of `#[warn(unused)]`) on by default
+
+error[E0502]: cannot borrow `b` as mutable because it is also borrowed as immutable
+   --> src\share\adlc\inspect.rs:181:63
+    |
+180 |             if let Some(mr) = &b.matrule {
+    |                                - immutable borrow occurs here
+181 |                 mr.borrow().m.append_components(globals, &mut b.components, false);
+    |                 -----------                                   ^                   - ... and the immutable borrow might be used here, when that temporary is dropped and runs the destructor for type `std::cell::Ref<'_, model::MatchRule>`
+    |                 |                                             |
+    |                 |                                             mutable borrow occurs here
+    |                 a temporary with access to the immutable borrow is created here ...
+
+error[E0502]: cannot borrow `b` as mutable because it is also borrowed as immutable
+   --> src\share\adlc\inspect.rs:208:63
+    |
+207 |             if let Some(mr) = &b.matrule {
+    |                                - immutable borrow occurs here
+208 |                 mr.borrow().m.append_components(globals, &mut b.components, false);
+    |                 -----------                                   ^                   - ... and the immutable borrow might be used here, when that temporary is dropped and runs the destructor for type `std::cell::Ref<'_, model::MatchRule>`
+    |                 |                                             |
+    |                 |                                             mutable borrow occurs here
+    |                 a temporary with access to the immutable borrow is created here ...
+
+warning: unused variable: `globals`
+   --> src\share\adlc\model.rs:708:40
+    |
+708 |     pub fn build_internalop(&mut self, globals: &HashMap<String, FormRef>) {
+    |                                        ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_globals`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `num_leaves`
+   --> src\share\adlc\model.rs:766:69
+    |
+766 |     pub fn new(m: MatchNode, depth: i32, construct: Option<String>, num_leaves: usize) -> MatchRule {
+    |                                                                     ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_num_leaves`
+
+warning: variable does not need to be mutable
+   --> src\share\adlc\parser.rs:762:37
+    |
+762 | ...                   let mut nrb = nr.borrow_mut();
+    |                           ----^^^
+    |                           |
+    |                           help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+   --> src\share\adlc\parser.rs:854:38
+    |
+854 | ...                   Some(mut head) => {
+    |                            ----^^^^
+    |                            |
+    |                            help: remove this `mut`
+
+warning: variable `parse_ins` is assigned to, but never used
+    --> src\share\adlc\parser.rs:3253:17
+     |
+3253 |             let mut parse_ins = false;
+     |                 ^^^^^^^^^^^^^
+     |
+     = note: consider using `_parse_ins` instead
+
+warning: value assigned to `parse_ins` is never read
+    --> src\share\adlc\parser.rs:3262:21
+     |
+3257 |                     parse_ins = true;
+     |                     ---------------- `parse_ins` is overwritten here before the previous value is read
+...
+3262 |                     parse_ins = true;
+     |                     ^^^^^^^^^^^^^^^^ this value is reassigned later and never used
+     |
+     = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: value assigned to `parse_ins` is never read
+    --> src\share\adlc\parser.rs:3257:21
+     |
+3257 |                     parse_ins = true;
+     |                     ^^^^^^^^^^^^^^^^
+     |
+     = help: maybe it is overwritten before being read?
+
+warning: unused variable: `kind`
+   --> src\share\c1\asm\x86.rs:278:37
+    |
+278 |             LirOp::Move { dst, src, kind } => {
+    |                                     ^^^^ help: try ignoring the field: `kind: _`
+
+warning: unused variable: `dst_kind`
+   --> src\share\c1\asm\x86.rs:403:13
+    |
+403 |         let dst_kind = dst.kind();
+    |             ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_dst_kind`
+
+warning: unused variable: `array`
+   --> src\share\c1\asm\x86.rs:596:40
+    |
+596 |     fn compute_element_addr(&mut self, array: Register, index: Register, elem: ArrayElemKind) -> Result<Register, BackendError> {
+    |                                        ^^^^^ help: if this is intentional, prefix it with an underscore: `_array`
+
+warning: unused variable: `array`
+    --> src\share\c1\asm\x86.rs:1039:37
+     |
+1039 |     fn emit_bounds_check(&mut self, array: Register, index: Register) -> Result<Option<usize>, BackendError> {
+     |                                     ^^^^^ help: if this is intentional, prefix it with an underscore: `_array`
+
+warning: unused variable: `index`
+    --> src\share\c1\asm\x86.rs:1039:54
+     |
+1039 |     fn emit_bounds_check(&mut self, array: Register, index: Register) -> Result<Option<usize>, BackendError> {
+     |                                                      ^^^^^ help: if this is intentional, prefix it with an underscore: `_index`
+
+warning: unreachable pattern
+    --> src\share\c1\asm\x86.rs:1195:13
+     |
+1195 |             _ => return Err(BackendError::InvalidLir),
+     |             ^ no value can reach this
+     |
+note: multiple earlier patterns match some of the same values
+    --> src\share\c1\asm\x86.rs:1195:13
+     |
+1179 |             LirOperand::ConstF32(v) => {
+     |             ----------------------- matches some of the same values
+...
+1183 |             LirOperand::ConstF64(v) => {
+     |             ----------------------- matches some of the same values
+...
+1187 |             LirOperand::Local { slot, kind } | LirOperand::Stack { slot, kind } | LirOperand::Temp { slot, kind } => {
+     |             ----------------------------------------------------------------------------------------------------- matches some of the same values
+...
+1192 |             LirOperand::ConstI32(v) => { self.mov_reg_imm(Register::RAX, *v as i32 as u64, false)?; self.cvtsi2ss(xmm, Register::R...
+     |             ----------------------- matches some of the same values
+...
+1195 |             _ => return Err(BackendError::InvalidLir),
+     |             ^ ...and 2 other patterns collectively make this unreachable
+     = note: `#[warn(unreachable_patterns)]` (part of `#[warn(unused)]`) on by default
+
+warning: unreachable pattern
+   --> src\share\c1\c1_GraphBuilder.rs:543:17
+    |
+542 |                 0x36..=0x3a | 0x3b..=0x3e => { self.abs_pop(&mut stack); }
+    |                 ----------- matches all the relevant values
+543 |                 0x37 | 0x3f..=0x42 => { self.abs_pop(&mut stack); }
+    |                 ^^^^ no value can reach this
+
+warning: unreachable pattern
+   --> src\share\c1\c1_GraphBuilder.rs:544:17
+    |
+542 |                 0x36..=0x3a | 0x3b..=0x3e => { self.abs_pop(&mut stack); }
+    |                 ----------- matches all the relevant values
+543 |                 0x37 | 0x3f..=0x42 => { self.abs_pop(&mut stack); }
+544 |                 0x38 | 0x43..=0x46 => { self.abs_pop(&mut stack); }
+    |                 ^^^^ no value can reach this
+
+warning: unreachable pattern
+   --> src\share\c1\c1_GraphBuilder.rs:545:17
+    |
+542 |                 0x36..=0x3a | 0x3b..=0x3e => { self.abs_pop(&mut stack); }
+    |                 ----------- matches all the relevant values
+...
+545 |                 0x39 | 0x47..=0x4a => { self.abs_pop(&mut stack); }
+    |                 ^^^^ no value can reach this
+
+warning: unreachable pattern
+   --> src\share\c1\c1_GraphBuilder.rs:546:17
+    |
+542 |                 0x36..=0x3a | 0x3b..=0x3e => { self.abs_pop(&mut stack); }
+    |                 ----------- matches all the relevant values
+...
+546 |                 0x3a | 0x4b..=0x4e => { self.abs_pop(&mut stack); }
+    |                 ^^^^ no value can reach this
+
+warning: unused variable: `constants`
+   --> src\share\ci\ciMethod.rs:336:13
+    |
+336 |         let constants = &self.holder.instance_klass().class.constants;
+    |             ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_constants`
+
+warning: unused variable: `k`
+   --> src\share\ci\ciType.rs:333:29
+    |
+333 |             (Self::Instance(k), Self::Array(_)) => false,
+    |                             ^ help: if this is intentional, prefix it with an underscore: `_k`
+
+warning: variable does not need to be mutable
+    --> src\share\classfile\classLoader.rs:1414:17
+     |
+1414 |             let mut image = image.borrow_mut();
+     |                 ----^^^^^
+     |                 |
+     |                 help: remove this `mut`
+
+warning: unused variable: `loader`
+   --> src\share\classfile\verifier.rs:713:5
+    |
+713 |     loader: Option<&ClassLoader<'a>>,
+    |     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_loader`
+
+warning: unused variable: `b`
+   --> src\share\compiler\compilerOracle.rs:235:24
+    |
+235 |             Self::Bool(b) => None,
+    |                        ^ help: if this is intentional, prefix it with an underscore: `_b`
+
+warning: value assigned to `ergo_tlab` is never read
+   --> src\share\gc\epsilon\epsilonHeap.rs:223:29
+    |
+223 |         let mut ergo_tlab = requested_size;
+    |                             ^^^^^^^^^^^^^^ this value is reassigned later and never used
+...
+227 |             ergo_tlab = thread.ergo_tlab_size();
+    |             ----------------------------------- `ergo_tlab` is overwritten here before the previous value is read
+
+warning: unused variable: `num_regions`
+  --> src\share\gc\shenandoah\shenandoahCollectionSet.rs:32:51
+   |
+32 |     pub fn new(heap_base: usize, heap_end: usize, num_regions: usize) -> Self {
+   |                                                   ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_num_regions`
+
+warning: variable does not need to be mutable
+   --> src\share\gc\shenandoah\shenandoahSATBMarkQueueSet.rs:406:17
+    |
+406 |             let mut completed = self.completed.lock();
+    |                 ----^^^^^^^^^
+    |                 |
+    |                 help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> src\share\gc\shenandoah\shenandoahSimpleBitMap.rs:156:17
+    |
+156 |             let mut element_bits = self.bitmap[array_idx] >> bit_number;
+    |                 ----^^^^^^^^^^^^
+    |                 |
+    |                 help: remove this `mut`
+
+warning: unreachable pattern
+  --> src\share\interpreter\bytecodeUtils.rs:97:9
+   |
+91 |         0x15..=0x19 | 0x36..=0x3a | 0xa9 => push(1, 2), // load/store/ret: u1
+   |         -------------------------------- matches all the relevant values
+...
+97 |         0xa9 => push(1, 2),          // ret: u1
+   |         ^^^^ no value can reach this
+
+error: lifetime may not live long enough
+   --> src\share\interpreter\interpreterRuntime.rs:383:9
+    |
+362 | pub fn resolve_get_put<'a>(
+    |                        -- lifetime `'a` defined here
+...
+383 |         holder,
+    |         ^^^^^^ this usage requires that `'a` must outlive `'static`
+    |
+    = note: requirement occurs because of the type `InstanceKlass<'_>`, which makes the generic argument `'_` invariant
+    = note: the struct `InstanceKlass<'a>` is invariant over the parameter `'a`
+    = help: see <https://doc.rust-lang.org/nomicon/subtyping.html> for more information about variance
+
+error[E0382]: use of moved value: `code`
+  --> src\share\interpreter\zero\zeroInterpreter.rs:80:51
+   |
+65 |         code: Code<'a>,
+   |         ---- move occurs because `code` has type `method::Code<'_>`, which does not implement the `Copy` trait
+...
+78 |             code,
+   |             ---- value moved here
+79 |             klass,
+80 |             stack: Vec::with_capacity(usize::from(code.maxStack)),
+   |                                                   ^^^^^^^^^^^^^ value used here after move
+   |
+help: consider cloning the value if the performance cost is acceptable
+   |
+78 |             code: code.clone(),
+   |                 ++++++++++++++
+
+error[E0507]: cannot move out of `self.code` which is behind a mutable reference
+   --> src\share\interpreter\zero\zeroInterpreter.rs:122:13
+    |
+122 |             self.code,
+    |             ^^^^^^^^^ move occurs because `self.code` has type `method::Code<'_>`, which does not implement the `Copy` trait
+    |
+help: consider cloning the value if the performance cost is acceptable
+    |
+122 |             self.code.clone(),
+    |                      ++++++++
+
+warning: unused variable: `constants`
+   --> src\share\interpreter\zero\zeroInterpreter.rs:115:9
+    |
+115 |         constants: &[Constant<'a>],
+    |         ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_constants`
+
+warning: variable does not need to be mutable
+  --> src\share\jfr\recorder\checkpoint\jfr_checkpoint_manager.rs:74:13
+   |
+74 |         let mut buf = match buf.take() {
+   |             ----^^^
+   |             |
+   |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> src\share\jfr\recorder\checkpoint\jfr_checkpoint_manager.rs:258:21
+    |
+258 |                 let mut buf = match map.remove(&key) {
+    |                     ----^^^
+    |                     |
+    |                     help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> src\share\jfr\recorder\checkpoint\jfr_checkpoint_manager.rs:327:9
+    |
+327 |         mut old: JfrBuffer,
+    |         ----^^^
+    |         |
+    |         help: remove this `mut`
+
+error[E0503]: cannot use `self.pos` because it was mutably borrowed
+   --> src\share\jfr\recorder\checkpoint\jfr_checkpoint_writer.rs:286:29
+    |
+286 |         self.buf_mut().data[self.pos] = v as u8;
+    |         ----               -^^^^^^^^-
+    |         |                  ||
+    |         |                  |use of borrowed `*self`
+    |         |                  borrow later used here
+    |         `*self` is borrowed here
+
+error[E0507]: cannot move out of `self.time` which is behind a mutable reference
+   --> src\share\jfr\recorder\checkpoint\jfr_checkpoint_writer.rs:425:22
+    |
+425 |         let time_v = self.time.value();
+    |                      ^^^^^^^^^ ------- `self.time` moved due to this method call
+    |                      |
+    |                      move occurs because `self.time` has type `JfrTicks`, which does not implement the `Copy` trait
+    |
+note: `share::jfr::utilities::jfr_time::JfrTicks::value` takes ownership of the receiver `self`, which moves `self.time`
+   --> src\share\jfr\utilities\jfr_time.rs:31:18
+    |
+ 31 |     pub fn value(self) -> i64 {
+    |                  ^^^^
+note: if `JfrTicks` implemented `Clone`, you could clone the value
+   --> src\share\jfr\utilities\jfr_time.rs:25:1
+    |
+ 25 | pub struct JfrTicks(pub i64);
+    | ^^^^^^^^^^^^^^^^^^^ consider implementing `Clone` for this type
+    |
+   ::: src\share\jfr\recorder\checkpoint\jfr_checkpoint_writer.rs:425:22
+    |
+425 |         let time_v = self.time.value();
+    |                      --------- you could clone this value
+
+warning: unused variable: `r`
+  --> src\share\jfr\recorder\service\jfr_recorder_service.rs:96:86
+   |
+96 | ...).lock().unwrap(); if let Some(r) = g.as_mut() { JfrMetadataRepository::flush_pending(); } }
+   |                                   ^ help: if this is intentional, prefix it with an underscore: `_r`
+
+error[E0596]: cannot borrow `to.data` as mutable, as it is behind a `&` reference
+   --> src\share\jfr\recorder\storage\jfr_buffer.rs:277:13
+    |
+277 |             to.data[dst..dst + actual_size].copy_from_slice(&src);
+    |             ^^^^^^^ `to` is a `&` reference, so it cannot be borrowed as mutable
+    |
+help: consider changing this to be a mutable reference
+    |
+269 |     pub fn move_to(&self, to: &mut JfrBuffer, size: usize) {
+    |                                +++
+
+error[E0499]: cannot borrow `self` as mutable more than once at a time
+   --> src\share\jfr\writers\jfr_writer.rs:692:13
+    |
+691 |         if let Some(f) = self.file.as_mut() {
+    |                          --------- first mutable borrow occurs here
+692 |             self.flush_page();
+    |             ^^^^ second mutable borrow occurs here
+693 |             f.flush()?;
+    |             - first borrow later used here
+
+warning: variable does not need to be mutable
+    --> src\share\jvmci\jvmciCodeInstaller.rs:1270:25
+     |
+1270 |                     let mut objs_off = crate::share::code::scopeDesc::SERIALIZED_NULL;
+     |                         ----^^^^^^^^
+     |                         |
+     |                         help: remove this `mut`
+
+warning: value assigned to `frame_flags` is never read
+    --> src\share\jvmci\jvmciCodeInstaller.rs:1261:43
+     |
+1261 |                     let mut frame_flags = 0u8;
+     |                                           ^^^ this value is reassigned later and never used
+...
+1273 |                         frame_flags = stream.read_u1("flags")?;
+     |                         -------------------------------------- `frame_flags` is overwritten here before the previous value is read
+
+warning: value assigned to `locals` is never read
+    --> src\share\jvmci\jvmciCodeInstaller.rs:1264:38
+     |
+1264 |                     let mut locals = Vec::new();
+     |                                      ^^^^^^^^^^ this value is reassigned later and never used
+...
+1278 |                         locals =
+     |                         ------ `locals` is overwritten here before the previous value is read
+
+warning: value assigned to `exprs` is never read
+    --> src\share\jvmci\jvmciCodeInstaller.rs:1265:37
+     |
+1265 |                     let mut exprs = Vec::new();
+     |                                     ^^^^^^^^^^ this value is reassigned later and never used
+...
+1280 |                         exprs =
+     |                         ----- `exprs` is overwritten here before the previous value is read
+
+warning: value assigned to `monitors` is never read
+    --> src\share\jvmci\jvmciCodeInstaller.rs:1266:40
+     |
+1266 |                     let mut monitors = Vec::new();
+     |                                        ^^^^^^^^^^ this value is reassigned later and never used
+...
+1282 |                         monitors = self.read_monitor_values(stream, frame_flags)?;
+     |                         -------- `monitors` is overwritten here before the previous value is read
+
+warning: unreachable pattern
+    --> src\share\prims\netNatives.rs:1671:17
+     |
+1671 |                 _ => Ok(0),
+     |                 ^ no value can reach this
+     |
+note: multiple earlier patterns match some of the same values
+    --> src\share\prims\netNatives.rs:1671:17
+     |
+1660 |                 Sock::Connected { local, remote, .. } => {
+     |                 ------------------------------------- matches some of the same values
+...
+1663 |                 Sock::Listener { listener, .. } => {
+     |                 ------------------------------- matches some of the same values
+...
+1666 |                 Sock::Datagram { sock, bound, .. } => Ok(bound
+     |                 ---------------------------------- matches some of the same values
+...
+1670 |                 Sock::Fresh { bound, .. } => Ok(bound.map(|a| a.port()).unwrap_or(0) as i64),
+     |                 ------------------------- matches some of the same values
+1671 |                 _ => Ok(0),
+     |                 ^ collectively making this unreachable
+
+warning: unreachable pattern
+    --> src\share\prims\netNatives.rs:1699:17
+     |
+1699 |                 _ => Ok(Ipv4Addr::UNSPECIFIED),
+     |                 ^ no value can reach this
+     |
+note: multiple earlier patterns match some of the same values
+    --> src\share\prims\netNatives.rs:1699:17
+     |
+1680 |                 Sock::Connected { local, remote, .. } => {
+     |                 ------------------------------------- matches some of the same values
+...
+1684 |                 Sock::Listener { listener, .. } => Ok(match listener.local_addr().ok().map(|a| a.ip()) {
+     |                 ------------------------------- matches some of the same values
+...
+1688 |                 Sock::Datagram { sock, bound, .. } => Ok(match bound
+     |                 ---------------------------------- matches some of the same values
+...
+1695 |                 Sock::Fresh { bound, .. } => Ok(match bound.map(|a| a.ip()) {
+     |                 ------------------------- matches some of the same values
+...
+1699 |                 _ => Ok(Ipv4Addr::UNSPECIFIED),
+     |                 ^ collectively making this unreachable
+
+warning: unused variable: `b`
+    --> src\share\prims\netNatives.rs:1581:26
+     |
+1581 |                     Some(b) => TcpStream::connect(addr).map_err(|e| sock_io_err(loader, e))?,
+     |                          ^ help: if this is intentional, prefix it with an underscore: `_b`
+
+warning: variable does not need to be mutable
+   --> src\share\prims\nioFileNatives.rs:711:9
+    |
+711 |     let mut consider = |offset: u64, is_acl: bool, size: &mut usize| -> io::Result<()> {
+    |         ----^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> src\share\prims\nioFileNatives.rs:1098:17
+     |
+1098 |             let mut mapping = GenericMapping {
+     |                 ----^^^^^^^
+     |                 |
+     |                 help: remove this `mut`
+
+warning: unreachable pattern
+   --> src\share\prims\urlNatives.rs:931:9
+    |
+919 |         (b"sun/net/www/protocol/jar/JarURLConnection", b"setUseCaches", b"(Z)V") => {
+    |         ------------------------------------------------------------------------ matches all the relevant values
+...
+931 |         (b"sun/net/www/protocol/jar/JarURLConnection", b"setUseCaches", b"(Z)V") => {
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no value can reach this
+
+warning: variable does not need to be mutable
+  --> src\share\prims\vmManagementNatives.rs:27:9
+   |
+27 |     let mut daemon = 0usize;
+   |         ----^^^^^^
+   |         |
+   |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> src\share\prims\processNatives.rs:475:9
+    |
+475 |     let mut startup = StartupInfo {
+    |         ----^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning[E0133]: call to unsafe function `share::sanitizers::address::asan_poison_memory_region` is unsafe and requires unsafe block
+  --> src\share\sanitizers\address.rs:17:5
+   |
+17 |     asan_poison_memory_region(_addr, _size);
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+   |
+   = note: consult the function's documentation for information on how to avoid undefined behavior
+note: an unsafe function restricts its caller, but its body is safe by default
+  --> src\share\sanitizers\address.rs:16:1
+   |
+16 | pub unsafe fn asan_poison_memory_region_range(_addr: *mut c_void, _size: usize) {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+   = note: `#[warn(unsafe_op_in_unsafe_fn)]` (part of `#[warn(rust_2024_compatibility)]`) on by default
+
+Some errors have detailed explanations: E0119, E0133, E0382, E0499, E0502, E0503, E0507, E0596.
+For more information about an error, try `rustc --explain E0119`.
+warning: `jvm25-rust` (lib) generated 60 warnings
+error: could not compile `jvm25-rust` (lib) due to 10 previous errors; 60 warnings emitted

@@ -37,6 +37,17 @@ impl JfrBuffer {
         }
     }
 
+    /// Copy the buffer contents/position into a fresh buffer (used when a
+    /// live list overflows and the tail must be preserved).
+    pub fn clone_shallow(&self) -> JfrBuffer {
+        let mut nb = JfrBuffer::new(self.data.len(), self.header_size);
+        nb.data[..self.pos()].copy_from_slice(&self.data[..self.pos()]);
+        nb.set_pos(self.pos());
+        nb.set_top(self.top());
+        nb.set_context(self.context());
+        nb
+    }
+
     pub fn initialize(&mut self, header_size: usize, size: usize) {
         self.header_size = header_size;
         self.data = vec![0u8; size];
@@ -255,7 +266,7 @@ impl JfrBuffer {
     // ---- data movement ----
 
     // JfrBuffer::move — move [top, pos) bytes into `to` at its pos.
-    pub fn move_to(&self, to: &JfrBuffer, size: usize) {
+    pub fn move_to(&self, to: &mut JfrBuffer, size: usize) {
         debug_assert!(to.free_size() >= size);
         let current_top = self.acquire_critical_section_top();
         let actual_size = self.pos().saturating_sub(current_top);

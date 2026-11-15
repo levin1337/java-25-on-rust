@@ -1,6 +1,8 @@
 use std::borrow::Borrow;
 use std::collections::hash_map::DefaultHasher;
-use std::hash::{BuildHasher, Hash, Hasher};
+use std::hash::{BuildHasher, BuildHasherDefault, Hash, Hasher};
+
+type DefaultBuildHasher = BuildHasherDefault<DefaultHasher>;
 
 #[derive(Clone, Debug)]
 struct Entry<K, V> {
@@ -10,7 +12,7 @@ struct Entry<K, V> {
 }
 
 #[derive(Clone, Debug)]
-pub struct HashTable<K, V, S = DefaultHasher> {
+pub struct HashTable<K, V, S = DefaultBuildHasher> {
     buckets: Vec<Option<usize>>,
     entries: Vec<Entry<K, V>>,
     used: usize,
@@ -99,14 +101,15 @@ where
     {
         let b = self.bucket_index(key);
         let mut cur = self.buckets[b];
+        let mut found = None;
         while let Some(i) = cur {
-            let e = &mut self.entries[i];
-            if e.key.borrow() == key {
-                return Some(&mut e.value);
+            if self.entries[i].key.borrow() == key {
+                found = Some(i);
+                break;
             }
-            cur = e.next;
+            cur = self.entries[i].next;
         }
-        None
+        found.map(|i| &mut self.entries[i].value)
     }
 
     pub fn insert(&mut self, key: K, value: V) -> Option<V> {
@@ -227,12 +230,12 @@ where
     }
 }
 
-impl<K, V> HashTable<K, V, DefaultHasher>
+impl<K, V> HashTable<K, V, DefaultBuildHasher>
 where
     K: Eq + Hash,
 {
     pub fn new(bucket_len: usize) -> Self {
-        Self::with_hasher(bucket_len, DefaultHasher::new())
+        Self::with_hasher(bucket_len, DefaultBuildHasher::default())
     }
 }
 

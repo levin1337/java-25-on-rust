@@ -17,7 +17,7 @@ use super::memTag::MemTag;
 use super::nativeCallStack::NativeCallStack;
 use super::nmtCommon::{NmtTrackingLevel, NmtUtil};
 use super::virtualMemoryTracker::{
-    ReservedMemoryRegion, VirtualMemory, VirtualMemoryAllocationSite, VirtualMemorySnapshot,
+    ReservedMemoryRegion, VirtualMemory, VirtualMemorySnapshot,
     VirtualMemorySummary, VirtualMemoryTracker,
 };
 use std::cmp::Ordering;
@@ -128,7 +128,7 @@ impl MemBaseline {
         VirtualMemorySummary::global().snapshot(&mut self.virtual_memory_snapshot);
         // MemoryFileTracker file allocations are folded into the VM
         // snapshot (their committed memory counts under their tags).
-        super::memoryFileTracker::MemoryFileTrackerInstance::summary_snapshot(
+        super::memoryFileTracker::MemoryFileTrackerInstance::global().summary_snapshot(
             &mut self.virtual_memory_snapshot,
         );
     }
@@ -173,7 +173,7 @@ impl MemBaseline {
                 });
             }
         }
-        sites.sort_by(|a, b| stack_cmp(&a.stack, &b.stack));
+        // Regions arrive in base-address order; keep it (ByAddress).
         self.virtual_memory_sites = sites;
         true
     }
@@ -214,6 +214,21 @@ impl MemBaseline {
     /// Virtual memory allocations, always in base address order.
     pub fn virtual_memory_allocations(&self) -> &[ReservedMemoryRegion] {
         &self.virtual_memory_allocations
+    }
+
+    /// Malloc sites in capture order (size-descending).
+    pub fn malloc_sites_ref(&self) -> &[MallocSiteSnapshot] {
+        &self.malloc_sites
+    }
+
+    /// Malloc sites for reports (size-descending).
+    pub fn malloc_sites_for_report(&self) -> &[MallocSiteSnapshot] {
+        &self.malloc_sites
+    }
+
+    /// VM allocation sites for reports (address order).
+    pub fn virtual_memory_sites_for_report(&self) -> &[VirtualMemoryAllocationSiteSnapshot] {
+        &self.virtual_memory_sites
     }
 
     /// Total reserved memory = malloc'd + reserved virtual.
@@ -304,7 +319,7 @@ impl MemBaseline {
                     self.virtual_memory_sites_order = SortingOrder::BySize;
                 }
             }
-            SortingOrder::BySite | SortingOrder::ByAddress => {
+            SortingOrder::BySite | SortingOrder::BySiteAndTag | SortingOrder::ByAddress => {
                 if self.virtual_memory_sites_order != SortingOrder::BySite {
                     self.virtual_memory_sites
                         .sort_by(|a, b| stack_cmp(&a.stack, &b.stack));

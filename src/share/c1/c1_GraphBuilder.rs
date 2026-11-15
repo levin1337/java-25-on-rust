@@ -952,14 +952,12 @@ impl<'a> GraphBuilder<'a> {
             stack.push(StackValue::new(self.unsupported(bci, op, "unresolved invoke"), ValueKind::Ref));
             return;
         }
-        let mut operands = Vec::new();
-        if !call.is_static {
-            operands.push(self.pop(stack).map(|x| x.expr).unwrap_or_else(|| HirInstruction::ConstantNull));
+        let total = call.arg_kinds.len() + usize::from(!call.is_static);
+        let mut operands = Vec::with_capacity(total);
+        for _ in 0..total {
+            operands.push(self.pop(stack).map(|x| x.expr).unwrap_or_else(|| HirInstruction::ConstantInt(0)));
         }
-        let mut args = Vec::with_capacity(call.arg_kinds.len());
-        for _ in 0..call.arg_kinds.len() { args.push(self.pop(stack).map(|x| x.expr).unwrap_or_else(|| HirInstruction::ConstantInt(0))); }
-        args.reverse();
-        operands.extend(args);
+        operands.reverse();
         if call.return_kind == ValueKind::Void {
             cfg.blocks[block_id].push(HirInstruction::Call { info: call, operands: operands.into_iter().map(Box::new).collect() });
         } else {

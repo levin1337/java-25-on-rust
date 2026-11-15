@@ -669,6 +669,18 @@ pub(crate) fn invoke<'a>(
             set_fd_fields(loader, fd, handle as i64)?;
             return Ok(Some(Value::Null));
         }
+        (b"isRegularFile0", b"(Ljava/io/FileDescriptor;)Z") => {
+            let handle = stream_handle(loader, arg(1))?;
+            let regular = if handle != 0 && !is_std_handle(handle) {
+                nioFileNatives::with_file(handle, |file, _| {
+                    file.metadata().map(|meta| meta.is_file()).map_err(io_error)
+                })
+                .unwrap_or(false)
+            } else {
+                false
+            };
+            Value::Int(i32::from(regular))
+        }
         (b"read0", b"()I") => {
             let handle = stream_handle(loader, arg(0))?;
             if handle == 0 {

@@ -344,7 +344,7 @@ mod tests {
 
     #[test]
     fn young_generation_membership() {
-        let young = ShenandoahYoungGeneration::new(4, 1 << 30);
+        let mut young = ShenandoahYoungGeneration::new(4, 1 << 30);
         let mut region = ShenandoahHeapRegion::new_affiliated(
             0,
             0x1000,
@@ -362,10 +362,9 @@ mod tests {
 
     #[test]
     fn old_generation_promotion_reserve() {
-        let old = ShenandoahOldGeneration::new(4, 1 << 30);
-        assert!(old.can_promote(100));
-        let mut old = old;
+        let mut old = ShenandoahOldGeneration::new(4, 1 << 30);
         old.set_promoted_reserve(1000);
+        assert!(old.can_promote(100));
         old.expend_promoted(400);
         assert!(old.can_promote(500));
         assert!(!old.can_promote(700));

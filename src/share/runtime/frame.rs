@@ -132,9 +132,9 @@ impl Frame {
     /// (0 = innermost), matching HotSpot's top-of-stack-first walk.
     pub(crate) fn from_interpreter(
         index: usize,
-        frame: &crate::share::interpreter::bytecodeInterpreter::Frame<'static>,
+        thread_id: u64,
+        info: &StackFrameInfo,
     ) -> Self {
-        let info = frame.stackWalkInfo();
         Self {
             kind: FrameType::InterpreterFrame,
             holder: info.class_name.as_bytes().to_vec(),
@@ -142,11 +142,11 @@ impl Frame {
             descriptor: info.signature.as_bytes().to_vec(),
             bci: info.bci.max(0) as usize,
             line_number: info.line_number,
-            thread_id: frame.threadId(),
+            thread_id,
             is_native: info.is_native,
             index,
             marked_for_deopt: false,
-            info: Some(info),
+            info: Some(info.clone()),
         }
     }
 
@@ -354,11 +354,13 @@ impl FrameIter {
     /// compiled/blob frames.  Iteration order is innermost -> outermost,
     /// matching `frame::sender` walks.
     pub fn new(current_thread: u64) -> Self {
+        // ACTIVE_FRAMES hands out short-lived `&Frame` borrows, so the
+        // owned `StackFrameInfo` snapshot is taken inside the callback.
         let mut collected = Vec::new();
         crate::share::interpreter::bytecodeInterpreter::for_each_active_frame(
             &mut |frame| {
                 if frame.threadId() == current_thread {
-                    collected.push(frame);
+                    collected.push((frame.threadId(), frame.stackWalkInfo()));
                 }
             },
         );
@@ -368,7 +370,9 @@ impl FrameIter {
         let frames = collected
             .iter()
             .enumerate()
-            .map(|(index, frame)| Frame::from_interpreter(index, frame))
+            .map(|(index, (thread_id, info))| {
+                Frame::from_interpreter(index, *thread_id, info)
+            })
             .collect();
         Self { frames, position: 0 }
     }
@@ -384,7 +388,7 @@ impl FrameIter {
 
     /// Appends a frame description (compiled activation reported by the
     /// JIT layer) at the innermost position.
-    pub fn push_front(&mut self, mut frame: Frame) {
+    pub fn push_front(&mut self, frame: Frame) {
         self.frames.insert(0, frame);
         for (index, entry) in self.frames.iter_mut().enumerate() {
             entry.index = index;

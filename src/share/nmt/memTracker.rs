@@ -44,7 +44,7 @@ impl MemTracker {
         }
         TRACKING_LEVEL.store(level as u8, Ordering::Release);
         let ok = level == NmtTrackingLevel::Off
-            || VirtualMemoryTracker::global().initialize(level)
+            || VirtualMemoryTracker::initialize(level)
                 && MallocTracker::initialize(level);
         let _ = GENERATION_BLOCK.set(());
         ok
@@ -205,7 +205,7 @@ impl MemTracker {
         addr: usize,
         bytes: usize,
         exec: bool,
-        tag: MemTag,
+        _tag: MemTag,
     ) -> std::io::Result<()> {
         use crate::share::platform::windows::OsWindows;
         OsWindows::commit_memory(addr, bytes, exec)?;
@@ -272,23 +272,31 @@ impl MemTracker {
         VirtualMemoryTracker::global().totals_for(tag)
     }
 
+    /// Build a report from a fresh baseline.
+    fn report_with_baseline(&self, summary_only: bool) -> String {
+        let mut baseline = super::memBaseline::MemBaseline::new();
+        baseline.baseline(summary_only);
+        MemReporter::new(&baseline).generate()
+    }
+
     /// memReporter-backed full report.
     pub fn generate_report(&self) -> String {
-        MemReporter::new().generate()
+        let summary_only = Self::tracking_level() != NmtTrackingLevel::Detail;
+        self.report_with_baseline(summary_only)
     }
 
     /// Backwards-compatible summary report.
     pub fn summary_report(&self) -> String {
-        self.generate_report()
+        self.report_with_baseline(true)
     }
 
     /// Detail report: summary plus per-site sections.
     pub fn detail_report(&self) -> String {
-        let mut out = self.generate_report();
+        let mut out = self.report_with_baseline(false);
         out.push_str("\nCall Site Detail (malloc):\n");
         out.push_str(&super::mallocSiteTable::MallocSiteTable::global().detail_section());
         out.push_str("\nVirtual Memory Allocation Sites:\n");
-        out.push_str(&super::virtualMemoryTracker::VirtualMemoryTracker::global().site_section());
+        out.push_str(&VirtualMemoryTracker::global().site_section());
         out
     }
 
@@ -340,6 +348,7 @@ mod tests {
 
     #[test]
     fn record_and_report() {
+        let _g = crate::share::nmt::nmtCommon::NMT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         MemTracker::initialize(NmtTrackingLevel::Summary);
         let t = MemTracker::global();
         let h1 = t.record_malloc(4096, MemTag::MtSymbol);

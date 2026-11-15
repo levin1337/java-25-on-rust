@@ -692,11 +692,12 @@ impl CodeBuffer {
     }
 
     pub fn set_mark(&mut self) {
-        self.code_section_ref().mark = Some(self.pos());
+        let p = self.pos();
+        self.code_section().mark = Some(p);
     }
 
     pub fn clear_mark(&mut self) {
-        self.code_section_ref().mark = None;
+        self.code_section().mark = None;
     }
 
     /// inst_mark(): position of last instruction mark in insts section.
@@ -788,7 +789,6 @@ impl CodeBuffer {
             for e in sec.relocs.iter() {
                 let mut ne = e.clone();
                 ne.pc_offset = (base + e.pc_offset as usize) as u32;
-                ne.field_offset = ne.field_offset; // unchanged
                 table.add(ne);
             }
         }
@@ -939,7 +939,7 @@ impl CodeBuffer {
 
     /// copy_codes: build a CodeBlob from this buffer.
     pub fn copy_codes(&self, blob_type: CodeBlobType, name: &str) -> Result<CodeBlob, CodeBufferError> {
-        let (image, table, (ib, sb, cb)) = self.copy_codes_into()?;
+        let (image, table, (_ib, sb, cb)) = self.copy_codes_into()?;
         Ok(CodeBlob {
             blob_type,
             name: name.to_string(),

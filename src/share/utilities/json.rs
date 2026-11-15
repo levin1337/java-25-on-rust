@@ -1,4 +1,4 @@
-use std::io::{self, Write};
+use std::io::Write;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JsonType {
@@ -105,8 +105,8 @@ impl<'a, 'b, C: JsonCallback<'a>> JsonParser<'a, 'b, C> {
         let full = format!("{} on line {} byte {}: {}", e.strerror(), self.line, self.column + 1, message);
         self.errors.push(full.clone());
         if !self.silent {
-            if let Some(st) = self.st.as_deref_mut() {
-                let _ = writeln!(st, "{}", full);
+            if let Some(st) = self.st.as_mut() {
+                let _ = writeln!(*st, "{}", full);
             }
         }
     }
@@ -122,7 +122,7 @@ impl<'a, 'b, C: JsonCallback<'a>> JsonParser<'a, 'b, C> {
         }
         if self.level == 0 {
             match c {
-                b'{' => {
+                x if x == b'{' as i32 => {
                     if !self.parse_json_object() {
                         return false;
                     }
@@ -136,7 +136,7 @@ impl<'a, 'b, C: JsonCallback<'a>> JsonParser<'a, 'b, C> {
                     }
                     return true;
                 }
-                b'[' => {
+                x if x == b'[' as i32 => {
                     if !self.parse_json_array() {
                         return false;
                     }
@@ -161,13 +161,13 @@ impl<'a, 'b, C: JsonCallback<'a>> JsonParser<'a, 'b, C> {
             }
         }
         match c {
-            b'{' => self.parse_json_object(),
-            b'[' => self.parse_json_array(),
-            b'"' => self.parse_json_string(false),
-            b'-' | b'0'..=b'9' => self.parse_json_number(),
-            b't' => self.parse_json_symbol("true", JsonType::True),
-            b'f' => self.parse_json_symbol("false", JsonType::False),
-            b'n' => self.parse_json_symbol("null", JsonType::Null),
+            x if x == b'{' as i32 => self.parse_json_object(),
+            x if x == b'[' as i32 => self.parse_json_array(),
+            x if x == b'"' as i32 => self.parse_json_string(false),
+            x if x == b'-' as i32 || (b'0' as i32..=b'9' as i32).contains(&x) => self.parse_json_number(),
+            x if x == b't' as i32 => self.parse_json_symbol("true", JsonType::True),
+            x if x == b'f' as i32 => self.parse_json_symbol("false", JsonType::False),
+            x if x == b'n' as i32 => self.parse_json_symbol("null", JsonType::Null),
             0 => {
                 self.errorf(JsonError::Syntax, "EOS was encountered when expecting a json value.");
                 false
@@ -199,7 +199,7 @@ impl<'a, 'b, C: JsonCallback<'a>> JsonParser<'a, 'b, C> {
                 return false;
             } else if c < 0 {
                 return false;
-            } else if c == b'}' {
+            } else if c == b'}' as i32 {
                 self.next();
                 break;
             }
@@ -225,7 +225,7 @@ impl<'a, 'b, C: JsonCallback<'a>> JsonParser<'a, 'b, C> {
             if self.expect_any(",}", "value separator or object end", JsonError::Syntax) <= 0 {
                 return false;
             }
-            if c == b'}' {
+            if c == b'}' as i32 {
                 break;
             }
         }
@@ -254,7 +254,7 @@ impl<'a, 'b, C: JsonCallback<'a>> JsonParser<'a, 'b, C> {
                 return false;
             } else if c < 0 {
                 return false;
-            } else if c == b']' {
+            } else if c == b']' as i32 {
                 self.next();
                 break;
             }
@@ -269,7 +269,7 @@ impl<'a, 'b, C: JsonCallback<'a>> JsonParser<'a, 'b, C> {
             if self.expect_any(",]", "value separator or array end", JsonError::Syntax) <= 0 {
                 return false;
             }
-            if c == b']' {
+            if c == b']' as i32 {
                 break;
             }
         }

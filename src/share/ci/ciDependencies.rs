@@ -46,7 +46,7 @@ impl<'a> CiMethodKey<'a> {
 
 /// One recorded compilation dependency
 /// (`Dependencies::Dependency` analogue).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum CiDependency<'a> {
     /// `ciMethod::can_be_statically_bound` must keep holding: the
     /// method is final/private/static and cannot be overridden.

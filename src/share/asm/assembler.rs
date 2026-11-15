@@ -7,7 +7,7 @@
  */
 
 use crate::share::asm::code_buffer::{CodeBuffer, CodeBufferError, SectionId};
-use crate::share::asm::reloc::{RelocError, RelocTable, RelocType, RelocWidth, RelocValue};
+use crate::share::asm::reloc::{RelocError, RelocType, RelocWidth, RelocValue};
 
 /// How a pending label patch is encoded, mirrors the platform
 /// patch_instruction dispatch (rel8 / rel32 / absolute).
@@ -154,7 +154,7 @@ impl LabelTable {
         let patch_indices: Vec<usize> = self.labels[label.0 as usize].patches.clone();
         let mut resolved = Vec::with_capacity(patch_indices.len());
         for pi in patch_indices {
-            let site = self.patches[pi];
+            let site = self.patches[pi].clone();
             Self::apply_patch(code, &site, offset)?;
             // Record pending reloc for Abs* patches once bound.
             if let Some(spec) = &site.reloc {
@@ -527,7 +527,7 @@ impl Assembler {
     /// bind at explicit offset in current section.
     pub fn bind_at(&mut self, label: LabelId, offset: usize) -> Result<(), AssemblerError> {
         let section = self.code.current;
-        self.labels.bind(&mut self.code, label, offset, section)
+        self.labels.bind(&mut self.code, label, offset, section).map(|_| ())
     }
 
     pub fn label_loc(&self, label: LabelId) -> Option<usize> {
@@ -576,7 +576,7 @@ impl Assembler {
     pub fn patch_label(
         &mut self,
         label: LabelId,
-        inst_offset: usize,
+        _inst_offset: usize,
         field_offset: usize,
         kind: PatchKind,
     ) -> Result<(), AssemblerError> {

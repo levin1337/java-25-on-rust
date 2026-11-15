@@ -10,7 +10,7 @@
  */
 
 use crate::share::jvmci::jvmciExceptions::{
-    JvmciException, JvmciResult, ThrowKind, JVMCI_NOT_ENABLED_ERROR_MESSAGE,
+    JvmciException, JvmciResult, ThrowKind,
 };
 use crate::share::jvmci::jvmciObject::{
     self, JvmciArray, JvmciHeapValue, JvmciObject, JvmciObjectArray, JvmciPrimitiveArray,
@@ -170,12 +170,20 @@ pub struct JvmciEnv {
     compile_state: Option<SharedCompileState>,
 }
 
+macro_rules! throw_method {
+    ($name:ident, $kind:expr) => {
+        pub fn $name(&mut self, msg: Option<&str>) -> JvmciException {
+            self.raise(JvmciException::throw_kind($kind, msg, "<jvmci>", 0))
+        }
+    };
+}
+
 impl JvmciEnv {
     fn init_fields(
         thread_id: u64,
         is_hotspot: bool,
-        file: &'static str,
-        line: u32,
+        _file: &'static str,
+        _line: u32,
     ) -> (Option<Arc<JvmciRuntime>>, i32, Option<String>) {
         let runtime = JvmciRuntime::for_thread(thread_id, is_hotspot);
         match runtime {
@@ -293,7 +301,7 @@ impl JvmciEnv {
 
     /// The JVMCIRuntime for this env.  Panics-equivalent of the C++
     /// `guarantee` is expressed as an error return.
-    pub fn runtime(&self) -> JvmciResult<Arc<JvmciRuntime>> {
+    pub fn runtime(&mut self) -> JvmciResult<Arc<JvmciRuntime>> {
         self.check_init()?;
         self.runtime.clone().ok_or_else(|| {
             JvmciException::internal_error(format!(
@@ -372,14 +380,6 @@ impl JvmciEnv {
 
     // ---- throw_<Kind> helpers (JVMCI_THROW macros) -------------------
 
-    macro_rules! throw_method {
-        ($name:ident, $kind:expr) => {
-            pub fn $name(&mut self, msg: Option<&str>) -> JvmciException {
-                self.raise(JvmciException::throw_kind($kind, msg, "<jvmci>", 0))
-            }
-        };
-    }
-
     throw_method!(throw_internal_error, ThrowKind::InternalError);
     throw_method!(
         throw_array_index_out_of_bounds,
@@ -412,7 +412,7 @@ impl JvmciEnv {
 
     // ---- array accessors --------------------------------------------
 
-    fn array_len(&self, array: JvmciObject) -> JvmciResult<usize> {
+    fn array_len(&mut self, array: JvmciObject) -> JvmciResult<usize> {
         self.check_init()?;
         match array.heap_value() {
             Some(JvmciHeapValue::ByteArray(v)) => Ok(v.len()),

@@ -30,6 +30,10 @@ pub trait LogOutput: Send + Sync {
 
     fn flush(&self) -> io::Result<()>;
     fn name(&self) -> &str;
+    /// LogOutput::set_option — key=value output option (foldmultilines).
+    fn set_option(&self, _key: &str, _value: &str) -> bool {
+        false
+    }
     /// LogOutput::describe — one-line description for VM.log print.
     fn describe(&self) -> String;
     /// LogFileOutput::force_rotate — no-op for non-rotating outputs.
@@ -255,6 +259,18 @@ impl LogOutput for StreamLogOutput {
 
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn set_option(&self, key: &str, value: &str) -> bool {
+        if key.eq_ignore_ascii_case("foldmultilines") {
+            if value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("false") {
+                self.state.lock().unwrap().fold_multilines =
+                    value.eq_ignore_ascii_case("true");
+                return true;
+            }
+            return false;
+        }
+        false
     }
 
     fn describe(&self) -> String {

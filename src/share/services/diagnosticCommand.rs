@@ -142,7 +142,7 @@ impl DCmdInstance for HelpDCmd {
                         writeln_cr(out, &format!("\nImpact: {}", impact))
                             .map_err(|e| e.to_string())?;
                         writeln_cr(out, "").map_err(|e| e.to_string())?;
-                        if let Some(mut inst) =
+                        if let Some(inst) =
                             diagnosticFramework::create_instance_for(&name)
                         {
                             inst.print_help(&name, out).map_err(|e| e.to_string())?;

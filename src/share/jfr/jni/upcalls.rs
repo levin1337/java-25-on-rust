@@ -1,17 +1,9 @@
-/*
- * Port of OpenJDK 25 HotSpot JfrUpcalls
- * (share/jfr/jni/jfrUpcalls.hpp/.cpp)
- *
- * VM->Java callbacks into `jdk.jfr.internal.JVMUpcalls` used while
- * instrumenting classes: retransformation byte production, eager
- * instrumentation bytes, internal-type unhiding, method-trace
- * instrumentation and method-timer publication.
- */
+
 
 use crate::share::{
     classfile::classLoader::ClassLoader,
     interpreter::bytecodeInterpreter::Value,
-    jfr::jni::{java_call::JfrJavaArguments, java_support},
+    jfr::jni::java_call::JfrJavaArguments,
     oops::instanceKlass::InstanceKlass,
     runtime::javaCalls::JavaValue,
 };
@@ -56,7 +48,6 @@ fn string_array_bytes<'a>(loader: &ClassLoader<'a>, values: &[&[u8]]) -> io::Res
     Ok(Value::ObjectArray(loader.alloc_obj_array(array)))
 }
 
-/// Reads a `[B` result value back into owned bytes.
 fn result_bytes<'a>(loader: &ClassLoader<'a>, value: Value<'a>) -> Option<Vec<u8>> {
     let Value::PrimitiveArray(handle) = value else {
         return None;
@@ -70,8 +61,6 @@ fn result_bytes<'a>(loader: &ClassLoader<'a>, value: Value<'a>) -> Option<Vec<u8
     }
 }
 
-/// Shared `invoke` helper: calls a static `JVMUpcalls` method with the
-/// standard `(JZZLjava/lang/Class;[B)`-style argument prefix.
 fn invoke<'a>(
     loader: &ClassLoader<'a>,
     output: &mut dyn io::Write,
@@ -102,9 +91,6 @@ fn invoke<'a>(
     Ok(result_bytes(loader, value))
 }
 
-/// `JfrUpcalls::on_retransform`: asks the Java side for the
-/// retransformed class bytes. Returns `None` when the class is not
-/// visible to JFR or the upcall produced no bytes.
 pub fn on_retransform<'a>(
     loader: &ClassLoader<'a>,
     trace_id: i64,
@@ -125,7 +111,6 @@ pub fn on_retransform<'a>(
     )
 }
 
-/// `JfrUpcalls::new_bytes_eager_instrumentation`.
 pub fn new_bytes_eager_instrumentation<'a>(
     loader: &ClassLoader<'a>,
     trace_id: i64,
@@ -148,7 +133,6 @@ pub fn new_bytes_eager_instrumentation<'a>(
     )
 }
 
-/// `JfrUpcalls::unhide_internal_types`.
 pub fn unhide_internal_types<'a>(
     loader: &ClassLoader<'a>,
     output: &mut dyn io::Write,
@@ -166,7 +150,6 @@ pub fn unhide_internal_types<'a>(
     }
 }
 
-/// `JfrTracedMethod` analogue: one method selected for tracing.
 #[derive(Clone, Debug)]
 pub struct TracedMethod {
     pub id: i64,
@@ -175,9 +158,6 @@ pub struct TracedMethod {
     pub modification: i32,
 }
 
-/// `JfrUpcalls::on_method_trace`: sends the traced-method tables to
-/// `JVMUpcalls.onMethodTrace` and returns the possibly rewritten class
-/// bytes.
 #[allow(clippy::too_many_arguments)]
 pub fn on_method_trace<'a>(
     loader: &ClassLoader<'a>,
@@ -224,7 +204,6 @@ pub fn on_method_trace<'a>(
     Ok(result_bytes(loader, value))
 }
 
-/// `JfrUpcalls::publish_method_timers_for_klass`.
 pub fn publish_method_timers_for_klass<'a>(
     loader: &ClassLoader<'a>,
     klass_id: i64,

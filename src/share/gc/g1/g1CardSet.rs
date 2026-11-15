@@ -280,7 +280,7 @@ impl G1CardSetContainer {
                 *num_set += 1;
                 G1AddCardResult::Added
             }
-            Self::Howl { buckets, card_count } => {
+            Self::Howl { buckets, .. } => {
                 let bucket_idx = config.howl_bucket_index(card) as usize;
                 let offset = config.howl_bitmap_offset(card);
                 if bucket_idx >= buckets.len() {
@@ -353,7 +353,7 @@ impl G1CardSetContainer {
     /// Iterate set cards, calling `f` with `base + card_in_container`.
     /// `limit` bounds the number of cards this container covers;
     /// cards at or beyond `limit` are skipped (Howl bucket tails).
-    fn for_each<F: FnMut(u32)>(&self, base: u32, limit: u32, mut f: F) {
+    fn for_each(&self, base: u32, limit: u32, f: &mut dyn FnMut(u32)) {
         match self {
             Self::Array { cards } => {
                 for &c in cards {
@@ -383,7 +383,7 @@ impl G1CardSetContainer {
                     let sub_base = base + (bi as u32) * per_bucket;
                     let covered = limit.saturating_sub((bi as u32) * per_bucket);
                     let sub_limit = (*per_bucket).min(covered);
-                    bucket.for_each(sub_base, sub_limit, &mut f);
+                    bucket.for_each(sub_base, sub_limit, f);
                 }
             }
             Self::Full => {
@@ -521,7 +521,7 @@ impl G1CardSet {
         for (&region, container) in &self.table {
             let base = self.base_card_of_region(region);
             let config = &self.config;
-            container.for_each(0, config.max_cards_in_card_set(), |c| {
+            container.for_each(0, config.max_cards_in_card_set(), &mut |c| {
                 f(base + c);
             });
         }
@@ -567,4 +567,77 @@ impl Default for G1CardSet {
 // Local constant to avoid a dependency cycle on heapRegion.rs.
 mod HeapRegionRef {
     pub const DEFAULT_REGION_SIZE: usize = 1024 * 1024;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config() -> G1CardSetConfiguration {
+        G1CardSetConfiguration::default_for_region(1024 * 1024, 512)
+    }
+
+    #[test]
+    fn array_add_find() {
+        let mut set = G1CardSet::new(config());
+        assert_eq!(set.add_card(10), G1AddCardResult::Added);
+        assert_eq!(set.add_card(10), G1AddCardResult::Found);
+        assert!(set.contains_card(10));
+        assert!(!set.contains_card(11));
+        assert_eq!(set.cards(), vec![10]);
+    }
+
+    #[test]
+    fn coarsens_to_bitmap() {
+        let cfg = config();
+        let mut set = G1CardSet::new(cfg);
+        // Fill beyond max_cards_in_array (8 * 1MB = 8 entries)
+        for i in 0..20u32 {
+            set.add_card(i * 7);
+        }
+        assert!(set.contains_card(19 * 7));
+        let cards = set.cards();
+        assert_eq!(cards.len(), 20);
+        assert!(cards.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
+    fn coarsens_to_howl_and_full() {
+        let mut set = G1CardSet::new(config());
+        // Add many cards to force Array->Bitmap->Howl->Full chain.
+        for i in 0..1500u32 {
+            set.add_card(i);
+        }
+        assert_eq!(set.cards().len(), 1500);
+        // Now add every card in region 0 -> should become Full.
+        for i in 0..2048u32 {
+            set.add_card(i);
+        }
+        for i in 0..2048u32 {
+            assert!(set.contains_card(i), "missing card {}", i);
+        }
+    }
+
+    #[test]
+    fn remove_card() {
+        let mut set = G1CardSet::new(config());
+        set.add_card(5);
+        set.add_card(9);
+        assert!(set.remove_card(5));
+        assert!(!set.remove_card(5));
+        assert!(set.contains_card(9));
+        assert_eq!(set.cards(), vec![9]);
+    }
+
+    #[test]
+    fn multi_region_cards() {
+        let mut set = G1CardSet::new(config());
+        // card indexes spanning two card regions (2048 cards each)
+        set.add_card(100);
+        set.add_card(2048 + 200);
+        set.add_card(4096 + 7);
+        let mut cards = set.cards();
+        cards.sort_unstable();
+        assert_eq!(cards, vec![100, 2248, 4103]);
+    }
 }

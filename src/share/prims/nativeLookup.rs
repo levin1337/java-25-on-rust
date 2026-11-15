@@ -525,6 +525,18 @@ fn invokeInstanceInner<'a>(
         }
     }
 
+    if owner == b"sun/net/spi/DefaultProxySelector" {
+        if let Some(result) = super::osServicesNatives::invoke(
+            loader,
+            name,
+            descriptor,
+            arguments,
+            output,
+        )? {
+            return Ok(Some(result));
+        }
+    }
+
     if owner == b"sun/nio/ch/FileKey" && name == b"init" {
         return super::nioFileNatives::file_key_init(loader, arguments)
             .map(|_| Some(None));
@@ -569,7 +581,9 @@ fn invokeInstanceInner<'a>(
         None => owner,
     };
 
-    if owner == b"java/lang/StackStreamFactory$AbstractStackWalker" {
+    if owner == b"java/lang/StackStreamFactory$AbstractStackWalker"
+        || owner == b"java/lang/StackFrameInfo"
+    {
         return super::stackwalk::invoke(loader, name, descriptor, arguments, output);
     }
 
@@ -578,6 +592,14 @@ fn invokeInstanceInner<'a>(
             loader, owner, name, descriptor, arguments,
         )? {
             return Ok(Some(result));
+        }
+    }
+
+    if super::constantPoolNatives::is_owner(owner) {
+        if let Some(result) =
+            super::constantPoolNatives::invoke(loader, name, descriptor, arguments)?
+        {
+            return Ok(Some(Some(result)));
         }
     }
 
@@ -1545,6 +1567,7 @@ fn invokeStaticInner<'a>(
         return Ok(Some(result));
     }
 
+
     if super::nioBitsNatives::is_owner(owner) {
         if let Some(result) = super::nioBitsNatives::invoke_static(
             loader,
@@ -1572,6 +1595,19 @@ fn invokeStaticInner<'a>(
     if owner == b"jdk/internal/jimage/NativeImageBuffer" {
         if let Some(result) = super::jimageNatives::invoke_static(
             loader,
+            name,
+            descriptor,
+            arguments,
+            output,
+        )? {
+            return Ok(Some(result));
+        }
+    }
+
+    if super::osServicesNatives::is_owner(owner) {
+        if let Some(result) = super::osServicesNatives::invoke_static(
+            loader,
+            owner,
             name,
             descriptor,
             arguments,
@@ -2007,6 +2043,32 @@ fn invokeStaticInner<'a>(
         (b"jdk/internal/loader/BootLoader", b"getSystemPackageLocation", b"(Ljava/lang/String;)Ljava/lang/String;") => {
             Some(Some(Value::Null))
         }
+        (b"jdk/internal/loader/BootLoader", b"getSystemPackageNames", b"()[Ljava/lang/String;") => {
+            // Packages defined to the boot loader, in VM internal form.
+            // Derived from the classes actually loaded so far; packages()
+            // consumers (Package.getPackages) only observe defined ones.
+            let mut names: Vec<String> = loader
+                .classes
+                .borrow()
+                .keys()
+                .filter_map(|name| {
+                    let text = std::str::from_utf8(name).ok()?;
+                    text.rfind('/')
+                        .map(|index| text[..index].to_owned())
+                })
+                .collect();
+            names.sort();
+            names.dedup();
+            let mut array = crate::share::oops::objArrayOop::ObjArrayOop::withComponent(
+                names.len() as i32,
+                b"java/lang/String",
+            )?;
+            for (index, name) in names.iter().enumerate() {
+                array.elements[index] =
+                    Value::HostString(loader.storage.alloc_str(name));
+            }
+            Some(Some(Value::ObjectArray(loader.alloc_obj_array(array))))
+        }
         // java.lang.Module VM-graph updates. Java-side state (reads,
         // exportedPackages/openPackages, ReflectionData) is maintained by
         // java.lang.Module itself, so these are no-ops for the interpreter.
@@ -2151,6 +2213,103 @@ fn invokeStaticInner<'a>(
         (b"jdk/internal/misc/VM", b"getNanoTimeAdjustment", b"(J)J") => Some(Some(Value::Long(0))),
         (b"jdk/internal/misc/VM", b"latestUserDefinedLoader", b"()Ljava/lang/ClassLoader;") => {
             Some(Some(Value::Null))
+        }
+        (b"jdk/internal/misc/VM", b"latestUserDefinedLoader0", b"()Ljava/lang/ClassLoader;") => {
+            // First user-defined loader up the Java call stack, or null when
+            // only JDK/platform frames are present (the Java wrapper then
+            // substitutes the platform loader). This VM has a single
+            // application loader, so any non-JDK frame maps to it.
+            let has_user_frame = loader.call_stack.snapshot().iter().rev().any(|name| {
+                !(name.starts_with(b"java/")
+                    || name.starts_with(b"javax/")
+                    || name.starts_with(b"jdk/")
+                    || name.starts_with(b"sun/")
+                    || name.starts_with(b"com/sun/"))
+            });
+            if !has_user_frame {
+                return Ok(Some(Some(Value::Null)));
+            }
+            match loader.systemClassLoaderObject() {
+                Ok(handle) => Some(Some(Value::Object(handle))),
+                Err(_) => Some(Some(Value::Null)),
+            }
+        }
+        (b"jdk/internal/misc/VM", b"getuid", b"()J")
+        | (b"jdk/internal/misc/VM", b"geteuid", b"()J")
+        | (b"jdk/internal/misc/VM", b"getgid", b"()J")
+        | (b"jdk/internal/misc/VM", b"getegid", b"()J") => {
+            // POSIX ids do not exist on this platform; HotSpot's Windows
+            // build reports -1 for all four, which also keeps
+            // VM.isSetUID() false.
+            Some(Some(Value::Long(-1)))
+        }
+        (b"jdk/internal/misc/VM", b"getRuntimeArguments", b"()[Ljava/lang/String;") => {
+            // HotSpot merges JAVA_TOOL_OPTIONS, JNI invocation arguments and
+            // _JAVA_OPTIONS into the VM argument vector. This launcher has
+            // no JNI-passed options, so the environment variables are the
+            // only sources; both are whitespace-separated option strings.
+            let mut args: Vec<String> = Vec::new();
+            for variable in ["JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS"] {
+                if let Ok(value) = std::env::var(variable) {
+                    args.extend(value.split_whitespace().map(str::to_owned));
+                }
+            }
+            let mut array = crate::share::oops::objArrayOop::ObjArrayOop::withComponent(
+                args.len() as i32,
+                b"java/lang/String",
+            )?;
+            for (index, arg) in args.iter().enumerate() {
+                array.elements[index] = Value::HostString(loader.storage.alloc_str(arg));
+            }
+            Some(Some(Value::ObjectArray(loader.alloc_obj_array(array))))
+        }
+        (b"java/lang/VirtualThread", b"postPinnedEvent", b"(Ljava/lang/String;)V")
+        | (b"java/lang/VirtualThread", b"notifyJvmtiDisableSuspend", b"(Z)V") => Some(None),
+        (b"java/lang/VirtualThread", b"takeVirtualThreadListToUnblock", b"()Ljava/lang/VirtualThread;") => {
+            // No virtual-thread scheduler exists in this VM, so there is
+            // never a pending unpark request.
+            Some(Some(Value::Null))
+        }
+        (b"jdk/internal/misc/CDS", b"needsClassInitBarrier0", b"(Ljava/lang/Class;)Z") => {
+            Some(Some(Value::Int(0)))
+        }
+        (b"jdk/internal/vm/vector/VectorSupport", b"registerNatives", b"()I") => {
+            Some(Some(Value::Int(0)))
+        }
+        (b"sun/net/sdp/SdpSupport", b"create0", b"()I") => {
+            Some(Some(Value::Int(-1)))
+        }
+        (b"sun/net/sdp/SdpSupport", b"convert0", b"(I)V") => Some(None),
+        (b"sun/net/www/protocol/http/ntlm/NTLMAuthentication", b"isTrustedSiteAvailable", b"()Z") => {
+            Some(Some(Value::Int(0)))
+        }
+        (b"sun/net/www/protocol/http/ntlm/NTLMAuthentication", b"isTrustedSite0", b"(Ljava/lang/String;)Z") => {
+            Some(Some(Value::Int(0)))
+        }
+        (b"sun/net/www/protocol/http/ntlm/NTLMAuthSequence", b"initFirst", b"(Ljava/lang/Class;)V") => Some(None),
+        (b"jdk/internal/vm/ForeignLinkerSupport", b"isSupported0", b"()Z") => {
+            Some(Some(Value::Int(0)))
+        }
+        (b"jdk/internal/foreign/abi/fallback/LibFallback", b"init", b"()Z") => {
+            Some(Some(Value::Int(0)))
+        }
+        (b"jdk/internal/vm/Continuation", b"doYield", b"()I")
+        | (b"jdk/internal/vm/Continuation", b"enterSpecial", b"(Ljdk/internal/vm/Continuation;ZZ)V")
+        | (b"jdk/internal/vm/Continuation", b"isPinned0", b"(Ljdk/internal/vm/ContinuationScope;)I")
+        | (b"jdk/internal/vm/Continuation", b"pin", b"()V")
+        | (b"jdk/internal/vm/Continuation", b"unpin", b"()V") => {
+            return Err(super::reflectionNatives::throw_java(
+                loader,
+                b"java/lang/UnsupportedOperationException",
+                Some("VM does not support continuations"),
+            ));
+        }
+        (b"jdk/internal/vm/ThreadSnapshot", b"create", b"(Ljava/lang/Thread;)Ljdk/internal/vm/ThreadSnapshot;") => {
+            return Err(super::reflectionNatives::throw_java(
+                loader,
+                b"java/lang/UnsupportedOperationException",
+                Some("VM does not support thread snapshots"),
+            ));
         }
         (b"java/lang/ClassLoader", b"registerAsParallelCapable", b"()Z") => {
             Some(Some(Value::Int(1)))

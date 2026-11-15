@@ -88,7 +88,11 @@ impl ShenandoahStringDedup {
     }
 
     pub fn insert(&mut self, bytes: Vec<u8>, obj: u64) -> bool {
-        self.table.insert(bytes, obj).is_none()
+        if self.table.contains_key(&bytes) {
+            return false;
+        }
+        self.table.insert(bytes, obj);
+        true
     }
 
     pub fn table_size(&self) -> usize {

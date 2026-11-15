@@ -24,6 +24,7 @@ struct FrameWalk {
     anchor: i64,
     receiver: usize,
     classOnly: bool,
+    continuation: Option<usize>,
     frames: std::vec::IntoIter<StackFrameInfo>,
 }
 
@@ -84,6 +85,31 @@ fn fillFrames<'a>(
             flags |= 0x400000;
         }
         let mirror = Value::ClassMirror(class.class.name);
+        // Method identity is recorded even for class-only frames: Java-side
+        // `StackFrameInfo.getMethodName/getMethodType` read these fields
+        // lazily (the VM's `expandStackFrameInfo` equivalent).
+        set_instance_field(
+            loader,
+            handle,
+            b"name",
+            b"Ljava/lang/String;",
+            Value::String(method.name),
+        )?;
+        set_instance_field(
+            loader,
+            handle,
+            b"type",
+            b"Ljava/lang/Object;",
+            Value::String(method.descriptor),
+        )?;
+        set_instance_field(loader, handle, b"bci", b"I", Value::Int(frame.bci))?;
+        set_instance_field(
+            loader,
+            handle,
+            b"ste",
+            b"Ljava/lang/StackTraceElement;",
+            Value::Null,
+        )?;
         let classOrMethod = if walk.classOnly {
             mirror
         } else {
@@ -92,28 +118,6 @@ fn fillFrames<'a>(
             let mut token = InstanceOop::new(resolved)?;
             token.fields[holderSlot] = mirror;
             let token = loader.alloc_object(token);
-            set_instance_field(
-                loader,
-                handle,
-                b"name",
-                b"Ljava/lang/String;",
-                Value::String(method.name),
-            )?;
-            set_instance_field(
-                loader,
-                handle,
-                b"type",
-                b"Ljava/lang/Object;",
-                Value::String(method.descriptor),
-            )?;
-            set_instance_field(loader, handle, b"bci", b"I", Value::Int(frame.bci))?;
-            set_instance_field(
-                loader,
-                handle,
-                b"ste",
-                b"Ljava/lang/StackTraceElement;",
-                Value::Null,
-            )?;
             Value::Object(token)
         };
         let mut objects = loader.borrow_objects_mut();
@@ -236,6 +240,7 @@ fn call_stack_walk<'a>(
         anchor,
         receiver,
         classOnly: mode & i64::from(JVM_STACKWALK_FILL_CLASS_REFS_ONLY) != 0,
+        continuation: None,
         frames: frames.into_iter(),
     };
     let count = fillFrames(loader, &mut walk, array, buffer_size, start_index)?;
@@ -310,6 +315,31 @@ pub(super) fn invoke<'a>(
             let end = start.saturating_add(*batch);
             fillFrames(loader, walk, *array, end, *start).map(|count| Some(Some(Value::Int(count))))
         }),
+        (
+            b"setContinuation",
+            b"(J[Ljava/lang/Object;Ljdk/internal/vm/Continuation;)V",
+            [Value::Object(_receiver), Value::Long(anchor), Value::ObjectArray(_), continuation],
+        ) => {
+            let continuation = match continuation {
+                Value::Null => None,
+                Value::Object(handle) => Some(*handle),
+                _ => return Err(io::Error::other("Invalid continuation")),
+            };
+            frameWalks.with_borrow_mut(|walks| {
+                if let Some(walk) = walks.iter_mut().rev().find(|walk| walk.anchor == *anchor) {
+                    walk.continuation = continuation;
+                }
+            });
+            Ok(Some(None))
+        }
+        (
+            b"expandStackFrameInfo",
+            b"()V",
+            [Value::Object(receiver)],
+        ) => {
+            expand_frame_info(loader, *receiver)?;
+            Ok(Some(None))
+        }
         _ => {
             if name == b"callStackWalk" || name == b"fetchStackFrames" {
                 eprintln!(
@@ -480,6 +510,28 @@ impl StackWalk {
         }
         None
     }
+}
+
+fn expand_frame_info<'a>(loader: &ClassLoader<'a>, receiver: usize) -> io::Result<()> {
+    let name = object_field(loader, receiver, b"name", b"Ljava/lang/String;")?;
+    if !matches!(name, Value::Null | Value::Empty) {
+        return Ok(());
+    }
+    let member = object_field(loader, receiver, b"classOrMemberName", b"Ljava/lang/Object;")?;
+    let Value::Object(token) = member else {
+        return Ok(());
+    };
+    let member_name = object_field(loader, token, b"name", b"Ljava/lang/String;")
+        .unwrap_or(Value::Null);
+    let member_type = object_field(loader, token, b"type", b"Ljava/lang/Object;")
+        .unwrap_or(Value::Null);
+    if !matches!(member_name, Value::Null | Value::Empty) {
+        set_instance_field(loader, receiver, b"name", b"Ljava/lang/String;", member_name)?;
+    }
+    if !matches!(member_type, Value::Null | Value::Empty) {
+        set_instance_field(loader, receiver, b"type", b"Ljava/lang/Object;", member_type)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

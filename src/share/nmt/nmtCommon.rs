@@ -144,6 +144,10 @@ impl NmtUtil {
     }
 }
 
+/// Serializes tests that mutate the global NMT singletons.
+#[cfg(test)]
+pub(crate) static NMT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;

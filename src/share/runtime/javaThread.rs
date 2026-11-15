@@ -54,7 +54,7 @@ impl JavaThreadState {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct JavaThread {
     base: Thread,
     state: JavaThreadState,

@@ -752,6 +752,114 @@ pub(crate) fn file_descriptor_handle<'a>(loader: &ClassLoader<'a>, value: Value<
 }
 
 /// `sun.nio.fs.WindowsNativeDispatcher` static natives.
+/// `SetFileSecurity0`: `SetFileSecurityW` on Windows; a no-op elsewhere
+/// (the dispatcher is only reachable through `WindowsNativeDispatcher`).
+fn set_file_security<'a>(
+    loader: &ClassLoader<'a>,
+    path: &str,
+    security_information: u32,
+    descriptor_address: u64,
+) -> io::Result<Option<Value<'a>>> {
+    #[cfg(windows)]
+    {
+        #[link(name = "advapi32")]
+        unsafe extern "system" {
+            fn SetFileSecurityW(
+                path: *const u16,
+                security_information: u32,
+                security_descriptor: *const std::ffi::c_void,
+            ) -> i32;
+            fn GetLastError() -> u32;
+        }
+        let wide: Vec<u16> = java_path(path)
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let descriptor = descriptor_address as *const std::ffi::c_void;
+        let ok = unsafe {
+            SetFileSecurityW(
+                wide.as_ptr(),
+                security_information,
+                descriptor,
+            )
+        };
+        if ok == 0 {
+            let code = unsafe { GetLastError() } as i32;
+            return Err(windows_exception(loader, code, "SetFileSecurity failed"));
+        }
+        return Ok(Some(Value::Null));
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (loader, path, security_information, descriptor_address);
+        Ok(Some(Value::Null))
+    }
+}
+
+/// `DeviceIoControlGetReparsePoint`: issues `FSCTL_GET_REPARSE_POINT`
+/// (`0x900A8`) against the handle's OS file object and copies the raw
+/// `REPARSE_DATA_BUFFER` into the supplied off-heap buffer.
+#[cfg(windows)]
+fn device_io_control_reparse<'a>(
+    loader: &ClassLoader<'a>,
+    handle: u64,
+    buffer_address: i64,
+    buffer_size: u32,
+) -> io::Result<Option<Value<'a>>> {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn DeviceIoControl(
+            device: *mut std::ffi::c_void,
+            code: u32,
+            input: *const std::ffi::c_void,
+            input_size: u32,
+            output: *mut std::ffi::c_void,
+            output_size: u32,
+            returned: *mut u32,
+            overlapped: *mut std::ffi::c_void,
+        ) -> i32;
+        fn GetLastError() -> u32;
+    }
+    use std::os::windows::io::AsRawHandle;
+    const FSCTL_GET_REPARSE_POINT: u32 = 0x0009_00A8;
+    with_entry(handle, |entry| {
+        let file = file_of(entry)?;
+        let mut buffer = vec![0u8; buffer_size as usize];
+        let mut returned = 0u32;
+        let raw = file.as_raw_handle() as *mut std::ffi::c_void;
+        let ok = unsafe {
+            DeviceIoControl(
+                raw,
+                FSCTL_GET_REPARSE_POINT,
+                std::ptr::null(),
+                0,
+                buffer.as_mut_ptr() as *mut std::ffi::c_void,
+                buffer_size,
+                &mut returned,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            let code = unsafe { GetLastError() } as i32;
+            return Err(windows_exception(loader, code, "DeviceIoControl failed"));
+        }
+        OffHeapMemory::global()
+            .write_bytes(buffer_address as u64, &buffer[..returned as usize])
+            .map_err(|error| io_exception(loader, &error.to_string()))
+    })
+    .map(|_| Some(Value::Null))
+}
+
+#[cfg(not(windows))]
+fn device_io_control_reparse<'a>(
+    loader: &ClassLoader<'a>,
+    _handle: u64,
+    _buffer_address: i64,
+    _buffer_size: u32,
+) -> io::Result<Option<Value<'a>>> {
+    Err(windows_exception(loader, 1, "Reparse points are not supported"))
+}
+
 pub(crate) fn dispatcher<'a>(
     loader: &ClassLoader<'a>,
     name: &[u8],
@@ -1235,6 +1343,23 @@ pub(crate) fn dispatcher<'a>(
         (b"FormatMessage", b"(I)Ljava/lang/String;") => {
             Value::HostString(loader.storage.alloc_str("I/O error"))
         }
+        (b"SetFileSecurity0", b"(JIJ)V") => {
+            let path = read_wide_path(arg(0))?;
+            return set_file_security(
+                loader,
+                &path,
+                arg(1) as u32,
+                arg(2) as u64,
+            );
+        }
+        (b"DeviceIoControlGetReparsePoint", b"(JJI)V") => {
+            return device_io_control_reparse(
+                loader,
+                arg(0) as u64,
+                arg(1),
+                arg(2) as u32,
+            );
+        }
         (b"LocalFree", b"(J)V")
         | (b"DeviceIoControlSetSparse", b"(J)V")
         | (b"CancelIo", b"(J)V") => return Ok(Some(Value::Null)),
@@ -1395,6 +1520,118 @@ pub(crate) fn dispatcher<'a>(
             return Ok(Some(Value::Null));
         }
         (b"GetOverlappedResult", b"(JJ)I") => Value::Int(0),
+        (b"SetFileTime0", b"(JJJJ)V") => {
+            let handle = arg(0) as u64;
+            let times = [arg(1), arg(2), arg(3)];
+            let outcome = with_entry(handle, |entry| {
+                let file = file_of(entry)?;
+                #[cfg(windows)]
+                {
+                    use std::os::windows::io::AsRawHandle;
+                    unsafe extern "system" {
+                        fn SetFileTime(
+                            file: *mut core::ffi::c_void,
+                            creation: *const u64,
+                            access: *const u64,
+                            write: *const u64,
+                        ) -> i32;
+                        fn GetLastError() -> u32;
+                    }
+                    let mut pointers = [std::ptr::null::<u64>(); 3];
+                    for (index, value) in times.iter().enumerate() {
+                        if *value >= 0 {
+                            pointers[index] = (value as *const i64).cast::<u64>();
+                        }
+                    }
+                    let ok = unsafe {
+                        SetFileTime(
+                            file.as_raw_handle() as *mut core::ffi::c_void,
+                            pointers[0],
+                            pointers[1],
+                            pointers[2],
+                        )
+                    };
+                    if ok == 0 {
+                        return Ok(unsafe { GetLastError() } as i32);
+                    }
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = times;
+                    file.set_modified(std::time::SystemTime::now())?;
+                }
+                Ok(0)
+            });
+            match outcome {
+                Ok(0) => {}
+                Ok(code) => {
+                    return Err(windows_exception(loader, code, "SetFileTime failed"));
+                }
+                Err(error) => return Err(win32_error(loader, &error)),
+            }
+            return Ok(Some(Value::Null));
+        }
+        (b"SetFileAttributes0", b"(JI)V") => {
+            let path = read_wide_path(arg(0))?;
+            let attributes = arg(1) as u32;
+            #[cfg(windows)]
+            {
+                let wide: Vec<u16> =
+                    path.encode_utf16().chain(std::iter::once(0)).collect();
+                unsafe extern "system" {
+                    fn SetFileAttributesW(name: *const u16, attributes: u32) -> i32;
+                    fn GetLastError() -> u32;
+                }
+                let ok = unsafe { SetFileAttributesW(wide.as_ptr(), attributes) };
+                if ok == 0 {
+                    let code = unsafe { GetLastError() } as i32;
+                    return Err(windows_exception(
+                        loader,
+                        code,
+                        &format!("SetFileAttributes failed for {path}"),
+                    ));
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = (path, attributes);
+            }
+            return Ok(Some(Value::Null));
+        }
+        (b"CreateSymbolicLink0", b"(JJI)V") => {
+            let link = read_wide_path(arg(0))?;
+            let target = read_wide_path(arg(1))?;
+            let flags = arg(2);
+            #[cfg(windows)]
+            {
+                let result = if flags & 1 != 0 {
+                    std::os::windows::fs::symlink_dir(&target, &link)
+                } else {
+                    std::os::windows::fs::symlink_file(&target, &link)
+                };
+                if let Err(error) = result {
+                    let code = error.raw_os_error().unwrap_or(1);
+                    return Err(windows_exception(
+                        loader,
+                        code,
+                        &format!("CreateSymbolicLink failed: {error}"),
+                    ));
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                std::os::unix::fs::symlink(&target, &link)
+                    .map_err(|error| win32_error(loader, &error))?;
+            }
+            return Ok(Some(Value::Null));
+        }
+        (b"CreateHardLink0", b"(JJ)V") => {
+            let new_file = read_wide_path(arg(0))?;
+            let existing = read_wide_path(arg(1))?;
+            std::fs::hard_link(&existing, &new_file)
+                .map_err(|error| win32_error(loader, &error))?;
+            return Ok(Some(Value::Null));
+        }
         _ => return Ok(None),
     };
     Ok(Some(result))

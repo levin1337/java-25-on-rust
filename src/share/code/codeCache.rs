@@ -363,12 +363,7 @@ impl AdapterHandlerTable {
 
     /// `AdapterHandlerLibrary::find_adapter` analogue: return the cached
     /// adapter or generate + register a new one.
-    pub fn find_or_create<F>(
-        &mut self,
-        kind: AdapterKind,
-        signature: &str,
-        emit: F,
-    ) -> &AdapterBlob
+    pub fn find_or_create<F>(&mut self, kind: AdapterKind, signature: &str, emit: F) -> &AdapterBlob
     where
         F: FnOnce(AdapterKind, &str) -> (Vec<u8>, usize, usize),
     {
@@ -386,7 +381,7 @@ impl AdapterHandlerTable {
                 frame_size,
                 exception_points: Vec::new(),
             };
-            self.adapters.insert(key, blob);
+            self.adapters.insert(key.clone(), blob);
         }
         self.adapters.get(&key).unwrap()
     }
@@ -523,6 +518,26 @@ pub mod adapter_emit {
         let mut chars = inner.chars().peekable();
         while let Some(c) = chars.next() {
             match c {
+                // Array type: consume remaining '[' dimensions, then the
+                // element type contributes its own slot count exactly once.
+                '[' => {
+                    while matches!(chars.peek(), Some('[')) {
+                        chars.next();
+                    }
+                    match chars.next() {
+                        Some('J') | Some('D') => count += 2,
+                        Some('L') => {
+                            count += 1;
+                            for c2 in chars.by_ref() {
+                                if c2 == ';' {
+                                    break;
+                                }
+                            }
+                        }
+                        Some(_) => count += 1,
+                        None => {}
+                    }
+                }
                 'J' | 'D' => count += 2,
                 'L' => {
                     count += 1;
@@ -531,10 +546,6 @@ pub mod adapter_emit {
                             break;
                         }
                     }
-                }
-                '[' => {
-                    count += 1;
-                    // skip remaining array dims/type markers conservatively
                 }
                 _ => count += 1,
             }
@@ -646,7 +657,11 @@ impl CodeCache {
                 CodeBlobType::MethodNonProfiled,
                 0,
             )),
-            all_heap: Mutex::new(Some(CodeHeap::new(CodeBlobType::All, capacity))),
+            all_heap: Mutex::new(Some(CodeHeap::with_base(
+                CodeBlobType::All,
+                0x1000_0000,
+                capacity,
+            ))),
             segmented: false,
             nmethods: Mutex::new(HashMap::new()),
             osr_nmethods: Mutex::new(HashMap::new()),
@@ -694,10 +709,7 @@ impl CodeCache {
             .insert(nm.code_begin(), nm.clone());
         if nm.is_osr_method() {
             let mut guard = self.osr_nmethods.lock().unwrap();
-            guard
-                .entry(key)
-                .or_default()
-                .insert(nm.entry_bci(), nm);
+            guard.entry(key).or_default().insert(nm.entry_bci(), nm);
         } else {
             let mut guard = self.nmethods.lock().unwrap();
             guard.insert(key, nm);
@@ -862,7 +874,12 @@ impl CodeCache {
         if !self.segmented {
             let mut guard = self.all_heap.lock().unwrap();
             if let Some(heap) = guard.as_mut() {
-                return heap.allocate_with_code(name, total_size, CodeBlobKind::Nmethod, code_bytes);
+                return heap.allocate_with_code(
+                    name,
+                    total_size,
+                    CodeBlobKind::Nmethod,
+                    code_bytes,
+                );
             }
             return Err("CodeHeap not initialized".to_string());
         }
@@ -877,11 +894,7 @@ impl CodeCache {
 
     /// Free the heap blob backing a swept nmethod.
     pub fn free_nmethod_blob(&self, method_key: &str) {
-        let addr = self
-            .nmethod_blobs
-            .lock()
-            .unwrap()
-            .remove(method_key);
+        let addr = self.nmethod_blobs.lock().unwrap().remove(method_key);
         if let Some(addr) = addr {
             if self.segmented {
                 for heap in [
@@ -952,8 +965,7 @@ impl CodeCache {
         if let Some(blob) = self.adapters.lock().unwrap().lookup(kind, signature) {
             return Ok(blob.entry_point);
         }
-        let (code, patch_off, frame_size) =
-            adapter_emit::emit_generic(kind, signature);
+        let (code, patch_off, frame_size) = adapter_emit::emit_generic(kind, signature);
         // Allocate the stub bytes in the non-nmethod heap so the blob is
         // tracked by the sweeper.
         let name = format!("adapter-{}-{}", kind.name(), signature);
@@ -1080,11 +1092,7 @@ impl CodeCache {
         if self.segmented {
             self.non_nmethods_heap.lock().unwrap().print_on(f);
             self.profiled_nmethods_heap.lock().unwrap().print_on(f);
-            self
-                .non_profiled_nmethods_heap
-                .lock()
-                .unwrap()
-                .print_on(f);
+            self.non_profiled_nmethods_heap.lock().unwrap().print_on(f);
         } else if let Some(heap) = self.all_heap.lock().unwrap().as_ref() {
             heap.print_on(f);
         }
@@ -1132,9 +1140,7 @@ impl CodeCache {
         let guard = self.nmethods.lock().unwrap();
         if let Some(nm) = guard.get(key) {
             // NMethod methods take &self (shared atomics), so no mut needed.
-            return nm.make_not_entrant_with_reason(
-                super::nmethod::InvalidationReason::NotUsed,
-            );
+            return nm.make_not_entrant_with_reason(super::nmethod::InvalidationReason::NotUsed);
         }
         false
     }
@@ -1231,7 +1237,7 @@ impl CodeCache {
         osr.retain(|_, m| !m.is_empty());
         drop(osr);
         for (key, bci, begin) in osr_freed {
-            self.pc_index.lock().unwrap().remove(&begin);
+            self.remove_pc_index_entry(begin);
             self.free_nmethod_blob(&format!("{}@{}", key, bci));
         }
         swept_keys.len()
@@ -1305,7 +1311,7 @@ impl CodeCache {
         for (key, bci, begin, size) in osr_freed {
             summary.swept_zombies += 1;
             summary.total_freed_bytes += size;
-            self.pc_index.lock().unwrap().remove(&begin);
+            self.remove_pc_index_entry(begin);
             self.free_nmethod_blob(&format!("{}@{}", key, bci));
         }
 
@@ -1317,7 +1323,8 @@ impl CodeCache {
     fn remove_pc_index_for_key(&self, method_key: &str) {
         let mut index = self.pc_index.lock().unwrap();
         index.retain(|_, nm| {
-            Self::method_key(nm.method_holder(), nm.method_name(), nm.method_signature()) != method_key
+            Self::method_key(nm.method_holder(), nm.method_name(), nm.method_signature())
+                != method_key
         });
     }
 
@@ -1394,14 +1401,20 @@ mod tests {
 
     fn heap_alloc_free_coalesce() {
         let mut heap = CodeHeap::with_base(CodeBlobType::MethodNonProfiled, 0x1000, 1024);
-        let a = heap.allocate("a".to_string(), 100, CodeBlobKind::Nmethod).unwrap();
-        let b = heap.allocate("b".to_string(), 100, CodeBlobKind::Nmethod).unwrap();
+        let a = heap
+            .allocate("a".to_string(), 100, CodeBlobKind::Nmethod)
+            .unwrap();
+        let b = heap
+            .allocate("b".to_string(), 100, CodeBlobKind::Nmethod)
+            .unwrap();
         assert_eq!(heap.used(), 200);
         assert!(heap.free_blob(a));
         assert!(heap.free_blob(b));
         // Coalesced: the whole 200 bytes should be one free region again,
         // reusable for a 200-byte allocation.
-        let c = heap.allocate("c".to_string(), 200, CodeBlobKind::Nmethod).unwrap();
+        let c = heap
+            .allocate("c".to_string(), 200, CodeBlobKind::Nmethod)
+            .unwrap();
         assert_eq!(heap.used(), 200);
         let _ = c;
     }
@@ -1410,12 +1423,19 @@ mod tests {
     fn heap_first_fit_and_bump() {
         heap_alloc_free_coalesce();
         let mut heap = CodeHeap::with_base(CodeBlobType::NonNMethod, 0x2000, 512);
-        let x = heap.allocate("x".to_string(), 64, CodeBlobKind::RuntimeStub).unwrap();
-        let y = heap.allocate("y".to_string(), 64, CodeBlobKind::RuntimeStub).unwrap();
+        let x = heap
+            .allocate("x".to_string(), 64, CodeBlobKind::RuntimeStub)
+            .unwrap();
+        let y = heap
+            .allocate("y".to_string(), 64, CodeBlobKind::RuntimeStub)
+            .unwrap();
         assert_eq!(y - x, 64);
         assert!(heap.free_space() >= 512 - 128);
         // Allocation beyond capacity fails.
-        assert!(heap.allocate("big".to_string(), 4096, CodeBlobKind::RuntimeStub).is_err());
+        assert!(
+            heap.allocate("big".to_string(), 4096, CodeBlobKind::RuntimeStub)
+                .is_err()
+        );
     }
 
     #[test]
@@ -1460,16 +1480,36 @@ mod tests {
     fn deinstall_removes_regular_and_osr() {
         let cache = CodeCache::new_non_segmented(1 << 20);
         let regular = NMethod::with_entry_points(
-            "U".to_string(), "r".to_string(), "()V".to_string(),
-            CompLevel::Simple, NMethod::INVOCATION_ENTRY_BCI,
-            0, 0, 0, 0, 0, vec![], vec![],
+            "U".to_string(),
+            "r".to_string(),
+            "()V".to_string(),
+            CompLevel::Simple,
+            NMethod::INVOCATION_ENTRY_BCI,
+            0,
+            0,
+            0,
+            0,
+            0,
+            vec![],
+            vec![],
         );
         let osr = NMethod::with_entry_points(
-            "U".to_string(), "r".to_string(), "()V".to_string(),
-            CompLevel::Simple, 12,
-            0, 0, 0, 0, 0, vec![], vec![],
+            "U".to_string(),
+            "r".to_string(),
+            "()V".to_string(),
+            CompLevel::Simple,
+            12,
+            0,
+            0,
+            0,
+            0,
+            0,
+            vec![],
+            vec![],
         );
-        cache.install_nmethod(regular, vec![0x90, 0xc3], 32).unwrap();
+        cache
+            .install_nmethod(regular, vec![0x90, 0xc3], 32)
+            .unwrap();
         cache.install_nmethod(osr, vec![0x90, 0xc3], 32).unwrap();
         assert_eq!(cache.nmethods_count(), 1);
         assert_eq!(cache.osr_nmethods_count(), 1);
@@ -1485,9 +1525,18 @@ mod tests {
     fn osr_not_entrant_swept_to_zombie() {
         let cache = CodeCache::new_non_segmented(1 << 20);
         let osr = NMethod::with_entry_points(
-            "V".to_string(), "o".to_string(), "()V".to_string(),
-            CompLevel::Simple, 4,
-            0, 0, 0, 0, 0, vec![], vec![],
+            "V".to_string(),
+            "o".to_string(),
+            "()V".to_string(),
+            CompLevel::Simple,
+            4,
+            0,
+            0,
+            0,
+            0,
+            0,
+            vec![],
+            vec![],
         );
         cache.install_nmethod(osr, vec![0x90, 0xc3], 32).unwrap();
         let key = CodeCache::method_key("V", "o", "()V");
@@ -1560,24 +1609,51 @@ mod tests {
     fn mark_all_deopt_includes_osr() {
         let cache = CodeCache::new_non_segmented(1 << 20);
         let regular = NMethod::with_entry_points(
-            "W".to_string(), "m".to_string(), "()V".to_string(),
-            CompLevel::Simple, NMethod::INVOCATION_ENTRY_BCI,
-            0, 0, 0, 0, 0, vec![], vec![],
+            "W".to_string(),
+            "m".to_string(),
+            "()V".to_string(),
+            CompLevel::Simple,
+            NMethod::INVOCATION_ENTRY_BCI,
+            0,
+            0,
+            0,
+            0,
+            0,
+            vec![],
+            vec![],
         );
         let osr = NMethod::with_entry_points(
-            "W".to_string(), "m".to_string(), "()V".to_string(),
-            CompLevel::Simple, 3,
-            0, 0, 0, 0, 0, vec![], vec![],
+            "W".to_string(),
+            "m".to_string(),
+            "()V".to_string(),
+            CompLevel::Simple,
+            3,
+            0,
+            0,
+            0,
+            0,
+            0,
+            vec![],
+            vec![],
         );
-        cache.install_nmethod(regular, vec![0x90, 0xc3], 32).unwrap();
+        cache
+            .install_nmethod(regular, vec![0x90, 0xc3], 32)
+            .unwrap();
         cache.install_nmethod(osr, vec![0x90, 0xc3], 32).unwrap();
         cache.mark_all_nmethods_for_deopt();
         let key = CodeCache::method_key("W", "m", "()V");
-        assert!(cache.find_nmethod_by_key(&key).unwrap().is_marked_for_deoptimization());
-        assert!(cache
-            .find_osr_nmethod_by_key(&key, 3)
-            .unwrap()
-            .is_marked_for_deoptimization());
+        assert!(
+            cache
+                .find_nmethod_by_key(&key)
+                .unwrap()
+                .is_marked_for_deoptimization()
+        );
+        assert!(
+            cache
+                .find_osr_nmethod_by_key(&key, 3)
+                .unwrap()
+                .is_marked_for_deoptimization()
+        );
     }
 
     #[test]
@@ -1595,6 +1671,7 @@ mod tests {
         assert_eq!(signature_arg_count("()V"), 0);
         assert_eq!(signature_arg_count("(I)J"), 1);
         assert_eq!(signature_arg_count("(JD)Ljava/lang/String;"), 4);
+        assert_eq!(signature_arg_count("(Ljava/lang/String;I)V"), 2);
         assert_eq!(signature_arg_count("([I[[D)V"), 3);
     }
 }

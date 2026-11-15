@@ -10,7 +10,7 @@
  * structure with Rc<RefCell<>> sharing instead of raw pointers.
  */
 
-use super::g1CardSet::{G1AddCardResult, G1CardSet, G1CardSetConfiguration};
+use super::g1CardSet::{G1CardSet, G1CardSetConfiguration};
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -153,4 +153,3 @@ impl G1CollectionSetCandidates {
     }
 }
 
-/// Re-export for convenience.

@@ -16,7 +16,7 @@ const REMAPPED_SHIFT: u32 = MARKED_SHIFT + MARKED_BITS;
 const REMAPPED_BITS: u32 = 4;
 
 const fn mask(shift: u32, bits: u32) -> u64 {
-    (((1u64 << bits) - 1) << shift)
+    ((1u64 << bits) - 1) << shift
 }
 
 const fn bit(shift: u32, offset: u32) -> u64 {

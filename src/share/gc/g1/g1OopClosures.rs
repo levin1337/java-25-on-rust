@@ -9,7 +9,7 @@
  */
 
 use super::g1ParScan::G1ParScanThreadState;
-use super::heapRegion::{G1HeapRegionAttr, G1HeapRegionAttrType};
+use super::heapRegion::G1HeapRegionAttr;
 
 /// `G1OopClosures::ScanTask` equivalents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

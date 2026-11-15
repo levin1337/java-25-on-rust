@@ -384,8 +384,9 @@ mod tests {
 
     #[test]
     fn fuzzy_match_finds_similar() {
-        assert_eq!(LogTag::fuzzy_match("gcs"), Some(LogTag::Gc));
-        assert_eq!(LogTag::fuzzy_match("klass"), Some(LogTag::Class));
+        assert_eq!(LogTag::fuzzy_match("clas"), Some(LogTag::Class));
+        assert_eq!(LogTag::fuzzy_match("heaps"), Some(LogTag::Heap));
+        assert_eq!(LogTag::fuzzy_match("gcs"), None);
         assert_eq!(LogTag::fuzzy_match("xyzzy"), None);
     }
 }

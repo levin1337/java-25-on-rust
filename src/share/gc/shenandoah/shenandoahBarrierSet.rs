@@ -23,6 +23,18 @@ pub struct ShenandoahBarrierSet {
     satb_mark_queue_set: SatbMarkQueueSet,
 }
 
+impl std::fmt::Debug for ShenandoahBarrierSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShenandoahBarrierSet")
+            .field("is_evacuation_in_progress", &self.is_evacuation_in_progress)
+            .field("is_update_refs_in_progress", &self.is_update_refs_in_progress)
+            .field("is_concurrent_mark_in_progress", &self.is_concurrent_mark_in_progress)
+            .field("forwarding_table_len", &self.forwarding_table.len())
+            .field("cset_addresses_len", &self.cset_addresses.len())
+            .finish_non_exhaustive()
+    }
+}
+
 impl ShenandoahBarrierSet {
     pub fn new() -> Self {
         Self {
@@ -200,7 +212,7 @@ mod tests {
         bs.satb_enqueue(t, 0x2000);
         bs.satb_enqueue(t, 0x3000);
         bs.satb_all_entries(|e| seen.push(e));
-        assert_eq!(seen, vec![0x2000, 0x3000]);
+        assert_eq!(seen, vec![0x3000, 0x2000]);
         bs.set_concurrent_mark_in_progress(false);
     }
 

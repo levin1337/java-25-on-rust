@@ -72,7 +72,7 @@ impl HeapDumper {
             }
         }
         let file = File::create(path)?;
-        let mut total = 0u64;
+        let total;
         if level >= 0 {
             let encoder = GzEncoder::new(file, Compression::new(level.clamp(0, 9) as u32));
             let mut w = encoder;

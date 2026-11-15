@@ -243,11 +243,11 @@ impl DCmdParser {
         }
     }
 
-    pub fn add_dcmd_option<T: DcmdValue>(&mut self, arg: DCmdArgument<T>) {
+    pub fn add_dcmd_option<T: DcmdValue + Send>(&mut self, arg: DCmdArgument<T>) {
         self.add_option_boxed(Box::new(arg));
     }
 
-    pub fn add_dcmd_argument<T: DcmdValue>(&mut self, arg: DCmdArgument<T>) {
+    pub fn add_dcmd_argument<T: DcmdValue + Send>(&mut self, arg: DCmdArgument<T>) {
         self.add_argument_boxed(Box::new(arg));
     }
 

@@ -64,7 +64,11 @@ impl<'a> InstanceOop<'a> {
     /// Validates that `value` is storable in a field of `kind` and
     /// narrows integer values to the field's descriptor width
     /// (Z/B/C/S semantics, same coercion the interpreter applies).
-    fn coerce_value(&self, descriptor: &[u8], kind: FieldKind, value: Value<'a>) -> io::Result<Value<'a>> {
+    fn coerce_value(
+        descriptor: &[u8],
+        kind: FieldKind,
+        value: Value<'a>,
+    ) -> io::Result<Value<'a>> {
         match kind {
             FieldKind::Int32 => {
                 let Value::Int(v) = value else {
@@ -137,18 +141,19 @@ impl<'a> InstanceOop<'a> {
         kind: FieldKind,
         value: Value<'a>,
     ) -> io::Result<()> {
-        let (_, info) = self
+        let (slot, descriptor) = self
             .field_info_by_offset(offset)
+            .map(|(_, info)| (info.slot, info.descriptor))
             .ok_or_else(|| io::Error::other("No instance field at offset"))?;
-        let declared = descriptor_kind(info.descriptor)
+        let declared = descriptor_kind(descriptor)
             .ok_or_else(|| io::Error::other("Invalid field descriptor"))?;
         if declared != kind {
             return Err(io::Error::other("Field kind mismatch"));
         }
-        let coerced = self.coerce_value(info.descriptor, kind, value)?;
+        let coerced = Self::coerce_value(descriptor, kind, value)?;
         *self
             .fields
-            .get_mut(info.slot)
+            .get_mut(slot)
             .ok_or_else(|| io::Error::other("Invalid instance field slot"))? = coerced;
         Ok(())
     }
@@ -174,7 +179,7 @@ impl<'a> InstanceOop<'a> {
         let slot = self.klass.instanceField(name, descriptor)?;
         let kind = descriptor_kind(descriptor)
             .ok_or_else(|| io::Error::other("Invalid field descriptor"))?;
-        let coerced = self.coerce_value(descriptor, kind, value)?;
+        let coerced = Self::coerce_value(descriptor, kind, value)?;
         *self
             .fields
             .get_mut(slot)

@@ -239,3 +239,61 @@ impl G1SATBMarkQueueSet {
         self.queues.len()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enqueue_dequeue() {
+        let mut q = G1SATBMarkQueue::new();
+        assert!(q.is_empty());
+        q.enqueue(100);
+        q.enqueue(200);
+        assert_eq!(q.len(), 2);
+        let mut seen = Vec::new();
+        q.apply_to_buffer(|o| seen.push(o));
+        assert_eq!(seen, vec![100, 200]);
+        assert!(q.is_empty());
+    }
+
+    #[test]
+    fn flush_partial() {
+        let mut q = G1SATBMarkQueue::new();
+        for i in 0..10 {
+            q.enqueue(i);
+        }
+        let mut seen = Vec::new();
+        let n = q.flush(4, |o| seen.push(o));
+        assert_eq!(n, 4);
+        assert_eq!(seen, vec![0, 1, 2, 3]);
+        assert_eq!(q.len(), 6);
+    }
+
+    #[test]
+    fn queue_set_drain() {
+        let mut set = G1SATBMarkQueueSet::new(2);
+        set.enqueue(0, 1);
+        set.enqueue(0, 2);
+        set.enqueue(1, 3);
+        let mut total = 0;
+        let mut drained = Vec::new();
+        while set.drain_one(|o| { drained.push(o); total += 1; }) > 0 {}
+        assert_eq!(total, 3);
+        drained.sort_unstable();
+        assert_eq!(drained, vec![1, 2, 3]);
+        assert!(set.is_complete());
+    }
+
+    #[test]
+    fn overflow_drops() {
+        let mut q = G1SATBMarkQueue::new();
+        for i in 0..SATB_BUFFER_MAX_ENTRIES + 10 {
+            let ok = q.enqueue(i);
+            if i >= SATB_BUFFER_MAX_ENTRIES {
+                assert!(!ok);
+            }
+        }
+        assert_eq!(q.dropped, 10);
+    }
+}

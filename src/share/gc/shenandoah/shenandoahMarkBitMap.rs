@@ -85,7 +85,7 @@ impl ShenandoahMarkBitMap {
 
     #[inline]
     fn bit_index(word: Idx) -> Idx {
-        word << BITS_PER_WORD as usize
+        word * BITS_PER_WORD as usize
     }
 
     #[inline]
@@ -107,18 +107,16 @@ impl ShenandoahMarkBitMap {
 
     #[inline]
     fn raw_to_words_align_down(bit: Idx) -> Idx {
-        bit >> BITS_PER_WORD as usize
+        bit / BITS_PER_WORD as usize
     }
 
     #[inline]
-    fn to_words_align_down(&self, bit: Idx) -> Idx {
-        debug_assert!(bit <= self.size);
+    fn to_words_align_down(bit: Idx) -> Idx {
         Self::raw_to_words_align_down(bit)
     }
 
     #[inline]
-    fn to_words_align_up(&self, bit: Idx) -> Idx {
-        debug_assert!(bit <= self.size);
+    fn to_words_align_up(bit: Idx) -> Idx {
         Self::raw_to_words_align_down(bit + (BITS_PER_WORD as usize - 1))
     }
 
@@ -449,14 +447,15 @@ mod tests {
         bm.mark_strong(0x1000 + 0x500, &mut false);
         assert_eq!(bm.get_next_marked_addr(0x1000, 0x1000 + 0x1000), 0x1000 + 0x100);
         assert_eq!(bm.get_next_marked_addr(0x1000 + 0x101, 0x1000 + 0x1000), 0x1000 + 0x300);
-        assert_eq!(bm.get_prev_marked_addr(0x1000 + 0x1000, 0x1000), 0x1000 + 0x500);
+        assert_eq!(bm.get_prev_marked_addr(0x1000, 0x1000 + 0x1000), 0x1000 + 0x500);
     }
 
     #[test]
     fn clear_range() {
         let bm = bitmap();
-        for off in [0x40usize, 0x80, 0x100, 0x180, 0x200] {
-            bm.mark_strong(0x1000 + off, &mut false);
+        let mut upgraded = false;
+        for off in [0x40u64, 0x80, 0x100, 0x180, 0x200] {
+            bm.mark_strong(0x1000 + off, &mut upgraded);
         }
         bm.clear_range(bm.address_to_index(0x1000 + 0x80), bm.address_to_index(0x1000 + 0x180));
         assert!(!bm.is_marked_strong(0x1000 + 0x80));

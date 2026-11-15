@@ -73,7 +73,7 @@ impl ShenandoahMarkingContext {
         if index >= self.top_at_mark_starts_base.len() {
             return true;
         }
-        addr >= self.top_at_mark_starts_base[index]
+        addr >= self.top_at_mark_starts_base[index] as u64
     }
 
     pub fn top_at_mark_start(&self, region: &ShenandoahHeapRegion) -> u64 {
@@ -161,7 +161,7 @@ mod tests {
             true,
         );
         ctx.initialize_top_at_mark_start(&region);
-        let obj = heap_base + 0x100;
+        let obj = heap_base + 0x40;
         region.allocate(0x40, 1);
         region.allocate(0x40, 2);
         ctx.capture_top_at_mark_start(&region);

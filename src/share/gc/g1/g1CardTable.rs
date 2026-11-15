@@ -190,7 +190,7 @@ impl G1CardTable {
         self.byte_map
             .iter()
             .enumerate()
-            .filter(|(_, &v)| v == Self::DIRTY)
+            .filter(|(_, v)| **v == Self::DIRTY)
             .map(|(i, _)| i)
     }
 
@@ -217,13 +217,16 @@ mod tests {
     #[test]
     fn dirty_preserves_scanned() {
         let mut table = G1CardTable::new(0, 2048, 9);
-        assert!(table.mark_clean_as_dirty(0));
-        assert!(!table.mark_clean_as_dirty(0)); // already dirty
+        table.mark_range_dirty(0, 4); // cards 0..4 dirty
+        assert!(table.mark_clean_as_dirty(0) == false); // already dirty
         table.change_dirty_cards_to(0, 2, G1CardTable::G1_CARD_ALREADY_SCANNED);
         assert!(table.is_scanned(0));
+        assert!(table.is_scanned(1));
         assert!(table.is_clean(0)); // scanned counts as clean
-        table.mark_range_dirty(0, 4); // must not resurrect scanned card
+        assert_eq!(table.card(2), G1CardTable::DIRTY);
+        table.mark_range_dirty(0, 4); // must not resurrect scanned cards
         assert!(table.is_scanned(0));
-        assert_eq!(table.card(1), G1CardTable::DIRTY);
+        assert!(table.is_scanned(1));
+        assert_eq!(table.card(2), G1CardTable::DIRTY);
     }
 }

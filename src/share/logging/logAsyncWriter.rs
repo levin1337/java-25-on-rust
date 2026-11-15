@@ -12,7 +12,6 @@ use super::logDecorations::{Decorations, LogDecorations};
 use super::logOutput::LogOutput;
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
-use std::time::Duration;
 
 /// LogConfiguration::AsyncMode
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

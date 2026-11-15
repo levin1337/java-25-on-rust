@@ -13,6 +13,7 @@ use super::ciInstanceKlass::CiInstanceKlass;
 use super::ciLiveness::{self, CiLiveness, CiLivenessPoint};
 use super::ciType::CIType;
 use crate::share::classfile::classFileParser::{Constant, Member};
+use crate::share::classfile::vmIntrinsics::VmIntrinsics;
 use crate::share::interpreter::bytecode::Bytecode;
 use crate::share::interpreter::bytecodes::Code as BytecodeCode;
 use crate::share::oops::constMethod::ConstMethod;
@@ -42,6 +43,7 @@ pub struct CiMethod<'a> {
     code: Option<Code<'a>>,
     liveness: OnceLock<CiLiveness>,
     method_obj: OnceLock<Option<Arc<Method>>>,
+    intrinsic_id: OnceLock<u16>,
 }
 
 impl<'a> CiMethod<'a> {
@@ -55,6 +57,7 @@ impl<'a> CiMethod<'a> {
             code,
             liveness: OnceLock::new(),
             method_obj: OnceLock::new(),
+            intrinsic_id: OnceLock::new(),
         }
     }
 
@@ -361,12 +364,38 @@ impl<'a> CiMethod<'a> {
             .map(|i| i as u16)
     }
 
-    /// `ciMethod::intrinsic_id`.  Intrinsic ids are assigned by
-    /// `vmIntrinsics` at link time; the port has no shared mutable
-    /// Method store yet, so this reflects the lazily built Method.
+    /// `ciMethod::intrinsic_id`: the `vmIntrinsics` id assigned to this
+    /// method by name+signature lookup (`_method_handles_intrinsic_ids`
+    /// table analogue — math, string, arraycopy, unsafe and thread
+    /// intrinsics).  `0` = not an intrinsic.
     #[inline]
     pub fn intrinsic_id(&self) -> u16 {
-        self.method_obj().map_or(0, |m| m.intrinsic_id())
+        *self.intrinsic_id.get_or_init(|| {
+            let id = VmIntrinsics::find_intrinsic(
+                &String::from_utf8_lossy(self.holder.name()),
+                &String::from_utf8_lossy(self.name()),
+                &String::from_utf8_lossy(self.signature()),
+            );
+            id as u16
+        })
+    }
+
+    /// `ciMethod::intrinsic_name`: debug name of the intrinsic.
+    pub fn intrinsic_name(&self) -> String {
+        format!("{:?}", self.intrinsic_id_value())
+    }
+
+    /// The resolved `vmIntrinsics` id enum.
+    pub fn intrinsic(&self) -> crate::share::classfile::vmIntrinsics::IntrinsicId {
+        self.intrinsic_id_value()
+    }
+
+    fn intrinsic_id_value(&self) -> crate::share::classfile::vmIntrinsics::IntrinsicId {
+        VmIntrinsics::find_intrinsic(
+            &String::from_utf8_lossy(self.holder.name()),
+            &String::from_utf8_lossy(self.name()),
+            &String::from_utf8_lossy(self.signature()),
+        )
     }
 
     #[inline]

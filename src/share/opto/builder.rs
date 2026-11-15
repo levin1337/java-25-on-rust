@@ -8,13 +8,11 @@
  * IfException nodes, and Root/Return terminals.
  */
 
+use super::ci_shim::{CiSignature, CiSignatureKind};
 use super::gvn::PhaseGVN;
-use super::node::{
-    call_pack, ArrayElemKind, CallResult, CmpCondition, NodeId, Opcode, NONE,
-};
+use super::node::{ArrayElemKind, CallResult, CmpCondition, NONE, NodeId, Opcode, call_pack};
 use crate::share::interpreter::bytecode::{self, Bytecode};
 use crate::share::interpreter::bytecodes::{self, Code};
-use super::ci_shim::{CiSignature, CiSignatureKind};
 use std::collections::{BTreeSet, HashMap};
 
 pub const CON_P_NULL: u32 = 0;
@@ -302,10 +300,22 @@ impl<'a> BytecodeGraphBuilder<'a> {
             if let Some(bc) = Bytecode::new(code, bci) {
                 if let Some(c) = bc.code() {
                     match c {
-                        Code::Ifeq | Code::Ifne | Code::Iflt | Code::Ifge | Code::Ifgt
-                        | Code::Ifle | Code::IfIcmpeq | Code::IfIcmpne | Code::IfIcmplt
-                        | Code::IfIcmpge | Code::IfIcmpgt | Code::IfIcmple | Code::IfAcmpeq
-                        | Code::IfAcmpne | Code::Ifnull | Code::Ifnonnull => {
+                        Code::Ifeq
+                        | Code::Ifne
+                        | Code::Iflt
+                        | Code::Ifge
+                        | Code::Ifgt
+                        | Code::Ifle
+                        | Code::IfIcmpeq
+                        | Code::IfIcmpne
+                        | Code::IfIcmplt
+                        | Code::IfIcmpge
+                        | Code::IfIcmpgt
+                        | Code::IfIcmple
+                        | Code::IfAcmpeq
+                        | Code::IfAcmpne
+                        | Code::Ifnull
+                        | Code::Ifnonnull => {
                             if let Some(t) = bc.get_s2(1) {
                                 let tgt = (bci as i64 + t as i64) as usize;
                                 if tgt < code.len() {
@@ -365,8 +375,13 @@ impl<'a> BytecodeGraphBuilder<'a> {
                             }
                             leaders.insert(next);
                         }
-                        Code::Ireturn | Code::Lreturn | Code::Freturn | Code::Dreturn
-                        | Code::Areturn | Code::Return | Code::Athrow => {
+                        Code::Ireturn
+                        | Code::Lreturn
+                        | Code::Freturn
+                        | Code::Dreturn
+                        | Code::Areturn
+                        | Code::Return
+                        | Code::Athrow => {
                             leaders.insert(next);
                         }
                         _ => {}
@@ -425,18 +440,29 @@ impl<'a> BytecodeGraphBuilder<'a> {
                 if let Some(bc) = Bytecode::new(self.code, bci) {
                     if let Some(c) = bc.code() {
                         match c {
-                            Code::Ifeq | Code::Ifne | Code::Iflt | Code::Ifge | Code::Ifgt
-                            | Code::Ifle | Code::IfIcmpeq | Code::IfIcmpne | Code::IfIcmplt
-                            | Code::IfIcmpge | Code::IfIcmpgt | Code::IfIcmple | Code::IfAcmpeq
-                            | Code::IfAcmpne | Code::Ifnull | Code::Ifnonnull => {
+                            Code::Ifeq
+                            | Code::Ifne
+                            | Code::Iflt
+                            | Code::Ifge
+                            | Code::Ifgt
+                            | Code::Ifle
+                            | Code::IfIcmpeq
+                            | Code::IfIcmpne
+                            | Code::IfIcmplt
+                            | Code::IfIcmpge
+                            | Code::IfIcmpgt
+                            | Code::IfIcmple
+                            | Code::IfAcmpeq
+                            | Code::IfAcmpne
+                            | Code::Ifnull
+                            | Code::Ifnonnull => {
                                 if let Some(t) = bc.get_s2(1) {
                                     let tgt = bci as i64 + t as i64;
                                     if let Some(tb) = self.target_block(tgt, code_len) {
                                         succs[i].push((tb, SuccKind::True));
                                     }
                                 }
-                                if let Some(fb) = self.target_block((bci + len) as i64, code_len)
-                                {
+                                if let Some(fb) = self.target_block((bci + len) as i64, code_len) {
                                     succs[i].push((fb, SuccKind::False));
                                 }
                             }
@@ -456,24 +482,14 @@ impl<'a> BytecodeGraphBuilder<'a> {
                                 }
                             }
                             Code::Tableswitch => {
-                                if let Some(ts) =
-                                    bytecode::BytecodeTableswitch::new(self.code, bci)
+                                if let Some(ts) = bytecode::BytecodeTableswitch::new(self.code, bci)
                                 {
-                                    if let (Some(lo), Some(hi)) =
-                                        (ts.low_key(), ts.high_key())
-                                    {
+                                    if let (Some(lo), Some(hi)) = (ts.low_key(), ts.high_key()) {
                                         for k in 0..=(hi - lo) {
-                                            if let Some(off) =
-                                                ts.dest_offset_at(k as usize)
-                                            {
+                                            if let Some(off) = ts.dest_offset_at(k as usize) {
                                                 let tgt = bci as i64 + off as i64;
-                                                if let Some(tb) =
-                                                    self.target_block(tgt, code_len)
-                                                {
-                                                    succs[i].push((
-                                                        tb,
-                                                        SuccKind::Case(k as usize),
-                                                    ));
+                                                if let Some(tb) = self.target_block(tgt, code_len) {
+                                                    succs[i].push((tb, SuccKind::Case(k as usize)));
                                                 }
                                             }
                                         }
@@ -494,9 +510,7 @@ impl<'a> BytecodeGraphBuilder<'a> {
                                         for k in 0..np {
                                             if let Some(off) = ls.offset_at(k) {
                                                 let tgt = bci as i64 + off as i64;
-                                                if let Some(tb) =
-                                                    self.target_block(tgt, code_len)
-                                                {
+                                                if let Some(tb) = self.target_block(tgt, code_len) {
                                                     succs[i].push((tb, SuccKind::Case(k)));
                                                 }
                                             }
@@ -510,8 +524,14 @@ impl<'a> BytecodeGraphBuilder<'a> {
                                     }
                                 }
                             }
-                            Code::Ireturn | Code::Lreturn | Code::Freturn | Code::Dreturn
-                            | Code::Areturn | Code::Return | Code::Athrow | Code::Ret => {
+                            Code::Ireturn
+                            | Code::Lreturn
+                            | Code::Freturn
+                            | Code::Dreturn
+                            | Code::Areturn
+                            | Code::Return
+                            | Code::Athrow
+                            | Code::Ret => {
                                 term = true;
                             }
                             _ => {}
@@ -738,11 +758,7 @@ impl<'a> BytecodeGraphBuilder<'a> {
             return;
         }
         for (i, s) in succs.iter().enumerate() {
-            let ctrl = self
-                .edge_ctrls
-                .get(i)
-                .copied()
-                .unwrap_or(frame.ctrl);
+            let ctrl = self.edge_ctrls.get(i).copied().unwrap_or(frame.ctrl);
             let info = EdgeInfo {
                 ctrl,
                 mem: frame.mem,
@@ -1091,7 +1107,9 @@ impl<'a> BytecodeGraphBuilder<'a> {
                 let arr = self.pop(frame);
                 let op = Self::load_op(kind);
                 let ek = self.gvn.con_i(ekind.code());
-                let n = self.gvn.transform(op, vec![frame.mem, frame.ctrl, arr, idx, ek]);
+                let n = self
+                    .gvn
+                    .transform(op, vec![frame.mem, frame.ctrl, arr, idx, ek]);
                 let cat2 = matches!(kind, FieldKind::Long | FieldKind::Double);
                 self.push(frame, n, cat2);
                 self.maybe_throw(bci, n, frame);
@@ -1438,20 +1456,14 @@ impl<'a> BytecodeGraphBuilder<'a> {
                         let site = self.site_node(cp);
                         if code == Getstatic {
                             let op = Self::load_op(kind);
-                            let n = self
-                                .gvn
-                                .transform(op, vec![frame.mem, frame.ctrl, site]);
-                            let cat2 =
-                                matches!(kind, FieldKind::Long | FieldKind::Double);
+                            let n = self.gvn.transform(op, vec![frame.mem, frame.ctrl, site]);
+                            let cat2 = matches!(kind, FieldKind::Long | FieldKind::Double);
                             self.push(frame, n, cat2);
                             self.maybe_throw(bci, n, frame);
                         } else {
                             let v = self.pop(frame);
                             let op = Self::store_op(kind);
-                            let n = self.gvn.alloc(
-                                op,
-                                vec![frame.mem, frame.ctrl, v, site],
-                            );
+                            let n = self.gvn.alloc(op, vec![frame.mem, frame.ctrl, v, site]);
                             frame.mem = n;
                             self.maybe_throw(bci, n, frame);
                         }
@@ -1470,22 +1482,19 @@ impl<'a> BytecodeGraphBuilder<'a> {
                         if code == Getfield {
                             let obj = self.pop(frame);
                             let op = Self::load_op(kind);
-                            let n = self.gvn.transform(
-                                op,
-                                vec![frame.mem, frame.ctrl, obj, offn, site],
-                            );
-                            let cat2 =
-                                matches!(kind, FieldKind::Long | FieldKind::Double);
+                            let n = self
+                                .gvn
+                                .transform(op, vec![frame.mem, frame.ctrl, obj, offn, site]);
+                            let cat2 = matches!(kind, FieldKind::Long | FieldKind::Double);
                             self.push(frame, n, cat2);
                             self.maybe_throw(bci, n, frame);
                         } else {
                             let v = self.pop(frame);
                             let obj = self.pop(frame);
                             let op = Self::store_op(kind);
-                            let n = self.gvn.alloc(
-                                op,
-                                vec![frame.mem, frame.ctrl, obj, offn, v, site],
-                            );
+                            let n = self
+                                .gvn
+                                .alloc(op, vec![frame.mem, frame.ctrl, obj, offn, v, site]);
                             frame.mem = n;
                             self.maybe_throw(bci, n, frame);
                         }
@@ -1493,8 +1502,7 @@ impl<'a> BytecodeGraphBuilder<'a> {
                     None => self.unsupported(bci, "field unresolved"),
                 }
             }
-            Invokevirtual | Invokespecial | Invokestatic | Invokeinterface
-            | Invokedynamic => {
+            Invokevirtual | Invokespecial | Invokestatic | Invokeinterface | Invokedynamic => {
                 let cp = bc.get_u2(1).unwrap_or(0) as u16;
                 let has_recv = !matches!(code, Invokestatic | Invokedynamic);
                 let ma = self.method_access_for(cp, has_recv);
@@ -1521,16 +1529,16 @@ impl<'a> BytecodeGraphBuilder<'a> {
                 }
                 inputs.extend(args);
                 inputs.push(self.site_node(cp));
-                let payload = call_pack(
-                    cp as u32,
-                    code as u8,
-                    res,
-                );
+                let payload = call_pack(cp as u32, code as u8, res);
                 let call = self.gvn.alloc(Opcode::Call(payload), inputs);
                 frame.ctrl = call;
                 frame.mem = call;
                 if res != CallResult::Void {
-                    self.push(frame, call, matches!(res, CallResult::I64 | CallResult::F64));
+                    self.push(
+                        frame,
+                        call,
+                        matches!(res, CallResult::I64 | CallResult::F64),
+                    );
                 }
                 self.maybe_throw(bci, call, frame);
             }
@@ -1571,14 +1579,13 @@ impl<'a> BytecodeGraphBuilder<'a> {
                 self.maybe_throw(bci, n, frame);
             }
             Multianewarray => {
-                let dims = bc.get_u1(2).unwrap_or(0) as usize;
+                let dims = bc.get_u1(3).unwrap_or(0) as usize;
                 for _ in 0..dims {
                     self.pop(frame);
                 }
-                let n = self.gvn.alloc(
-                    Opcode::MultianewArray,
-                    vec![frame.mem, frame.ctrl],
-                );
+                let n = self
+                    .gvn
+                    .alloc(Opcode::MultianewArray, vec![frame.mem, frame.ctrl]);
                 frame.ctrl = n;
                 frame.mem = n;
                 self.push(frame, n, false);
@@ -1586,16 +1593,17 @@ impl<'a> BytecodeGraphBuilder<'a> {
             }
             Arraylength => {
                 let arr = self.pop(frame);
-                let n = self.gvn.alloc(
-                    Opcode::ArrayLength,
-                    vec![frame.mem, frame.ctrl, arr],
-                );
+                let n = self
+                    .gvn
+                    .alloc(Opcode::ArrayLength, vec![frame.mem, frame.ctrl, arr]);
                 self.push(frame, n, false);
                 self.maybe_throw(bci, n, frame);
             }
             Athrow => {
                 let obj = self.pop(frame);
-                let n = self.gvn.alloc(Opcode::Athrow, vec![frame.mem, frame.ctrl, obj]);
+                let n = self
+                    .gvn
+                    .alloc(Opcode::Athrow, vec![frame.mem, frame.ctrl, obj]);
                 self.result.throws += 1;
                 if self.exc_at.contains_key(&bci) {
                     self.deliver_exc_athrow(bci, n, obj, frame);
@@ -1730,14 +1738,14 @@ impl<'a> BytecodeGraphBuilder<'a> {
     fn local_index(&self, code: Code, bc: &Bytecode) -> usize {
         use Code::*;
         match code {
-            Iload0 | Lload0 | Fload0 | Dload0 | Aload0 | Istore0 | Lstore0 | Fstore0
-            | Dstore0 | Astore0 => 0,
-            Iload1 | Lload1 | Fload1 | Dload1 | Aload1 | Istore1 | Lstore1 | Fstore1
-            | Dstore1 | Astore1 => 1,
-            Iload2 | Lload2 | Fload2 | Dload2 | Aload2 | Istore2 | Lstore2 | Fstore2
-            | Dstore2 | Astore2 => 2,
-            Iload3 | Lload3 | Fload3 | Dload3 | Aload3 | Istore3 | Lstore3 | Fstore3
-            | Dstore3 | Astore3 => 3,
+            Iload0 | Lload0 | Fload0 | Dload0 | Aload0 | Istore0 | Lstore0 | Fstore0 | Dstore0
+            | Astore0 => 0,
+            Iload1 | Lload1 | Fload1 | Dload1 | Aload1 | Istore1 | Lstore1 | Fstore1 | Dstore1
+            | Astore1 => 1,
+            Iload2 | Lload2 | Fload2 | Dload2 | Aload2 | Istore2 | Lstore2 | Fstore2 | Dstore2
+            | Astore2 => 2,
+            Iload3 | Lload3 | Fload3 | Dload3 | Aload3 | Istore3 | Lstore3 | Fstore3 | Dstore3
+            | Astore3 => 3,
             _ => bc.get_u1(1).unwrap_or(0) as usize,
         }
     }
@@ -1764,13 +1772,16 @@ impl<'a> BytecodeGraphBuilder<'a> {
                 let tgt = ts
                     .dest_offset_at((k - lo) as usize)
                     .map(|o| bci as i64 + o as i64);
-                if tgt.and_then(|t| self.target_block(t, self.code.len())).is_none() {
+                if tgt
+                    .and_then(|t| self.target_block(t, self.code.len()))
+                    .is_none()
+                {
                     continue;
                 }
                 let key = self.gvn.con_i(k);
-                let test =
-                    self.gvn
-                        .transform(Opcode::BoolCmp(CmpCondition::Eq), vec![val, key]);
+                let test = self
+                    .gvn
+                    .transform(Opcode::BoolCmp(CmpCondition::Eq), vec![val, key]);
                 let (_ifn, ift, iff) = self.emit_if(ctrl, frame.mem, test);
                 ctrls.push(ift);
                 ctrl = iff;
@@ -1791,16 +1802,17 @@ impl<'a> BytecodeGraphBuilder<'a> {
             let mut ctrls: Vec<NodeId> = Vec::new();
             for i in 0..n {
                 if let Some(m) = ls.match_at(i) {
-                    let tgt = ls
-                        .offset_at(i)
-                        .map(|o| bci as i64 + o as i64);
-                    if tgt.and_then(|t| self.target_block(t, self.code.len())).is_none() {
+                    let tgt = ls.offset_at(i).map(|o| bci as i64 + o as i64);
+                    if tgt
+                        .and_then(|t| self.target_block(t, self.code.len()))
+                        .is_none()
+                    {
                         continue;
                     }
                     let key = self.gvn.con_i(m);
-                    let test =
-                        self.gvn
-                            .transform(Opcode::BoolCmp(CmpCondition::Eq), vec![val, key]);
+                    let test = self
+                        .gvn
+                        .transform(Opcode::BoolCmp(CmpCondition::Eq), vec![val, key]);
                     let (_ifn, ift, iff) = self.emit_if(ctrl, frame.mem, test);
                     ctrls.push(ift);
                     ctrl = iff;
@@ -1838,13 +1850,7 @@ impl<'a> BytecodeGraphBuilder<'a> {
         }
     }
 
-    fn deliver_exc_athrow(
-        &mut self,
-        bci: usize,
-        athrow_node: NodeId,
-        obj: NodeId,
-        frame: &Frame,
-    ) {
+    fn deliver_exc_athrow(&mut self, bci: usize, athrow_node: NodeId, obj: NodeId, frame: &Frame) {
         let edges = match self.exc_at.get(&bci) {
             Some(e) => e.clone(),
             None => return,
@@ -1924,57 +1930,65 @@ pub fn resolve_sites(
     code: &[u8],
 ) -> HashMap<u16, SiteInfo> {
     let mut sites = HashMap::new();
-    let mut bci = 0usize;
-    while bci + 2 < code.len() {
-        let op = code[bci];
-        let cp_ops = matches!(
-            op,
-            0xb2..=0xba | 0xbb | 0xbd | 0xc0 | 0xc1 | 0xc5
-        );
-        if cp_ops {
-            let idx = u16::from_be_bytes([code[bci + 1], code[bci + 2]]);
-            if idx != 0 && !sites.contains_key(&idx) {
-                match op {
-                    0xb6..=0xba => {
-                        if let Ok([owner, name, desc]) = klass.memberRef(idx, false) {
-                            sites.insert(
-                                idx,
-                                SiteInfo {
-                                    class: String::from_utf8_lossy(owner).into_owned(),
-                                    name: String::from_utf8_lossy(name).into_owned(),
-                                    desc: String::from_utf8_lossy(desc).into_owned(),
-                                },
-                            );
-                        }
-                    }
-                    0xb2..=0xb5 => {
-                        if let Ok([owner, name, desc]) = klass.memberRef(idx, true) {
-                            sites.insert(
-                                idx,
-                                SiteInfo {
-                                    class: String::from_utf8_lossy(owner).into_owned(),
-                                    name: String::from_utf8_lossy(name).into_owned(),
-                                    desc: String::from_utf8_lossy(desc).into_owned(),
-                                },
-                            );
-                        }
-                    }
-                    _ => {
-                        if let Ok(class) = klass.className(idx) {
-                            sites.insert(
-                                idx,
-                                SiteInfo {
-                                    class: String::from_utf8_lossy(class).into_owned(),
-                                    name: String::new(),
-                                    desc: String::new(),
-                                },
-                            );
-                        }
-                    }
+    for (bci, op, _len) in bytecodes::instructions(code) {
+        let cp = match op {
+            Code::Getstatic
+            | Code::Putstatic
+            | Code::Getfield
+            | Code::Putfield
+            | Code::Invokevirtual
+            | Code::Invokespecial
+            | Code::Invokestatic
+            | Code::Invokeinterface
+            | Code::Invokedynamic
+            | Code::New
+            | Code::Anewarray
+            | Code::Checkcast
+            | Code::Instanceof
+            | Code::Multianewarray => {
+                if bci + 2 >= code.len() {
+                    continue;
                 }
+                u16::from_be_bytes([code[bci + 1], code[bci + 2]])
             }
+            _ => continue,
+        };
+        if cp == 0 || sites.contains_key(&cp) {
+            continue;
         }
-        bci += 1;
+        let is_field = matches!(
+            op,
+            Code::Getstatic | Code::Putstatic | Code::Getfield | Code::Putfield
+        );
+        let is_method = matches!(
+            op,
+            Code::Invokevirtual
+                | Code::Invokespecial
+                | Code::Invokestatic
+                | Code::Invokeinterface
+                | Code::Invokedynamic
+        );
+        if is_field || is_method {
+            if let Ok([owner, name, desc]) = klass.memberRef(cp, is_field) {
+                sites.insert(
+                    cp,
+                    SiteInfo {
+                        class: String::from_utf8_lossy(owner).into_owned(),
+                        name: String::from_utf8_lossy(name).into_owned(),
+                        desc: String::from_utf8_lossy(desc).into_owned(),
+                    },
+                );
+            }
+        } else if let Ok(class) = klass.className(cp) {
+            sites.insert(
+                cp,
+                SiteInfo {
+                    class: String::from_utf8_lossy(class).into_owned(),
+                    name: String::new(),
+                    desc: String::new(),
+                },
+            );
+        }
     }
     sites
 }

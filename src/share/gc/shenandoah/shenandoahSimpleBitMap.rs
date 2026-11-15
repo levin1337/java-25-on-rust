@@ -397,8 +397,9 @@ mod tests {
         assert!(!bm.is_set(4));
         assert_eq!(bm.find_first_set_bit(0), 3);
         assert_eq!(bm.find_first_set_bit(4), 70);
-        assert_eq!(bm.find_last_set_bit(200), 130);
-        assert_eq!(bm.find_last_set_bit_range(-1, 130), 70);
+        assert_eq!(bm.find_last_set_bit(199), 130);
+        assert_eq!(bm.find_last_set_bit_range(-1, 129), 70);
+        assert_eq!(bm.find_last_set_bit_range(-1, 130), 130);
     }
 
     #[test]
@@ -413,7 +414,8 @@ mod tests {
         assert_eq!(bm.find_first_consecutive_set_bits_n(0, 8), 10);
         assert_eq!(bm.find_first_consecutive_set_bits_n(20, 8), 100);
         assert_eq!(bm.find_first_consecutive_set_bits_n(20, 11), 300);
-        assert_eq!(bm.find_last_consecutive_set_bits_n(300, 10), 100);
-        assert_eq!(bm.find_last_consecutive_set_bits_n(95, 8), -1);
+        assert_eq!(bm.find_last_consecutive_set_bits_n(299, 10), 100);
+        assert_eq!(bm.find_last_consecutive_set_bits_n(95, 8), 10);
+        assert_eq!(bm.find_last_consecutive_set_bits_n(16, 8), -1);
     }
 }

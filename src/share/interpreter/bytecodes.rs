@@ -5,9 +5,10 @@
  * provides utility functions to get bytecode attributes.
  */
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(i32)]
 pub enum Code {
+    #[default]
     Illegal = -1,
 
     // Java bytecodes
@@ -800,8 +801,8 @@ pub fn length_for(opcode: u8) -> i32 {
         // Variable-length instructions: wide, tableswitch, lookupswitch.
         0xaa | 0xab | 0xc4 => 0,
         // JVM-internal bytecodes (codes 203..=238), formats "bJJ" etc.
-        0xcb..=0xd2 | 0xd3..=0xdb | 0xe3 | 0xe7 | 0xe9 | 0xea | 0xeb | 0xee => 3,
-        0xdc | 0xe8 | 0xec => 1,
+        0xcb..=0xd2 | 0xd3..=0xdb | 0xe3 | 0xe7 | 0xe9 | 0xea | 0xeb => 3,
+        0xdc | 0xe8 | 0xec | 0xee => 1,
         0xdd..=0xdf | 0xe1 => 4,
         0xe0 | 0xe6 => 2,
         0xe2 => 3,
@@ -1329,3 +1330,9 @@ pub fn native_byte_order(code: Code) -> bool {
 // `Bytecodes::is_defined` for internal codes uses the name table;
 // `flags`-style predicates above cover the semantic attributes.
 
+impl std::ops::Add<u8> for Code {
+    type Output = Code;
+    fn add(self, rhs: u8) -> Code {
+        Code::from_u8((self as u8).wrapping_add(rhs)).unwrap_or(Code::Illegal)
+    }
+}

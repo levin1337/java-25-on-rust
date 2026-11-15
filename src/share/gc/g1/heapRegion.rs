@@ -15,7 +15,7 @@
  * the HotSpot constants so selection logic ports directly.
  */
 
-use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Tag values identical to `G1HeapRegionType::Tag` in
 /// g1HeapRegionType.hpp.
@@ -774,5 +774,70 @@ impl HeapRegionProvider for Vec<HeapRegion> {
 
     fn region_mut(&mut self, index: usize) -> Option<&mut HeapRegion> {
         self.get_mut(index)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn region_type_queries() {
+        assert!(G1HeapRegionType::Eden.is_young());
+        assert!(G1HeapRegionType::Survivor.is_young());
+        assert!(G1HeapRegionType::Old.is_old_or_humongous());
+        assert!(G1HeapRegionType::StartsHumongous.is_humongous());
+        assert!(!G1HeapRegionType::ContinuesHumongous.is_old());
+        assert!(G1HeapRegionType::Free.is_free());
+    }
+
+    #[test]
+    fn region_alloc_and_reset() {
+        let mut r = HeapRegion::new(0, 0, 1024);
+        assert_eq!(r.allocate(100), Some(0));
+        assert_eq!(r.allocate(924), Some(100));
+        assert_eq!(r.allocate(1), None);
+        assert_eq!(r.used(), 1024);
+        r.reset();
+        assert!(r.is_free());
+        assert_eq!(r.used(), 0);
+    }
+
+    #[test]
+    fn humongous_links() {
+        let mut start = HeapRegion::new(0, 0, 1024);
+        let mut cont = HeapRegion::new(1, 1024, 1024);
+        start.set_starts_humongous(2, 1500);
+        cont.set_continues_humongous(0);
+        assert!(start.is_starts_humongous());
+        assert_eq!(start.humongous_end_region_index(), 2);
+        assert!(cont.is_continues_humongous());
+        assert_eq!(cont.humongous_start_region_index(), 0);
+    }
+
+    #[test]
+    fn attr_transitions() {
+        let mut attr = G1HeapRegionAttr::new();
+        assert!(attr.is_default());
+        assert!(!attr.is_in_cset());
+        attr.set_young();
+        assert!(attr.is_in_cset());
+        attr.set_new_survivor();
+        assert!(attr.is_new_survivor());
+        assert!(!attr.is_in_cset());
+        attr.set_not_in_cset();
+        attr.set_humongous_candidate();
+        assert!(attr.is_humongous_candidate());
+        assert!(attr.remset_is_tracked());
+        attr.clear_humongous_candidate();
+        assert!(attr.is_default());
+    }
+
+    #[test]
+    fn collection_efficiency() {
+        let mut r = HeapRegion::new(0, 0, 1024);
+        let _ = r.allocate(512);
+        r.set_live_bytes(256);
+        assert!((r.collection_efficiency() - 0.5).abs() < 1e-9);
     }
 }

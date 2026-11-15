@@ -1,15 +1,7 @@
-/*
- * Port of OpenJDK 25 HotSpot JfrJvmtiAgent
- * (share/jfr/instrumentation/jfrJvmtiAgent.hpp/.cpp)
- *
- * Owns the JVMTI environment JFR uses for class retransformation and
- * class load/unload tracking. On Agent_OnLoad it requests the
- * capabilities HotSpot requires (retransform classes, retransform any
- * class, get capabilities) and installs the event callbacks that feed
- * JfrClassTransformer / JfrEventClassTransformer.
- */
+
 
 use crate::share::{
+    classfile::classLoader::ClassLoader,
     jfr::instrumentation::{class_transformer, event_class_transformer},
     prims::jvmti::{JvmtiCapabilities, JvmtiEnv, JvmtiError, JvmtiEvent, JvmtiEventMode},
 };
@@ -17,7 +9,6 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 static AGENT: OnceLock<Arc<JvmtiAgent>> = OnceLock::new();
 
-/// JVMTI capabilities JFR needs (HotSpot `JfrJvmtiAgent::onload`).
 fn required_capabilities() -> JvmtiCapabilities {
     let mut caps = JvmtiCapabilities::default();
     caps.can_redefine_classes = true;
@@ -39,15 +30,11 @@ impl JvmtiAgent {
         }
     }
 
-    /// `JfrJvmtiAgent::onload`: acquires a JVMTI env, adds the required
-    /// capabilities and enables the class-load / class-unload /
-    /// retransformation events feeding the transformer.
     pub fn onload(env: Arc<JvmtiEnv>) -> Result<Arc<Self>, JvmtiError> {
         let agent = AGENT.get_or_init(|| Arc::new(JvmtiAgent::new())).clone();
         agent.install(env)
     }
 
-    /// Global accessor (HotSpot `JfrJvmtiAgent::get_instance`).
     pub fn instance() -> Option<Arc<Self>> {
         AGENT.get().cloned()
     }
@@ -67,13 +54,10 @@ impl JvmtiAgent {
         Ok(self.clone())
     }
 
-    /// Current JVMTI environment, when the agent is installed.
     pub fn env(&self) -> Option<Arc<JvmtiEnv>> {
         self.env.lock().unwrap().clone()
     }
 
-    /// `JfrJvmtiAgent::is_retransform_allowed` analogue: retransforms
-    /// are permitted when the capability was granted.
     pub fn retransform_allowed(&self) -> bool {
         self.env().is_some_and(|env| {
             let caps = env.get_capabilities();
@@ -81,8 +65,6 @@ impl JvmtiAgent {
         })
     }
 
-    /// Handles the JVMTI ClassLoad event: runs the transformer pipeline
-    /// for classes that may be JFR event classes.
     pub fn on_class_load<'a>(
         &self,
         loader: &crate::share::classfile::classLoader::ClassLoader<'a>,
@@ -98,16 +80,13 @@ impl JvmtiAgent {
         let _ = class_transformer::transform(loader, &klass, None, self.env().as_deref(), output);
     }
 
-    /// Handles the JVMTI ClassUnload event.
     pub fn on_class_unload(&self, klass_name: &[u8]) {
         event_class_transformer::on_class_unload(klass_name);
     }
 
-    /// Handles the JVMTI ClassFileLoadHook event: returns transformed
-    /// bytes when the transformer produced them.
     pub fn on_class_file_load<'a>(
         &self,
-        loader: &crate::share::classfile::classLoader<'a>,
+        loader: &ClassLoader<'a>,
         klass_name: &[u8],
         class_bytes: &[u8],
         output: &mut dyn std::io::Write,

@@ -14,11 +14,11 @@
 
 use super::builder::{BuilderContext, ExceptionHandler, MethodCode};
 use super::codegen::{BackendError, BackendOptions, ParamKind, ParamSlot};
-use crate::share::oops::objLayout::ObjLayoutMode;
 use super::compile::Compile;
 use crate::share::compiler::abstractCompiler::{AbstractCompiler, CompileError, CompilerType};
 use crate::share::compiler::compileTask::{CompileOutcome, CompileTask, FailureReason};
 use crate::share::compiler::compilerDefinitions::CompLevel;
+use crate::share::oops::objLayout::ObjLayoutMode;
 
 pub struct C2Compiler {
     pub compiled_methods: usize,
@@ -87,7 +87,11 @@ impl AbstractCompiler for C2Compiler {
 
     fn compile_method(&mut self, task: &CompileTask) -> Result<CompileOutcome, CompileError> {
         let method = task.method_obj.as_ref().ok_or_else(|| {
-            CompileError::new(FailureReason::Unresolved, "missing Method handle", CompLevel::FullOptimization)
+            CompileError::new(
+                FailureReason::Unresolved,
+                "missing Method handle",
+                CompLevel::FullOptimization,
+            )
         })?;
         if task.is_osr() {
             return Err(CompileError::unsupported(
@@ -104,20 +108,22 @@ impl AbstractCompiler for C2Compiler {
             ));
         }
         let descriptor = task.method.descriptor.as_str();
-        if !crate::share::jitruntime::signature_supported(descriptor.as_bytes(), method.is_static()) {
+        if !crate::share::jitruntime::signature_supported(descriptor.as_bytes(), method.is_static())
+        {
             return Err(CompileError::new(
                 FailureReason::Unsupported,
                 format!("signature {} outside executable subset", descriptor),
                 CompLevel::FullOptimization,
             ));
         }
-        let (params, param_slots) = parse_params(descriptor, method.is_static()).ok_or_else(|| {
-            CompileError::new(
-                FailureReason::Unsupported,
-                format!("unsupported signature {}", descriptor),
-                CompLevel::FullOptimization,
-            )
-        })?;
+        let (params, param_slots) =
+            parse_params(descriptor, method.is_static()).ok_or_else(|| {
+                CompileError::new(
+                    FailureReason::Unsupported,
+                    format!("unsupported signature {}", descriptor),
+                    CompLevel::FullOptimization,
+                )
+            })?;
         let handlers: Vec<ExceptionHandler> = method
             .const_method()
             .exception_table()
@@ -137,7 +143,31 @@ impl AbstractCompiler for C2Compiler {
             code: bytecode,
             handlers: &handlers,
         };
-        let ctx = BuilderContext::empty();
+        let mut sites: std::collections::HashMap<u16, super::builder::SiteInfo> =
+            std::collections::HashMap::new();
+        if let Some(loader) = crate::share::runtime::threading::jvm_loader()
+            && let Some(klass) = loader
+                .classes
+                .borrow()
+                .get(task.method.class_name.as_bytes())
+                .cloned()
+        {
+            sites = super::builder::resolve_sites(&klass, bytecode);
+        }
+        if let Some(md) = &task.jit_metadata {
+            for (idx, s) in &md.sites {
+                if *idx <= u16::MAX as u32 {
+                    sites
+                        .entry(*idx as u16)
+                        .or_insert_with(|| super::builder::SiteInfo {
+                            class: s.class.clone(),
+                            name: s.name.clone(),
+                            desc: s.desc.clone(),
+                        });
+                }
+            }
+        }
+        let ctx = BuilderContext::with_sites(&sites);
         let options = BackendOptions {
             stubs: crate::share::jitruntime::stub_map(),
             params,

@@ -14,7 +14,6 @@
 use super::g1ConcurrentMarkBitMap::G1ConcurrentMarkBitMap;
 use super::g1OopClosures::{G1OopClosure, ScanTask};
 use super::g1OopStarChunkedList::G1OopStarChunkedList;
-use super::heapRegion::G1HeapRegionAttr;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -468,3 +467,78 @@ impl<'a, C: G1OopClosure> G1ParTask<'a, C> {
 /// Shared reference-counted wrapper for running `G1ParTask` across
 /// scoped threads.
 pub type SharedParTask<'a, C> = Arc<Mutex<G1ParTask<'a, C>>>;
+
+#[cfg(test)]
+mod tests {
+    use super::super::g1OopClosures::{G1OopClosure, ScanTask};
+    use super::*;
+
+    struct CountingClosure {
+        oops: Vec<usize>,
+    }
+
+    impl G1OopClosure for CountingClosure {
+        fn do_oop(&mut self, oop: usize, state: &mut G1ParScanThreadState) {
+            self.oops.push(oop);
+            state.card_stats.scanned_cards += 1;
+        }
+    }
+
+    #[test]
+    fn chunked_list_lifo() {
+        let mut list = G1OopStarChunkedList::new(4);
+        for i in 0..10 {
+            list.push(i);
+        }
+        assert_eq!(list.len(), 10);
+        let mut out = Vec::new();
+        list.drain_into(|x| out.push(x));
+        assert_eq!(out, (0..10).rev().collect::<Vec<_>>());
+        assert!(list.is_empty());
+    }
+
+    #[test]
+    fn par_state_trim() {
+        let mut state = G1ParScanThreadState::new(0, 15);
+        for i in 0..5000 {
+            state.stack.push(i);
+        }
+        state.trim_queue_to_threshold(100);
+        assert!(state.stack.len() <= 100);
+        assert_eq!(state.trim_queue.len(), 4900);
+        state.untrim_queue();
+        assert_eq!(state.stack.len(), 5000);
+        assert!(state.trim_queue.is_empty());
+    }
+
+    #[test]
+    fn task_queue_steal() {
+        let set = G1ScannerTasksQueueSet::new(2);
+        set.push(0, ScanTask::Oop(1));
+        set.push(0, ScanTask::Oop(2));
+        set.push(0, ScanTask::Oop(3));
+        let stolen = set.steal(0, 2);
+        assert_eq!(stolen.len(), 2);
+        assert_eq!(set.pop(0), Some(ScanTask::Oop(1)));
+    }
+
+    #[test]
+    fn par_task_processes_stack() {
+        let cset = vec![0, 1, 2];
+        let mut task = G1ParTask::new(2, 15, cset, CountingClosure { oops: Vec::new() });
+        {
+            let state = task.states.state_mut(0).unwrap();
+            state.stack.push(11);
+            state.stack.push(22);
+            state.overflow_stack.push(ScanTask::Oop(33));
+        }
+        let n = task.process_worker_step(0);
+        assert_eq!(n, 3);
+        assert_eq!(task.closure().oops, vec![33, 22, 11]);
+        // claim regions
+        assert_eq!(task.claim_next_region(), Some(0));
+        assert_eq!(task.claim_next_region(), Some(1));
+        assert_eq!(task.claim_next_region(), Some(2));
+        assert_eq!(task.claim_next_region(), None);
+    }
+}

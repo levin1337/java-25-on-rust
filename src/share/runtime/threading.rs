@@ -304,9 +304,7 @@ fn spawn_os_thread(
             match result {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
-                    if std::env::var_os("JVM25_TRACE").is_some() {
-                        eprintln!("[thread {tid}] java.lang.Thread.run died: {error}");
-                    }
+                    eprintln!("[thread {tid}] java.lang.Thread.run died: {error}");
                 }
                 Err(payload) => {
                     let message = payload
@@ -624,6 +622,10 @@ pub fn unpark(loader: &ClassLoader<'_>, value: Value<'_>) -> io::Result<()> {
 /// exit). Polls the registry; infra threads were retired at `register`
 /// time so they never appear here as pending work.
 pub fn wait_non_daemon(loader: &ClassLoader<'_>) {
+    // The primordial thread parks here in Rust code after `main` returns;
+    // without a GC registration its stale `Running` entry would block
+    // every stop-the-world cycle forever.
+    crate::share::memory::heap::quiesce();
     loop {
         let pending = {
             let threads = loader.java_threads.borrow();

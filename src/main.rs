@@ -141,6 +141,7 @@ fn inspect() -> Result<(), Box<dyn Error>> {
     let mut out = jvm25_rust::share::runtime::jvmOut::JvmOut::stdout();
     jvm25_rust::share::runtime::jvmOut::install(&out);
     javaCalls::mainClass(loader.as_ref(), &name, arguments, &mut out)?;
+    jvm25_rust::share::runtime::threading::wait_non_daemon(loader.as_ref());
     Ok(())
 }
 

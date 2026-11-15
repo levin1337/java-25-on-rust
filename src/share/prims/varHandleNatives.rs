@@ -197,7 +197,7 @@ pub(crate) fn polymorphic<'a>(
     if !receiver_klass_name.starts_with(b"java/lang/invoke/VarHandle") {
         return Ok(None);
     }
-    if std::env::var_os("JVM25_TRACE").is_some() {
+    if std::env::var_os("JVM25_TRACE_VH").is_some() {
         eprintln!(
             "[varhandle] {}.{}{} args={}",
             String::from_utf8_lossy(receiver_klass_name),

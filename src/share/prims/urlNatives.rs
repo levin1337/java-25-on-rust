@@ -790,6 +790,27 @@ fn is_jar_connection<'a>(loader: &ClassLoader<'a>, receiver: Value<'a>) -> bool 
     })
 }
 
+/// True when `receiver` is the VM's own application/system class loader
+/// (backed by the flat class store). Custom Java loaders must run their
+/// real `ClassLoader` resource methods so `URLClassPath` can supply jar
+/// resources.
+fn is_vm_loader(loader: &ClassLoader<'_>, receiver: Value<'_>) -> bool {
+    match receiver {
+        Value::Object(handle) => {
+            let system = loader.systemClassLoaderObject().unwrap_or(usize::MAX);
+            let registered = *loader.class_loader_object_handle().borrow();
+            handle == system || Some(handle) == registered
+        }
+        _ => false,
+    }
+}
+
+fn resource_name<'a>(loader: &ClassLoader<'a>, value: Value<'a>) -> io::Result<String> {
+    stringNatives::string(loader, value)?
+        .map(|name| name.into_owned())
+        .ok_or_else(|| invalid("Invalid resource name"))
+}
+
 pub(crate) fn invoke_instance<'a>(
     loader: &ClassLoader<'a>,
     owner: &[u8],
@@ -810,26 +831,39 @@ pub(crate) fn invoke_instance<'a>(
     };
     match (owner, name, descriptor) {
         (b"java/lang/ClassLoader", b"getResources", b"(Ljava/lang/String;)Ljava/util/Enumeration;") => {
-            // Only intercept for the VM's own application/system loader,
-            // which is backed by the flat class store (jimage + classpath
-            // sources). Custom Java loaders (URLClassLoader & friends) must
-            // run their real `getResources` so their `findResources`/
-            // `URLClassPath` can supply jar resources — the symbolic owner
-            // is `java/lang/ClassLoader` for every subclass call, so the
-            // receiver must be checked explicitly.
             let receiver = arguments.first().copied().unwrap_or(Value::Null);
-            let is_vm_loader = match receiver {
-                Value::Object(handle) => {
-                    let system = loader.systemClassLoaderObject().unwrap_or(usize::MAX);
-                    let registered = *loader.class_loader_object_handle().borrow();
-                    handle == system || Some(handle) == registered
-                }
-                _ => false,
-            };
-            if !is_vm_loader {
+            if !is_vm_loader(loader, receiver) {
                 return Ok(None);
             }
             get_resources(loader, arguments).map(|result| result.map(Some))
+        }
+        (b"java/lang/ClassLoader", b"getResource", b"(Ljava/lang/String;)Ljava/net/URL;") => {
+            let receiver = arguments.first().copied().unwrap_or(Value::Null);
+            if !is_vm_loader(loader, receiver) {
+                return Ok(None);
+            }
+            let name = resource_name(loader, arguments.get(1).copied().unwrap_or(Value::Null))?;
+            let Some(spec) = resource_specs(loader, &name)?.into_iter().next() else {
+                return Ok(Some(Some(Value::Null)));
+            };
+            let url_klass = loader.load(b"java/net/URL")?;
+            bytecodeInterpreter::initialize(loader, &url_klass, &mut sink(), 0)?;
+            let handle = make_url(loader, &url_klass, &spec)?;
+            Ok(Some(Some(Value::Object(handle))))
+        }
+        (b"java/lang/ClassLoader", b"getResourceAsStream", b"(Ljava/lang/String;)Ljava/io/InputStream;") => {
+            let receiver = arguments.first().copied().unwrap_or(Value::Null);
+            if !is_vm_loader(loader, receiver) {
+                return Ok(None);
+            }
+            let name = resource_name(loader, arguments.get(1).copied().unwrap_or(Value::Null))?;
+            match loader.open_resource(name.as_bytes())? {
+                Some(bytes) => {
+                    let stream = byte_array_input_stream(loader, &bytes)?;
+                    Ok(Some(Some(stream)))
+                }
+                None => Ok(Some(Some(Value::Null))),
+            }
         }
         (b"java/net/URL", b"openConnection", b"()Ljava/net/URLConnection;")
         | (b"java/net/URL", b"openConnection", b"(Ljava/net/Proxy;)Ljava/net/URLConnection;") => {

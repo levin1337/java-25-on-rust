@@ -146,7 +146,7 @@ impl FieldType {
 struct KlassInfo {
     super_name: Option<Vec<u8>>,
     interfaces: Vec<Vec<u8>>,
-    is_interface: bool,
+    flags: u16,
 }
 
 impl KlassInfo {
@@ -157,7 +157,7 @@ impl KlassInfo {
                 b"java/lang/Cloneable".to_vec(),
                 b"java/lang/Serializable".to_vec(),
             ],
-            is_interface: false,
+            flags: 0x0430u16, // final | abstract | super
         }
     }
 }
@@ -436,7 +436,7 @@ impl<'m, 'a> BytecodeVerifier<'m, 'a> {
             return Some(KlassInfo {
                 super_name: self.class.superName.map(|s| s.to_vec()),
                 interfaces: self.class.interfaces.iter().map(|i| i.to_vec()).collect(),
-                is_interface: self.class.accessFlags & 0x0200 != 0,
+                flags: self.class.accessFlags,
             });
         }
         let loader = self.loader?;
@@ -445,7 +445,7 @@ impl<'m, 'a> BytecodeVerifier<'m, 'a> {
         Some(KlassInfo {
             super_name: klass.super_klass.as_ref().map(|s| s.class.name.to_vec()),
             interfaces: klass.interfaces.iter().map(|i| i.class.name.to_vec()).collect(),
-            is_interface: klass.class.accessFlags & 0x0200 != 0,
+            flags: klass.class.accessFlags,
         })
     }
 
@@ -473,7 +473,7 @@ impl<'m, 'a> BytecodeVerifier<'m, 'a> {
         // the strict array rules above already restricted array sources to
         // Cloneable/Serializable.
         if let Some(info) = self.klass_info(to)
-            && info.is_interface
+            && info.flags & 0x0200 != 0
         {
             return true;
         }
@@ -495,6 +495,20 @@ impl<'m, 'a> BytecodeVerifier<'m, 'a> {
                 pending.push(s);
             }
             pending.extend(info.interfaces);
+        }
+        // Interface leniency (matches HotSpot): a non-final class type is
+        // assignable to an interface it does not declare, because a
+        // subclass could implement it. Final classes and interfaces must
+        // match exactly.
+        if let (Some(to_info), Some(from_info)) = (self.klass_info(to), self.klass_info(from)) {
+            const ACC_INTERFACE: u16 = 0x0200;
+            const ACC_FINAL: u16 = 0x0010;
+            if to_info.flags & ACC_INTERFACE != 0
+                && from_info.flags & ACC_INTERFACE == 0
+                && from_info.flags & ACC_FINAL == 0
+            {
+                return true;
+            }
         }
         false
     }

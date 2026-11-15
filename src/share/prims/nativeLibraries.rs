@@ -316,6 +316,8 @@ impl NativeLibraries {
             .lock()
             .unwrap()
             .insert(symbol_name.to_owned(), function);
+        // A newly registered symbol may satisfy a previously-missed probe.
+        super::nativeLookup::clear_native_misses();
     }
 
     pub fn dispatch(

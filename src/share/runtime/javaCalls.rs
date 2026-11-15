@@ -365,6 +365,7 @@ pub fn mainClass<'a>(
     // JVM exit semantics: stay alive until all non-daemon Java threads
     // finish, like a real VM does after main() returns.
     crate::share::runtime::threading::wait_non_daemon(loader);
+    crate::share::prims::nativeLookup::dump_native_profile();
     Ok(())
 }
 

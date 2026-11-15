@@ -181,6 +181,134 @@ pub static NATIVE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 
 static CALL_TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+// --- native call profiler (JVM25_PROFILE_NATIVE=1) -------------------------
+
+type NativeProfileMap = HashMap<String, (u64, u128)>;
+
+static NATIVE_TIMES: OnceLock<Mutex<NativeProfileMap>> = OnceLock::new();
+
+fn profile_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("JVM25_PROFILE_NATIVE").is_some())
+}
+
+struct NativeProfileGuard {
+    active: bool,
+    label: String,
+    start: std::time::Instant,
+}
+
+fn profile_enter(owner: &[u8], name: &[u8], descriptor: &[u8]) -> NativeProfileGuard {
+    if !profile_enabled() {
+        return NativeProfileGuard {
+            active: false,
+            label: String::new(),
+            start: std::time::Instant::now(),
+        };
+    }
+    NativeProfileGuard {
+        active: true,
+        label: format!(
+            "{}.{}{}",
+            String::from_utf8_lossy(owner),
+            String::from_utf8_lossy(name),
+            String::from_utf8_lossy(descriptor)
+        ),
+        start: std::time::Instant::now(),
+    }
+}
+
+impl Drop for NativeProfileGuard {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let map = NATIVE_TIMES.get_or_init(|| Mutex::new(HashMap::new()));
+        if let Ok(mut map) = map.lock() {
+            let entry = map.entry(std::mem::take(&mut self.label)).or_default();
+            entry.0 += 1;
+            entry.1 += self.start.elapsed().as_nanos();
+        }
+    }
+}
+
+/// Prints the top native methods by cumulative time. No-op unless
+/// `JVM25_PROFILE_NATIVE` was set when the process started.
+pub fn dump_native_profile() {
+    if !profile_enabled() {
+        return;
+    }
+    let Some(map) = NATIVE_TIMES.get() else {
+        return;
+    };
+    let Ok(map) = map.lock() else {
+        return;
+    };
+    let mut entries: Vec<_> = map.iter().collect();
+    entries.sort_by_key(|(_, (_, nanos))| std::cmp::Reverse(*nanos));
+    eprintln!("[native-profile] top {} by total ns:", entries.len().min(30));
+    for (label, (calls, nanos)) in entries.iter().take(30) {
+        eprintln!("  {nanos:>12} ns  {calls:>7} calls  {label}");
+    }
+}
+
+// --- negative-result cache --------------------------------------------------
+//
+// `invokeInstance`/`invokeStatic` are probed for EVERY invokevirtual /
+// invokestatic call site before Java resolution runs. For the vast
+// majority of call sites the probe scans ~20 dispatch modules and returns
+// `Ok(None)`. The outcome depends only on (owner, name, descriptor) plus
+// the dynamic native registries, so misses are memoized globally; the
+// cache is cleared whenever RegisterNatives or a custom symbol appears.
+
+type NativeMissKey = (Vec<u8>, Vec<u8>, Vec<u8>);
+
+static NATIVE_MISSES: OnceLock<Mutex<HashMap<u64, Vec<NativeMissKey>>>> = OnceLock::new();
+
+fn native_miss_hash(owner: &[u8], name: &[u8], descriptor: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    owner.hash(&mut h);
+    name.hash(&mut h);
+    descriptor.hash(&mut h);
+    h.finish()
+}
+
+fn native_miss_contains(owner: &[u8], name: &[u8], descriptor: &[u8]) -> bool {
+    let Some(map) = NATIVE_MISSES.get() else {
+        return false;
+    };
+    let Ok(map) = map.lock() else {
+        return false;
+    };
+    map.get(&native_miss_hash(owner, name, descriptor))
+        .is_some_and(|bucket| {
+            bucket
+                .iter()
+                .any(|(o, n, d)| o.as_slice() == owner && n.as_slice() == name && d.as_slice() == descriptor)
+        })
+}
+
+fn native_miss_insert(owner: &[u8], name: &[u8], descriptor: &[u8]) {
+    let map = NATIVE_MISSES.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(mut map) = map.lock() {
+        map.entry(native_miss_hash(owner, name, descriptor))
+            .or_default()
+            .push((owner.to_vec(), name.to_vec(), descriptor.to_vec()));
+    }
+}
+
+/// Drops all memoized native-probe misses. Called when a native method is
+/// registered dynamically (JNI `RegisterNatives`, custom symbols) so a
+/// previously-unknown triple is probed again.
+pub fn clear_native_misses() {
+    if let Some(map) = NATIVE_MISSES.get()
+        && let Ok(mut map) = map.lock()
+    {
+        map.clear();
+    }
+}
+
 thread_local! {
     /// Label of the native method currently executing on this OS thread,
     /// used by hang diagnostics (JVM25_DUMP wall-clock dumps).
@@ -263,6 +391,9 @@ fn maybe_dump_stack(loader: &crate::share::classfile::classLoader::ClassLoader<'
     eprintln!("[calldump] {}", stack.join(" <- "));
 }
 
+/// Public entry for instance-call native dispatch. Memoizes negative
+/// results: a `(owner, name, descriptor)` triple that no module claims is
+/// remembered so later probes cost a hash lookup instead of a full scan.
 pub fn invokeInstance<'a>(
     loader: &crate::share::classfile::classLoader::ClassLoader<'a>,
     owner: &[u8],
@@ -272,7 +403,29 @@ pub fn invokeInstance<'a>(
     output: &mut dyn std::io::Write,
     depth: usize,
 ) -> io::Result<Option<Option<crate::share::interpreter::bytecodeInterpreter::Value<'a>>>> {
+    if native_miss_contains(owner, name, descriptor) {
+        return Ok(None);
+    }
+    let result = invokeInstanceInner(
+        loader, owner, name, descriptor, arguments, output, depth,
+    )?;
+    if result.is_none() {
+        native_miss_insert(owner, name, descriptor);
+    }
+    Ok(result)
+}
+
+fn invokeInstanceInner<'a>(
+    loader: &crate::share::classfile::classLoader::ClassLoader<'a>,
+    owner: &[u8],
+    name: &[u8],
+    descriptor: &[u8],
+    arguments: &[crate::share::interpreter::bytecodeInterpreter::Value<'a>],
+    output: &mut dyn std::io::Write,
+    depth: usize,
+) -> io::Result<Option<Option<crate::share::interpreter::bytecodeInterpreter::Value<'a>>>> {
     let _rg = crate::share::recprobe::Guard::enter("invokeInstance");
+    let _pg = profile_enter(owner, name, descriptor);
     let _ng = NativeGuard::enter(owner, name);
     NATIVE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     maybe_dump_stack(loader);
@@ -352,6 +505,13 @@ pub fn invokeInstance<'a>(
     if (owner.starts_with(b"java/net/") || owner == b"java/lang/ClassLoader" || owner.starts_with(b"jvm25/"))
         && let Some(result) =
             super::urlNatives::invoke_instance(loader, owner, name, descriptor, arguments)?
+    {
+        return Ok(Some(result));
+    }
+
+    if owner.starts_with(b"java/net/")
+        && let Some(result) =
+            super::netNatives::invoke_instance(loader, owner, name, descriptor, arguments)?
     {
         return Ok(Some(result));
     }
@@ -1354,6 +1514,7 @@ fn current_thread<'a>(
     Ok(Value::Object(handle))
 }
 
+/// Public entry for static-call native dispatch; see `invokeInstance`.
 pub fn invokeStatic<'a>(
     loader: &crate::share::classfile::classLoader::ClassLoader<'a>,
     owner: &[u8],
@@ -1363,7 +1524,29 @@ pub fn invokeStatic<'a>(
     output: &mut dyn std::io::Write,
     depth: usize,
 ) -> io::Result<Option<Option<crate::share::interpreter::bytecodeInterpreter::Value<'a>>>> {
+    if native_miss_contains(owner, name, descriptor) {
+        return Ok(None);
+    }
+    let result = invokeStaticInner(
+        loader, owner, name, descriptor, arguments, output, depth,
+    )?;
+    if result.is_none() {
+        native_miss_insert(owner, name, descriptor);
+    }
+    Ok(result)
+}
+
+fn invokeStaticInner<'a>(
+    loader: &crate::share::classfile::classLoader::ClassLoader<'a>,
+    owner: &[u8],
+    name: &[u8],
+    descriptor: &[u8],
+    arguments: &[crate::share::interpreter::bytecodeInterpreter::Value<'a>],
+    output: &mut dyn std::io::Write,
+    depth: usize,
+) -> io::Result<Option<Option<crate::share::interpreter::bytecodeInterpreter::Value<'a>>>> {
     let _rg = crate::share::recprobe::Guard::enter("invokeStatic");
+    let _pg = profile_enter(owner, name, descriptor);
     let _ng = NativeGuard::enter(owner, name);
     NATIVE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     maybe_dump_stack(loader);

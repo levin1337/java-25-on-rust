@@ -910,6 +910,25 @@ fn dotted(ip: Ipv4Addr) -> String {
     ip.to_string()
 }
 
+/// Instance entry point: `arguments[0]` is the receiver. JDK 25 calls some
+/// `InetAddressImpl` helpers (e.g. `getLocalHostName`) through the instance
+/// dispatch; the underlying natives are receiver-independent, so strip the
+/// receiver and reuse the static table.
+pub(crate) fn invoke_instance<'a>(
+    loader: &ClassLoader<'a>,
+    owner: &[u8],
+    name: &[u8],
+    descriptor: &[u8],
+    arguments: &[Value<'a>],
+) -> io::Result<Option<Option<Value<'a>>>> {
+    let rest = if arguments.is_empty() {
+        arguments
+    } else {
+        &arguments[1..]
+    };
+    invoke_static(loader, owner, name, descriptor, rest)
+}
+
 /// Dispatches `java.net` statics and instance-less natives.
 pub(crate) fn invoke_static<'a>(
     loader: &ClassLoader<'a>,
@@ -918,6 +937,12 @@ pub(crate) fn invoke_static<'a>(
     descriptor: &[u8],
     arguments: &[Value<'a>],
 ) -> io::Result<Option<Option<Value<'a>>>> {
+    if std::env::var_os("JVM25_TRACE_NET").is_some() {
+        eprintln!("[netstatic] {} {} {}", String::from_utf8_lossy(owner), String::from_utf8_lossy(name), String::from_utf8_lossy(descriptor));
+    }
+    if std::env::var_os("JVM25_TRACE_NET2").is_some() {
+        eprintln!("[netstatic2] {} {} {} args={}", String::from_utf8_lossy(owner), String::from_utf8_lossy(name), String::from_utf8_lossy(descriptor), arguments.len());
+    }
     let result = match (owner, name, descriptor) {
         (b"java/net/InetAddress", b"isIPv4Available", b"()Z") => {
             Some(Some(Value::Int(1)))
@@ -1038,6 +1063,9 @@ pub(crate) fn invoke_static<'a>(
         }
         _ => return net_channel(loader, owner, name, descriptor, arguments),
     };
+    if std::env::var_os("JVM25_TRACE_NET2").is_some() {
+        eprintln!("[netstatic2-out] {} {} {} -> {:?}", String::from_utf8_lossy(owner), String::from_utf8_lossy(name), String::from_utf8_lossy(descriptor), result.is_some());
+    }
     Ok(result)
 }
 

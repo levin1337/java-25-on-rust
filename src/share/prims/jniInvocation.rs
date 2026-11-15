@@ -3745,6 +3745,8 @@ unsafe extern "system" fn jni_register_natives(
             },
         );
     }
+    // Registered natives may satisfy previously-missed dispatch probes.
+    crate::share::prims::nativeLookup::clear_native_misses();
     JNI_OK
 }
 
@@ -4093,6 +4095,7 @@ pub fn register_resolved_native(
             plan,
         },
     );
+    crate::share::prims::nativeLookup::clear_native_misses();
     Ok(())
 }
 

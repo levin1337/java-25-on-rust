@@ -1,225 +1,257 @@
 /*
  * Port of OpenJDK 25 HotSpot ObjectMonitor (share/runtime/objectMonitor.hpp / objectMonitor.cpp)
  *
- * Implements heavyweight Java monitors with recursive lock/unlock,
- * owner tracking, entry queues, and wait/notify coordination.
+ * Real blocking monitor: ownership, recursion, entry waiters and the
+ * wait/notify set are coordinated by a mutex + condition variable so Java
+ * threads on separate OS threads can contend, wait and notify correctly.
  */
 
+use parking_lot::{Condvar, Mutex, MutexGuard};
 use std::collections::VecDeque;
 
-#[derive(Debug, Clone)]
-pub struct ObjectMonitor {
+#[derive(Debug)]
+struct Waiter {
+    tid: u64,
+    notified: bool,
+}
+
+#[derive(Debug, Default)]
+struct MonitorState {
     owner: Option<u64>,
     recursions: u32,
-    object_handle: usize,
-    entry_list: VecDeque<u64>,
-    wait_set: VecDeque<u64>,
-    contentions: u32,
-    succ: Option<u64>,
+    /// Threads blocked in `wait()` (monitor released while waiting).
+    waiting: VecDeque<Waiter>,
+    /// Threads blocked in `enter()` waiting for the owner to release.
+    entry_waiters: usize,
+}
+
+/// A single Java object monitor. All state transitions happen under
+/// `state`; threads sleep on `cond` and re-check their predicate after
+/// every wakeup (spurious wakeups are legal).
+pub struct ObjectMonitor {
+    state: Mutex<MonitorState>,
+    cond: Condvar,
 }
 
 impl ObjectMonitor {
-    pub fn new(object_handle: usize) -> Self {
+    pub fn new(_object_handle: usize) -> Self {
         Self {
-            owner: None,
-            recursions: 0,
-            object_handle,
-            entry_list: VecDeque::new(),
-            wait_set: VecDeque::new(),
-            contentions: 0,
-            succ: None,
+            state: Mutex::new(MonitorState::default()),
+            cond: Condvar::new(),
         }
-    }
-
-    #[inline]
-    pub fn object_handle(&self) -> usize {
-        self.object_handle
-    }
-
-    #[inline]
-    pub fn owner(&self) -> Option<u64> {
-        self.owner
-    }
-
-    #[inline]
-    pub fn recursions(&self) -> u32 {
-        self.recursions
-    }
-
-    #[inline]
-    pub fn is_locked(&self) -> bool {
-        self.owner.is_some()
     }
 
     #[inline]
     pub fn is_owned_by(&self, thread_id: u64) -> bool {
-        self.owner == Some(thread_id)
+        self.state.lock().owner == Some(thread_id)
     }
 
     #[inline]
-    pub fn contentions(&self) -> u32 {
-        self.contentions
+    pub fn is_locked(&self) -> bool {
+        self.state.lock().owner.is_some()
     }
 
     #[inline]
     pub fn waiters_count(&self) -> usize {
-        self.wait_set.len()
+        self.state.lock().waiting.len()
     }
 
-    #[inline]
-    pub fn entry_list_count(&self) -> usize {
-        self.entry_list.len()
-    }
-
-    /// Determines if the monitor is currently in use and cannot be deflated.
-    #[inline]
-    pub fn is_busy(&self) -> bool {
-        self.owner.is_some()
-            || !self.wait_set.is_empty()
-            || !self.entry_list.is_empty()
-            || self.contentions > 0
-    }
-
-    /// Enter monitor for the specified thread.
-    /// Returns true if lock was immediately acquired or re-entered,
-    /// or false if contended and enqueued on entry_list.
-    pub fn enter(&mut self, thread_id: u64) -> bool {
-        match self.owner {
+    /// Fast non-blocking acquire. Returns true when the monitor was taken
+    /// (fresh or recursive).
+    pub fn try_enter(&self, thread_id: u64) -> bool {
+        let mut state = self.state.lock();
+        match state.owner {
             None => {
-                self.owner = Some(thread_id);
-                self.recursions = 0;
+                state.owner = Some(thread_id);
+                state.recursions = 0;
                 true
             }
-            Some(curr_owner) if curr_owner == thread_id => {
-                self.recursions = self.recursions.saturating_add(1);
-                true
-            }
-            Some(_) => {
-                self.entry_list.push_back(thread_id);
-                self.contentions = self.contentions.saturating_add(1);
-                false
-            }
-        }
-    }
-
-    /// Try non-blocking acquisition of the monitor.
-    pub fn try_enter(&mut self, thread_id: u64) -> bool {
-        match self.owner {
-            None => {
-                self.owner = Some(thread_id);
-                self.recursions = 0;
-                true
-            }
-            Some(curr_owner) if curr_owner == thread_id => {
-                self.recursions = self.recursions.saturating_add(1);
+            Some(owner) if owner == thread_id => {
+                state.recursions = state.recursions.saturating_add(1);
                 true
             }
             Some(_) => false,
         }
     }
 
-    /// Exit monitor for the specified thread.
-    /// Returns:
-    /// - Ok(false) if monitor was decremented but is still held (reentrant).
-    /// - Ok(true) if monitor was fully released.
-    /// - Err if the calling thread does not hold the monitor.
-    pub fn exit(&mut self, thread_id: u64) -> Result<bool, &'static str> {
-        if self.owner != Some(thread_id) {
-            return Err("IllegalMonitorStateException");
+    /// Blocking acquire: waits on the condition variable while another
+    /// thread owns the monitor.
+    pub fn enter_blocking(&self, thread_id: u64) {
+        if std::env::var_os("JVM25_BLOCKTRACE").is_some() {
+            eprintln!("[block] enter_blocking tid={thread_id}");
         }
-
-        if self.recursions > 0 {
-            self.recursions -= 1;
-            Ok(false)
-        } else {
-            self.owner = None;
-            if let Some(next_thread) = self.entry_list.pop_front() {
-                self.contentions = self.contentions.saturating_sub(1);
-                self.owner = Some(next_thread);
-                self.recursions = 0;
-                self.succ = Some(next_thread);
-            } else {
-                self.succ = None;
-            }
-            Ok(true)
-        }
-    }
-
-    /// Waits on the monitor, releasing the lock and adding thread to wait_set.
-    /// Returns saved recursions on success.
-    pub fn wait(&mut self, thread_id: u64) -> Result<u32, &'static str> {
-        if self.owner != Some(thread_id) {
-            return Err("IllegalMonitorStateException");
-        }
-
-        let saved_recursions = self.recursions;
-        self.recursions = 0;
-        self.owner = None;
-        self.wait_set.push_back(thread_id);
-
-        // Hand off ownership to next entry waiter if available
-        if let Some(next_thread) = self.entry_list.pop_front() {
-            self.contentions = self.contentions.saturating_sub(1);
-            self.owner = Some(next_thread);
-            self.recursions = 0;
-            self.succ = Some(next_thread);
-        } else {
-            self.succ = None;
-        }
-
-        Ok(saved_recursions)
-    }
-
-    /// Reenters the monitor after wait completes, restoring saved recursions.
-    pub fn reenter_after_wait(&mut self, thread_id: u64, saved_recursions: u32) -> bool {
-        match self.owner {
-            None => {
-                self.owner = Some(thread_id);
-                self.recursions = saved_recursions;
-                true
-            }
-            // The monitor was handed to us directly by `exit`.
-            Some(owner) if owner == thread_id => {
-                self.recursions = saved_recursions;
-                true
-            }
-            Some(_) => {
-                if !self.entry_list.contains(&thread_id) {
-                    self.entry_list.push_back(thread_id);
-                    self.contentions = self.contentions.saturating_add(1);
+        let mut state = self.state.lock();
+        loop {
+            match state.owner {
+                None => {
+                    state.owner = Some(thread_id);
+                    state.recursions = 0;
+                    return;
                 }
-                false
+                Some(owner) if owner == thread_id => {
+                    state.recursions = state.recursions.saturating_add(1);
+                    return;
+                }
+                Some(_) => {
+                    state.entry_waiters += 1;
+                    self.cond.wait(&mut state);
+                    state.entry_waiters = state.entry_waiters.saturating_sub(1);
+                }
             }
         }
     }
 
-    /// Removes a thread from both the wait set and the entry list. Used when
-    /// a timed wait expires without a matching notify, or when a thread
-    /// leaves the monitor for any other reason.
-    pub fn remove_waiter(&mut self, thread_id: u64) -> bool {
-        let before = self.wait_set.len() + self.entry_list.len();
-        self.wait_set.retain(|&id| id != thread_id);
-        self.entry_list.retain(|&id| id != thread_id);
-        before != self.wait_set.len() + self.entry_list.len()
-    }
-
-    /// Notifies one waiting thread from wait_set.
-    pub fn notify(&mut self, thread_id: u64) -> Result<bool, &'static str> {
-        if self.owner != Some(thread_id) {
+    /// Releases one level of ownership. Returns `Ok(true)` when the monitor
+    /// was fully released, `Ok(false)` on recursive exit, or an error when
+    /// the caller does not own the monitor.
+    pub fn exit(&self, thread_id: u64) -> Result<bool, &'static str> {
+        let mut state = self.state.lock();
+        if state.owner != Some(thread_id) {
             return Err("IllegalMonitorStateException");
         }
-
-        Ok(self.wait_set.pop_front().is_some())
+        let fully_released = if state.recursions > 0 {
+            state.recursions -= 1;
+            false
+        } else {
+            state.owner = None;
+            true
+        };
+        // Wake entry waiters; wait-set members re-check `notified` and go
+        // back to sleep, which is harmless.
+        self.cond.notify_all();
+        Ok(fully_released)
     }
 
-    /// Notifies all waiting threads from wait_set.
-    pub fn notify_all(&mut self, thread_id: u64) -> Result<usize, &'static str> {
-        if self.owner != Some(thread_id) {
+    /// `Object.wait`: verifies ownership, fully releases the monitor,
+    /// blocks until notified or the deadline expires, then re-acquires the
+    /// monitor (restoring the saved recursion depth) before returning.
+    ///
+    /// `timeout_millis <= 0` waits indefinitely. Returns the saved
+    /// recursion count.
+    pub fn wait_blocking(
+        &self,
+        thread_id: u64,
+        timeout_millis: i64,
+    ) -> Result<u32, &'static str> {
+        if std::env::var_os("JVM25_BLOCKTRACE").is_some() {
+            eprintln!("[block] wait_blocking tid={thread_id} timeout={timeout_millis}");
+        }
+        let mut state = self.state.lock();
+        if state.owner != Some(thread_id) {
             return Err("IllegalMonitorStateException");
         }
+        let saved_recursions = state.recursions;
+        // Release the monitor completely, as the JMM requires.
+        state.owner = None;
+        state.recursions = 0;
+        state.waiting.push_back(Waiter {
+            tid: thread_id,
+            notified: false,
+        });
+        self.cond.notify_all();
 
-        let count = self.wait_set.len();
-        self.wait_set.clear();
+        let deadline = if timeout_millis > 0 {
+            Some(std::time::Instant::now() + std::time::Duration::from_millis(timeout_millis as u64))
+        } else {
+            None
+        };
+
+        // Sleep until our waiter entry is notified or the deadline hits.
+        loop {
+            let idx = state.waiting.iter().position(|w| w.tid == thread_id);
+            let Some(idx) = idx else {
+                // Entry vanished (should not happen; treat as notified).
+                break;
+            };
+            if state.waiting[idx].notified {
+                break;
+            }
+            if let Some(d) = deadline {
+                let now = std::time::Instant::now();
+                if now >= d {
+                    break;
+                }
+                let remaining = d - now;
+                let _ = self.cond.wait_for(&mut state, remaining);
+            } else {
+                self.cond.wait(&mut state);
+            }
+        }
+        state.waiting.retain(|w| w.tid != thread_id);
+
+        // Re-acquire the monitor, restoring the saved recursion depth.
+        loop {
+            match state.owner {
+                None => {
+                    state.owner = Some(thread_id);
+                    state.recursions = saved_recursions;
+                    return Ok(saved_recursions);
+                }
+                Some(owner) if owner == thread_id => {
+                    state.recursions = saved_recursions;
+                    return Ok(saved_recursions);
+                }
+                Some(_) => {
+                    self.cond.wait(&mut state);
+                }
+            }
+        }
+    }
+
+    /// `Object.notify`: wakes a single waiting thread. The caller must own
+    /// the monitor.
+    pub fn notify(&self, thread_id: u64) -> Result<bool, &'static str> {
+        let mut state = self.lock_owned(thread_id)?;
+        let idx = state.waiting.iter().position(|w| !w.notified);
+        if let Some(idx) = idx {
+            state.waiting[idx].notified = true;
+            self.cond.notify_all();
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// `Object.notifyAll`: wakes every waiting thread. The caller must own
+    /// the monitor.
+    pub fn notify_all(&self, thread_id: u64) -> Result<usize, &'static str> {
+        let mut state = self.lock_owned(thread_id)?;
+        let count = state.waiting.iter().filter(|w| !w.notified).count();
+        for w in state.waiting.iter_mut() {
+            w.notified = true;
+        }
+        self.cond.notify_all();
         Ok(count)
+    }
+
+    /// Runtime-internal release of every recursion level owned by
+    /// `thread_id`, used when a Java thread terminates (JLS: monitors held
+    /// by a terminating thread are released). Wakes entry waiters.
+    pub fn force_release(&self, thread_id: u64) {
+        let mut state = self.state.lock();
+        if state.owner == Some(thread_id) {
+            state.owner = None;
+            state.recursions = 0;
+            self.cond.notify_all();
+        }
+    }
+
+    /// Runtime-internal broadcast that does not require monitor ownership.
+    /// Used by thread termination so `join()` waiters observe the state
+    /// change (equivalent to HotSpot's `Thread::exit` notifyAll).
+    pub fn force_notify_all(&self) {
+        let mut state = self.state.lock();
+        for w in state.waiting.iter_mut() {
+            w.notified = true;
+        }
+        self.cond.notify_all();
+    }
+
+    fn lock_owned(&self, thread_id: u64) -> Result<MutexGuard<'_, MonitorState>, &'static str> {
+        let state = self.state.lock();
+        if state.owner != Some(thread_id) {
+            return Err("IllegalMonitorStateException");
+        }
+        Ok(state)
     }
 }

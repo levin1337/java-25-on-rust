@@ -8,7 +8,7 @@
 use super::jni::NativeMethodFn;
 use std::collections::HashMap;
 use std::io;
-use std::rc::Rc;
+use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
 
 #[allow(dead_code)]
@@ -110,6 +110,99 @@ impl Default for NativeLookup {
 /// Handles native instance methods which can be resolved before bytecode
 /// dispatch. The outer `Option` means "handled by the VM"; the inner `Option`
 /// is the Java-level return value (`None` for void methods).
+/// JNI natives bind to the class that declares the method. A call site may
+/// name a subclass (e.g. `PhantomReference.clear0`), while the native is
+/// declared on the superclass (`Reference.clear0`). Walk the superclass
+/// chain and return the declaring class name, or `None` when the owner
+/// cannot be loaded or no class in the chain declares the method.
+fn native_declaring_owner<'a>(
+    loader: &crate::share::classfile::classLoader::ClassLoader<'a>,
+    owner: &[u8],
+    name: &[u8],
+    descriptor: &[u8],
+) -> Option<Vec<u8>> {
+    let declares = |klass: &crate::share::oops::instanceKlass::InstanceKlass<'a>| {
+        klass
+            .class
+            .methods
+            .iter()
+            .any(|method| method.name == name && method.descriptor == descriptor)
+    };
+    let first = loader.load(owner).ok()?;
+    if declares(&first) {
+        // Common case: the constant-pool owner declares the method itself.
+        return None;
+    }
+    let mut current = first.super_klass.clone();
+    while let Some(klass) = current {
+        if declares(&klass) {
+            return Some(klass.class.name.to_vec());
+        }
+        current = klass.super_klass.clone();
+    }
+    None
+}
+
+static CALL_TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+thread_local! {
+    /// Label of the native method currently executing on this OS thread,
+    /// used by hang diagnostics (JVM25_DUMP wall-clock dumps).
+    static CURRENT_NATIVE: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+/// Returns the native method label currently executing on this thread.
+pub fn current_native() -> String {
+    CURRENT_NATIVE.with(|cell| cell.borrow().clone())
+}
+
+struct NativeGuard {
+    previous: String,
+}
+
+impl NativeGuard {
+    fn enter(owner: &[u8], name: &[u8]) -> Self {
+        let label = format!(
+            "{}.{}",
+            String::from_utf8_lossy(owner),
+            String::from_utf8_lossy(name)
+        );
+        crate::share::runtime::threading::debug_native(label.clone());
+        let previous = CURRENT_NATIVE.with(|cell| {
+            let mut cell = cell.borrow_mut();
+            std::mem::replace(&mut *cell, label)
+        });
+        Self { previous }
+    }
+}
+
+impl Drop for NativeGuard {
+    fn drop(&mut self) {
+        CURRENT_NATIVE.with(|cell| {
+            *cell.borrow_mut() = std::mem::take(&mut self.previous);
+        });
+        crate::share::runtime::threading::debug_native(std::mem::take(&mut self.previous));
+    }
+}
+
+fn maybe_dump_stack(loader: &crate::share::classfile::classLoader::ClassLoader<'_>) {
+    if std::env::var_os("JVM25_CALLDUMP").is_none() {
+        return;
+    }
+    if CALL_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 2_000_000 != 0 {
+        return;
+    }
+    let stack: Vec<String> = loader
+        .call_stack
+        .snapshot()
+        .iter()
+        .rev()
+        .take(30)
+        .map(|name| String::from_utf8_lossy(name).into_owned())
+        .collect();
+    eprintln!("[calldump] {}", stack.join(" <- "));
+}
+
 pub fn invokeInstance<'a>(
     loader: &crate::share::classfile::classLoader::ClassLoader<'a>,
     owner: &[u8],
@@ -120,6 +213,8 @@ pub fn invokeInstance<'a>(
     depth: usize,
 ) -> io::Result<Option<Option<crate::share::interpreter::bytecodeInterpreter::Value<'a>>>> {
     let _rg = crate::share::recprobe::Guard::enter("invokeInstance");
+    let _ng = NativeGuard::enter(owner, name);
+    maybe_dump_stack(loader);
     use super::jvm::Jvm;
     use crate::share::interpreter::bytecodeInterpreter::Value;
 
@@ -172,6 +267,14 @@ pub fn invokeInstance<'a>(
         }
     }
 
+    if super::perfNatives::is_owner(owner) {
+        if let Some(result) =
+            super::perfNatives::invoke(loader, name, descriptor, arguments, output)?
+        {
+            return Ok(Some(result));
+        }
+    }
+
     if let Some(result) =
         super::varHandleNatives::invoke(loader, name, descriptor, arguments)?
     {
@@ -189,6 +292,14 @@ pub fn invokeInstance<'a>(
         super::urlNatives::invoke_instance(loader, owner, name, descriptor, arguments)?
     {
         return Ok(Some(result));
+    }
+
+    if super::selectorNatives::is_owner(owner) {
+        if let Some(result) =
+            super::selectorNatives::invoke(loader, name, descriptor, arguments)?
+        {
+            return Ok(Some(result));
+        }
     }
 
     if owner == b"java/lang/ClassLoader"
@@ -310,6 +421,16 @@ pub fn invokeInstance<'a>(
         return Ok(Some(Some(Value::Object(handle))));
     }
 
+    // Resolve inherited natives to their declaring class before dispatch.
+    let resolved_owner;
+    let owner = match native_declaring_owner(loader, owner, name, descriptor) {
+        Some(declaring) => {
+            resolved_owner = declaring;
+            resolved_owner.as_slice()
+        }
+        None => owner,
+    };
+
     let result = match (owner, name, descriptor) {
         (b"java/lang/Runtime", b"availableProcessors", b"()I") => {
             let cpus = std::thread::available_parallelism()
@@ -325,6 +446,16 @@ pub fn invokeInstance<'a>(
         }
         (b"java/lang/Runtime", b"maxMemory", b"()J") => Some(Value::Long(Jvm::max_memory() as i64)),
         (b"java/lang/Runtime", b"gc", b"()V") => None,
+        (b"java/lang/Shutdown", b"beforeHalt", b"()V") => None,
+        (b"java/lang/Shutdown", b"halt0", b"(I)V") => {
+            let status = match arguments.first().copied() {
+                Some(Value::Int(status)) => status,
+                _ => 0,
+            };
+            let _ = std::io::Write::flush(output);
+            eprintln!("[halt0i] exit status={status}");
+            std::process::exit(status);
+        }
         (b"java/lang/ClassLoader", b"findBootstrapClass", b"(Ljava/lang/String;)Ljava/lang/Class;") => {
             let name_value = arguments.get(1).copied().unwrap_or(Value::Null);
             let text = super::stringNatives::string(loader, name_value)?
@@ -362,7 +493,7 @@ pub fn invokeInstance<'a>(
                         let object = objects
                             .get(handle)
                             .ok_or_else(|| io::Error::other("Invalid object reference"))?;
-                        (Rc::clone(&object.klass), object.fields.clone())
+                        (Arc::clone(&object.klass), object.fields.clone())
                     };
                     let mut cloned =
                         crate::share::oops::instanceOop::InstanceOop::new(klass)?;
@@ -413,6 +544,25 @@ pub fn invokeInstance<'a>(
             )?;
             Some(arguments.first().copied().unwrap_or(Value::Null))
         }
+        // Perf counters are optional in HotSpot (`-XX:-UsePerfData` yields
+        // null); JDK callers null-check the result.
+        (b"jdk/internal/perf/Perf", b"createLong", b"(Ljava/lang/String;IIJ)Ljava/nio/ByteBuffer;")
+        | (b"jdk/internal/perf/Perf", b"createByteArray", b"(Ljava/lang/String;II[BI)Ljava/nio/ByteBuffer;")
+        | (b"jdk/internal/perf/Perf", b"attach0", b"(I)Ljava/nio/ByteBuffer;") => {
+            Some(Value::Null)
+        }
+        (b"jdk/internal/perf/Perf", b"highResCounter", b"()J") => {
+            Some(Value::Long(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as i64)
+                    .unwrap_or(0),
+            ))
+        }
+        (b"jdk/internal/perf/Perf", b"highResFrequency", b"()J") => {
+            Some(Value::Long(1_000_000_000))
+        }
+        (b"jdk/internal/perf/Perf", b"detach", b"(Ljava/nio/ByteBuffer;)V") => None,
         (b"java/lang/Object", b"wait0", b"(J)V") => {
             let receiver = arguments.first().copied().unwrap_or(Value::Null);
             let Some(key) =
@@ -503,6 +653,30 @@ pub fn invokeInstance<'a>(
             }
             None
         }
+        (b"java/lang/Thread", b"sleep0", b"(J)V")
+        | (b"java/lang/Thread", b"sleepNanos0", b"(J)V") => {
+            let nanos = match arguments.first() {
+                Some(Value::Long(nanos)) => *nanos,
+                _ => 0,
+            };
+            crate::share::runtime::threading::sleep_nanos(loader, nanos, output, depth)?;
+            None
+        }
+        (b"java/lang/Thread", b"yield0", b"()V") => {
+            crate::share::runtime::threading::yield_thread(loader, output, depth)?;
+            None
+        }
+        (b"java/lang/Thread", b"onSpinWait0", b"(J)V") => {
+            let nanos = match arguments.first() {
+                Some(Value::Long(nanos)) => *nanos,
+                _ => 0,
+            };
+            let spins = (nanos.max(0) as u64 / 64).clamp(1, 8192);
+            for _ in 0..spins {
+                std::hint::spin_loop();
+            }
+            None
+        }
         (b"java/lang/Thread", b"getStackTrace0", b"()[Ljava/lang/StackTraceElement;") => {
             let component = loader
                 .storage
@@ -531,7 +705,49 @@ pub fn invokeInstance<'a>(
             };
             Some(Value::Int(i32::from(referent == Some(target))))
         }
-        (b"java/lang/ref/Reference", b"clear0", b"()V") => {
+        _ if owner.starts_with(b"java/lang/ref/")
+            && name == b"clear0"
+            && descriptor == b"()V" =>
+        {
+            let receiver = arguments.first().copied().unwrap_or(Value::Null);
+            if let Value::Object(handle) = receiver {
+                let _ = set_instance_field(
+                    loader,
+                    handle,
+                    b"referent",
+                    b"Ljava/lang/Object;",
+                    Value::Null,
+                );
+            }
+            None
+        }
+        // FinalReference inactive accessors: same `referent` slot as
+        // Reference.get/clear, used by FinalizerThread after the GC has
+        // already decided the referent is unreachable.
+        _ if owner.starts_with(b"java/lang/ref/")
+            && name == b"getFromInactiveFinalReference"
+            && descriptor == b"()Ljava/lang/Object;" =>
+        {
+            let receiver = arguments.first().copied().unwrap_or(Value::Null);
+            let value = match receiver {
+                Value::Object(handle) => {
+                    let objects = loader.borrow_objects();
+                    objects.get(handle).and_then(|object| {
+                        let slot = object
+                            .klass
+                            .instanceField(b"referent", b"Ljava/lang/Object;")
+                            .ok()?;
+                        object.fields.get(slot).copied()
+                    })
+                }
+                _ => None,
+            };
+            Some(value.unwrap_or(Value::Null))
+        }
+        _ if owner.starts_with(b"java/lang/ref/")
+            && name == b"clearInactiveFinalReference"
+            && descriptor == b"()V" =>
+        {
             let receiver = arguments.first().copied().unwrap_or(Value::Null);
             if let Value::Object(handle) = receiver {
                 let _ = set_instance_field(
@@ -635,6 +851,20 @@ pub fn invokeInstance<'a>(
                 }
             }
         }
+        _ if owner == b"java/lang/ProcessHandleImpl$Info" => {
+            match super::processNatives::statik(loader, owner, name, descriptor, arguments)? {
+                Some(_value) if descriptor.ends_with(b")V") => None,
+                Some(value) => Some(value),
+                None => {
+                    return match super::jniInvocation::invoke_dll_native(
+                        loader, owner, name, descriptor, false, arguments,
+                    )? {
+                        Some(result) => Ok(Some(result)),
+                        None => Ok(None),
+                    };
+                }
+            }
+        }
         _ if owner == b"java/util/zip/Inflater" || owner == b"java/util/zip/Deflater" => {
             match super::zipNatives::instance(loader, owner, name, descriptor, arguments)? {
                 Some(value) => Some(value),
@@ -650,11 +880,28 @@ pub fn invokeInstance<'a>(
         }
         _ => {
             if std::env::var_os("JVM25_TRACE").is_some() {
+                let args_dbg = if name == b"<init>" {
+                    let parts: Vec<String> = arguments
+                        .iter()
+                        .map(|value| match value {
+                            Value::String(bytes) => {
+                                format!("\"{}\"", String::from_utf8_lossy(bytes))
+                            }
+                            Value::HostString(text) => format!("\"{text}\""),
+                            Value::Null => "null".to_owned(),
+                            other => format!("{other:?}"),
+                        })
+                        .collect();
+                    format!(" args=[{}]", parts.join(", "))
+                } else {
+                    String::new()
+                };
                 eprintln!(
-                    "[nativeInstance] {}.{}{}",
+                    "[nativeInstance] {}.{}{}{}",
                     String::from_utf8_lossy(owner),
                     String::from_utf8_lossy(name),
-                    String::from_utf8_lossy(descriptor)
+                    String::from_utf8_lossy(descriptor),
+                    args_dbg
                 );
             }
             return match super::jniInvocation::invoke_dll_native(
@@ -682,7 +929,7 @@ fn raw_instance<'a>(
 }
 
 /// Writes an instance field by name/descriptor on an already-allocated object.
-fn set_instance_field<'a>(
+pub(crate) fn set_instance_field<'a>(
     loader: &crate::share::classfile::classLoader::ClassLoader<'a>,
     handle: usize,
     name: &[u8],
@@ -732,11 +979,41 @@ fn fill_in_stack_trace<'a>(
     let mut array = ObjArrayOop::withComponent(frames.len() as i32, component)?;
     let mut count = 0usize;
     for frame in frames.iter() {
-        if frame.class_name.as_str() == "java/lang/Throwable" {
+        if std::env::var_os("JVM25_TRACE_NATIVE").is_some() {
+            eprintln!(
+                "[fillInStackTrace] frame {}.{}{}",
+                frame.class_name.as_str(),
+                frame.method_name.as_str(),
+                frame.signature.as_str()
+            );
+        }
+        // HotSpot drops the `fillInStackTrace` machinery and every
+        // `Throwable` subclass constructor frame: the trace starts at the
+        // code that created the throwable.
+        let class_name = frame.class_name.as_str();
+        if class_name == "java/lang/Throwable" {
             continue;
         }
-        let class_name = frame.class_name.as_str().replace('/', ".");
+        let loaded = if !class_name.starts_with('[') && !class_name.starts_with(':') {
+            loader.load(class_name.as_bytes()).ok()
+        } else {
+            None
+        };
+        if frame.method_name.as_str() == "<init>"
+            && let Some(klass) = loaded.as_ref()
+            && crate::share::classfile::systemDictionary::SystemDictionary::is_subclass_of(
+                klass,
+                b"java/lang/Throwable",
+            )
+        {
+            continue;
+        }
+        let dotted = class_name.replace('/', ".");
         let method_name = frame.method_name.as_str().to_owned();
+        let file_name = loaded
+            .as_ref()
+            .and_then(|klass| klass.class.source_file())
+            .map(|bytes| String::from_utf8_lossy(bytes).into_owned());
         let element = match raw_instance(loader, b"java/lang/StackTraceElement") {
             Ok(handle) => handle,
             Err(error) => {
@@ -751,7 +1028,7 @@ fn fill_in_stack_trace<'a>(
             element,
             b"declaringClass",
             b"Ljava/lang/String;",
-            Value::HostString(loader.storage.alloc_str(&class_name)),
+            Value::HostString(loader.storage.alloc_str(&dotted)),
         )?;
         set_instance_field(
             loader,
@@ -765,7 +1042,10 @@ fn fill_in_stack_trace<'a>(
             element,
             b"fileName",
             b"Ljava/lang/String;",
-            Value::Null,
+            match file_name.as_deref() {
+                Some(name) => Value::HostString(loader.storage.alloc_str(name)),
+                None => Value::Null,
+            },
         )?;
         set_instance_field(
             loader,
@@ -1017,6 +1297,8 @@ pub fn invokeStatic<'a>(
     depth: usize,
 ) -> io::Result<Option<Option<crate::share::interpreter::bytecodeInterpreter::Value<'a>>>> {
     let _rg = crate::share::recprobe::Guard::enter("invokeStatic");
+    let _ng = NativeGuard::enter(owner, name);
+    maybe_dump_stack(loader);
     use super::jvm::Jvm;
     use super::jvmNatives::JvmNatives;
     use crate::share::interpreter::bytecodeInterpreter::Value;
@@ -1050,10 +1332,42 @@ pub fn invokeStatic<'a>(
         }
     }
 
+    if super::perfNatives::is_owner(owner) {
+        if let Some(result) =
+            super::perfNatives::invoke_static(loader, name, descriptor, arguments, output)?
+        {
+            return Ok(Some(result));
+        }
+    }
+
     if let Some(result) =
         super::netNatives::invoke_static(loader, owner, name, descriptor, arguments)?
     {
         return Ok(Some(result));
+    }
+
+    if super::nioBitsNatives::is_owner(owner) {
+        if let Some(result) = super::nioBitsNatives::invoke_static(
+            loader,
+            name,
+            descriptor,
+            arguments,
+            output,
+        )? {
+            return Ok(Some(result));
+        }
+    }
+
+    if super::selectorNatives::is_owner(owner) {
+        if let Some(result) = super::selectorNatives::invoke_static(
+            loader,
+            name,
+            descriptor,
+            arguments,
+            output,
+        )? {
+            return Ok(Some(result));
+        }
     }
 
     if owner == b"jdk/internal/jimage/NativeImageBuffer" {
@@ -1067,6 +1381,16 @@ pub fn invokeStatic<'a>(
             return Ok(Some(result));
         }
     }
+
+    // Resolve inherited natives to their declaring class before dispatch.
+    let resolved_owner;
+    let owner = match native_declaring_owner(loader, owner, name, descriptor) {
+        Some(declaring) => {
+            resolved_owner = declaring;
+            resolved_owner.as_slice()
+        }
+        None => owner,
+    };
 
     let result = match (owner, name, descriptor) {
         (b"java/lang/ProcessEnvironment", b"environmentBlock", b"()Ljava/lang/String;") if cfg!(windows) => {
@@ -1114,6 +1438,20 @@ pub fn invokeStatic<'a>(
         ) => {
             init_stack_trace_elements(loader, arguments)?;
             Some(None)
+        }
+        (b"java/lang/Shutdown", b"beforeHalt", b"()V") => Some(None),
+        (b"java/lang/Shutdown", b"halt0", b"(I)V") => {
+            let status = match arguments.first().copied() {
+                Some(Value::Int(status)) => status,
+                _ => 0,
+            };
+            let _ = std::io::Write::flush(output);
+            let mut frames = Vec::new();
+            crate::share::interpreter::bytecodeInterpreter::for_each_active_frame(
+                &mut |f| frames.push(f.site()),
+            );
+            eprintln!("[halt0] exit status={status} stack={frames:?}");
+            std::process::exit(status)
         }
         (b"java/io/ObjectStreamClass", b"initNative", b"()V") => Some(None),
         (b"java/io/ObjectStreamClass", b"hasStaticInitializer", b"(Ljava/lang/Class;)Z") => {
@@ -1411,14 +1749,38 @@ pub fn invokeStatic<'a>(
             Some(None)
         }
         (b"java/lang/ref/Reference", b"getAndClearReferencePendingList", b"()Ljava/lang/ref/Reference;") => {
-            Some(Some(Value::Null))
+            let head = loader.reference_pending.borrow_mut().take();
+            Some(Some(match head {
+                Some(handle) => Value::Object(handle),
+                None => Value::Null,
+            }))
         }
         (b"java/lang/ref/Reference", b"hasReferencePendingList", b"()Z") => {
-            Some(Some(Value::Int(0)))
+            Some(Some(Value::Int(
+                i32::from(loader.reference_pending.borrow().is_some()),
+            )))
         }
-        (b"java/lang/ref/Reference", b"waitForReferencePendingList", b"()V") => Some(None),
-        (b"jdk/internal/misc/VM", b"initialize", b"()V")
-        | (b"jdk/internal/misc/VM", b"saveAndRemoveProperties", b"()V")
+        (b"java/lang/ref/Reference", b"waitForReferencePendingList", b"()V") => {
+            let pending_empty = { loader.reference_pending.borrow().is_none() };
+            if pending_empty {
+                crate::share::runtime::threading::park(loader, false, 0, output, depth)?;
+            }
+            Some(None)
+        }
+        (b"jdk/internal/misc/VM", b"initialize", b"()V") => {
+            // HotSpot's VM_Initialize processes VM options and ends up calling
+            // VM.saveProperties, whose Java body derives `directMemory` from
+            // the `jdk.nio.MaxDirectMemorySize` property (defaulting to
+            // Runtime.maxMemory()). Without this, Bits.reserveMemory sees the
+            // 64MB clinit default and rejects the ~170MB lib/modules map.
+            if let Ok(vm) = loader.load(b"jdk/internal/misc/VM")
+                && let Ok(cell) = vm.staticField(b"directMemory", b"J")
+            {
+                cell.set(Value::Long(Jvm::max_memory() as i64));
+            }
+            Some(None)
+        }
+        (b"jdk/internal/misc/VM", b"saveAndRemoveProperties", b"()V")
         | (b"jdk/internal/misc/VM", b"initializeOSEnvironment", b"()V") => Some(None),
         (b"jdk/internal/misc/VM", b"saveProperties", b"(Ljava/util/Map;)V") => {
             if let Ok(vm) = loader.load(b"jdk/internal/misc/VM")
@@ -1435,6 +1797,12 @@ pub fn invokeStatic<'a>(
                 cell.set(arguments.first().copied().unwrap_or(Value::Int(0)));
             }
             Some(None)
+        }
+        (b"jdk/internal/vm/ContinuationSupport", b"isSupported0", b"()Z") => {
+            // This VM has no continuation/virtual-thread support; report
+            // the capability honestly so JDK code takes the platform-thread
+            // fallback paths instead of crashing on an unlinked native.
+            Some(Some(Value::Int(0)))
         }
         (b"java/util/concurrent/atomic/AtomicLong", b"VMSupportsCS8", b"()Z") => Some(Some(Value::Int(1))),
         (b"jdk/internal/misc/VM", b"isBooted", b"()Z") => Some(Some(Value::Int(1))),
@@ -1502,9 +1870,21 @@ pub fn invokeStatic<'a>(
             crate::share::runtime::threading::yield_thread(loader, output, depth)?;
             Some(None)
         }
-        (b"java/lang/Thread", b"sleep0", b"(J)V") => {
-            // sleep0 takes nanoseconds (Thread.sleep converts millis via
-            // TimeUnit.MILLISECONDS.toNanos before calling it).
+        (b"java/lang/Thread", b"onSpinWait0", b"(J)V") => {
+            let nanos = match arguments.first() {
+                Some(Value::Long(nanos)) => *nanos,
+                _ => 0,
+            };
+            let spins = (nanos.max(0) as u64 / 64).clamp(1, 8192);
+            for _ in 0..spins {
+                std::hint::spin_loop();
+            }
+            Some(None)
+        }
+        (b"java/lang/Thread", b"sleep0", b"(J)V")
+        | (b"java/lang/Thread", b"sleepNanos0", b"(J)V") => {
+            // sleep0/sleepNanos0 take nanoseconds (Thread.sleep converts
+            // millis via TimeUnit.MILLISECONDS.toNanos before calling it).
             let nanos = match arguments.first() {
                 Some(Value::Long(nanos)) => *nanos,
                 _ => 0,
@@ -1520,18 +1900,32 @@ pub fn invokeStatic<'a>(
             )))))
         }
         (b"java/lang/Thread", b"getThreads", b"()[Ljava/lang/Thread;") => {
-            match current_thread(loader) {
-                Ok(thread) => {
-                    let mut array = crate::share::oops::objArrayOop::ObjArrayOop::withComponent(
-                        1,
-                        b"java/lang/Thread",
-                    )
-                    .unwrap();
-                    array.elements[0] = thread;
-                    Some(Some(Value::ObjectArray(loader.alloc_obj_array(array))))
+            // All live Java threads: registered spawned threads plus the
+            // primordial thread (keyed by its object handle).
+            let mut handles: Vec<usize> = loader
+                .java_threads
+                .borrow()
+                .iter()
+                .filter(|(_, info)| info.state != crate::share::runtime::threading::ThreadState::Finished)
+                .map(|(&handle, _)| handle)
+                .collect();
+            if let Ok(current) = current_thread(loader) {
+                if let Value::Object(handle) = current
+                    && !handles.contains(&handle)
+                {
+                    handles.push(handle);
                 }
-                Err(error) => return Err(error),
             }
+            let mut array =
+                crate::share::oops::objArrayOop::ObjArrayOop::withComponent(
+                    handles.len() as i32,
+                    b"java/lang/Thread",
+                )
+                .unwrap();
+            for (slot, handle) in array.elements.iter_mut().zip(handles) {
+                *slot = Value::Object(handle);
+            }
+            Some(Some(Value::ObjectArray(loader.alloc_obj_array(array))))
         }
         (
             b"java/lang/Thread",
@@ -1643,13 +2037,11 @@ pub fn invokeStatic<'a>(
             Some(Some(Value::ObjectArray(loader.alloc_obj_array(array))))
         }
         (b"jdk/internal/reflect/Reflection", b"getCallerClass", b"()Ljava/lang/Class;") => {
-            let stack = loader.call_stack.borrow();
-            let caller = stack
-                .len()
+            let len = loader.call_stack.len();
+            let caller = len
                 .checked_sub(2)
-                .and_then(|i| stack.get(i))
-                .or_else(|| stack.last())
-                .copied();
+                .and_then(|i| loader.call_stack.get(i))
+                .or_else(|| loader.call_stack.last());
             Some(Some(caller.map(Value::ClassMirror).unwrap_or(Value::Null)))
         }
         (
@@ -1772,7 +2164,6 @@ pub fn invokeStatic<'a>(
             ))))
         }
         (b"jdk/internal/reflect/Reflection", b"getCallerClass", b"(I)Ljava/lang/Class;") => {
-            let stack = loader.call_stack.borrow();
             let depth = arguments
                 .first()
                 .and_then(|value| match value {
@@ -1780,11 +2171,11 @@ pub fn invokeStatic<'a>(
                     _ => None,
                 })
                 .unwrap_or(0);
-            let caller = stack
+            let caller = loader
+                .call_stack
                 .len()
                 .checked_sub(depth + 2)
-                .and_then(|i| stack.get(i))
-                .copied();
+                .and_then(|i| loader.call_stack.get(i));
             Some(Some(caller.map(Value::ClassMirror).unwrap_or(Value::Null)))
         }
         (b"jdk/internal/jimage/NativeImageBuffer", b"getNativeMap", b"(Ljava/lang/String;)Ljava/nio/ByteBuffer;") => {
@@ -1800,8 +2191,25 @@ pub fn invokeStatic<'a>(
                 None => return Ok(None),
             }
         }
+        _ if owner == b"java/lang/ProcessImpl"
+            || owner == b"java/lang/ProcessHandleImpl"
+            || owner == b"java/lang/ProcessHandleImpl$Info" =>
+        {
+            match super::processNatives::statik(loader, owner, name, descriptor, arguments)? {
+                Some(_value) if descriptor.ends_with(b")V") => Some(None),
+                Some(value) => Some(Some(value)),
+                None => return Ok(None),
+            }
+        }
         _ if owner == b"sun/nio/fs/WindowsNativeDispatcher" => {
             match super::nioFileNatives::dispatcher(loader, name, descriptor, arguments)? {
+                Some(_value) if descriptor.ends_with(b")V") => Some(None),
+                Some(value) => Some(Some(value)),
+                None => return Ok(None),
+            }
+        }
+        _ if owner == b"java/nio/MappedMemoryUtils" => {
+            match super::nioFileNatives::mapped_memory_utils(loader, name, descriptor, arguments)? {
                 Some(_value) if descriptor.ends_with(b")V") => Some(None),
                 Some(value) => Some(Some(value)),
                 None => return Ok(None),

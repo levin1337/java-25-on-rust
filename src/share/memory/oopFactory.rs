@@ -10,12 +10,12 @@ use crate::share::oops::{
     typeArrayOop::TypeArrayOop,
 };
 use std::io;
-use std::rc::Rc;
+use std::sync::Arc;
 
 pub struct OopFactory;
 
 impl OopFactory {
-    pub fn new_instance<'a>(klass: Rc<InstanceKlass<'a>>) -> io::Result<InstanceOop<'a>> {
+    pub fn new_instance<'a>(klass: Arc<InstanceKlass<'a>>) -> io::Result<InstanceOop<'a>> {
         InstanceOop::new(klass)
     }
 

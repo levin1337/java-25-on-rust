@@ -187,6 +187,7 @@ impl NativeLibraries {
         // whose JNI_OnLoad expects HotSpot internals we do not reproduce.
         if let Some(on_load) = on_load {
             if std::env::var_os("JVM25_SKIP_JNI_ONLOAD").is_none() {
+                eprintln!("[jniload] {}", path.display());
                 let vm = crate::share::prims::jniInvocation::JavaVm::global();
                 let _env = unsafe { &*vm }.ensure_attached();
                 let result = unsafe { on_load(vm, std::ptr::null_mut()) };

@@ -24,7 +24,7 @@ use crate::share::{
     runtime::reflection::Reflection,
 };
 use std::io::{self, Error};
-use std::rc::Rc;
+use std::sync::Arc;
 
 type NativeResult<'a> = Option<Option<Value<'a>>>;
 
@@ -158,6 +158,7 @@ fn string_value<'a>(loader: &ClassLoader<'a>, text: &str) -> Value<'a> {
 
 fn java_string<'a>(loader: &ClassLoader<'a>, value: Value<'a>) -> io::Result<String> {
     let Some(text) = stringNatives::string(loader, value)? else {
+        if std::env::var_os("JVM25_TRACE_STR").is_some() { eprintln!("[str-fail-refl]"); }
         return Err(invalid("Expected java.lang.String"));
     };
     Ok(text.into_owned())
@@ -319,11 +320,11 @@ fn member_string<'a>(loader: &ClassLoader<'a>, value: Value<'a>) -> io::Result<V
 fn klass_of<'a>(
     loader: &ClassLoader<'a>,
     handle: usize,
-) -> io::Result<Rc<InstanceKlass<'a>>> {
+) -> io::Result<Arc<InstanceKlass<'a>>> {
     let objects = loader.borrow_objects();
     objects
         .get(handle)
-        .map(|object| Rc::clone(&object.klass))
+        .map(|object| Arc::clone(&object.klass))
         .ok_or_else(|| invalid("Invalid object"))
 }
 
@@ -435,7 +436,7 @@ fn unbox<'a>(loader: &ClassLoader<'a>, value: Value<'a>) -> io::Result<(u8, Valu
         let object = objects
             .get(handle)
             .ok_or_else(|| invalid("Invalid object"))?;
-        (Rc::clone(&object.klass), object.klass.class.name)
+        (Arc::clone(&object.klass), object.klass.class.name)
     };
     let internal = String::from_utf8_lossy(name);
     let Some(tag) = Reflection::unbox_target_descriptor(internal.as_ref()) else {
@@ -573,14 +574,14 @@ fn find_declared<'k, 'a>(
 fn receiver_klass<'a>(
     loader: &ClassLoader<'a>,
     receiver: Value<'a>,
-) -> io::Result<Rc<InstanceKlass<'a>>> {
+) -> io::Result<Arc<InstanceKlass<'a>>> {
     match receiver {
         Value::Null => Err(npe(loader)),
         Value::Object(handle) => {
             let objects = loader.borrow_objects();
             objects
                 .get(handle)
-                .map(|object| Rc::clone(&object.klass))
+                .map(|object| Arc::clone(&object.klass))
                 .ok_or_else(|| npe(loader))
         }
         Value::ClassMirror(_) => loader.load(b"java/lang/Class"),
@@ -619,7 +620,7 @@ fn invoke_resolved_value<'a>(
         if find_declared(&declaring_klass, name, &descriptor).is_none() {
             return Err(iae(loader, "Cannot find private method"));
         }
-        Rc::clone(&declaring_klass)
+        Arc::clone(&declaring_klass)
     } else {
         let receiver_klass = receiver_klass(loader, receiver)?;
         LinkResolver::resolve_virtual_call(&receiver_klass, name, &descriptor).map_err(|error| {
@@ -1322,6 +1323,7 @@ fn method_matches(member: &Member<'_>, parameters: &[Vec<u8>]) -> bool {
             .all(|(expected, actual)| *expected == actual.as_slice())
 }
 
+#[allow(dead_code)]
 fn is_synthetic(member: &Member<'_>) -> bool {
     u32::from(member.accessFlags) & ACC_SYNTHETIC != 0
 }
@@ -1338,7 +1340,6 @@ fn find_declared_method(
         member.name == name
             && member.name != b"<init>"
             && member.name != b"<clinit>"
-            && !is_synthetic(member)
             && (!public_only || member.accessFlags & ACC_PUBLIC != 0)
             && method_matches(member, parameters)
     })
@@ -1351,13 +1352,13 @@ fn find_public_method<'a>(
     class: &'a [u8],
     name: &[u8],
     parameters: &[Vec<u8>],
-) -> io::Result<Option<(Rc<InstanceKlass<'a>>, usize)>> {
+) -> io::Result<Option<(Arc<InstanceKlass<'a>>, usize)>> {
     let root = if class.starts_with(b"[") || class.starts_with(b":") {
         loader.load(b"java/lang/Object")?
     } else {
         loader.load(class)?
     };
-    let mut current = Some(Rc::clone(&root));
+    let mut current = Some(Arc::clone(&root));
     while let Some(klass) = current {
         if let Some(index) = find_declared_method(&klass, name, parameters, true) {
             return Ok(Some((klass, index)));
@@ -1366,7 +1367,7 @@ fn find_public_method<'a>(
     }
     // Interface methods (including defaults) are only visible when no
     // class in the hierarchy provides the method.
-    let mut pending: Vec<Rc<InstanceKlass<'a>>> = root.interfaces.clone();
+    let mut pending: Vec<Arc<InstanceKlass<'a>>> = root.interfaces.clone();
     let mut seen: std::collections::HashSet<&'a [u8]> = std::collections::HashSet::new();
     while let Some(iface) = pending.pop() {
         if !seen.insert(iface.class.name) {
@@ -1385,37 +1386,36 @@ fn find_public_method<'a>(
 fn public_methods<'a>(
     loader: &ClassLoader<'a>,
     class: &'a [u8],
-) -> io::Result<Vec<(Rc<InstanceKlass<'a>>, usize)>> {
+) -> io::Result<Vec<(Arc<InstanceKlass<'a>>, usize)>> {
     let root = if class.starts_with(b"[") || class.starts_with(b":") {
         loader.load(b"java/lang/Object")?
     } else {
         loader.load(class)?
     };
-    let mut result: Vec<(Rc<InstanceKlass<'a>>, usize)> = Vec::new();
+    let mut result: Vec<(Arc<InstanceKlass<'a>>, usize)> = Vec::new();
     let mut seen: std::collections::HashSet<(Vec<u8>, Vec<u8>)> =
         std::collections::HashSet::new();
-    let push = |klass: &Rc<InstanceKlass<'a>>,
-                    result: &mut Vec<(Rc<InstanceKlass<'a>>, usize)>,
+    let push = |klass: &Arc<InstanceKlass<'a>>,
+                    result: &mut Vec<(Arc<InstanceKlass<'a>>, usize)>,
                     seen: &mut std::collections::HashSet<(Vec<u8>, Vec<u8>)>| {
         for (index, member) in klass.class.methods.iter().enumerate() {
             if member.name == b"<init>"
                 || member.name == b"<clinit>"
-                || is_synthetic(member)
                 || member.accessFlags & ACC_PUBLIC == 0
             {
                 continue;
             }
             if seen.insert((member.name.to_vec(), member.descriptor.to_vec())) {
-                result.push((Rc::clone(klass), index));
+                result.push((Arc::clone(klass), index));
             }
         }
     };
-    let mut current = Some(Rc::clone(&root));
+    let mut current = Some(Arc::clone(&root));
     while let Some(klass) = current {
         push(&klass, &mut result, &mut seen);
         current = klass.super_klass();
     }
-    let mut pending: Vec<Rc<InstanceKlass<'a>>> = root.interfaces.clone();
+    let mut pending: Vec<Arc<InstanceKlass<'a>>> = root.interfaces.clone();
     let mut visited: std::collections::HashSet<&'a [u8]> = std::collections::HashSet::new();
     while let Some(iface) = pending.pop() {
         if !visited.insert(iface.class.name) {
@@ -1429,14 +1429,13 @@ fn public_methods<'a>(
 
 fn declared_methods<'a>(
     loader: &ClassLoader<'a>,
-    klass: &Rc<InstanceKlass<'a>>,
+    klass: &Arc<InstanceKlass<'a>>,
     public_only: bool,
 ) -> io::Result<Value<'a>> {
     let mut handles = Vec::new();
     for (index, member) in klass.class.methods.iter().enumerate() {
         if member.name == b"<init>"
             || member.name == b"<clinit>"
-            || is_synthetic(member)
             || (public_only && member.accessFlags & ACC_PUBLIC == 0)
         {
             continue;
@@ -1455,7 +1454,6 @@ fn find_declared_field(
 ) -> Option<usize> {
     klass.class.fields.iter().position(|field| {
         field.name == name
-            && !is_synthetic(field)
             && (!public_only || field.accessFlags & ACC_PUBLIC != 0)
     })
 }
@@ -1466,20 +1464,20 @@ fn find_public_field<'a>(
     loader: &ClassLoader<'a>,
     class: &'a [u8],
     name: &[u8],
-) -> io::Result<Option<(Rc<InstanceKlass<'a>>, usize)>> {
+) -> io::Result<Option<(Arc<InstanceKlass<'a>>, usize)>> {
     let root = if class.starts_with(b"[") || class.starts_with(b":") {
         loader.load(b"java/lang/Object")?
     } else {
         loader.load(class)?
     };
-    let mut current = Some(Rc::clone(&root));
+    let mut current = Some(Arc::clone(&root));
     while let Some(klass) = current {
         if let Some(index) = find_declared_field(&klass, name, true) {
             return Ok(Some((klass, index)));
         }
         current = klass.super_klass();
     }
-    let mut pending: Vec<Rc<InstanceKlass<'a>>> = root.interfaces.clone();
+    let mut pending: Vec<Arc<InstanceKlass<'a>>> = root.interfaces.clone();
     let mut seen: std::collections::HashSet<&'a [u8]> = std::collections::HashSet::new();
     while let Some(iface) = pending.pop() {
         if !seen.insert(iface.class.name) {
@@ -1496,32 +1494,32 @@ fn find_public_field<'a>(
 fn public_fields<'a>(
     loader: &ClassLoader<'a>,
     class: &'a [u8],
-) -> io::Result<Vec<(Rc<InstanceKlass<'a>>, usize)>> {
+) -> io::Result<Vec<(Arc<InstanceKlass<'a>>, usize)>> {
     let root = if class.starts_with(b"[") || class.starts_with(b":") {
         loader.load(b"java/lang/Object")?
     } else {
         loader.load(class)?
     };
-    let mut result: Vec<(Rc<InstanceKlass<'a>>, usize)> = Vec::new();
+    let mut result: Vec<(Arc<InstanceKlass<'a>>, usize)> = Vec::new();
     let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
-    let push = |klass: &Rc<InstanceKlass<'a>>,
-                    result: &mut Vec<(Rc<InstanceKlass<'a>>, usize)>,
+    let push = |klass: &Arc<InstanceKlass<'a>>,
+                    result: &mut Vec<(Arc<InstanceKlass<'a>>, usize)>,
                     seen: &mut std::collections::HashSet<Vec<u8>>| {
         for (index, field) in klass.class.fields.iter().enumerate() {
-            if is_synthetic(field) || field.accessFlags & ACC_PUBLIC == 0 {
+            if field.accessFlags & ACC_PUBLIC == 0 {
                 continue;
             }
             if seen.insert(field.name.to_vec()) {
-                result.push((Rc::clone(klass), index));
+                result.push((Arc::clone(klass), index));
             }
         }
     };
-    let mut current = Some(Rc::clone(&root));
+    let mut current = Some(Arc::clone(&root));
     while let Some(klass) = current {
         push(&klass, &mut result, &mut seen);
         current = klass.super_klass();
     }
-    let mut pending: Vec<Rc<InstanceKlass<'a>>> = root.interfaces.clone();
+    let mut pending: Vec<Arc<InstanceKlass<'a>>> = root.interfaces.clone();
     let mut visited: std::collections::HashSet<&'a [u8]> = std::collections::HashSet::new();
     while let Some(iface) = pending.pop() {
         if !visited.insert(iface.class.name) {
@@ -1535,12 +1533,12 @@ fn public_fields<'a>(
 
 fn declared_fields<'a>(
     loader: &ClassLoader<'a>,
-    klass: &Rc<InstanceKlass<'a>>,
+    klass: &Arc<InstanceKlass<'a>>,
     public_only: bool,
 ) -> io::Result<Value<'a>> {
     let mut handles = Vec::new();
     for (index, member) in klass.class.fields.iter().enumerate() {
-        if is_synthetic(member) || (public_only && member.accessFlags & ACC_PUBLIC == 0) {
+        if public_only && member.accessFlags & ACC_PUBLIC == 0 {
             continue;
         }
         let _ = index;
@@ -1551,13 +1549,12 @@ fn declared_fields<'a>(
 
 fn find_constructor<'a>(
     _loader: &ClassLoader<'a>,
-    klass: &Rc<InstanceKlass<'a>>,
+    klass: &Arc<InstanceKlass<'a>>,
     parameters: &[Vec<u8>],
     public_only: bool,
 ) -> Option<usize> {
     klass.class.methods.iter().position(|member| {
         member.name == b"<init>"
-            && !is_synthetic(member)
             && (!public_only || member.accessFlags & ACC_PUBLIC != 0)
             && method_matches(member, parameters)
     })
@@ -1565,12 +1562,12 @@ fn find_constructor<'a>(
 
 fn constructors_array<'a>(
     loader: &ClassLoader<'a>,
-    klass: &Rc<InstanceKlass<'a>>,
+    klass: &Arc<InstanceKlass<'a>>,
     public_only: bool,
 ) -> io::Result<Value<'a>> {
     let mut handles = Vec::new();
     for (index, member) in klass.class.methods.iter().enumerate() {
-        if member.name != b"<init>" || is_synthetic(member) {
+        if member.name != b"<init>" {
             continue;
         }
         if public_only && member.accessFlags & ACC_PUBLIC == 0 {
@@ -1763,7 +1760,6 @@ fn class_java_method<'a>(
         (b"getRecordComponents", b"()[Ljava/lang/reflect/RecordComponent;") => {
             class_array(loader, &[]).ok()
         }
-        (b"getProtectionDomain", b"()Ljava/security/ProtectionDomain;") => Some(Value::Null),
         (b"getAnnotations", b"()[Ljava/lang/annotation/Annotation;")
         | (b"getDeclaredAnnotations", b"()[Ljava/lang/annotation/Annotation;") => {
             member_array(loader, b"java/lang/annotation/Annotation", Vec::new()).ok()
@@ -2074,6 +2070,15 @@ fn enum_constants<'a>(loader: &ClassLoader<'a>, class: &'a [u8]) -> io::Result<V
             .super_klass()
             .is_some_and(|super_klass| super_klass.class.name == b"java/lang/Enum")
     {
+        // Enum constant fields are populated by <clinit>; a bare `Level.class`
+        // literal does not initialize the class, so run it before reading the
+        // static fields (JVMS: values() would trigger initialization).
+        let _ = crate::share::interpreter::bytecodeInterpreter::initialize(
+            loader,
+            &klass,
+            &mut io::sink(),
+            0,
+        );
         is_enum = true;
         let self_descriptor = format!("L{};", String::from_utf8_lossy(class));
         let self_descriptor = loader.storage.alloc_str(&self_descriptor);
@@ -2421,9 +2426,6 @@ pub(crate) fn class_invoke<'a>(
                 if only_public && member.accessFlags & ACC_PUBLIC == 0 {
                     continue;
                 }
-                if u32::from(member.accessFlags) & ACC_SYNTHETIC != 0 {
-                    continue;
-                }
                 handles.push(new_field_object(loader, klass, member)?);
             }
             member_array(loader, b"java/lang/reflect/Field", handles)?
@@ -2437,7 +2439,6 @@ pub(crate) fn class_invoke<'a>(
             for (index, member) in klass.class.methods.iter().enumerate() {
                 if member.name == b"<init>"
                     || member.name == b"<clinit>"
-                    || u32::from(member.accessFlags) & ACC_SYNTHETIC != 0
                     || (only_public && member.accessFlags & ACC_PUBLIC == 0)
                 {
                     continue;
@@ -2454,7 +2455,6 @@ pub(crate) fn class_invoke<'a>(
             let mut handles = Vec::new();
             for (index, member) in klass.class.methods.iter().enumerate() {
                 if member.name != b"<init>"
-                    || u32::from(member.accessFlags) & ACC_SYNTHETIC != 0
                     || (only_public && member.accessFlags & ACC_PUBLIC == 0)
                 {
                     continue;

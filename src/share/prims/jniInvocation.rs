@@ -108,6 +108,13 @@ struct JvmState {
     fields: HashMap<u64, JniFieldId>,
     next_id: u64,
     natives: HashMap<(Vec<u8>, Vec<u8>, Vec<u8>), NativeCode>,
+    /// (owner, name, descriptor, is_static) -> whether the Java method is
+    /// declared `native`. Keys are (ptr, len) of the class-file slices —
+    /// bump-allocated and stable for the VM lifetime, so lookups need no
+    /// allocation on the hot path.
+    method_native: HashMap<(usize, usize, usize, usize, usize, usize, bool), Option<bool>>,
+    /// Methods with no DLL export; avoids repeated symbol lookups.
+    native_misses: HashSet<(Vec<u8>, Vec<u8>, Vec<u8>)>,
     trampoline_cache: HashMap<(usize, Vec<u8>), NativeCode>,
     attached: HashSet<ThreadId>,
     monitors: HashMap<(u8, usize), Arc<Mutex<()>>>,
@@ -920,7 +927,7 @@ fn class_token(env: *mut NativeEnvironment, name: &[u8]) -> *mut c_void {
 fn class_klass<'a>(
     loader: &ClassLoader<'a>,
     name: &[u8],
-) -> io::Result<Option<std::rc::Rc<crate::share::oops::instanceKlass::InstanceKlass<'a>>>> {
+) -> io::Result<Option<std::sync::Arc<crate::share::oops::instanceKlass::InstanceKlass<'a>>>> {
     if name.starts_with(b":") {
         return Ok(None);
     }
@@ -1117,29 +1124,55 @@ fn jclass_klass<'a>(
     env: *mut NativeEnvironment,
     loader: &ClassLoader<'a>,
     token: *mut c_void,
-) -> io::Result<Option<std::rc::Rc<crate::share::oops::instanceKlass::InstanceKlass<'a>>>> {
+) -> io::Result<Option<std::sync::Arc<crate::share::oops::instanceKlass::InstanceKlass<'a>>>> {
     let name = class_name_of(env, token)?;
     class_klass(loader, &name)
 }
 
-fn find_method<'a>(
+fn method_declared<'a>(
     klass: &crate::share::oops::instanceKlass::InstanceKlass<'a>,
     name: &[u8],
     sig: &[u8],
     is_static: bool,
 ) -> bool {
-    let mut current = Some(klass);
-    while let Some(k) = current {
-        if k.class.methods.iter().any(|method| {
-            method.name == name
-                && method.descriptor == sig
-                && (method.accessFlags & 0x0008 != 0) == is_static
-        }) {
+    klass.class.methods.iter().any(|method| {
+        method.name == name
+            && method.descriptor == sig
+            && (method.accessFlags & 0x0008 != 0) == is_static
+    })
+}
+
+fn find_method<'a>(
+    klass: &std::sync::Arc<crate::share::oops::instanceKlass::InstanceKlass<'a>>,
+    name: &[u8],
+    sig: &[u8],
+    is_static: bool,
+) -> bool {
+    fn search<'a>(
+        klass: &std::sync::Arc<crate::share::oops::instanceKlass::InstanceKlass<'a>>,
+        name: &[u8],
+        sig: &[u8],
+        is_static: bool,
+        visited: &mut HashSet<usize>,
+    ) -> bool {
+        if !visited.insert(std::sync::Arc::as_ptr(klass) as usize) {
+            return false;
+        }
+        if method_declared(klass, name, sig, is_static) {
             return true;
         }
-        current = k.super_klass.as_deref();
+        if let Some(parent) = &klass.super_klass
+            && search(parent, name, sig, is_static, visited)
+        {
+            return true;
+        }
+        klass
+            .interfaces
+            .iter()
+            .any(|iface| search(iface, name, sig, is_static, visited))
     }
-    false
+    let mut visited = HashSet::new();
+    search(klass, name, sig, is_static, &mut visited)
 }
 
 fn register_method_id(
@@ -1674,6 +1707,10 @@ unsafe fn jni_get_method_id_impl(
     let (Some(name), Some(sig)) = (cstr_bytes(name), cstr_bytes(sig)) else {
         return ptr::null_mut();
     };
+    if name == b"<init>" || name == b"<clinit>" {
+        throw_error(env, b"java/lang/NoSuchMethodError", None);
+        return ptr::null_mut();
+    }
     let Some(vm) = (unsafe { vm_of(env) }) else {
         return ptr::null_mut();
     };
@@ -2415,7 +2452,7 @@ fn invoke_java_method(
                         .objects
                         .borrow()
                         .get(*handle)
-                        .map(|o| std::rc::Rc::clone(&o.klass))
+                        .map(|o| std::sync::Arc::clone(&o.klass))
                         .ok_or_else(|| Error::other("Invalid receiver"))?,
                     Value::ObjectArray(handle) => {
                         // Arrays only support clone(); handled by interpreter.
@@ -3849,26 +3886,94 @@ unsafe extern "system" fn jni_exception_check(env: *mut NativeEnvironment) -> u8
     u8::from(pending(env))
 }
 
+/// Reads a `long`/`int` instance field (walking the hierarchy via
+/// `instanceField`) from a direct `ByteBuffer`/`MappedByteBuffer` object.
+fn buffer_field_i64(
+    loader: &ClassLoader<'_>,
+    handle: usize,
+    name: &[u8],
+    desc: &[u8],
+) -> Option<i64> {
+    let objects = loader.borrow_objects();
+    let object = objects.get(handle)?;
+    let slot = object.klass.instanceField(name, desc).ok()?;
+    match object.fields.get(slot) {
+        Some(Value::Long(value)) => Some(*value),
+        Some(Value::Int(value)) => Some(i64::from(*value)),
+        _ => None,
+    }
+}
+
 unsafe extern "system" fn jni_new_direct_byte_buffer(
-    _env: *mut NativeEnvironment,
-    _address: *mut c_void,
-    _capacity: i64,
+    env: *mut NativeEnvironment,
+    address: *mut c_void,
+    capacity: i64,
 ) -> JniObject {
-    ptr::null_mut()
+    let Some(vm) = (unsafe { vm_of(env) }) else {
+        return ptr::null_mut();
+    };
+    let Some(loader) = vm.class_loader() else {
+        return ptr::null_mut();
+    };
+    let Ok(klass) = loader.load(b"java/nio/DirectByteBuffer") else {
+        return ptr::null_mut();
+    };
+    let Ok(object) = crate::share::oops::instanceOop::InstanceOop::new(klass.clone()) else {
+        return ptr::null_mut();
+    };
+    let handle = loader.alloc_object(object);
+    let set = |name: &[u8], desc: &[u8], value: Value<'static>| {
+        let _ = super::nativeLookup::set_instance_field(loader, handle, name, desc, value);
+    };
+    let addr = address as usize as u64 as i64;
+    set(b"address", b"J", Value::Long(addr));
+    set(b"capacity", b"I", Value::Int(capacity as i32));
+    set(b"position", b"I", Value::Int(0));
+    set(b"limit", b"I", Value::Int(capacity as i32));
+    set(b"mark", b"I", Value::Int(-1));
+    let _ = klass;
+    new_local(env, JniRefTarget::Object(Oop::Instance(handle)))
 }
 
 unsafe extern "system" fn jni_get_direct_buffer_address(
-    _env: *mut NativeEnvironment,
-    _buf: JniObject,
+    env: *mut NativeEnvironment,
+    buf: JniObject,
 ) -> *mut c_void {
-    ptr::null_mut()
+    let Ok(oop) = (unsafe { resolve_oop(env, buf) }) else {
+        return ptr::null_mut();
+    };
+    let Oop::Instance(handle) = oop else {
+        return ptr::null_mut();
+    };
+    let Some(vm) = (unsafe { vm_of(env) }) else {
+        return ptr::null_mut();
+    };
+    let Some(loader) = vm.class_loader() else {
+        return ptr::null_mut();
+    };
+    match buffer_field_i64(loader, handle, b"address", b"J") {
+        Some(address) if address != 0 => address as usize as *mut c_void,
+        _ => ptr::null_mut(),
+    }
 }
 
 unsafe extern "system" fn jni_get_direct_buffer_capacity(
-    _env: *mut NativeEnvironment,
-    _buf: JniObject,
+    env: *mut NativeEnvironment,
+    buf: JniObject,
 ) -> i64 {
-    -1
+    let Ok(oop) = (unsafe { resolve_oop(env, buf) }) else {
+        return -1;
+    };
+    let Oop::Instance(handle) = oop else {
+        return -1;
+    };
+    let Some(vm) = (unsafe { vm_of(env) }) else {
+        return -1;
+    };
+    let Some(loader) = vm.class_loader() else {
+        return -1;
+    };
+    buffer_field_i64(loader, handle, b"capacity", b"I").unwrap_or(-1)
 }
 
 unsafe extern "system" fn jni_get_object_ref_type(
@@ -4042,6 +4147,38 @@ pub fn has_native_implementation(vm: &JavaVm, class_name: &[u8], name: &[u8], si
         .contains_key(&(class_name.to_vec(), name.to_vec(), sig.to_vec()))
 }
 
+/// Whether `owner.name(descriptor)` is declared with `ACC_NATIVE`, walking
+/// the superclass chain for instance methods. Used to skip JNI symbol
+/// resolution for ordinary bytecode methods.
+/// `Some(true)`/`Some(false)` when the owner class loads and the method
+/// is/isn't declared `native`; `None` when the class cannot be loaded
+/// (synthetic dispatch, tests) — callers must fall back to symbol
+/// resolution in that case.
+fn method_is_native(
+    loader: &ClassLoader<'_>,
+    owner: &[u8],
+    name: &[u8],
+    descriptor: &[u8],
+    is_static: bool,
+) -> Option<bool> {
+    let mut klass = loader.load(owner).ok()?;
+    loop {
+        let found = klass.class.methods.iter().any(|method| {
+            method.name == name
+                && method.descriptor == descriptor
+                && (method.accessFlags & 0x0008 != 0) == is_static
+                && method.accessFlags & 0x0100 != 0
+        });
+        if found {
+            return Some(true);
+        }
+        match klass.super_klass.clone() {
+            Some(parent) => klass = parent,
+            None => return Some(false),
+        }
+    }
+}
+
 /// Resolves and invokes a native method implemented by a loaded DLL.
 ///
 /// Lookup order mirrors HotSpot's NativeLookup: first methods registered via
@@ -4069,7 +4206,39 @@ pub fn invoke_dll_native(
         .class_loader()
         .ok_or_else(|| Error::other("No class loader bound"))?;
 
+    // Fast path: only methods actually declared `native` can have a DLL
+    // implementation. The cache key borrows the (bump-stable) class-file
+    // slices by pointer so ordinary calls allocate nothing here.
+    let method_key = (
+        owner.as_ptr() as usize,
+        owner.len(),
+        name.as_ptr() as usize,
+        name.len(),
+        descriptor.as_ptr() as usize,
+        descriptor.len(),
+        is_static,
+    );
+    let cached_native = vm.state().method_native.get(&method_key).copied();
+    let is_native = match cached_native {
+        Some(value) => value,
+        None => {
+            // NOTE: no JvmState lock may be held here — class loading can
+            // re-enter the interpreter and this function.
+            let value = method_is_native(loader, owner, name, descriptor, is_static);
+            vm.state().method_native.insert(method_key, value);
+            value
+        }
+    };
+    // Only a provably non-native method skips DLL resolution; `None`
+    // (unloadable owner) falls through to symbol lookup.
+    if is_native == Some(false) {
+        return Ok(None);
+    }
+
     let key = (owner.to_vec(), name.to_vec(), descriptor.to_vec());
+    if vm.state().native_misses.contains(&key) {
+        return Ok(None);
+    }
     let code =
         if let Some(code) = vm.state().natives.get(&key).cloned() {
             code
@@ -4080,6 +4249,7 @@ pub fn invoke_dll_native(
             let Some(func) = super::nativeLibraries::NativeLibraries::global()
                 .resolve_native_function(&class_name, &method_name, &sig)
             else {
+                vm.state().native_misses.insert(key.clone());
                 return Ok(None);
             };
             let code = trampoline_for(vm, func, descriptor, is_static)?;
@@ -4098,6 +4268,8 @@ pub fn invoke_dll_native(
             None => (None, &[][..]),
         }
     };
+
+    vm.references().pushFrame();
 
     let mut ctx = CallContext {
         func: code.func,
@@ -4133,6 +4305,22 @@ pub fn invoke_dll_native(
         unsafe { std::mem::transmute(code.trampoline) };
     let raw = unsafe { trampoline(&ctx) };
 
+    let result_token = if ret_kind == Some(4) {
+        match vm
+            .references()
+            .popFrame(JniReference::fromRaw(raw as *mut c_void))
+        {
+            Ok(popped) => JniReference::intoRaw(popped),
+            Err(_) => {
+                let _ = vm.references().popFrameVoid();
+                ptr::null_mut()
+            }
+        }
+    } else {
+        let _ = vm.references().popFrameVoid();
+        ptr::null_mut()
+    };
+
     if pending(env)
         && let Some(error) = take_pending_error(env, loader)
     {
@@ -4144,10 +4332,7 @@ pub fn invoke_dll_native(
         Some(1) => Value::Long(raw as i64),
         Some(2) => Value::Float(f32::from_bits(raw as u32)),
         Some(3) => Value::Double(f64::from_bits(raw)),
-        Some(4) => {
-            let token = raw as *mut c_void;
-            token_to_value(env, loader, token).unwrap_or(Value::Null)
-        }
+        Some(4) => token_to_value(env, loader, result_token).unwrap_or(Value::Null),
         _ => Value::Int(raw as u32 as i32),
     };
     Ok(Some(Some(value)))

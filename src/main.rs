@@ -40,7 +40,8 @@ fn inspect() -> Result<(), Box<dyn Error>> {
         return inspectClass(Path::new(&target));
     }
 
-    let storage = bumpalo::Bump::new();
+    let storage: &'static jvm25_rust::share::runtime::syncBump::SyncBump =
+        Box::leak(Box::new(jvm25_rust::share::runtime::syncBump::SyncBump::new()));
     let (mut loader, name) = if target == "-jar" {
         let path = arguments
             .next()
@@ -71,8 +72,9 @@ fn inspect() -> Result<(), Box<dyn Error>> {
             .to_str()
             .filter(|name| !name.is_empty() && !name.starts_with('-'))
             .ok_or_else(|| io::Error::other("Invalid main class"))?;
-        let mut loader = ClassLoader::open_classpath(classpath, &storage)?;
-        loader.setSystemProperty("java.class.path", classpath)?;
+        let classpath = expand_classpath_wildcards(classpath);
+        let mut loader = ClassLoader::open_classpath(&classpath, &storage)?;
+        loader.setSystemProperty("java.class.path", &classpath)?;
         (loader, name.replace('.', "/"))
     };
     if let Some(modules) = modules {
@@ -94,8 +96,47 @@ fn inspect() -> Result<(), Box<dyn Error>> {
     let arguments: Vec<_> = arguments
         .map(|argument| argument.to_string_lossy().into_owned())
         .collect();
-    javaCalls::mainClass(&loader, &name, &arguments, &mut io::stdout().lock())?;
+    let loader = std::sync::Arc::new(loader);
+    jvm25_rust::share::runtime::threading::install_loader(loader.clone());
+    let arguments: &'static [String] = Box::leak(arguments.into_boxed_slice());
+    let mut out = jvm25_rust::share::runtime::jvmOut::JvmOut::stdout();
+    jvm25_rust::share::runtime::jvmOut::install(&out);
+    javaCalls::mainClass(loader.as_ref(), &name, arguments, &mut out)?;
     Ok(())
+}
+
+/// Expands `dir/*` classpath elements into the sorted list of JAR files they
+/// contain, matching `java` launcher semantics. The expanded form is what the
+/// JDK's own `URLClassPath` sees via `java.class.path`, so entries must not
+/// retain the literal `*` (Win32 canonicalization rejects it).
+fn expand_classpath_wildcards(classpath: &str) -> String {
+    let separator = if cfg!(windows) { ';' } else { ':' };
+    let mut expanded = Vec::new();
+    for entry in classpath.split(separator) {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let path = Path::new(entry);
+        if path.file_name().is_some_and(|name| name == "*") {
+            if let Some(dir) = path.parent()
+                && let Ok(entries) = fs::read_dir(dir)
+            {
+                let mut jars: Vec<_> = entries
+                    .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+                    .filter(|path| {
+                        path.extension()
+                            .is_some_and(|ext| ext.eq_ignore_ascii_case("jar"))
+                    })
+                    .collect();
+                jars.sort();
+                expanded.extend(jars.iter().map(|jar| jar.to_string_lossy().into_owned()));
+            }
+        } else {
+            expanded.push(entry.to_owned());
+        }
+    }
+    expanded.join(&separator.to_string())
 }
 
 fn inspectClass(path: &Path) -> Result<(), Box<dyn Error>> {
@@ -113,10 +154,40 @@ fn inspectClass(path: &Path) -> Result<(), Box<dyn Error>> {
 }
 
 fn main() -> ExitCode {
+    std::panic::set_hook(Box::new(|info| {
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}", l.file(), l.line()))
+            .unwrap_or_default();
+        let message = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "non-string panic".to_string());
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(r"D:\jvm25-rust\panic.log")
+        {
+            use std::io::Write;
+            let _ = writeln!(
+                file,
+                "[panic] tid={:?} at {location}: {message}",
+                std::thread::current().id()
+            );
+        }
+        eprintln!("thread panicked at {location}: {message}");
+    }));
     // The bytecode interpreter recurses per Java call; give it a large stack
-    // like a real JVM thread would have.
+    // like a real JVM thread would have. JVM25_STACK_MB overrides the size
+    // for memory-constrained machines.
+    let stack_mb: usize = std::env::var("JVM25_STACK_MB")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1024);
     let worker = std::thread::Builder::new()
-        .stack_size(1024 * 1024 * 1024)
+        .stack_size(stack_mb * 1024 * 1024)
         .spawn(|| inspect().map_err(|error| error.to_string()));
     let result = match worker {
         Ok(handle) => handle.join().unwrap_or_else(|_| {

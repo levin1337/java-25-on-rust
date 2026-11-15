@@ -1,7 +1,11 @@
 use crate::share::{
-    classfile::{classFileParser::decodeString, classLoader::ClassLoader},
-    interpreter::bytecodeInterpreter::Value,
+    classfile::{
+        classFileParser::decodeString,
+        classLoader::{ClassLoader, ClassOrigin},
+    },
+    interpreter::bytecodeInterpreter::{self, Value},
     oops::instanceOop::InstanceOop,
+    runtime::javaCalls::{JavaCallArguments, JavaCalls},
 };
 use std::io;
 
@@ -295,7 +299,7 @@ pub(crate) fn invoke<'a>(
             if !ok {
                 let stack = loader
                     .call_stack
-                    .borrow()
+                    .snapshot()
                     .iter()
                     .rev()
                     .take(6)
@@ -341,7 +345,7 @@ pub(crate) fn invoke<'a>(
             if !ok {
                 let stack = loader
                     .call_stack
-                    .borrow()
+                    .snapshot()
                     .iter()
                     .rev()
                     .take(6)
@@ -410,5 +414,85 @@ pub(crate) fn materialize_class<'a>(
         .push(Value::Object(handle));
     loader.class_object_names.borrow_mut().insert(handle, name);
     loader.class_objects.borrow_mut().insert(key, handle);
+    if let Some(origin) = loader.class_origin(name)
+        && let Ok(domain) = protection_domain_for_origin(loader, &origin)
+    {
+        if let Ok(slot) = klass.instanceField(
+            b"protectionDomain",
+            b"Ljava/security/ProtectionDomain;",
+        ) {
+            let mut objects = loader.borrow_objects_mut();
+            if let Some(object) = objects.get_mut(handle)
+                && slot < object.fields.len()
+            {
+                object.fields[slot] = domain;
+            }
+        }
+    }
     Ok(Some(Value::Object(handle)))
+}
+
+/// Allocates a Java object and invokes its `<init>` constructor.
+fn new_java_object<'a>(
+    loader: &ClassLoader<'a>,
+    internal: &[u8],
+    ctor_descriptor: &[u8],
+    args: &[Value<'a>],
+) -> io::Result<Value<'a>> {
+    let klass = loader.load(internal)?;
+    let _ = bytecodeInterpreter::initialize(loader, &klass, &mut io::sink(), 0)?;
+    let object = InstanceOop::new(klass.clone())?;
+    let handle = loader.alloc_object(object);
+    let mut call_args = JavaCallArguments::new();
+    call_args.push_oop(Value::Object(handle));
+    for arg in args {
+        call_args.push_oop(*arg);
+    }
+    JavaCalls::call_special(
+        loader,
+        &klass,
+        b"<init>",
+        ctor_descriptor,
+        &call_args,
+        &mut io::sink(),
+    )?;
+    Ok(Value::Object(handle))
+}
+
+/// Builds `ProtectionDomain(CodeSource(URL(location), null), Permissions())`
+/// for a classpath origin, mirroring what `URLClassLoader`/`JarLoader` store
+/// in `java.lang.Class.protectionDomain` on a real JVM.
+fn protection_domain_for_origin<'a>(
+    loader: &ClassLoader<'a>,
+    origin: &ClassOrigin,
+) -> io::Result<Value<'a>> {
+    let path = match origin {
+        ClassOrigin::Jar(path) => path,
+        ClassOrigin::Directory(path) => path,
+    };
+    let mut spec = String::from("file:///");
+    spec.push_str(&path.to_string_lossy().replace('\\', "/"));
+    if matches!(origin, ClassOrigin::Directory(_)) && !spec.ends_with('/') {
+        spec.push('/');
+    }
+    let spec = loader.storage.alloc_str(&spec);
+    let url = new_java_object(
+        loader,
+        b"java/net/URL",
+        b"(Ljava/lang/String;)V",
+        &[Value::HostString(spec)],
+    )?;
+    let code_source = new_java_object(
+        loader,
+        b"java/security/CodeSource",
+        b"(Ljava/net/URL;[Ljava/security/cert/Certificate;)V",
+        &[url, Value::Null],
+    )?;
+    let permissions = new_java_object(loader, b"java/security/Permissions", b"()V", &[])?;
+    new_java_object(
+        loader,
+        b"java/security/ProtectionDomain",
+        b"(Ljava/security/CodeSource;Ljava/security/PermissionCollection;)V",
+        &[code_source, permissions],
+    )
 }

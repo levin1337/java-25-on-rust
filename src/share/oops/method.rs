@@ -12,7 +12,7 @@ use super::constMethod::ConstMethod;
 use super::methodCounters::MethodCounters;
 use crate::classfile::Member;
 use std::io::{self, Error};
-use std::rc::Rc;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExceptionTableEntry {
@@ -98,7 +98,7 @@ impl<'a> Code<'a> {
 /// Separates mutable execution state and profiling from immutable ConstMethod bytecode.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Method {
-    const_method: Rc<ConstMethod>,
+    const_method: Arc<ConstMethod>,
     method_counters: Option<MethodCounters>,
     vtable_index: i32,
     access_flags: u16,
@@ -123,7 +123,7 @@ impl Method {
     pub const ACC_STRICT: u16 = 0x0800;
     pub const ACC_SYNTHETIC: u16 = 0x1000;
 
-    pub fn new(const_method: Rc<ConstMethod>, access_flags: u16) -> Self {
+    pub fn new(const_method: Arc<ConstMethod>, access_flags: u16) -> Self {
         Self {
             const_method,
             method_counters: None,
@@ -135,7 +135,7 @@ impl Method {
     }
 
     pub fn with_vtable_index(
-        const_method: Rc<ConstMethod>,
+        const_method: Arc<ConstMethod>,
         access_flags: u16,
         vtable_index: i32,
     ) -> Self {
@@ -155,7 +155,7 @@ impl Method {
     }
 
     #[inline]
-    pub fn const_method_rc(&self) -> &Rc<ConstMethod> {
+    pub fn const_method_rc(&self) -> &Arc<ConstMethod> {
         &self.const_method
     }
 

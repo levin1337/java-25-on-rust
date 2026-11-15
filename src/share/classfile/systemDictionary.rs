@@ -10,7 +10,7 @@ use crate::share::classfile::classLoader::ClassLoader;
 use crate::share::oops::instanceKlass::InstanceKlass;
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Error};
-use std::rc::Rc;
+use std::sync::Arc;
 use std::sync::RwLock;
 
 // Placeholder entry used during class loading to detect ClassCircularityError
@@ -64,7 +64,7 @@ impl PlaceholderTable {
 // Dictionary storing loaded classes per loader
 #[derive(Default)]
 pub struct Dictionary<'a> {
-    entries: RwLock<HashMap<Vec<u8>, Rc<InstanceKlass<'a>>>>,
+    entries: RwLock<HashMap<Vec<u8>, Arc<InstanceKlass<'a>>>>,
 }
 
 impl<'a> Dictionary<'a> {
@@ -74,11 +74,11 @@ impl<'a> Dictionary<'a> {
         }
     }
 
-    pub fn find_class(&self, name: &[u8]) -> Option<Rc<InstanceKlass<'a>>> {
+    pub fn find_class(&self, name: &[u8]) -> Option<Arc<InstanceKlass<'a>>> {
         self.entries.read().unwrap().get(name).cloned()
     }
 
-    pub fn add_class(&self, name: &[u8], klass: Rc<InstanceKlass<'a>>) {
+    pub fn add_class(&self, name: &[u8], klass: Arc<InstanceKlass<'a>>) {
         self.entries.write().unwrap().insert(name.to_vec(), klass);
     }
 
@@ -135,14 +135,14 @@ impl SystemDictionary {
     pub fn find_instance_klass<'a>(
         loader: &ClassLoader<'a>,
         class_name: &[u8],
-    ) -> Option<Rc<InstanceKlass<'a>>> {
+    ) -> Option<Arc<InstanceKlass<'a>>> {
         loader.classes.borrow().get(class_name).cloned()
     }
 
     pub fn resolve_or_null<'a>(
         loader: &ClassLoader<'a>,
         class_name: &[u8],
-    ) -> Option<Rc<InstanceKlass<'a>>> {
+    ) -> Option<Arc<InstanceKlass<'a>>> {
         loader.load(class_name).ok()
     }
 
@@ -150,7 +150,7 @@ impl SystemDictionary {
         loader: &ClassLoader<'a>,
         class_name: &[u8],
         throw_error: bool,
-    ) -> io::Result<Rc<InstanceKlass<'a>>> {
+    ) -> io::Result<Arc<InstanceKlass<'a>>> {
         match loader.load(class_name) {
             Ok(klass) => Ok(klass),
             Err(e) => {
@@ -171,7 +171,7 @@ impl SystemDictionary {
         class_name: &[u8],
         next_name: &[u8],
         is_superclass: bool,
-    ) -> io::Result<Rc<InstanceKlass<'a>>> {
+    ) -> io::Result<Arc<InstanceKlass<'a>>> {
         if class_name == next_name {
             return Err(Error::other("ClassCircularityError"));
         }
@@ -187,7 +187,7 @@ impl SystemDictionary {
         class_name: &[u8],
         super_name: &[u8],
         is_superclass: bool,
-    ) -> io::Result<Rc<InstanceKlass<'a>>> {
+    ) -> io::Result<Arc<InstanceKlass<'a>>> {
         Self::resolve_with_circularity_detection(loader, class_name, super_name, is_superclass)
     }
 

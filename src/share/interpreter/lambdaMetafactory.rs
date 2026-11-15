@@ -15,7 +15,7 @@ use crate::share::interpreter::bootstrapInfo::{BootstrapArg, BootstrapInfo};
 use crate::share::interpreter::bytecodeInterpreter::Value;
 use crate::share::oops::instanceKlass::InstanceKlass;
 use std::io::{self, Error};
-use std::rc::Rc;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static LAMBDA_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -455,12 +455,12 @@ pub fn invoke<'a>(
             &sam_return,
             args,
         )?;
-        loader.cache_lambda_class(caller_name, bsm_index, Rc::clone(&generated));
+        loader.cache_lambda_class(caller_name, bsm_index, Arc::clone(&generated));
         generated
     };
 
     // Instantiate: fields hold the captured call-site values.
-    let object = crate::share::oops::instanceOop::InstanceOop::new(Rc::clone(&lambda_klass))?;
+    let object = crate::share::oops::instanceOop::InstanceOop::new(Arc::clone(&lambda_klass))?;
     let handle = loader.alloc_object(object);
     for (i, value) in captured.iter().enumerate() {
         let field_name = format!("arg{i}");
@@ -496,7 +496,7 @@ fn generate_class<'a>(
     impl_return: &Type,
     sam_return: &Type,
     bsm_args: &[BootstrapArg],
-) -> io::Result<Rc<InstanceKlass<'a>>> {
+) -> io::Result<Arc<InstanceKlass<'a>>> {
     // altMetafactory flags (java.lang.invoke.LambdaMetafactory):
     // FLAG_SERIALIZABLE = 1, FLAG_MARKERS = 2, FLAG_BRIDGES = 4.
     // With FLAG_MARKERS the next arg is a marker-interface count followed by

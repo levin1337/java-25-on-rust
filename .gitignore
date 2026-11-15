@@ -372,9 +372,16 @@ FodyWeavers.xsd
 
 # Rust build output
 /target/
-/target-*/
+/target*/
 **/*.rs.bk
 *.pdb
+
+# JVM debug artifacts
+panic.log
+nul
+.mixin.out
+jvmtest.txt
+run-minecraft.bat
 
 # VS solution for the reference C++ HotSpot sources in jvm228/ (not part of this repo)
 jvm25.sln

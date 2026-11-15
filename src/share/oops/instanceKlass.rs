@@ -16,16 +16,20 @@ use super::method::Code;
 use super::objLayout::ObjLayout;
 use crate::classfile::{ClassFile, Constant};
 use crate::share::interpreter::bytecodeInterpreter::Value;
-use std::cell::Cell;
+use crate::share::runtime::shareCell::Share;
 use std::io::{self, Error};
-use std::rc::Rc;
+use std::sync::{Arc, Condvar, Mutex};
 
 pub struct InstanceKlass<'a> {
     pub class: ClassFile<'a>,
-    pub super_klass: Option<Rc<InstanceKlass<'a>>>,
-    pub interfaces: Vec<Rc<InstanceKlass<'a>>>,
-    pub(crate) state: Cell<InitState>,
-    pub static_fields: Vec<Cell<Value<'a>>>,
+    pub super_klass: Option<Arc<InstanceKlass<'a>>>,
+    pub interfaces: Vec<Arc<InstanceKlass<'a>>>,
+    pub(crate) state: Share<InitState>,
+    /// JVMS §12.4.2 initialization lock: `Some(tid)` while `tid` runs
+    /// `<clinit>`; other threads wait on `init_cond` until the state
+    /// leaves `BeingInitialized`.
+    pub(crate) init_gate: Arc<(Mutex<Option<u64>>, Condvar)>,
+    pub static_fields: Vec<Share<Value<'a>>>,
     pub static_field_infos: Vec<FieldInfo<'a>>,
     pub instance_field_infos: Vec<FieldInfo<'a>>,
     pub instance_field_offset: usize,
@@ -60,8 +64,8 @@ pub enum InitState {
 impl<'a> InstanceKlass<'a> {
     pub fn new(
         class: ClassFile<'a>,
-        super_klass: Option<Rc<InstanceKlass<'a>>>,
-        interfaces: Vec<Rc<InstanceKlass<'a>>>,
+        super_klass: Option<Arc<InstanceKlass<'a>>>,
+        interfaces: Vec<Arc<InstanceKlass<'a>>>,
     ) -> io::Result<Self> {
         let instance_field_offset = super_klass.as_ref().map_or(0, |s| s.total_instance_fields);
 
@@ -109,7 +113,7 @@ impl<'a> InstanceKlass<'a> {
                         };
                     }
                 }
-                static_fields.push(Cell::new(val));
+                static_fields.push(Share::new(val));
             } else {
                 let info = FieldInfo::new(
                     field.accessFlags,
@@ -163,8 +167,8 @@ impl<'a> InstanceKlass<'a> {
         // transitive superinterface hierarchy (HotSpot registers every
         // superinterface, direct or indirect, in the itable).
         let mut itable = KlassItable::new(class_name_str);
-        let mut all_interfaces: Vec<Rc<InstanceKlass<'a>>> = Vec::new();
-        let mut pending: Vec<Rc<InstanceKlass<'a>>> = interfaces.clone();
+        let mut all_interfaces: Vec<Arc<InstanceKlass<'a>>> = Vec::new();
+        let mut pending: Vec<Arc<InstanceKlass<'a>>> = interfaces.clone();
         let mut seen: std::collections::HashSet<&'a [u8]> = std::collections::HashSet::new();
         while let Some(iface) = pending.pop() {
             if !seen.insert(iface.class.name) {
@@ -192,7 +196,8 @@ impl<'a> InstanceKlass<'a> {
             class,
             super_klass,
             interfaces,
-            state: Cell::new(InitState::Loaded),
+            state: Share::new(InitState::Loaded),
+            init_gate: Arc::new((Mutex::new(None), Condvar::new())),
             static_fields,
             static_field_infos,
             instance_field_infos,
@@ -207,8 +212,8 @@ impl<'a> InstanceKlass<'a> {
     }
 
     #[inline]
-    pub fn super_klass(&self) -> Option<Rc<InstanceKlass<'a>>> {
-        self.super_klass.as_ref().map(Rc::clone)
+    pub fn super_klass(&self) -> Option<Arc<InstanceKlass<'a>>> {
+        self.super_klass.as_ref().map(Arc::clone)
     }
 
     #[inline]
@@ -264,7 +269,7 @@ impl<'a> InstanceKlass<'a> {
     /// Direct superinterfaces that must be initialized before this class,
     /// per JVMS §5.5: every direct superinterface declaring a non-static
     /// concrete method triggers recursive initialization.
-    pub fn default_method_superinterfaces(&self) -> Vec<Rc<InstanceKlass<'a>>> {
+    pub fn default_method_superinterfaces(&self) -> Vec<Arc<InstanceKlass<'a>>> {
         if self.is_interface() || !self.has_nonstatic_concrete_methods() {
             return Vec::new();
         }
@@ -296,7 +301,7 @@ impl<'a> InstanceKlass<'a> {
         (self.class.accessFlags & 0x0010) != 0
     }
 
-    pub fn staticField(&self, name: &[u8], descriptor: &[u8]) -> io::Result<&Cell<Value<'a>>> {
+    pub fn staticField(&self, name: &[u8], descriptor: &[u8]) -> io::Result<&Share<Value<'a>>> {
         for (info, cell) in self.static_field_infos.iter().zip(&self.static_fields) {
             if info.name == name && info.descriptor == descriptor {
                 return Ok(cell);
@@ -312,21 +317,21 @@ impl<'a> InstanceKlass<'a> {
         )))
     }
 
-    pub fn staticInt(&self, name: &[u8], descriptor: &[u8]) -> io::Result<&Cell<Value<'a>>> {
+    pub fn staticInt(&self, name: &[u8], descriptor: &[u8]) -> io::Result<&Share<Value<'a>>> {
         self.staticField(name, descriptor)
     }
 
     pub(crate) fn staticFieldOwner(
-        self: &Rc<Self>,
+        self: &Arc<Self>,
         name: &[u8],
         descriptor: &[u8],
-    ) -> io::Result<Rc<Self>> {
+    ) -> io::Result<Arc<Self>> {
         if self
             .static_field_infos
             .iter()
             .any(|field| field.name == name && field.descriptor == descriptor)
         {
-            return Ok(Rc::clone(self));
+            return Ok(Arc::clone(self));
         }
         for interface in &self.interfaces {
             if let Ok(owner) = interface.staticFieldOwner(name, descriptor) {
@@ -416,6 +421,40 @@ impl<'a> InstanceKlass<'a> {
             String::from_utf8_lossy(name),
             String::from_utf8_lossy(descriptor)
         )))
+    }
+
+    /// HotSpot `InstanceKlass::has_finalizer`: true when this class or a
+    /// superclass (other than `java.lang.Object`) declares `finalize()V`.
+    /// Such instances must be registered with `java.lang.ref.Finalizer`
+    /// at allocation time so the FinalizerThread can run `finalize()`.
+    pub fn has_finalizer(&self) -> bool {
+        fn declares_finalize(klass: &InstanceKlass<'_>) -> bool {
+            klass.class.methods.iter().any(|method| {
+                method.name == b"finalize"
+                    && method.descriptor == b"()V"
+                    && (method.accessFlags & 0x0008) == 0 // not static
+            })
+        }
+        // java.lang.Object.finalize and java.lang.Enum.finalize (final,
+        // empty — enums may not declare finalize) do not make a class
+        // finalizable.
+        if self.class.name != b"java/lang/Object"
+            && self.class.name != b"java/lang/Enum"
+            && declares_finalize(self)
+        {
+            return true;
+        }
+        let mut current = self.super_klass.as_ref();
+        while let Some(klass) = current {
+            if klass.class.name == b"java/lang/Object" || klass.class.name == b"java/lang/Enum" {
+                return false;
+            }
+            if declares_finalize(klass) {
+                return true;
+            }
+            current = klass.super_klass.as_ref();
+        }
+        false
     }
 
     pub fn className(&self, index: u16) -> io::Result<&'a [u8]> {

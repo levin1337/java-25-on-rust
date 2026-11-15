@@ -24,7 +24,7 @@ use std::{
     fs::File,
     io::{self, Read},
     path::Path,
-    rc::Rc,
+    sync::Arc,
 };
 
 /// Internal name of the synthetic `java.net.URLConnection` subclass embedded
@@ -220,7 +220,7 @@ fn url_parts<'a>(
 /// Lazily defines the synthetic `jvm25.url.UrlConnection` class.
 fn connection_class<'a>(
     loader: &ClassLoader<'a>,
-) -> io::Result<Rc<InstanceKlass<'a>>> {
+) -> io::Result<Arc<InstanceKlass<'a>>> {
     if let Ok(klass) = loader.load(URL_CONNECTION_CLASS) {
         return Ok(klass);
     }
@@ -530,7 +530,7 @@ pub(crate) fn classResource<'a>(
 /// Constructs a real `java.net.URL` for `spec` through `URL.<init>(String)`.
 fn make_url<'a>(
     loader: &ClassLoader<'a>,
-    url_klass: &Rc<InstanceKlass<'a>>,
+    url_klass: &Arc<InstanceKlass<'a>>,
     spec: &str,
 ) -> io::Result<usize> {
     let object = InstanceOop::new(url_klass.clone())?;

@@ -13,24 +13,92 @@ use crate::share::oops::objArrayOop::ObjArrayOop;
 use crate::share::oops::typeArrayOop::TypeArrayOop;
 use crate::share::runtime::synchronizer::Synchronizer;
 use crate::{classfile::ClassFile, share::oops::instanceKlass::InstanceKlass};
-use bumpalo::Bump;
+use crate::share::runtime::shareCell::{Share, ShareMut, ShareRef};
+use crate::share::runtime::syncBump::SyncBump;
+use parking_lot::ReentrantMutex;
 use std::{
-    cell::{Cell, Ref, RefCell},
     collections::{HashMap, HashSet, VecDeque},
     fs::{self, File},
     io::{self, Error, Read},
     path::{Path, PathBuf},
-    rc::Rc,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
 };
 use zip::ZipArchive;
 
+thread_local! {
+    /// Java call stack of the current OS thread (internal names of the
+    /// classes owning the active interpreter frames). Each Java thread
+    /// runs on a dedicated OS thread, so this must be thread-local: a
+    /// shared stack would interleave frames of unrelated threads and
+    /// corrupt caller detection (`MethodHandles.lookup`,
+    /// `Reflection.getCallerClass`) and exception stack traces.
+    static CALL_STACK: std::cell::RefCell<Vec<&'static [u8]>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Per-thread Java call stack. Zero-sized; all state lives in the
+/// thread-local above so `ClassLoader` stays cheaply shareable.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct CallStack;
+
+impl CallStack {
+    fn with<R>(&self, f: impl FnOnce(&mut Vec<&'static [u8]>) -> R) -> R {
+        CALL_STACK.with(|stack| f(&mut stack.borrow_mut()))
+    }
+
+    /// Pushes a class internal name. The name is borrowed from
+    /// loader-owned storage which outlives every Java thread (the VM
+    /// allocator is leaked at startup and threads hold `Arc`s to it).
+    pub(crate) fn push(&self, name: &[u8]) {
+        // SAFETY: class names point into `SyncBump`/loader storage that is
+        // never freed; every OS thread observing this stack keeps the
+        // loader alive.
+        let name: &'static [u8] = unsafe { std::mem::transmute(name) };
+        self.with(|stack| stack.push(name));
+    }
+
+    pub(crate) fn pop(&self) {
+        self.with(|stack| {
+            stack.pop();
+        });
+    }
+
+    /// Copies the stack top-first order is preserved (index 0 = outermost).
+    pub(crate) fn snapshot(&self) -> Vec<&'static [u8]> {
+        self.with(|stack| stack.clone())
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.with(|stack| stack.len())
+    }
+
+    pub(crate) fn get(&self, index: usize) -> Option<&'static [u8]> {
+        self.with(|stack| stack.get(index).copied())
+    }
+
+    pub(crate) fn last(&self) -> Option<&'static [u8]> {
+        self.with(|stack| stack.last().copied())
+    }
+}
+
 mod borrow_trace {
     use std::cell::RefCell;
+    use std::sync::OnceLock;
     thread_local! {
         static SITES: RefCell<Vec<&'static std::panic::Location<'static>>> =
             const { RefCell::new(Vec::new()) };
     }
+    fn enabled() -> bool {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var_os("JVM25_BORROWTRACE").is_some())
+    }
     pub fn note(loc: &'static std::panic::Location<'static>) {
+        if !enabled() {
+            return;
+        }
         SITES.with(|sites| {
             let mut sites = sites.borrow_mut();
             if sites.len() >= 512 {
@@ -46,13 +114,6 @@ mod borrow_trace {
             }
         });
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum FreeSlot {
-    Object(usize),
-    TypeArray(usize),
-    ObjArray(usize),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,46 +181,70 @@ pub enum ClassSource {
 }
 
 pub struct ClassLoader<'a> {
-    pub(crate) storage: &'a Bump,
-    pub(crate) sources: RefCell<Vec<ClassSource>>,
-    pub(crate) classes: RefCell<HashMap<&'a [u8], Rc<InstanceKlass<'a>>>>,
-    loading: RefCell<HashSet<Vec<u8>>>,
-    pub(crate) bootImage: Option<RefCell<super::jimage::JImageReader>>,
-    pub(crate) systemProperties: RefCell<HashMap<String, &'a str>>,
-    pub(crate) arrays: RefCell<Vec<TypeArrayOop>>,
-    pub(crate) objects: RefCell<Vec<InstanceOop<'a>>>,
-    pub(crate) obj_arrays: RefCell<Vec<ObjArrayOop<'a>>>,
-    pub(crate) objects_live: RefCell<Vec<bool>>,
-    pub(crate) arrays_live: RefCell<Vec<bool>>,
-    pub(crate) obj_arrays_live: RefCell<Vec<bool>>,
-    free_slots: RefCell<Vec<FreeSlot>>,
-    allocations_since_gc: Cell<usize>,
-    pub(crate) gc_extra_roots: RefCell<Vec<Value<'a>>>,
-    pub(crate) synchronizer: RefCell<Synchronizer>,
-    class_loader_object: RefCell<Option<usize>>,
-    unnamed_module_object: RefCell<Option<usize>>,
-    module_objects: RefCell<HashMap<String, usize>>,
-    current_thread_object: RefCell<Option<usize>>,
-    pub(crate) call_stack: RefCell<Vec<&'a [u8]>>,
-    pub(crate) lambda_cache: RefCell<HashMap<(Vec<u8>, u16), Rc<InstanceKlass<'a>>>>,
+    pub(crate) storage: &'a SyncBump,
+    pub(crate) sources: Share<Vec<ClassSource>>,
+    pub(crate) classes: Share<HashMap<&'a [u8], Arc<InstanceKlass<'a>>>>,
+    loading: Share<HashSet<Vec<u8>>>,
+    /// Serializes the define/load slow path across Java OS threads.
+    /// Reentrant so recursive loads (superclass/interfaces) on the same
+    /// thread proceed; other threads wait, then hit the `classes` cache.
+    load_lock: ReentrantMutex<()>,
+    pub(crate) bootImage: Option<Share<super::jimage::JImageReader>>,
+    pub(crate) systemProperties: Share<HashMap<String, &'a str>>,
+    pub(crate) arrays: Share<Vec<TypeArrayOop>>,
+    pub(crate) objects: Share<Vec<InstanceOop<'a>>>,
+    pub(crate) obj_arrays: Share<Vec<ObjArrayOop<'a>>>,
+    pub(crate) objects_live: Share<Vec<bool>>,
+    pub(crate) arrays_live: Share<Vec<bool>>,
+    pub(crate) obj_arrays_live: Share<Vec<bool>>,
+    /// Per-arena free slot stacks (LIFO) reused by `alloc_*`. Kept as
+    /// separate stacks so allocation is O(1) — a single mixed list made
+    /// every allocation scan for the matching slot kind.
+    free_objects: Share<Vec<usize>>,
+    free_type_arrays: Share<Vec<usize>>,
+    free_obj_arrays: Share<Vec<usize>>,
+    allocations_since_gc: AtomicUsize,
+    pub(crate) gc_extra_roots: Share<Vec<Value<'a>>>,
+    /// Head of the VM pending-reference list (JVMS/JDK `Reference` discovery
+    /// list). GC links cleared references through their `discovered` field;
+    /// `Reference.getAndClearReferencePendingList` consumes the head.
+    pub(crate) reference_pending: Share<Option<usize>>,
+    pub(crate) synchronizer: Share<Synchronizer>,
+    class_loader_object: Share<Option<usize>>,
+    unnamed_module_object: Share<Option<usize>>,
+    module_objects: Share<HashMap<String, usize>>,
+    current_thread_object: Share<Option<usize>>,
+    pub(crate) call_stack: CallStack,
+    pub(crate) lambda_cache: Share<HashMap<(Vec<u8>, u16), Arc<InstanceKlass<'a>>>>,
     /// Cooperative Java thread registry (see runtime::threading).
-    pub(crate) java_threads: RefCell<HashMap<usize, crate::share::runtime::threading::JavaThreadInfo>>,
+    pub(crate) java_threads: Share<HashMap<usize, crate::share::runtime::threading::JavaThreadInfo>>,
     /// FIFO of thread object handles ready to run.
-    pub(crate) thread_ready: RefCell<VecDeque<usize>>,
+    pub(crate) thread_ready: Share<VecDeque<usize>>,
     /// Thread object handle currently executing (`None` = main thread).
-    pub(crate) current_java_thread: RefCell<Option<usize>>,
+    pub(crate) current_java_thread: Share<Option<usize>>,
     /// Next monitor id assigned to a started Java thread.
-    pub(crate) next_java_tid: Cell<u64>,
+    pub(crate) next_java_tid: Share<u64>,
     /// Nested scheduler depth guard.
-    pub(crate) schedule_depth: Cell<u32>,
+    pub(crate) schedule_depth: Share<u32>,
     /// Consecutive suspend-and-reschedule activations; bounds scheduler
     /// churn when only suspended workers remain runnable.
-    pub(crate) suspend_streak: Cell<u32>,
+    pub(crate) suspend_streak: Share<u32>,
     /// Materialized `java.lang.Class` objects keyed by internal class name.
-    pub(crate) class_objects: RefCell<HashMap<Vec<u8>, usize>>,
+    pub(crate) class_objects: Share<HashMap<Vec<u8>, usize>>,
     /// Reverse lookup: materialized Class object handle -> internal name.
-    pub(crate) class_object_names: RefCell<HashMap<usize, &'a [u8]>>,
+    pub(crate) class_object_names: Share<HashMap<usize, &'a [u8]>>,
+    /// Classpath origin of each loaded class, used to synthesize the
+    /// `protectionDomain`/`CodeSource` a real `defineClass` would store.
+    pub(crate) class_origins: Share<HashMap<Vec<u8>, Option<ClassOrigin>>>,
     loader_type: ClassLoaderType,
+}
+
+/// Where a class's bytecode was loaded from. Mirrors the distinction
+/// `URLClassLoader` makes between JAR and directory code sources.
+#[derive(Clone, Debug)]
+pub enum ClassOrigin {
+    Jar(PathBuf),
+    Directory(PathBuf),
 }
 
 /// Extracts the resource name (path inside the module) from a jimage
@@ -196,7 +281,7 @@ impl<'a> ClassLoader<'a> {
         0
     }
 
-    pub(crate) fn class_loader_object_handle(&self) -> &RefCell<Option<usize>> {
+    pub(crate) fn class_loader_object_handle(&self) -> &Share<Option<usize>> {
         &self.class_loader_object
     }
 
@@ -219,7 +304,7 @@ impl<'a> ClassLoader<'a> {
         Ok(handle)
     }
 
-    pub(crate) fn unnamed_module_object_handle(&self) -> &RefCell<Option<usize>> {
+    pub(crate) fn unnamed_module_object_handle(&self) -> &Share<Option<usize>> {
         &self.unnamed_module_object
     }
 
@@ -235,6 +320,22 @@ impl<'a> ClassLoader<'a> {
         self.module_objects.borrow().get(name).copied()
     }
 
+    /// GC root access: all materialized `java.lang.Module` objects.
+    pub(crate) fn module_objects_handle(&self) -> &Share<HashMap<String, usize>> {
+        &self.module_objects
+    }
+
+    /// GC sweep access: dead arena slots awaiting reuse, per arena.
+    pub(crate) fn free_objects_handle(&self) -> &Share<Vec<usize>> {
+        &self.free_objects
+    }
+    pub(crate) fn free_type_arrays_handle(&self) -> &Share<Vec<usize>> {
+        &self.free_type_arrays
+    }
+    pub(crate) fn free_obj_arrays_handle(&self) -> &Share<Vec<usize>> {
+        &self.free_obj_arrays
+    }
+
     /// Module name providing the given internal class name, when the class
     /// comes from a named JDK module in the boot image. Returns `None` for
     /// classpath classes (unnamed module) and unknown classes.
@@ -244,7 +345,7 @@ impl<'a> ClassLoader<'a> {
         image.borrow().class_module(&name).map(str::to_owned)
     }
 
-    pub(crate) fn current_thread_object_handle(&self) -> &RefCell<Option<usize>> {
+    pub(crate) fn current_thread_object_handle(&self) -> &Share<Option<usize>> {
         &self.current_thread_object
     }
 
@@ -382,7 +483,7 @@ impl<'a> ClassLoader<'a> {
         ])
     }
 
-    pub fn open(path: &Path, storage: &'a Bump) -> io::Result<Self> {
+    pub fn open(path: &Path, storage: &'a SyncBump) -> io::Result<Self> {
         let source = if path.is_dir() {
             ClassSource::Directory(path.to_path_buf())
         } else {
@@ -393,40 +494,45 @@ impl<'a> ClassLoader<'a> {
         };
         Ok(Self {
             storage,
-            sources: RefCell::new(vec![source]),
-            classes: RefCell::new(HashMap::new()),
-            loading: RefCell::new(HashSet::new()),
+            sources: Share::new(vec![source]),
+            classes: Share::new(HashMap::new()),
+            loading: Share::new(HashSet::new()),
+            load_lock: ReentrantMutex::new(()),
             bootImage: None,
-            systemProperties: RefCell::new(Self::default_system_properties()),
-            arrays: RefCell::new(Vec::new()),
-            objects: RefCell::new(Vec::new()),
-            obj_arrays: RefCell::new(Vec::new()),
-            objects_live: RefCell::new(Vec::new()),
-            arrays_live: RefCell::new(Vec::new()),
-            obj_arrays_live: RefCell::new(Vec::new()),
-            free_slots: RefCell::new(Vec::new()),
-            allocations_since_gc: Cell::new(0),
-            gc_extra_roots: RefCell::new(Vec::new()),
-            synchronizer: RefCell::new(Synchronizer::new()),
-            class_loader_object: RefCell::new(None),
-            unnamed_module_object: RefCell::new(None),
-            module_objects: RefCell::new(HashMap::new()),
-            current_thread_object: RefCell::new(None),
-            call_stack: RefCell::new(Vec::new()),
-            lambda_cache: RefCell::new(HashMap::new()),
-            java_threads: RefCell::new(HashMap::new()),
-            thread_ready: RefCell::new(VecDeque::new()),
-            current_java_thread: RefCell::new(None),
-            next_java_tid: Cell::new(2),
-            schedule_depth: Cell::new(0),
-            suspend_streak: Cell::new(0),
-            class_objects: RefCell::new(HashMap::new()),
-            class_object_names: RefCell::new(HashMap::new()),
+            systemProperties: Share::new(Self::default_system_properties()),
+            arrays: Share::new(Vec::new()),
+            objects: Share::new(Vec::new()),
+            obj_arrays: Share::new(Vec::new()),
+            objects_live: Share::new(Vec::new()),
+            arrays_live: Share::new(Vec::new()),
+            obj_arrays_live: Share::new(Vec::new()),
+            free_objects: Share::new(Vec::new()),
+            free_type_arrays: Share::new(Vec::new()),
+            free_obj_arrays: Share::new(Vec::new()),
+            allocations_since_gc: AtomicUsize::new(0),
+            gc_extra_roots: Share::new(Vec::new()),
+            reference_pending: Share::new(None),
+            synchronizer: Share::new(Synchronizer::new()),
+            class_loader_object: Share::new(None),
+            unnamed_module_object: Share::new(None),
+            module_objects: Share::new(HashMap::new()),
+            current_thread_object: Share::new(None),
+            call_stack: CallStack,
+            lambda_cache: Share::new(HashMap::new()),
+            java_threads: Share::new(HashMap::new()),
+            thread_ready: Share::new(VecDeque::new()),
+            current_java_thread: Share::new(None),
+            next_java_tid: Share::new(2),
+            schedule_depth: Share::new(0),
+            suspend_streak: Share::new(0),
+            class_objects: Share::new(HashMap::new()),
+            class_object_names: Share::new(HashMap::new()),
+            class_origins: Share::new(HashMap::new()),
             loader_type: ClassLoaderType::AppLoader,
         })
     }
 
-    pub fn open_classpath(classpath: &str, storage: &'a Bump) -> io::Result<Self> {
+    pub fn open_classpath(classpath: &str, storage: &'a SyncBump) -> io::Result<Self> {
         let mut sources = Vec::new();
         for entry in std::env::split_paths(classpath) {
             let p = if entry.as_os_str().is_empty() {
@@ -474,90 +580,85 @@ impl<'a> ClassLoader<'a> {
         }
         Ok(Self {
             storage,
-            sources: RefCell::new(sources),
-            classes: RefCell::new(HashMap::new()),
-            loading: RefCell::new(HashSet::new()),
+            sources: Share::new(sources),
+            classes: Share::new(HashMap::new()),
+            loading: Share::new(HashSet::new()),
+            load_lock: ReentrantMutex::new(()),
             bootImage: None,
-            systemProperties: RefCell::new(Self::default_system_properties()),
-            arrays: RefCell::new(Vec::new()),
-            objects: RefCell::new(Vec::new()),
-            obj_arrays: RefCell::new(Vec::new()),
-            objects_live: RefCell::new(Vec::new()),
-            arrays_live: RefCell::new(Vec::new()),
-            obj_arrays_live: RefCell::new(Vec::new()),
-            free_slots: RefCell::new(Vec::new()),
-            allocations_since_gc: Cell::new(0),
-            gc_extra_roots: RefCell::new(Vec::new()),
-            synchronizer: RefCell::new(Synchronizer::new()),
-            class_loader_object: RefCell::new(None),
-            unnamed_module_object: RefCell::new(None),
-            module_objects: RefCell::new(HashMap::new()),
-            current_thread_object: RefCell::new(None),
-            call_stack: RefCell::new(Vec::new()),
-            lambda_cache: RefCell::new(HashMap::new()),
-            java_threads: RefCell::new(HashMap::new()),
-            thread_ready: RefCell::new(VecDeque::new()),
-            current_java_thread: RefCell::new(None),
-            next_java_tid: Cell::new(2),
-            schedule_depth: Cell::new(0),
-            suspend_streak: Cell::new(0),
-            class_objects: RefCell::new(HashMap::new()),
-            class_object_names: RefCell::new(HashMap::new()),
+            systemProperties: Share::new(Self::default_system_properties()),
+            arrays: Share::new(Vec::new()),
+            objects: Share::new(Vec::new()),
+            obj_arrays: Share::new(Vec::new()),
+            objects_live: Share::new(Vec::new()),
+            arrays_live: Share::new(Vec::new()),
+            obj_arrays_live: Share::new(Vec::new()),
+            free_objects: Share::new(Vec::new()),
+            free_type_arrays: Share::new(Vec::new()),
+            free_obj_arrays: Share::new(Vec::new()),
+            allocations_since_gc: AtomicUsize::new(0),
+            gc_extra_roots: Share::new(Vec::new()),
+            reference_pending: Share::new(None),
+            synchronizer: Share::new(Synchronizer::new()),
+            class_loader_object: Share::new(None),
+            unnamed_module_object: Share::new(None),
+            module_objects: Share::new(HashMap::new()),
+            current_thread_object: Share::new(None),
+            call_stack: CallStack,
+            lambda_cache: Share::new(HashMap::new()),
+            java_threads: Share::new(HashMap::new()),
+            thread_ready: Share::new(VecDeque::new()),
+            current_java_thread: Share::new(None),
+            next_java_tid: Share::new(2),
+            schedule_depth: Share::new(0),
+            suspend_streak: Share::new(0),
+            class_objects: Share::new(HashMap::new()),
+            class_object_names: Share::new(HashMap::new()),
+            class_origins: Share::new(HashMap::new()),
             loader_type: ClassLoaderType::AppLoader,
         })
     }
 
     pub(crate) fn note_allocation(&self) {
         self.allocations_since_gc
-            .set(self.allocations_since_gc.get() + 1);
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn gc_due(&self) -> bool {
-        self.allocations_since_gc.get() >= 2048
+        self.allocations_since_gc.load(Ordering::Relaxed) >= 2048
     }
 
     pub(crate) fn reset_allocations(&self) {
-        self.allocations_since_gc.set(0);
+        self.allocations_since_gc.store(0, Ordering::Relaxed);
     }
 
     #[track_caller]
-    pub(crate) fn borrow_objects(&self) -> Ref<'_, Vec<InstanceOop<'a>>> {
+    pub(crate) fn borrow_objects(&self) -> ShareRef<'_, Vec<InstanceOop<'a>>> {
         borrow_trace::note(std::panic::Location::caller());
         self.objects.borrow()
     }
 
     #[track_caller]
-    pub(crate) fn borrow_objects_mut(&self) -> std::cell::RefMut<'_, Vec<InstanceOop<'a>>> {
+    pub(crate) fn borrow_objects_mut(&self) -> ShareMut<'_, Vec<InstanceOop<'a>>> {
         borrow_trace::note(std::panic::Location::caller());
         self.objects.borrow_mut()
     }
 
     pub(crate) fn alloc_object(&self, object: InstanceOop<'a>) -> usize {
         self.note_allocation();
-        let mut objects = match self.objects.try_borrow_mut() {
-            Ok(guard) => guard,
-            Err(_) => {
-                borrow_trace::dump();
-                panic!("objects arena already borrowed");
-            }
-        };
-        let mut free = self.free_slots.borrow_mut();
-        if let Some(position) = free
-            .iter()
-            .rposition(|slot| matches!(slot, FreeSlot::Object(_)))
-        {
-            let FreeSlot::Object(index) = free.remove(position) else {
-                unreachable!()
-            };
+        // Free-list pop first so the lock order (free -> arena -> live) is
+        // consistent with the GC sweep and cannot deadlock.
+        let reused = self.free_objects.borrow_mut().pop();
+        // Blocking borrow: other OS threads may hold the arena mid-
+        // allocation; same-thread reentrancy still panics via borrow rules.
+        let mut objects = self.objects.borrow_mut();
+        if let Some(index) = reused {
             objects[index] = object;
             drop(objects);
-            drop(free);
             let mut live = self.objects_live.borrow_mut();
             live.resize(self.borrow_objects().len(), true);
             live[index] = true;
             return index;
         }
-        drop(free);
         let handle = objects.len();
         objects.push(object);
         drop(objects);
@@ -569,24 +670,16 @@ impl<'a> ClassLoader<'a> {
 
     pub(crate) fn alloc_type_array(&self, array: TypeArrayOop) -> usize {
         self.note_allocation();
+        let reused = self.free_type_arrays.borrow_mut().pop();
         let mut arrays = self.arrays.borrow_mut();
-        let mut free = self.free_slots.borrow_mut();
-        if let Some(position) = free
-            .iter()
-            .rposition(|slot| matches!(slot, FreeSlot::TypeArray(_)))
-        {
-            let FreeSlot::TypeArray(index) = free.remove(position) else {
-                unreachable!()
-            };
+        if let Some(index) = reused {
             arrays[index] = array;
             drop(arrays);
-            drop(free);
             let mut live = self.arrays_live.borrow_mut();
             live.resize(self.arrays.borrow().len(), true);
             live[index] = true;
             return index;
         }
-        drop(free);
         let handle = arrays.len();
         arrays.push(array);
         drop(arrays);
@@ -598,24 +691,16 @@ impl<'a> ClassLoader<'a> {
 
     pub(crate) fn alloc_obj_array(&self, array: ObjArrayOop<'a>) -> usize {
         self.note_allocation();
+        let reused = self.free_obj_arrays.borrow_mut().pop();
         let mut arrays = self.obj_arrays.borrow_mut();
-        let mut free = self.free_slots.borrow_mut();
-        if let Some(position) = free
-            .iter()
-            .rposition(|slot| matches!(slot, FreeSlot::ObjArray(_)))
-        {
-            let FreeSlot::ObjArray(index) = free.remove(position) else {
-                unreachable!()
-            };
+        if let Some(index) = reused {
             arrays[index] = array;
             drop(arrays);
-            drop(free);
             let mut live = self.obj_arrays_live.borrow_mut();
             live.resize(self.obj_arrays.borrow().len(), true);
             live[index] = true;
             return index;
         }
-        drop(free);
         let handle = arrays.len();
         arrays.push(array);
         drop(arrays);
@@ -623,10 +708,6 @@ impl<'a> ClassLoader<'a> {
         live.resize(handle + 1, true);
         live[handle] = true;
         handle
-    }
-
-    pub(crate) fn free_slot(&self, slot: FreeSlot) {
-        self.free_slots.borrow_mut().push(slot);
     }
 
     pub fn add_source(&self, source: ClassSource) {
@@ -663,7 +744,7 @@ impl<'a> ClassLoader<'a> {
     }
 
     pub fn withBootImage(mut self, path: &Path) -> io::Result<Self> {
-        self.bootImage = Some(RefCell::new(super::jimage::JImageReader::open(path)?));
+        self.bootImage = Some(Share::new(super::jimage::JImageReader::open(path)?));
         Ok(self)
     }
 
@@ -711,21 +792,30 @@ impl<'a> ClassLoader<'a> {
     }
 
     pub fn open_stream(&self, name: &[u8]) -> io::Result<Vec<u8>> {
+        self.open_stream_with_origin(name).map(|(bytes, _)| bytes)
+    }
+
+    /// Like `open_stream` but also reports the classpath source the class
+    /// bytes came from (`None` for boot-image classes).
+    pub fn open_stream_with_origin(
+        &self,
+        name: &[u8],
+    ) -> io::Result<(Vec<u8>, Option<ClassOrigin>)> {
         let rel_path = super::classFileParser::decodeString(name)?;
         if let Some(image) = &self.bootImage
             && let Some(bytes) = image.borrow_mut().findClass(&rel_path)?
         {
-            return Ok(bytes);
+            return Ok((bytes, None));
         }
         let mut bytes = Vec::new();
 
         let mut sources = self.sources.borrow_mut();
         for source in sources.iter_mut() {
             match source {
-                ClassSource::Jar { archive: zip, .. } => {
+                ClassSource::Jar { archive: zip, path } => {
                     if let Ok(mut entry) = zip.by_name(&format!("{rel_path}.class")) {
                         if entry.read_to_end(&mut bytes).is_ok() {
-                            return Ok(bytes);
+                            return Ok((bytes, Some(ClassOrigin::Jar(path.clone()))));
                         }
                     }
                 }
@@ -733,7 +823,7 @@ impl<'a> ClassLoader<'a> {
                     let file_path = dir.join(format!("{rel_path}.class"));
                     if file_path.exists() {
                         if let Ok(content) = fs::read(&file_path) {
-                            return Ok(content);
+                            return Ok((content, Some(ClassOrigin::Directory(dir.clone()))));
                         }
                     }
                 }
@@ -741,6 +831,15 @@ impl<'a> ClassLoader<'a> {
         }
 
         Err(super::linkageError::LinkageError::class_not_found(name).io())
+    }
+
+    /// Classpath origin recorded when the class was loaded, if any.
+    pub fn class_origin(&self, name: &[u8]) -> Option<ClassOrigin> {
+        self.class_origins
+            .borrow()
+            .get(name)
+            .cloned()
+            .flatten()
     }
 
     /// Reads a non-class resource (properties files, data files, ...).
@@ -821,11 +920,11 @@ impl<'a> ClassLoader<'a> {
             }))
     }
 
-    pub fn load_class(&self, name: &[u8]) -> io::Result<Rc<InstanceKlass<'a>>> {
+    pub fn load_class(&self, name: &[u8]) -> io::Result<Arc<InstanceKlass<'a>>> {
         self.load(name)
     }
 
-    pub fn load(&self, name: &[u8]) -> io::Result<Rc<InstanceKlass<'a>>> {
+    pub fn load(&self, name: &[u8]) -> io::Result<Arc<InstanceKlass<'a>>> {
         if name.starts_with(b"[") || name.starts_with(b":") {
             return Err(Error::other(format!(
                 "Array or primitive class cannot be loaded by name: {}",
@@ -833,7 +932,13 @@ impl<'a> ClassLoader<'a> {
             )));
         }
         if let Some(klass) = self.classes.borrow().get(name) {
-            return Ok(Rc::clone(klass));
+            return Ok(Arc::clone(klass));
+        }
+        // Serialize class definition across Java OS threads; recursive
+        // loads on this thread re-enter freely.
+        let _load_guard = self.load_lock.lock();
+        if let Some(klass) = self.classes.borrow().get(name) {
+            return Ok(Arc::clone(klass));
         }
         if !self.loading.borrow_mut().insert(name.to_vec()) {
             return Err(super::linkageError::LinkageError::new(
@@ -847,7 +952,7 @@ impl<'a> ClassLoader<'a> {
         result
     }
 
-    fn loadClass(&self, name: &[u8]) -> io::Result<Rc<InstanceKlass<'a>>> {
+    fn loadClass(&self, name: &[u8]) -> io::Result<Arc<InstanceKlass<'a>>> {
     let _rg = crate::share::recprobe::Guard::enter("loadClass");
         if name == b"java/lang/Object" && self.bootImage.is_none() {
             let synthetic_class = ClassFile {
@@ -862,14 +967,19 @@ impl<'a> ClassLoader<'a> {
                 methods: Vec::new(),
                 attributes: Vec::new(),
             };
-            let klass = Rc::new(InstanceKlass::new(synthetic_class, None, Vec::new())?);
+            let klass = Arc::new(InstanceKlass::new(synthetic_class, None, Vec::new())?);
             self.classes
                 .borrow_mut()
-                .insert(klass.class.name, Rc::clone(&klass));
+                .insert(klass.class.name, Arc::clone(&klass));
             return Ok(klass);
         }
 
-        let bytes = self.open_stream(name)?;
+        let (bytes, origin) = self.open_stream_with_origin(name)?;
+        if let Some(origin) = origin {
+            self.class_origins
+                .borrow_mut()
+                .insert(name.to_vec(), Some(origin));
+        }
         let bytes = self.storage.alloc_slice_copy(&bytes);
         let class = ClassFile::parse(bytes, false).map_err(|error| {
             use super::classFileParser::ClassError as E;
@@ -897,7 +1007,8 @@ impl<'a> ClassLoader<'a> {
     /// classes such as invokedynamic lambda proxies). The bytes are copied
     /// into the loader's bump storage so the parsed `ClassFile` borrows stay
     /// valid for `'a`.
-    pub fn define_class_bytes(&self, name: &[u8], bytes: &[u8]) -> io::Result<Rc<InstanceKlass<'a>>> {
+    pub fn define_class_bytes(&self, name: &[u8], bytes: &[u8]) -> io::Result<Arc<InstanceKlass<'a>>> {
+        let _load_guard = self.load_lock.lock();
         let bytes = self.storage.alloc_slice_copy(bytes);
         let class = ClassFile::parse(bytes, false).map_err(|error| {
             super::linkageError::LinkageError::new(
@@ -916,7 +1027,7 @@ impl<'a> ClassLoader<'a> {
     /// builds the InstanceKlass and registers it. Used both for classes loaded
     /// from classpath/image sources and for synthetic classes generated at
     /// runtime (e.g. invokedynamic lambda classes).
-    fn defineParsed(&self, class: ClassFile<'a>) -> io::Result<Rc<InstanceKlass<'a>>> {
+    fn defineParsed(&self, class: ClassFile<'a>) -> io::Result<Arc<InstanceKlass<'a>>> {
         let class_name = class.name;
         let no_class_def = |dep: &[u8], error: io::Error| {
             if super::linkageError::linkage_kind(&error).is_some() {
@@ -978,17 +1089,18 @@ impl<'a> ClassLoader<'a> {
             }
         }
 
-        let klass = Rc::new(InstanceKlass::new(class, super_klass, interfaces)?);
+        let klass = Arc::new(InstanceKlass::new(class, super_klass, interfaces)?);
         self.classes
             .borrow_mut()
-            .insert(klass.class.name, Rc::clone(&klass));
+            .insert(klass.class.name, Arc::clone(&klass));
         Ok(klass)
     }
 
     /// Defines a synthetic class from an already-parsed ClassFile structure.
     /// All byte slices inside `class` must be allocated in this loader's
     /// storage (or be 'static) so that they live for 'a.
-    pub fn define_class(&self, class: ClassFile<'a>) -> io::Result<Rc<InstanceKlass<'a>>> {
+    pub fn define_class(&self, class: ClassFile<'a>) -> io::Result<Arc<InstanceKlass<'a>>> {
+        let _load_guard = self.load_lock.lock();
         self.defineParsed(class)
     }
 
@@ -998,11 +1110,11 @@ impl<'a> ClassLoader<'a> {
         &self,
         caller: &[u8],
         bsm_index: u16,
-    ) -> Option<Rc<InstanceKlass<'a>>> {
+    ) -> Option<Arc<InstanceKlass<'a>>> {
         self.lambda_cache
             .borrow()
             .get(&(caller.to_vec(), bsm_index))
-            .map(Rc::clone)
+            .map(Arc::clone)
     }
 
     /// Caches a generated lambda class for an invokedynamic call site.
@@ -1010,7 +1122,7 @@ impl<'a> ClassLoader<'a> {
         &self,
         caller: &[u8],
         bsm_index: u16,
-        klass: Rc<InstanceKlass<'a>>,
+        klass: Arc<InstanceKlass<'a>>,
     ) {
         self.lambda_cache
             .borrow_mut()
@@ -1020,6 +1132,28 @@ impl<'a> ClassLoader<'a> {
     pub fn systemClassLoaderObject(&self) -> io::Result<usize> {
         if let Some(handle) = *self.class_loader_object.borrow() {
             return Ok(handle);
+        }
+        // Prefer the real application class loader created by
+        // `jdk.internal.loader.ClassLoaders.<clinit>`: it has a live
+        // `URLClassPath`, `nameToModule` map and parent chain, all of which
+        // `BuiltinClassLoader.findResource`/`findMiscResource` require.
+        // A bare `InstanceOop` leaves those fields null and resource lookup
+        // dies with NPE.
+        if self.bootImage.is_some()
+            && let Ok(klass) = self.load(b"jdk/internal/loader/ClassLoaders")
+        {
+            let _ = crate::share::interpreter::bytecodeInterpreter::initialize(
+                self,
+                &klass,
+                &mut io::sink(),
+                0,
+            );
+            if let Ok(cell) = klass.staticField(b"APP_LOADER", b"Ljdk/internal/loader/ClassLoaders$AppClassLoader;") {
+                if let Value::Object(handle) = cell.get() {
+                    *self.class_loader_object.borrow_mut() = Some(handle);
+                    return Ok(handle);
+                }
+            }
         }
         let klass = if self.bootImage.is_some() {
             match self.load(b"jdk/internal/loader/ClassLoaders$AppClassLoader") {
@@ -1105,6 +1239,20 @@ impl<'a> ClassLoader<'a> {
         if let Ok(index) = object.klass.instanceField(b"name", b"Ljava/lang/String;") {
             object.fields[index] = Value::HostString(self.storage.alloc_str("main"));
         }
+        // `Thread.<init>` never ran for this synthesized object, so lock
+        // fields that real threads get from the constructor stay null.
+        // `Thread.blockedOn` does `synchronized(interruptLock)` and NPEs on
+        // null — give it a real monitor object like `<init>` would.
+        if let Ok(index) = object
+            .klass
+            .instanceField(b"interruptLock", b"Ljava/lang/Object;")
+            && let Ok(lock_klass) = self.load(b"java/lang/Object")
+        {
+            if let Ok(lock) = InstanceOop::new(lock_klass) {
+                let lock_handle = self.alloc_object(lock);
+                object.fields[index] = Value::Object(lock_handle);
+            }
+        }
         let handle = self.alloc_object(object);
         *self.current_thread_object.borrow_mut() = Some(handle);
         if std::env::var_os("JVM25_TRACE").is_some() {
@@ -1168,4 +1316,10 @@ impl<'a> ClassLoader<'a> {
         }
         Err(Error::other("Missing Main-Class in JAR manifest"))
     }
+}
+
+#[allow(dead_code)]
+fn _assert_loader_is_thread_safe() {
+    fn check<T: Send + Sync>() {}
+    check::<ClassLoader<'static>>();
 }

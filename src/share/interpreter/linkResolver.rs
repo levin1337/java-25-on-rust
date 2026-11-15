@@ -14,7 +14,7 @@ use crate::share::{
 };
 use std::collections::HashSet;
 use std::io::{self, Error};
-use std::rc::Rc;
+use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CallKind {
@@ -25,7 +25,7 @@ pub enum CallKind {
 
 #[derive(Clone)]
 pub struct CallInfo<'a> {
-    pub resolved_klass: Rc<InstanceKlass<'a>>,
+    pub resolved_klass: Arc<InstanceKlass<'a>>,
     pub resolved_method: Code<'a>,
     pub selected_method: Code<'a>,
     pub call_kind: CallKind,
@@ -37,10 +37,10 @@ pub struct LinkResolver;
 impl LinkResolver {
     /// Resolves invokevirtual dispatch using receiver klass's vtable.
     pub fn resolve_virtual_call<'a>(
-        receiver_klass: &Rc<InstanceKlass<'a>>,
+        receiver_klass: &Arc<InstanceKlass<'a>>,
         name: &[u8],
         descriptor: &[u8],
-    ) -> io::Result<(Rc<InstanceKlass<'a>>, Code<'a>)> {
+    ) -> io::Result<(Arc<InstanceKlass<'a>>, Code<'a>)> {
         let name_str = String::from_utf8_lossy(name);
         let sig_str = String::from_utf8_lossy(descriptor);
 
@@ -55,7 +55,7 @@ impl LinkResolver {
                         if let Some(method) = k.class.methods.iter().find(|m| {
                             m.name == name && m.descriptor == descriptor && (m.accessFlags & 8 == 0)
                         }) {
-                            return Ok((Rc::clone(k), Code::parse(method)?));
+                            return Ok((Arc::clone(k), Code::parse(method)?));
                         }
                     }
                     curr = k.super_klass.as_ref();
@@ -80,7 +80,7 @@ impl LinkResolver {
                         String::from_utf8_lossy(descriptor)
                     )));
                 }
-                return Ok((Rc::clone(k), Code::parse(method)?));
+                return Ok((Arc::clone(k), Code::parse(method)?));
             }
             interfaces.extend(&k.interfaces);
             current = k.super_klass.as_ref();
@@ -115,7 +115,7 @@ impl LinkResolver {
             if defaults.next().is_some() {
                 return Err(Error::other("Conflicting interface default methods"));
             }
-            return Ok((Rc::clone(interface), Code::parse(method)?));
+            return Ok((Arc::clone(interface), Code::parse(method)?));
         }
 
         {
@@ -172,11 +172,11 @@ impl LinkResolver {
 
     /// Resolves invokeinterface dispatch using receiver klass's itable and vtable.
     pub fn resolve_interface_call<'a>(
-        receiver_klass: &Rc<InstanceKlass<'a>>,
+        receiver_klass: &Arc<InstanceKlass<'a>>,
         interface_name: &[u8],
         name: &[u8],
         descriptor: &[u8],
-    ) -> io::Result<(Rc<InstanceKlass<'a>>, Code<'a>)> {
+    ) -> io::Result<(Arc<InstanceKlass<'a>>, Code<'a>)> {
         let iface_str = String::from_utf8_lossy(interface_name);
         let name_str = String::from_utf8_lossy(name);
         let sig_str = String::from_utf8_lossy(descriptor);
@@ -194,7 +194,7 @@ impl LinkResolver {
                         if let Some(method) = k.class.methods.iter().find(|m| {
                             m.name == name && m.descriptor == descriptor && (m.accessFlags & 8 == 0)
                         }) {
-                            return Ok((Rc::clone(k), Code::parse(method)?));
+                            return Ok((Arc::clone(k), Code::parse(method)?));
                         }
                     }
                     curr = k.super_klass.as_ref();
@@ -207,10 +207,10 @@ impl LinkResolver {
         // targeting private interface methods). Walk the receiver's interface
         // hierarchy looking for the interface that declares the method.
         {
-            let mut pending: Vec<Rc<InstanceKlass<'a>>> = receiver_klass.interfaces.clone();
+            let mut pending: Vec<Arc<InstanceKlass<'a>>> = receiver_klass.interfaces.clone();
             let mut visited = HashSet::new();
             while let Some(iface) = pending.pop() {
-                if !visited.insert(Rc::as_ptr(&iface) as usize) {
+                if !visited.insert(Arc::as_ptr(&iface) as usize) {
                     continue;
                 }
                 pending.extend(iface.interfaces.iter().cloned());
@@ -229,7 +229,7 @@ impl LinkResolver {
                         && m.accessFlags & 8 == 0
                         && m.code_attribute().is_some()
                 }) {
-                    return Ok((Rc::clone(&iface), Code::parse(method)?));
+                    return Ok((Arc::clone(&iface), Code::parse(method)?));
                 }
             }
         }
@@ -246,7 +246,7 @@ impl LinkResolver {
                 if let Some(method) = k.class.methods.iter().find(|m| {
                     m.name == name && m.descriptor == descriptor && (m.accessFlags & 1 != 0)
                 }) {
-                    return Ok((Rc::clone(k), Code::parse(method)?));
+                    return Ok((Arc::clone(k), Code::parse(method)?));
                 }
             }
             curr = k.super_klass.as_ref();
@@ -263,25 +263,25 @@ impl LinkResolver {
     /// superclasses without virtual override; interface owners additionally
     /// search superinterfaces for private/default methods (JVMS §5.4.3.3).
     pub fn resolve_special_call<'a>(
-        target_klass: &Rc<InstanceKlass<'a>>,
+        target_klass: &Arc<InstanceKlass<'a>>,
         name: &[u8],
         descriptor: &[u8],
-    ) -> io::Result<(Rc<InstanceKlass<'a>>, Code<'a>)> {
-        let mut current = Some(Rc::clone(target_klass));
+    ) -> io::Result<(Arc<InstanceKlass<'a>>, Code<'a>)> {
+        let mut current = Some(Arc::clone(target_klass));
         while let Some(klass) = current {
             if let Some(method) = klass.class.methods.iter().find(|method| {
                 method.name == name
                     && method.descriptor == descriptor
                     && method.accessFlags & 8 == 0
             }) {
-                return Ok((Rc::clone(&klass), Code::parse(method)?));
+                return Ok((Arc::clone(&klass), Code::parse(method)?));
             }
             current = klass.super_klass();
         }
-        let mut pending: Vec<Rc<InstanceKlass<'a>>> = target_klass.interfaces.clone();
+        let mut pending: Vec<Arc<InstanceKlass<'a>>> = target_klass.interfaces.clone();
         let mut visited = HashSet::new();
         while let Some(iface) = pending.pop() {
-            if !visited.insert(Rc::as_ptr(&iface) as usize) {
+            if !visited.insert(Arc::as_ptr(&iface) as usize) {
                 continue;
             }
             if let Some(method) = iface.class.methods.iter().find(|method| {
@@ -289,7 +289,7 @@ impl LinkResolver {
                     && method.descriptor == descriptor
                     && method.accessFlags & 8 == 0
             }) {
-                return Ok((Rc::clone(&iface), Code::parse(method)?));
+                return Ok((Arc::clone(&iface), Code::parse(method)?));
             }
             pending.extend(iface.interfaces.iter().cloned());
         }
@@ -302,18 +302,18 @@ impl LinkResolver {
 
     /// Resolves invokestatic call.
     pub fn resolve_static_call<'a>(
-        target_klass: &Rc<InstanceKlass<'a>>,
+        target_klass: &Arc<InstanceKlass<'a>>,
         name: &[u8],
         descriptor: &[u8],
-    ) -> io::Result<(Rc<InstanceKlass<'a>>, Code<'a>)> {
-        let mut current = Some(Rc::clone(target_klass));
+    ) -> io::Result<(Arc<InstanceKlass<'a>>, Code<'a>)> {
+        let mut current = Some(Arc::clone(target_klass));
         while let Some(klass) = current {
             if let Some(method) = klass.class.methods.iter().find(|method| {
                 method.name == name
                     && method.descriptor == descriptor
                     && method.accessFlags & 8 != 0
             }) {
-                return Ok((Rc::clone(&klass), Code::parse(method)?));
+                return Ok((Arc::clone(&klass), Code::parse(method)?));
             }
             current = klass.super_klass();
         }
@@ -323,7 +323,7 @@ impl LinkResolver {
     /// Resolves invokedynamic call site via BootstrapInfo.
     pub fn resolve_invokedynamic<'a>(
         loader: &ClassLoader<'a>,
-        caller_klass: &Rc<InstanceKlass<'a>>,
+        caller_klass: &Arc<InstanceKlass<'a>>,
         bsm_attr_index: u16,
         name: &[u8],
         descriptor: &[u8],

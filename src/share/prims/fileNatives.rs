@@ -60,6 +60,103 @@ fn java_path(path: &str) -> String {
     }
 }
 
+/// `WinNTFileSystem.canonicalize` semantics: `GetFullPathNameW` + `_wfullpath`
+/// are purely lexical — they succeed for paths that do not exist. Only fall
+/// back to the host canonicalizer (which resolves symlinks but requires the
+/// file to exist) when it works; otherwise normalize lexically.
+fn canonicalize_java(path: &Path) -> io::Result<String> {
+    match std::fs::canonicalize(path) {
+        Ok(canonical) => {
+            let mut canonical = canonical.to_string_lossy().into_owned();
+            // Strip the Windows \\?\ verbatim prefix like the JDK does.
+            if let Some(stripped) = canonical.strip_prefix("\\\\?\\") {
+                canonical = stripped.to_owned();
+            }
+            Ok(canonical)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            Ok(lexical_canonical(&path.to_string_lossy()))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(windows)]
+fn lexical_canonical(path: &str) -> String {
+    let mut text = path.replace('/', "\\");
+    let bytes = text.as_bytes();
+    let has_drive = bytes.len() >= 2 && bytes[1] == b':';
+    let is_unc = text.starts_with("\\\\");
+    if !has_drive && !is_unc {
+        if let Ok(cwd) = std::env::current_dir() {
+            text = format!("{}\\{}", cwd.to_string_lossy().replace('/', "\\"), text);
+        }
+    }
+    // Split off the root prefix: "\\?\X:", "\\server\share", "X:\" or "X:".
+    let (prefix, rest) = if let Some(stripped) = text.strip_prefix("\\\\?\\") {
+        // Verbatim path: keep the prefix through the drive/root.
+        let mut end = 0;
+        let b = stripped.as_bytes();
+        if b.len() >= 2 && b[1] == b':' {
+            end = 2;
+            if b.get(2) == Some(&b'\\') {
+                end = 3;
+            }
+        }
+        (text[..4 + end].to_owned(), stripped[end..].to_owned())
+    } else if is_unc {
+        // \\server\share\... — the share is the root.
+        let parts: Vec<&str> = text.split('\\').collect();
+        let take = parts.iter().take(4).map(|p| p.len() + 1).sum::<usize>();
+        let prefix_len = take.min(text.len());
+        (text[..prefix_len].to_owned(), text[prefix_len..].to_owned())
+    } else {
+        let drive_len = if has_drive { 2 } else { 0 };
+        let mut end = drive_len;
+        if text.as_bytes().get(end) == Some(&b'\\') {
+            end += 1;
+        }
+        (text[..end].to_owned(), text[end..].to_owned())
+    };
+    let mut components: Vec<&str> = Vec::new();
+    for part in rest.split('\\') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                components.pop();
+            }
+            _ => components.push(part),
+        }
+    }
+    let mut result = prefix;
+    if !result.ends_with('\\') && !components.is_empty() {
+        result.push('\\');
+    }
+    result.push_str(&components.join("\\"));
+    result
+}
+
+#[cfg(not(windows))]
+fn lexical_canonical(path: &str) -> String {
+    let mut text = path.replace('\\', "/");
+    if !text.starts_with('/') {
+        if let Ok(cwd) = std::env::current_dir() {
+            text = format!("{}/{}", cwd.to_string_lossy(), text);
+        }
+    }
+    let mut components: Vec<&str> = Vec::new();
+    for part in text.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                components.pop();
+            }
+            _ => components.push(part),
+        }
+    }
+    format!("/{}", components.join("/"))
+}
+
 fn metadata(path: &Path) -> Option<std::fs::Metadata> {
     std::fs::symlink_metadata(path).ok()
 }
@@ -199,13 +296,8 @@ pub(crate) fn invoke<'a>(
                 return Err(invalid("Expected path string"));
             };
             let path = java_path(text.as_ref());
-            match std::fs::canonicalize(&path) {
+            match canonicalize_java(Path::new(&path)) {
                 Ok(canonical) => {
-                    let mut canonical = canonical.to_string_lossy().into_owned();
-                    // Strip the Windows \\?\ verbatim prefix like the JDK does.
-                    if let Some(stripped) = canonical.strip_prefix("\\\\?\\") {
-                        canonical = stripped.to_owned();
-                    }
                     Value::HostString(loader.storage.alloc_str(&canonical))
                 }
                 Err(error) => {
@@ -221,12 +313,8 @@ pub(crate) fn invoke<'a>(
                 return Err(invalid("Expected path string"));
             };
             let path = java_path(text.as_ref());
-            match std::fs::canonicalize(&path) {
+            match canonicalize_java(Path::new(&path)) {
                 Ok(canonical) => {
-                    let mut canonical = canonical.to_string_lossy().into_owned();
-                    if let Some(stripped) = canonical.strip_prefix("\\\\?\\") {
-                        canonical = stripped.to_owned();
-                    }
                     Value::HostString(loader.storage.alloc_str(&canonical))
                 }
                 Err(error) => {
@@ -414,6 +502,30 @@ pub(crate) fn invoke<'a>(
             };
             Value::Int(i32::from(result.is_ok()))
         }
+        (b"delete0", b"(Ljava/io/File;Z)Z") => {
+            let path = file_path(loader, arg(1))?;
+            let allow_readonly = match arg(2) {
+                Value::Int(flag) => flag != 0,
+                _ => false,
+            };
+            let path = java_path(&path);
+            let fs_path = Path::new(&path);
+            if allow_readonly
+                && let Ok(metadata) = std::fs::metadata(fs_path)
+            {
+                let mut permissions = metadata.permissions();
+                if permissions.readonly() {
+                    permissions.set_readonly(false);
+                    let _ = std::fs::set_permissions(fs_path, permissions);
+                }
+            }
+            let result = if fs_path.is_dir() {
+                std::fs::remove_dir(fs_path)
+            } else {
+                std::fs::remove_file(fs_path)
+            };
+            Value::Int(i32::from(result.is_ok()))
+        }
         (b"rename0", b"(Ljava/io/File;Ljava/io/File;)Z") => {
             let from = file_path(loader, arg(1))?;
             let to = file_path(loader, arg(2))?;
@@ -491,13 +603,15 @@ pub(crate) fn invoke<'a>(
                 Value::Int(mode) => mode,
                 _ => return Err(invalid("Invalid open mode")),
             };
+            // RandomAccessFile.open0 mode bits (java.io.RandomAccessFile):
+            // O_RDONLY=1, O_RDWR=2, plus O_SYNC/O_DSYNC/O_TEMPORARY flags.
             let access = mode & 3;
             let (read, write) = match access {
-                0 => (true, false),
-                1 => (false, true),
-                _ => (true, true),
+                1 => (true, false),
+                2 => (true, true),
+                _ => (true, false),
             };
-            let append = mode & 0x8 != 0;
+            let append = false;
             let path = java_path(text.as_ref());
             let handle = nioFileNatives::open_file(&path, read, write, append, false)
                 .map_err(|error| {
@@ -548,6 +662,11 @@ pub(crate) fn invoke<'a>(
                 ));
             }
             let mut buf = vec![0u8; len as usize];
+            if std::env::var_os("JVM25_TRACE_FREAD").is_some() {
+                let path = nioFileNatives::entry_path(handle)
+                    .unwrap_or_else(|| "?".to_string());
+                eprintln!("[fread] {path} handle={handle} off={offset} len={len}");
+            }
             let count = nioFileNatives::with_file(handle, |file, pos| {
                 file.seek(SeekFrom::Start(*pos))?;
                 let n = file.read(&mut buf)?;
@@ -757,12 +876,8 @@ pub(crate) fn invoke_static<'a>(
                 return Err(invalid("Expected path string"));
             };
             let path = java_path(text.as_ref());
-            match std::fs::canonicalize(&path) {
+            match canonicalize_java(Path::new(&path)) {
                 Ok(canonical) => {
-                    let mut canonical = canonical.to_string_lossy().into_owned();
-                    if let Some(stripped) = canonical.strip_prefix("\\\\?\\") {
-                        canonical = stripped.to_owned();
-                    }
                     Value::HostString(loader.storage.alloc_str(&canonical))
                 }
                 Err(error) => {

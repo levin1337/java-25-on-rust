@@ -10,7 +10,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::{self, Error};
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::share::{
     classfile::classLoader::ClassLoader,
@@ -59,6 +59,7 @@ fn string_value<'a>(loader: &ClassLoader<'a>, text: &str) -> Value<'a> {
 
 fn java_string<'a>(loader: &ClassLoader<'a>, value: Value<'a>) -> io::Result<String> {
     let Some(text) = stringNatives::string(loader, value)? else {
+        if std::env::var_os("JVM25_TRACE_STR").is_some() { eprintln!("[str-fail-mh]"); }
         return Err(invalid("Expected java.lang.String"));
     };
     Ok(text.into_owned())
@@ -218,12 +219,12 @@ fn set_object_field<'a>(
     Ok(())
 }
 
-fn object_klass<'a>(loader: &ClassLoader<'a>, handle: usize) -> io::Result<Rc<InstanceKlass<'a>>> {
+fn object_klass<'a>(loader: &ClassLoader<'a>, handle: usize) -> io::Result<Arc<InstanceKlass<'a>>> {
     let objects = loader.borrow_objects();
     let object = objects
         .get(handle)
         .ok_or_else(|| invalid("Invalid object reference"))?;
-    Ok(Rc::clone(&object.klass))
+    Ok(Arc::clone(&object.klass))
 }
 
 /// Extracts the internal class name from a `java.lang.Class` value.
@@ -381,19 +382,19 @@ fn record_snapshot(loader: &ClassLoader<'_>, handle: usize) -> io::Result<()> {
 }
 
 fn find_method_member<'k, 'a>(
-    klass: &'k Rc<InstanceKlass<'a>>,
+    klass: &'k Arc<InstanceKlass<'a>>,
     name: &[u8],
     descriptor: &[u8],
     want_static: bool,
-) -> Option<(Rc<InstanceKlass<'a>>, usize)> {
-    let mut current = Some(Rc::clone(klass));
+) -> Option<(Arc<InstanceKlass<'a>>, usize)> {
+    let mut current = Some(Arc::clone(klass));
     while let Some(k) = current {
         for (index, method) in k.class.methods.iter().enumerate() {
             if method.name == name
                 && method.descriptor == descriptor
                 && (method.accessFlags & ACC_STATIC != 0) == want_static
             {
-                return Some((Rc::clone(&k), index));
+                return Some((Arc::clone(&k), index));
             }
         }
         current = k.super_klass();
@@ -406,14 +407,14 @@ fn find_method_member<'k, 'a>(
 /// because the MemberName carries the polymorphic call-site type rather than
 /// the erased varargs descriptor.
 fn find_polymorphic_method<'a>(
-    klass: &Rc<InstanceKlass<'a>>,
+    klass: &Arc<InstanceKlass<'a>>,
     name: &[u8],
-) -> Option<(Rc<InstanceKlass<'a>>, usize)> {
-    let mut current = Some(Rc::clone(klass));
+) -> Option<(Arc<InstanceKlass<'a>>, usize)> {
+    let mut current = Some(Arc::clone(klass));
     while let Some(k) = current {
         for (index, method) in k.class.methods.iter().enumerate() {
             if method.name == name && method.descriptor.starts_with(b"([Ljava/lang/Object;)") {
-                return Some((Rc::clone(&k), index));
+                return Some((Arc::clone(&k), index));
             }
         }
         current = k.super_klass();
@@ -422,14 +423,14 @@ fn find_polymorphic_method<'a>(
 }
 
 fn find_interface_method<'a>(
-    klass: &Rc<InstanceKlass<'a>>,
+    klass: &Arc<InstanceKlass<'a>>,
     name: &[u8],
     descriptor: &[u8],
-) -> Option<(Rc<InstanceKlass<'a>>, usize)> {
-    let mut pending: Vec<Rc<InstanceKlass<'a>>> = klass.interfaces.clone();
+) -> Option<(Arc<InstanceKlass<'a>>, usize)> {
+    let mut pending: Vec<Arc<InstanceKlass<'a>>> = klass.interfaces.clone();
     let mut visited = std::collections::HashSet::new();
     while let Some(iface) = pending.pop() {
-        if !visited.insert(Rc::as_ptr(&iface) as usize) {
+        if !visited.insert(Arc::as_ptr(&iface) as usize) {
             continue;
         }
         pending.extend(iface.interfaces.iter().cloned());
@@ -439,7 +440,7 @@ fn find_interface_method<'a>(
                 && method.accessFlags & ACC_STATIC == 0
                 && method.accessFlags & ACC_ABSTRACT == 0
             {
-                return Some((Rc::clone(&iface), index));
+                return Some((Arc::clone(&iface), index));
             }
         }
     }
@@ -447,17 +448,17 @@ fn find_interface_method<'a>(
 }
 
 fn find_instance_field<'a>(
-    klass: &Rc<InstanceKlass<'a>>,
+    klass: &Arc<InstanceKlass<'a>>,
     name: &[u8],
     descriptor: &[u8],
-) -> Option<Rc<InstanceKlass<'a>>> {
-    let mut current = Some(Rc::clone(klass));
+) -> Option<Arc<InstanceKlass<'a>>> {
+    let mut current = Some(Arc::clone(klass));
     while let Some(k) = current {
         if k.instance_field_infos
             .iter()
             .any(|info| info.name == name && info.descriptor == descriptor)
         {
-            return Some(Rc::clone(&k));
+            return Some(Arc::clone(&k));
         }
         current = k.super_klass();
     }
@@ -465,17 +466,17 @@ fn find_instance_field<'a>(
 }
 
 fn find_static_field<'a>(
-    klass: &Rc<InstanceKlass<'a>>,
+    klass: &Arc<InstanceKlass<'a>>,
     name: &[u8],
     descriptor: &[u8],
-) -> Option<Rc<InstanceKlass<'a>>> {
-    let mut current = Some(Rc::clone(klass));
+) -> Option<Arc<InstanceKlass<'a>>> {
+    let mut current = Some(Arc::clone(klass));
     while let Some(k) = current {
         if k.static_field_infos
             .iter()
             .any(|info| info.name == name && info.descriptor == descriptor)
         {
-            return Some(Rc::clone(&k));
+            return Some(Arc::clone(&k));
         }
         current = k.super_klass();
     }
@@ -489,7 +490,7 @@ fn locate_field<'a>(
     clazz: &[u8],
     name: &[u8],
     descriptor: &[u8],
-) -> io::Result<(Rc<InstanceKlass<'a>>, bool)> {
+) -> io::Result<(Arc<InstanceKlass<'a>>, bool)> {
     let klass = loader.load(clazz).map_err(|_| class_not_found(loader, clazz))?;
     if let Some(owner) = find_instance_field(&klass, name, descriptor) {
         return Ok((owner, false));
@@ -501,7 +502,7 @@ fn locate_field<'a>(
 }
 
 fn field_info_offset<'a>(
-    klass: &Rc<InstanceKlass<'a>>,
+    klass: &Arc<InstanceKlass<'a>>,
     name: &[u8],
     descriptor: &[u8],
     want_static: bool,
@@ -755,7 +756,7 @@ fn write_resolved_field<'a>(
     loader: &ClassLoader<'a>,
     mn: usize,
     state: &MemberState<'a>,
-    owner: &Rc<InstanceKlass<'a>>,
+    owner: &Arc<InstanceKlass<'a>>,
     descriptor: &[u8],
     want_static: bool,
 ) -> io::Result<()> {
@@ -952,7 +953,7 @@ enum VarTarget<'a> {
     InstanceField { receiver: usize, slot: usize, kind: u8 },
     /// (declaring klass, static_fields index, kind byte)
     StaticField {
-        klass: Rc<InstanceKlass<'a>>,
+        klass: Arc<InstanceKlass<'a>>,
         index: usize,
         kind: u8,
     },
@@ -1816,7 +1817,7 @@ fn coerce_to_kind<'a>(loader: &ClassLoader<'a>, value: Value<'a>, kind: u8) -> i
 fn receiver_klass<'a>(
     loader: &ClassLoader<'a>,
     value: Value<'a>,
-) -> io::Result<Rc<InstanceKlass<'a>>> {
+) -> io::Result<Arc<InstanceKlass<'a>>> {
     match value {
         Value::Object(handle) => object_klass(loader, handle),
         Value::ClassMirror(_) => loader.load(b"java/lang/Class"),
@@ -1864,7 +1865,7 @@ fn receiver_klass<'a>(
 /// native targets.
 fn execute_member<'a>(
     loader: &ClassLoader<'a>,
-    target_klass: &Rc<InstanceKlass<'a>>,
+    target_klass: &Arc<InstanceKlass<'a>>,
     member_index: usize,
     args: &[Value<'a>],
     is_static_native: bool,
@@ -2166,7 +2167,7 @@ fn method_handle_invoke<'a>(
                         && method.descriptor == member_descriptor
                         && method.accessFlags & ACC_STATIC == 0
                 })
-                .map(|index| (Rc::clone(&klass), index));
+                .map(|index| (Arc::clone(&klass), index));
             let Some((target_klass, index)) = found else {
                 return Err(no_such_method(loader, b"<init>", &member_descriptor));
             };

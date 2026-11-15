@@ -7,13 +7,17 @@
  */
 
 use super::{offHeapMemory::OffHeapMemory, stringNatives, r#unsafe::Unsafe};
+use crate::classfile::ClassFile;
 use crate::share::{
-    classfile::classLoader::ClassLoader,
+    classfile::{
+        classLoader::ClassLoader,
+        linkageError::{LinkageError, LinkageErrorKind},
+    },
     interpreter::bytecodeInterpreter::Value,
     oops::{instanceKlass::InitState, instanceOop::InstanceOop, typeArrayOop::TypeArrayOop},
 };
 use std::io::{self, Error};
-use std::rc::Rc;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 /// Sentinel offset returned by `Thread.getNextThreadIdOffset`. Unsafe accesses
@@ -337,6 +341,10 @@ pub(crate) fn invoke<'a>(
             Some(allocate_instance(loader, class_arg(arguments, 1)?)?)
         }
         (b"getUncompressedObject", b"(J)Ljava/lang/Object;") => Some(Value::Null),
+        (
+            b"defineClass0",
+            b"(Ljava/lang/String;[BIILjava/lang/ClassLoader;Ljava/security/ProtectionDomain;)Ljava/lang/Class;",
+        ) => Some(define_class0(loader, arguments)?),
         (b"unpark", b"(Ljava/lang/Object;)V") => {
             crate::share::runtime::threading::unpark(
                 loader,
@@ -353,8 +361,11 @@ pub(crate) fn invoke<'a>(
             crate::share::runtime::threading::park(loader, is_absolute, time, output, depth)?;
             None
         }
-        (b"fullFence", b"()V")
-        | (b"writeback0", b"(J)V")
+        (b"loadFence", b"()V") | (b"storeFence", b"()V") | (b"fullFence", b"()V") => {
+            std::sync::atomic::fence(Ordering::SeqCst);
+            None
+        }
+        (b"writeback0", b"(J)V")
         | (b"writebackPreSync0", b"()V")
         | (b"writebackPostSync0", b"()V") => None,
         (b"throwException", b"(Ljava/lang/Throwable;)V") => {
@@ -362,7 +373,13 @@ pub(crate) fn invoke<'a>(
                 "Java exception thrown by Unsafe.throwException",
             ));
         }
-        _ => return Ok(None),
+        _ => {
+            if let Some((kind, op)) = bitwise_access(name, descriptor) {
+                Some(get_and_bitwise_typed(loader, arguments, kind, op)?)
+            } else {
+                return Ok(None);
+            }
+        }
     };
 
     Ok(Some(result))
@@ -458,6 +475,7 @@ fn double_arg(arguments: &[Value<'_>], index: usize) -> io::Result<f64> {
 
 fn string_arg<'a>(loader: &ClassLoader<'a>, value: Value<'a>) -> io::Result<String> {
     let Some(text) = stringNatives::string(loader, value)? else {
+        if std::env::var_os("JVM25_TRACE_STR").is_some() { eprintln!("[str-fail-unsafe] {:?}", std::mem::discriminant(&value)); }
         return Err(invalid(if matches!(value, Value::Null) {
             "NullPointerException"
         } else {
@@ -677,7 +695,7 @@ fn find_static_field<'a>(
     loader: &ClassLoader<'a>,
     class: &[u8],
     offset: i64,
-) -> io::Result<(Rc<crate::share::oops::instanceKlass::InstanceKlass<'a>>, usize, u8)> {
+) -> io::Result<(Arc<crate::share::oops::instanceKlass::InstanceKlass<'a>>, usize, u8)> {
     let klass = loader.load(class)?;
     for (index, info) in klass.static_field_infos.iter().enumerate() {
         if i64::from(info.offset) == offset {
@@ -1066,6 +1084,110 @@ fn get_and_add<'a>(
     Ok(old)
 }
 
+#[derive(Clone, Copy)]
+enum BitwiseKind {
+    Boolean,
+    Byte,
+    Char,
+    Short,
+    Int,
+    Long,
+    Float,
+    Double,
+}
+
+#[derive(Clone, Copy)]
+enum BitwiseOp {
+    And,
+    Or,
+    Xor,
+}
+
+fn bitwise_access(name: &[u8], descriptor: &[u8]) -> Option<(BitwiseKind, BitwiseOp)> {
+    let rest = name.strip_prefix(b"getAndBitwise")?;
+    let (op, rest) = if let Some(rest) = rest.strip_prefix(b"And") {
+        (BitwiseOp::And, rest)
+    } else if let Some(rest) = rest.strip_prefix(b"Or") {
+        (BitwiseOp::Or, rest)
+    } else {
+        (BitwiseOp::Xor, rest.strip_prefix(b"Xor")?)
+    };
+    let kind_name = rest
+        .strip_suffix(b"Release")
+        .or_else(|| rest.strip_suffix(b"Acquire"))
+        .unwrap_or(rest);
+    let kind = match (kind_name, descriptor) {
+        (b"Boolean", b"(Ljava/lang/Object;JZ)Z") => BitwiseKind::Boolean,
+        (b"Byte", b"(Ljava/lang/Object;JB)B") => BitwiseKind::Byte,
+        (b"Char", b"(Ljava/lang/Object;JC)C") => BitwiseKind::Char,
+        (b"Short", b"(Ljava/lang/Object;JS)S") => BitwiseKind::Short,
+        (b"Int", b"(Ljava/lang/Object;JI)I") => BitwiseKind::Int,
+        (b"Long", b"(Ljava/lang/Object;JJ)J") => BitwiseKind::Long,
+        (b"Float", b"(Ljava/lang/Object;JF)F") => BitwiseKind::Float,
+        (b"Double", b"(Ljava/lang/Object;JD)D") => BitwiseKind::Double,
+        _ => return None,
+    };
+    Some((kind, op))
+}
+
+fn get_and_bitwise<'a>(
+    loader: &ClassLoader<'a>,
+    arguments: &[Value<'a>],
+    object_index: usize,
+    size: usize,
+    mask: u64,
+    wide: bool,
+    op: BitwiseOp,
+) -> io::Result<u64> {
+    let bits = if size == 8 {
+        u64::MAX
+    } else {
+        (1u64 << (size * 8)) - 1
+    };
+    let old = read_raw(loader, arguments, object_index, size)?.value & bits;
+    let new = match op {
+        BitwiseOp::And => old & mask,
+        BitwiseOp::Or => old | mask,
+        BitwiseOp::Xor => old ^ mask,
+    } & bits;
+    let value = if wide {
+        Value::Long(new as i64)
+    } else {
+        Value::Int(new as u32 as i32)
+    };
+    write_raw(loader, arguments, object_index, size, value)?;
+    Ok(old)
+}
+
+fn get_and_bitwise_typed<'a>(
+    loader: &ClassLoader<'a>,
+    arguments: &[Value<'a>],
+    kind: BitwiseKind,
+    op: BitwiseOp,
+) -> io::Result<Value<'static>> {
+    let (size, wide, mask) = match kind {
+        BitwiseKind::Boolean => (1usize, false, u64::from(bool_arg(arguments, 3)?)),
+        BitwiseKind::Byte => (1, false, u64::from(byte_arg(arguments, 3)? as u8)),
+        BitwiseKind::Char => (2, false, u64::from(char_arg(arguments, 3)?)),
+        BitwiseKind::Short => (2, false, u64::from(short_arg(arguments, 3)? as u16)),
+        BitwiseKind::Int => (4, false, u64::from(int_arg(arguments, 3)? as u32)),
+        BitwiseKind::Long => (8, true, long_arg(arguments, 3)? as u64),
+        BitwiseKind::Float => (4, false, u64::from(float_arg(arguments, 3)?.to_bits())),
+        BitwiseKind::Double => (8, true, double_arg(arguments, 3)?.to_bits()),
+    };
+    let old = get_and_bitwise(loader, arguments, 1, size, mask, wide, op)?;
+    Ok(match kind {
+        BitwiseKind::Boolean => Value::Int(i32::from(old & 1 != 0)),
+        BitwiseKind::Byte => Value::Int(i32::from(old as u8 as i8)),
+        BitwiseKind::Char => Value::Int(i32::from(old as u16)),
+        BitwiseKind::Short => Value::Int(i32::from(old as u16 as i16)),
+        BitwiseKind::Int => Value::Int(old as u32 as i32),
+        BitwiseKind::Long => Value::Long(old as i64),
+        BitwiseKind::Float => Value::Float(f32::from_bits(old as u32)),
+        BitwiseKind::Double => Value::Double(f64::from_bits(old)),
+    })
+}
+
 fn compare_exchange_long_value<'a>(
     loader: &ClassLoader<'a>,
     arguments: &[Value<'a>],
@@ -1310,6 +1432,57 @@ fn read_byte(loader: &ClassLoader<'_>, object: Value<'_>, offset: i64) -> io::Re
         }
         _ => Err(invalid("Unsupported Unsafe copy object")),
     }
+}
+
+fn define_class0<'a>(
+    loader: &ClassLoader<'a>,
+    arguments: &[Value<'a>],
+) -> io::Result<Value<'a>> {
+    let expected_name = match arguments.get(0).copied().unwrap_or(Value::Null) {
+        Value::Null => None,
+        value => Some(string_arg(loader, value)?.replace('.', "/")),
+    };
+    let bytes_value = arguments.get(1).copied().unwrap_or(Value::Null);
+    let Value::PrimitiveArray(handle) = bytes_value else {
+        return Err(invalid("defineClass0: expected byte[]"));
+    };
+    let offset = usize::try_from(i64::from(int_arg(arguments, 2)?))
+        .map_err(|_| invalid("defineClass0: negative offset"))?;
+    let length = usize::try_from(i64::from(int_arg(arguments, 3)?))
+        .map_err(|_| invalid("defineClass0: negative length"))?;
+    let window: Vec<u8> = {
+        let arrays = loader.arrays.borrow();
+        let Some(TypeArrayOop::Byte(bytes)) = arrays.get(handle) else {
+            return Err(invalid("defineClass0: expected byte[]"));
+        };
+        if offset > bytes.len() || length > bytes.len() - offset {
+            return Err(invalid("defineClass0: offset/length out of bounds"));
+        }
+        bytes[offset..offset + length]
+            .iter()
+            .map(|&b| b as u8)
+            .collect()
+    };
+    let owned = loader.storage.alloc_slice_copy(&window);
+    let class = ClassFile::parse(owned, false).map_err(|error| {
+        LinkageError::new(LinkageErrorKind::ClassFormat, error.to_string()).io()
+    })?;
+    let name = class.name;
+    if let Some(expected) = expected_name
+        && expected.as_bytes() != name
+    {
+        return Err(LinkageError::new(
+            LinkageErrorKind::NoClassDefFound,
+            format!(
+                "{} (wrong name: {})",
+                String::from_utf8_lossy(name),
+                expected
+            ),
+        )
+        .io());
+    }
+    loader.define_class(class)?;
+    Ok(Value::ClassMirror(name))
 }
 
 fn write_byte(

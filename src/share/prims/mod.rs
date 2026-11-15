@@ -29,3 +29,7 @@ pub(crate) mod zipNatives;
 pub(crate) mod urlNatives;
 pub(crate) mod vmManagementNatives;
 pub(crate) mod jimageNatives;
+pub(crate) mod nioBitsNatives;
+pub(crate) mod selectorNatives;
+pub(crate) mod perfNatives;
+pub(crate) mod processNatives;

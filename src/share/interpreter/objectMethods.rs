@@ -14,7 +14,7 @@ use crate::share::interpreter::bootstrapInfo::{BootstrapArg, BootstrapInfo};
 use crate::share::interpreter::bytecodeInterpreter::Value;
 use crate::share::oops::instanceKlass::InstanceKlass;
 use std::io::{self, Error, Write};
-use std::rc::Rc;
+use std::sync::Arc;
 
 fn is_object_methods_bootstrap(
     klass: &InstanceKlass<'_>,
@@ -100,7 +100,7 @@ fn values_equal(loader: &ClassLoader<'_>, a: Value<'_>, b: Value<'_>) -> bool {
         (V::Object(x), V::Object(y)) => {
             let objects = loader.borrow_objects();
             match (objects.get(x), objects.get(y)) {
-                (Some(ox), Some(oy)) => Rc::ptr_eq(&ox.klass, &oy.klass),
+                (Some(ox), Some(oy)) => Arc::ptr_eq(&ox.klass, &oy.klass),
                 _ => x == y,
             }
         }
@@ -145,7 +145,7 @@ pub fn invoke<'a>(
             objects
                 .get(handle)
                 .map(|o| crate::share::oops::instanceOop::InstanceOop {
-                    klass: Rc::clone(&o.klass),
+                    klass: Arc::clone(&o.klass),
                     fields: o.fields.clone(),
                 })
         }
@@ -203,7 +203,7 @@ pub fn invoke<'a>(
                         match objects.get(handle) {
                             Some(other_obj) => (
                                 other_obj.fields.clone(),
-                                Rc::ptr_eq(&other_obj.klass, &record),
+                                Arc::ptr_eq(&other_obj.klass, &record),
                             ),
                             None => return Ok(Some(Value::Int(0))),
                         }
@@ -212,7 +212,7 @@ pub fn invoke<'a>(
                         return Ok(Some(Value::Int(0)));
                     }
                     let other_object = crate::share::oops::instanceOop::InstanceOop {
-                        klass: Rc::clone(&record),
+                        klass: Arc::clone(&record),
                         fields: other_fields,
                     };
                     let mut equal = true;

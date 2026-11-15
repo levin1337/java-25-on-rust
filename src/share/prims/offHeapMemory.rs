@@ -7,7 +7,7 @@
  * Essential for LWJGL vertex buffers, OpenGL direct pointers, and Netty byte buffers.
  */
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::io::{self, Error};
 use std::sync::{Mutex, OnceLock};
 
@@ -18,7 +18,10 @@ struct MemoryBlock {
 
 #[derive(Debug, Default)]
 pub struct OffHeapMemory {
-    blocks: Mutex<HashMap<u64, MemoryBlock>>,
+    // BTreeMap keyed by base address: addresses are handed out
+    // monotonically, so lookups are O(log n) via range instead of a
+    // linear scan of every block per access.
+    blocks: Mutex<BTreeMap<u64, MemoryBlock>>,
     next_address: Mutex<u64>,
 }
 
@@ -31,7 +34,7 @@ impl OffHeapMemory {
 
     pub fn new() -> Self {
         Self {
-            blocks: Mutex::new(HashMap::new()),
+            blocks: Mutex::new(BTreeMap::new()),
             next_address: Mutex::new(Self::BASE_ADDRESS),
         }
     }
@@ -80,12 +83,12 @@ impl OffHeapMemory {
     }
 
     fn find_block_and_offset<'a>(
-        blocks: &'a HashMap<u64, MemoryBlock>,
+        blocks: &'a BTreeMap<u64, MemoryBlock>,
         addr: u64,
         size: usize,
     ) -> io::Result<(&'a [u8], usize)> {
-        for (&base, block) in blocks.iter() {
-            if addr >= base && addr + (size as u64) <= base + (block.data.len() as u64) {
+        if let Some((&base, block)) = blocks.range(..=addr).next_back() {
+            if addr + (size as u64) <= base + (block.data.len() as u64) {
                 let offset = (addr - base) as usize;
                 return Ok((&block.data, offset));
             }
@@ -97,12 +100,14 @@ impl OffHeapMemory {
     }
 
     fn find_block_and_offset_mut<'a>(
-        blocks: &'a mut HashMap<u64, MemoryBlock>,
+        blocks: &'a mut BTreeMap<u64, MemoryBlock>,
         addr: u64,
         size: usize,
     ) -> io::Result<(&'a mut [u8], usize)> {
-        for (&base, block) in blocks.iter_mut() {
-            if addr >= base && addr + (size as u64) <= base + (block.data.len() as u64) {
+        let base = blocks.range(..=addr).next_back().map(|(&b, _)| b);
+        if let Some(base) = base {
+            let block = blocks.get_mut(&base).unwrap();
+            if addr + (size as u64) <= base + (block.data.len() as u64) {
                 let offset = (addr - base) as usize;
                 return Ok((&mut block.data, offset));
             }
@@ -213,6 +218,21 @@ impl OffHeapMemory {
             let (dst_data, dst_off) = Self::find_block_and_offset_mut(&mut blocks, dst, bytes)?;
             dst_data[dst_off..dst_off + bytes].copy_from_slice(&temp);
         }
+        Ok(())
+    }
+
+    /// Reads `bytes.len()` bytes starting at `addr` in one lock acquisition.
+    pub fn read_bytes(&self, addr: u64, bytes: usize) -> io::Result<Vec<u8>> {
+        let blocks = self.blocks.lock().unwrap();
+        let (data, offset) = Self::find_block_and_offset(&blocks, addr, bytes)?;
+        Ok(data[offset..offset + bytes].to_vec())
+    }
+
+    /// Writes a byte slice into an existing off-heap block.
+    pub fn write_bytes(&self, addr: u64, bytes: &[u8]) -> io::Result<()> {
+        let mut blocks = self.blocks.lock().unwrap();
+        let (data, offset) = Self::find_block_and_offset_mut(&mut blocks, addr, bytes.len())?;
+        data[offset..offset + bytes.len()].copy_from_slice(bytes);
         Ok(())
     }
 

@@ -3,7 +3,7 @@
 //!
 //! Stream handles returned by `init` are indexes into a global table. The
 //! `inflate*`/`deflate*` methods follow the JDK return packing:
-//! `written | consumed << 31 | finished << 62 | flag << 63`, and store
+//! `consumed | written << 31 | finished << 62 | flag << 63`, and store
 //! `inputConsumed`/`outputConsumed` on the Java receiver.
 
 use super::offHeapMemory::OffHeapMemory;
@@ -22,8 +22,10 @@ fn invalid(message: &'static str) -> io::Error {
 }
 
 enum Stream {
-    Inflate(flate2::Decompress),
-    Deflate(flate2::Compress),
+    // bool = zlib wrapper enabled, u32 = adler32 state
+    Inflate(flate2::Decompress, bool, u32),
+    // bool = zlib wrapper enabled, u32 = compression level, u32 = adler32 state
+    Deflate(flate2::Compress, bool, u32, u32),
 }
 
 struct Table {
@@ -83,12 +85,7 @@ fn collect_input<'a>(
         }
         Value::Long(address) => {
             let base = u64::try_from(address).map_err(|_| invalid("Invalid buffer address"))?;
-            let memory = OffHeapMemory::global();
-            let mut data = vec![0u8; length];
-            for (index, byte) in data.iter_mut().enumerate() {
-                *byte = memory.get_byte(base + offset as u64 + index as u64)? as u8;
-            }
-            Ok(data)
+            OffHeapMemory::global().read_bytes(base + offset as u64, length)
         }
         _ => Err(invalid("Unsupported input")),
     }
@@ -120,11 +117,7 @@ fn store_output<'a>(
         }
         Value::Long(address) => {
             let base = u64::try_from(address).map_err(|_| invalid("Invalid buffer address"))?;
-            let memory = OffHeapMemory::global();
-            for (index, &byte) in data.iter().enumerate() {
-                memory.put_byte(base + offset as u64 + index as u64, byte as i8)?;
-            }
-            Ok(())
+            OffHeapMemory::global().write_bytes(base + offset as u64, data)
         }
         _ => Err(invalid("Unsupported output")),
     }
@@ -214,7 +207,7 @@ fn run_inflate<'a>(
             .get_mut(&stream_handle)
             .ok_or_else(|| invalid("Invalid zip stream"))?;
         match stream {
-            Stream::Inflate(decompress) => {
+            Stream::Inflate(decompress, zlib, adler) => {
                 let before_in = decompress.total_in();
                 let before_out = decompress.total_out();
                 let status = decompress
@@ -222,6 +215,9 @@ fn run_inflate<'a>(
                     .map_err(|_error| invalid("DataFormatException"))?;
                 let consumed = (decompress.total_in() - before_in) as usize;
                 let written = (decompress.total_out() - before_out) as usize;
+                if *zlib {
+                    *adler = adler32(*adler, &output[..written.min(output.len())]);
+                }
                 (written.min(output_len), consumed.min(input.len()), matches!(status, flate2::Status::StreamEnd))
             }
             _ => return Err(invalid("Not an inflater")),
@@ -234,7 +230,7 @@ fn run_inflate<'a>(
         &output[..written],
     )?;
     set_counters(loader, receiver, consumed, written)?;
-    Ok((written as u64) | ((consumed as u64) << 31) | ((finished as u64) << 62))
+    Ok((consumed as u64) | ((written as u64) << 31) | ((finished as u64) << 62))
 }
 
 fn run_deflate<'a>(
@@ -265,7 +261,7 @@ fn run_deflate<'a>(
             .get_mut(&stream_handle)
             .ok_or_else(|| invalid("Invalid zip stream"))?;
         match stream {
-            Stream::Deflate(compress) => {
+            Stream::Deflate(compress, zlib, _, adler) => {
                 let before_in = compress.total_in();
                 let before_out = compress.total_out();
                 // zlib flush constants passed straight through by the JDK.
@@ -281,6 +277,9 @@ fn run_deflate<'a>(
                     .map_err(|_| invalid("Deflate error"))?;
                 let consumed = (compress.total_in() - before_in) as usize;
                 let written = (compress.total_out() - before_out) as usize;
+                if *zlib {
+                    *adler = adler32(*adler, &input[..consumed.min(input.len())]);
+                }
                 (
                     written.min(output_len),
                     consumed.min(input.len()),
@@ -290,6 +289,12 @@ fn run_deflate<'a>(
             _ => return Err(invalid("Not a deflater")),
         }
     };
+    if std::env::var_os("JVM25_TRACE_ZIP").is_some() {
+        eprintln!(
+            "[deflate] in_len={} out_len={} flush={} -> written={} consumed={} finished={}",
+            input.len(), output_len, flush, written, consumed, finished
+        );
+    }
     store_output(
         loader,
         arg_value(arguments, layout + 3),
@@ -297,7 +302,7 @@ fn run_deflate<'a>(
         &output[..written],
     )?;
     set_counters(loader, receiver, consumed, written)?;
-    Ok((written as u64) | ((consumed as u64) << 31) | ((finished as u64) << 62))
+    Ok((consumed as u64) | ((written as u64) << 31) | ((finished as u64) << 62))
 }
 
 /// Instance natives for Inflater/Deflater.
@@ -340,17 +345,14 @@ pub(crate) fn statik<'a>(
     let result = match (owner, name, descriptor) {
         (b"java/util/zip/Inflater", b"init", b"(Z)J") => {
             let nowrap = arg_i64(arguments, 0) != 0;
-            Value::Long(alloc(Stream::Inflate(flate2::Decompress::new(!nowrap))) as i64)
+            Value::Long(alloc(Stream::Inflate(flate2::Decompress::new(!nowrap), !nowrap, 1)) as i64)
         }
         (b"java/util/zip/Deflater", b"init", b"(IIZ)J") => {
             let level = arg_i64(arguments, 0);
             let nowrap = arg_i64(arguments, 2) != 0;
-            let level = if level < 0 {
-                flate2::Compression::default()
-            } else {
-                flate2::Compression::new(level.min(9) as u32)
-            };
-            Value::Long(alloc(Stream::Deflate(flate2::Compress::new(level, !nowrap))) as i64)
+            let level_inner = if level < 0 { 6 } else { level.min(9) as u32 };
+            let level = flate2::Compression::new(level_inner);
+            Value::Long(alloc(Stream::Deflate(flate2::Compress::new(level, !nowrap), !nowrap, level_inner, 1)) as i64)
         }
         (b"java/util/zip/Inflater", b"reset", b"(J)V")
         | (b"java/util/zip/Deflater", b"reset", b"(J)V") => {
@@ -358,9 +360,14 @@ pub(crate) fn statik<'a>(
             let mut table = table().lock().unwrap();
             if let Some(stream) = table.streams.get_mut(&handle) {
                 match stream {
-                    Stream::Inflate(decompress) => *decompress = flate2::Decompress::new(true),
-                    Stream::Deflate(compress) => {
-                        *compress = flate2::Compress::new(flate2::Compression::default(), true)
+                    Stream::Inflate(decompress, zlib, adler) => {
+                        *decompress = flate2::Decompress::new(*zlib);
+                        *adler = 1;
+                    }
+                    Stream::Deflate(compress, zlib, level, adler) => {
+                        *compress =
+                            flate2::Compress::new(flate2::Compression::new(*level), *zlib);
+                        *adler = 1;
                     }
                 }
             }
@@ -373,7 +380,16 @@ pub(crate) fn statik<'a>(
             return Ok(Some(Value::Null));
         }
         (b"java/util/zip/Inflater", b"getAdler", b"(J)I")
-        | (b"java/util/zip/Deflater", b"getAdler", b"(J)I") => Value::Int(1),
+        | (b"java/util/zip/Deflater", b"getAdler", b"(J)I") => {
+            let handle = arg_i64(arguments, 0) as u64;
+            let table = table().lock().unwrap();
+            let adler = match table.streams.get(&handle) {
+                Some(Stream::Inflate(_, _, adler))
+                | Some(Stream::Deflate(_, _, _, adler)) => *adler,
+                _ => 1,
+            };
+            Value::Int(adler as i32)
+        }
         (b"java/util/zip/CRC32", b"update", b"(II)I") => {
             let crc = arg_i64(arguments, 0) as u32;
             let byte = arg_i64(arguments, 1) as u8;
@@ -394,12 +410,39 @@ pub(crate) fn statik<'a>(
             let offset = arg_usize(arguments, 2);
             let length = arg_usize(arguments, 3);
             let memory = OffHeapMemory::global();
+            let data = memory.read_bytes(address + offset as u64, length)?;
             let mut value = crc ^ 0xFFFF_FFFF;
-            for index in 0..length {
-                let byte = memory.get_byte(address + (offset + index) as u64)? as u8;
+            for byte in data {
                 value = crc32_update(value, byte);
             }
             Value::Int(crc32_finalize(value) as i32)
+        }
+        (b"java/util/zip/CRC32C", b"update", b"(II)I") => {
+            let crc = arg_i64(arguments, 0) as u32;
+            let byte = arg_i64(arguments, 1) as u8;
+            Value::Int(crc32c_finalize(crc32c_update(crc ^ 0xFFFF_FFFF, byte)) as i32)
+        }
+        (b"java/util/zip/CRC32C", b"updateBytes0", b"(I[BII)I") => {
+            let crc = arg_i64(arguments, 0) as u32;
+            let data = collect_input(loader, arg_value(arguments, 1), arg_usize(arguments, 2), arg_usize(arguments, 3))?;
+            let mut value = crc ^ 0xFFFF_FFFF;
+            for &byte in &data {
+                value = crc32c_update(value, byte);
+            }
+            Value::Int(crc32c_finalize(value) as i32)
+        }
+        (b"java/util/zip/CRC32C", b"updateByteBuffer0", b"(IJII)I") => {
+            let crc = arg_i64(arguments, 0) as u32;
+            let address = arg_i64(arguments, 1) as u64;
+            let offset = arg_usize(arguments, 2);
+            let length = arg_usize(arguments, 3);
+            let memory = OffHeapMemory::global();
+            let data = memory.read_bytes(address + offset as u64, length)?;
+            let mut value = crc ^ 0xFFFF_FFFF;
+            for byte in data {
+                value = crc32c_update(value, byte);
+            }
+            Value::Int(crc32c_finalize(value) as i32)
         }
         _ => return Ok(None),
     };
@@ -417,4 +460,31 @@ fn crc32_update(crc: u32, byte: u8) -> u32 {
         crc = if crc & 1 != 0 { (crc >> 1) ^ 0xEDB8_8320 } else { crc >> 1 };
     }
     crc
+}
+
+fn crc32c_finalize(value: u32) -> u32 {
+    !value
+}
+
+fn crc32c_update(crc: u32, byte: u8) -> u32 {
+    let mut crc = crc ^ u32::from(byte);
+    for _ in 0..8 {
+        crc = if crc & 1 != 0 { (crc >> 1) ^ 0x82F6_3B78 } else { crc >> 1 };
+    }
+    crc
+}
+
+fn adler32(adler: u32, data: &[u8]) -> u32 {
+    let mut a = u64::from(adler & 0xFFFF);
+    let mut b = u64::from(adler >> 16);
+    const MOD_ADLER: u64 = 65_521;
+    for chunk in data.chunks(5552) {
+        for &byte in chunk {
+            a += u64::from(byte);
+            b += a;
+        }
+        a %= MOD_ADLER;
+        b %= MOD_ADLER;
+    }
+    ((b << 16) | a) as u32
 }

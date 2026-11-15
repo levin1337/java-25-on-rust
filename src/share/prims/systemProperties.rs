@@ -19,10 +19,10 @@ pub(crate) fn invoke<'a>(
             b"(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
             [key, value],
         ) => {
-            let key = propertyKey(*key)?.into_owned();
+            let key = propertyKey(loader, *key)?.into_owned();
             let value = match value {
                 Value::HostString(value) => *value,
-                _ => loader.storage.alloc_str(&string(*value)?),
+                _ => loader.storage.alloc_str(&string(loader, *value)?),
             };
             loader.systemProperties.borrow_mut().insert(key, value)
         }
@@ -31,13 +31,13 @@ pub(crate) fn invoke<'a>(
             loader
                 .systemProperties
                 .borrow()
-                .get(propertyKey(*key)?.as_ref())
+                .get(propertyKey(loader, *key)?.as_ref())
                 .copied()
         }
         (b"clearProperty", b"(Ljava/lang/String;)Ljava/lang/String;", [key]) => loader
             .systemProperties
             .borrow_mut()
-            .remove(propertyKey(*key)?.as_ref()),
+            .remove(propertyKey(loader, *key)?.as_ref()),
         _ => return Ok(None),
     };
     let result = previous
@@ -49,8 +49,8 @@ pub(crate) fn invoke<'a>(
     Ok(Some(result))
 }
 
-fn propertyKey(value: Value<'_>) -> io::Result<Cow<'_, str>> {
-    let key = string(value)?;
+fn propertyKey<'a>(loader: &ClassLoader<'a>, value: Value<'a>) -> io::Result<Cow<'a, str>> {
+    let key = string(loader, value)?;
     if key.is_empty() {
         return Err(Error::other("IllegalArgumentException: empty property key"));
     }
@@ -246,11 +246,14 @@ fn platform_properties_arch() -> String {
     .to_owned()
 }
 
-fn string(value: Value<'_>) -> io::Result<Cow<'_, str>> {
+fn string<'a>(loader: &ClassLoader<'a>, value: Value<'a>) -> io::Result<Cow<'a, str>> {
     match value {
         Value::HostString(value) => Ok(Cow::Borrowed(value)),
         Value::String(bytes) => decodeString(bytes).map(Cow::Owned),
         Value::Null => Err(Error::other("NullPointerException")),
-        _ => Err(Error::other("Expected java.lang.String")),
+        _ => match super::stringNatives::string(loader, value)? {
+            Some(text) => Ok(text),
+            None => Err(Error::other("Expected java.lang.String")),
+        },
     }
 }

@@ -13,7 +13,7 @@ use crate::share::{
     oops::{instanceKlass::InstanceKlass, instanceOop::InstanceOop},
 };
 use std::io::{self, Write};
-use std::rc::Rc;
+use std::sync::Arc;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum JavaValue<'a> {
@@ -90,7 +90,7 @@ impl JavaCalls {
     /// Dispatches a static method call (invokestatic)
     pub fn call_static<'a>(
         loader: &ClassLoader<'a>,
-        klass: &Rc<InstanceKlass<'a>>,
+        klass: &Arc<InstanceKlass<'a>>,
         name: &[u8],
         descriptor: &[u8],
         args: &JavaCallArguments<'a>,
@@ -104,7 +104,7 @@ impl JavaCalls {
     /// Dispatches a special method call (invokespecial: constructors, private methods, super calls)
     pub fn call_special<'a>(
         loader: &ClassLoader<'a>,
-        klass: &Rc<InstanceKlass<'a>>,
+        klass: &Arc<InstanceKlass<'a>>,
         name: &[u8],
         descriptor: &[u8],
         args: &JavaCallArguments<'a>,
@@ -118,7 +118,7 @@ impl JavaCalls {
     /// Dispatches a virtual method call with vtable dynamic dispatch (invokevirtual)
     pub fn call_virtual<'a>(
         loader: &ClassLoader<'a>,
-        receiver_klass: &Rc<InstanceKlass<'a>>,
+        receiver_klass: &Arc<InstanceKlass<'a>>,
         name: &[u8],
         descriptor: &[u8],
         args: &JavaCallArguments<'a>,
@@ -276,6 +276,8 @@ pub fn mainClass<'a>(
     arguments: &'a [String],
     output: &mut dyn Write,
 ) -> io::Result<()> {
+    crate::share::runtime::threading::mark_primordial();
+    let t0 = std::time::Instant::now();
     if let Ok(system) = loader.load(b"java/lang/System") {
         // HotSpot eagerly initializes java.lang.ref.Reference during VM
         // startup; its <clinit> registers JavaLangRefAccess in SharedSecrets,
@@ -284,13 +286,17 @@ pub fn mainClass<'a>(
             let _ = bytecodeInterpreter::initialize(loader, &reference, output, 0);
         }
         let args = JavaCallArguments::new();
+        eprintln!("[phase] 1");
         let _ = JavaCalls::call_static(loader, &system, b"initPhase1", b"()V", &args, output);
+        eprintln!("[phase] 2 {:?}", t0.elapsed());
         let mut args = JavaCallArguments::new();
         args.push_int(0);
         args.push_int(0);
         let _ = JavaCalls::call_static(loader, &system, b"initPhase2", b"(ZZ)I", &args, output);
+        eprintln!("[phase] 3 {:?}", t0.elapsed());
         let args = JavaCallArguments::new();
         let _ = JavaCalls::call_static(loader, &system, b"initPhase3", b"()V", &args, output);
+        eprintln!("[phase] done {:?}", t0.elapsed());
     }
     let mut encoded = Vec::with_capacity(name.len());
     for unit in name.encode_utf16() {
@@ -306,24 +312,83 @@ pub fn mainClass<'a>(
             ]),
         }
     }
+    eprintln!("[phase] load main {:?}", t0.elapsed());
     let klass = loader.load(&encoded)?;
+    eprintln!("[phase] main loaded {:?}", t0.elapsed());
     let mut args = JavaCallArguments::new();
     args.push_oop(Value::Arguments(arguments));
 
-    eprintln!("[dbg] bootstrap...");
+    eprintln!("[dbg] bootstrap... {:?}", t0.elapsed());
     bootstrap(loader, output)?;
-    eprintln!("[dbg] bootstrap done");
-    let res = JavaCalls::call_static(
+    eprintln!("[dbg] bootstrap done {:?}", t0.elapsed());
+    let res = match JavaCalls::call_static(
         loader,
         &klass,
         b"main",
         b"([Ljava/lang/String;)V",
         &args,
         output,
-    )?;
+    ) {
+        Ok(res) => res,
+        Err(error) => {
+            // Surface the throwable's class/message/cause chain on stderr —
+            // System.err is not wired to the process stderr, so printStackTrace
+            // output would be lost.
+            if let Some(handle) = bytecodeInterpreter::throwable_of(&error) {
+                dump_throwable_chain(loader, handle);
+            }
+            return Err(error);
+        }
+    };
 
     if res.is_some() {
         return Err(io::Error::other("main must return void"));
     }
     Ok(())
+}
+
+/// Prints `className: detailMessage` for a throwable and its `cause` chain
+/// to the process stderr. Used when `main` exits with a Java exception.
+fn dump_throwable_chain<'a>(loader: &ClassLoader<'a>, mut handle: usize) {
+    for _ in 0..16 {
+        let (class_name, message, cause) = {
+            let objects = loader.borrow_objects();
+            let Some(object) = objects.get(handle) else {
+                return;
+            };
+            let class_name = String::from_utf8_lossy(&object.klass.class.name).into_owned();
+            let message_slot = object
+                .klass
+                .instanceField(b"detailMessage", b"Ljava/lang/String;")
+                .ok();
+            let cause_slot = object
+                .klass
+                .instanceField(b"cause", b"Ljava/lang/Throwable;")
+                .ok();
+            let message = message_slot
+                .and_then(|slot| object.fields.get(slot).copied())
+                .and_then(|value| {
+                    crate::share::prims::stringNatives::string(loader, value)
+                        .ok()
+                        .flatten()
+                        .map(|cow| cow.into_owned())
+                });
+            let cause = cause_slot
+                .and_then(|slot| object.fields.get(slot).copied())
+                .and_then(|value| match value {
+                    Value::Object(h) => Some(h),
+                    _ => None,
+                });
+            (class_name, message, cause)
+        };
+        match &message {
+            Some(message) => eprintln!("[throw] {class_name}: {message}"),
+            None => eprintln!("[throw] {class_name}"),
+        }
+        match cause {
+            // Throwable.cause == this is the JDK "unset" sentinel.
+            Some(next) if next != handle => handle = next,
+            _ => return,
+        }
+    }
 }

@@ -12,10 +12,12 @@ use crate::share::{
     interpreter::bytecodeInterpreter::Value,
 };
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     io::{self, Read, Seek, SeekFrom, Write},
-    sync::{Mutex, OnceLock},
+    sync::{Condvar, Mutex, OnceLock},
 };
+#[cfg(windows)]
+use std::os::windows::fs::FileExt as _;
 
 fn invalid(message: &'static str) -> io::Error {
     io::Error::other(message)
@@ -74,6 +76,10 @@ fn windows_exception<'a>(
     message: &str,
 ) -> io::Error {
     let class_name = b"sun/nio/fs/WindowsException";
+    if code == 2 || code == 3 {
+        eprintln!("[WindowsException] code={code} msg={message}");
+        eprintln!("{}", std::backtrace::Backtrace::force_capture());
+    }
     match throwable(loader, class_name, message) {
         Ok(handle) => {
             if let Ok(klass) = loader.load(class_name)
@@ -101,6 +107,7 @@ fn win32_error<'a>(loader: &ClassLoader<'a>, error: &io::Error) -> io::Error {
         AlreadyExists => 80,    // ERROR_ALREADY_EXISTS
         _ => 1,                 // ERROR_INVALID_FUNCTION
     };
+    eprintln!("[win32_error] code={code} error={error}");
     windows_exception(loader, code, &error.to_string())
 }
 
@@ -151,6 +158,9 @@ pub(crate) fn entry_path(handle: u64) -> Option<String> {
 }
 
 pub(crate) fn with_entry<R>(handle: u64, f: impl FnOnce(&mut Entry) -> io::Result<R>) -> io::Result<R> {
+    // Keep memory-mapped regions coherent: pending mapped writes are
+    // flushed before any other I/O through this descriptor.
+    flush_maps_for_fd(handle);
     let mut table = table().lock().unwrap();
     let entry = table
         .entries
@@ -164,6 +174,68 @@ pub(crate) fn file_of(entry: &mut Entry) -> io::Result<&mut std::fs::File> {
         EntryKind::File(file) => Ok(file),
         _ => Err(invalid("Handle is not a file")),
     }
+}
+
+// ---------------------------------------------------------------------------
+// File mappings (`FileDispatcherImpl.map0`/`unmap0`).
+//
+// Real mmap is not available through std; instead the mapped region is copied
+// into `OffHeapMemory` and tracked here. Writes through the MappedByteBuffer
+// land in that copy; writable mappings are flushed back to the file on
+// `unmap0` and before any other I/O on the same descriptor (keeps
+// FileChannel.read-after-map-write coherent).
+// ---------------------------------------------------------------------------
+
+struct FileMap {
+    fd: u64,
+    path: String,
+    file_pos: u64,
+    len: u64,
+    writable: bool,
+}
+
+fn file_maps() -> &'static Mutex<HashMap<u64, FileMap>> {
+    static MAPS: OnceLock<Mutex<HashMap<u64, FileMap>>> = OnceLock::new();
+    MAPS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Writes back every writable mapping of `fd`, if any.
+pub(crate) fn flush_maps_for_fd(fd: u64) {
+    let pending: Vec<(u64, FileMap)> = {
+        let maps = file_maps().lock().unwrap();
+        maps.iter()
+            .filter(|(_, m)| m.fd == fd && m.writable)
+            .map(|(&addr, m)| {
+                (
+                    addr,
+                    FileMap {
+                        fd: m.fd,
+                        path: m.path.clone(),
+                        file_pos: m.file_pos,
+                        len: m.len,
+                        writable: m.writable,
+                    },
+                )
+            })
+            .collect()
+    };
+    for (addr, m) in pending {
+        flush_map(addr, &m);
+    }
+}
+
+fn flush_map(addr: u64, m: &FileMap) {
+    let Ok(data) = OffHeapMemory::global().read_bytes(addr, m.len as usize) else {
+        return;
+    };
+    let _ = write_file_at(&m.path, m.file_pos, &data);
+}
+
+fn write_file_at(path: &str, pos: u64, data: &[u8]) -> io::Result<()> {
+    use std::io::Seek;
+    let mut file = std::fs::OpenOptions::new().write(true).open(path)?;
+    file.seek(SeekFrom::Start(pos))?;
+    file.write_all(data)
 }
 
 // ---------------------------------------------------------------------------
@@ -233,10 +305,18 @@ fn split_search_path(path: &str) -> (String, String) {
     if let Some(index) = trimmed.rfind(['\\', '/']) {
         let (dir, pat) = trimmed.split_at(index);
         let pat = &pat[1..];
-        if pat.is_empty() {
-            return (dir.to_string(), "*".to_string());
+        let mut dir = dir.to_string();
+        // `C:\foo` splits into dir `C:` which is not a listable path;
+        // the drive root must keep its trailing separator (`C:\`).
+        if dir.len() == 2 && dir.ends_with(':') {
+            dir.push('\\');
         }
-        (dir.to_string(), pat.to_string())
+        if pat.is_empty() {
+            return (dir, "*".to_string());
+        }
+        (dir, pat.to_string())
+    } else if trimmed.len() == 2 && trimmed.ends_with(':') {
+        (format!("{}\\", trimmed), "*".to_string())
     } else {
         (String::new(), "*".to_string())
     }
@@ -364,7 +444,7 @@ fn set_first_file_fields<'a>(
 }
 
 /// Reads a NUL-terminated UTF-16LE path from off-heap memory.
-fn read_wide_path(address: i64) -> io::Result<String> {
+fn read_wide_units(address: i64) -> io::Result<Vec<u16>> {
     let base = u64::try_from(address).map_err(|_| invalid("Invalid path address"))?;
     let memory = OffHeapMemory::global();
     let mut units = Vec::new();
@@ -382,6 +462,11 @@ fn read_wide_path(address: i64) -> io::Result<String> {
             return Err(invalid("Path too long"));
         }
     }
+    Ok(units)
+}
+
+fn read_wide_path(address: i64) -> io::Result<String> {
+    let units = read_wide_units(address)?;
     Ok(String::from_utf16_lossy(&units))
 }
 
@@ -391,6 +476,119 @@ fn java_path(path: &str) -> String {
     } else {
         path.replace('\\', "/")
     }
+}
+
+/// Fills `bytes` with operating-system entropy (BCryptGenRandom on Windows,
+/// /dev/urandom elsewhere).
+#[cfg(windows)]
+fn fill_random(bytes: &mut [u8]) -> bool {
+    #[link(name = "bcrypt")]
+    unsafe extern "system" {
+        fn BCryptGenRandom(
+            algorithm: *mut core::ffi::c_void,
+            buffer: *mut u8,
+            length: u32,
+            flags: u32,
+        ) -> i32;
+    }
+    const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 0x0000_0002;
+    if bytes.is_empty() {
+        return true;
+    }
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        let chunk = (bytes.len() - offset).min(u32::MAX as usize) as u32;
+        let status = unsafe {
+            BCryptGenRandom(
+                core::ptr::null_mut(),
+                bytes[offset..].as_mut_ptr(),
+                chunk,
+                BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+            )
+        };
+        if status != 0 {
+            return false;
+        }
+        offset += chunk as usize;
+    }
+    true
+}
+
+#[cfg(not(windows))]
+fn fill_random(bytes: &mut [u8]) -> bool {
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut file| file.read_exact(bytes))
+        .is_ok()
+}
+
+// ---------------------------------------------------------------------------
+// I/O completion ports (CreateIoCompletionPort / GetQueuedCompletionStatus0 /
+// PostQueuedCompletionStatus)
+// ---------------------------------------------------------------------------
+
+struct CompletionEntry {
+    bytes: u32,
+    key: i64,
+}
+
+struct IocpState {
+    queue: VecDeque<CompletionEntry>,
+    closed: bool,
+}
+
+fn iocp_sync() -> &'static (Mutex<HashMap<u64, IocpState>>, Condvar) {
+    static IOCP: OnceLock<(Mutex<HashMap<u64, IocpState>>, Condvar)> = OnceLock::new();
+    IOCP.get_or_init(|| (Mutex::new(HashMap::new()), Condvar::new()))
+}
+
+fn iocp_alloc() -> u64 {
+    static NEXT: Mutex<u64> = Mutex::new(0x4000_0000);
+    let mut next = NEXT.lock().unwrap();
+    let handle = *next;
+    *next += 0x10;
+    handle
+}
+
+/// Writes `error`/`bytesTransferred`/`completionKey` onto a
+/// `WindowsNativeDispatcher$CompletionStatus` object.
+fn set_completion_fields<'a>(
+    loader: &ClassLoader<'a>,
+    value: Value<'a>,
+    error: i32,
+    bytes: i32,
+    key: i64,
+) -> io::Result<()> {
+    let Value::Object(object_handle) = value else {
+        return Err(invalid("Expected CompletionStatus object"));
+    };
+    let updates = {
+        let objects = loader.borrow_objects();
+        let object = objects
+            .get(object_handle)
+            .ok_or_else(|| invalid("Invalid CompletionStatus object"))?;
+        let klass = &object.klass;
+        vec![
+            (klass.instanceField(b"error", b"I")?, Value::Int(error)),
+            (
+                klass.instanceField(b"bytesTransferred", b"I")?,
+                Value::Int(bytes),
+            ),
+            (
+                klass.instanceField(b"completionKey", b"J")?,
+                Value::Long(key),
+            ),
+        ]
+    };
+    let mut objects = loader.borrow_objects_mut();
+    let object = objects
+        .get_mut(object_handle)
+        .ok_or_else(|| invalid("Invalid CompletionStatus object"))?;
+    for (slot, value) in updates {
+        if slot < object.fields.len() {
+            object.fields[slot] = value;
+        }
+    }
+    Ok(())
 }
 
 /// Reads `count` bytes from off-heap memory into a Vec.
@@ -405,6 +603,21 @@ fn read_buffer(address: i64, count: usize) -> io::Result<Vec<u8>> {
 }
 
 /// Writes bytes into off-heap memory.
+fn copy_dir_all(source: &str, dest: &str) -> io::Result<()> {
+    std::fs::create_dir_all(dest)?;
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = std::path::Path::new(dest).join(entry.file_name());
+        if from.is_dir() {
+            copy_dir_all(&from.to_string_lossy(), &to.to_string_lossy())?;
+        } else {
+            std::fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
+}
+
 fn write_buffer(address: i64, data: &[u8]) -> io::Result<()> {
     let base = u64::try_from(address).map_err(|_| invalid("Invalid buffer address"))?;
     let memory = OffHeapMemory::global();
@@ -460,10 +673,25 @@ pub(crate) fn dispatcher<'a>(
                 eprintln!("[CreateFile0] path={:?} desired={:#x} disp={}", path, desired, disposition);
             }
             let _ = share;
+            if path.contains("asm-9.10.1") {
+                eprintln!("[CreateFile0] path={path:?} desired={desired:#x} disp={disposition}");
+            }
             let mut options = std::fs::OpenOptions::new();
-            options.read(desired & 0x8000_0000 != 0 || desired & 0x1 != 0);
-            options.write(desired & 0x4000_0000 != 0 || desired & 0x2000_0000 != 0 || desired & 0x400 != 0);
+            // FILE_* / GENERIC_* desired-access bits.
+            let wants_read = desired
+                & (0x8000_0000 | 0x1000_0000 | 0x1 | 0x8 | 0x20 | 0x80 | 0x0010_0000)
+                != 0;
+            let wants_write = desired
+                & (0x4000_0000 | 0x1000_0000 | 0x2 | 0x10 | 0x100 | 0x0001_0000)
+                != 0;
+            options.read(wants_read);
+            options.write(wants_write);
             options.append(desired & 0x4 != 0);
+            // Attribute-only opens (FILE_READ_ATTRIBUTES etc.) still need a
+            // usable handle for metadata queries.
+            if !wants_read && !wants_write && desired & 0x4 == 0 {
+                options.read(true);
+            }
             match disposition {
                 1 => {
                     options.create_new(true);
@@ -488,7 +716,15 @@ pub(crate) fn dispatcher<'a>(
             }
         }
         (b"CloseHandle", b"(J)V") => {
-            free_handle(arg(0) as u64);
+            let handle = arg(0) as u64;
+            free_handle(handle);
+            let (lock, cvar) = iocp_sync();
+            let mut ports = lock.lock().unwrap();
+            if let Some(state) = ports.get_mut(&handle) {
+                state.closed = true;
+                state.queue.clear();
+                cvar.notify_all();
+            }
             return Ok(Some(Value::Null));
         }
         (b"GetFileAttributes0", b"(J)I") => {
@@ -507,10 +743,23 @@ pub(crate) fn dispatcher<'a>(
         (b"GetFileAttributesEx0", b"(JJ)V") => {
             let path = read_wide_path(arg(0))?;
             let out = arg(1);
+            if path.contains("asm-9.10.1") {
+                eprintln!("[GetFileAttributesEx0] path={path:?}");
+            }
             let mut data = [0u8; 36];
-            if let Ok(meta) = std::fs::metadata(java_path(&path)) {
+            let meta = match std::fs::metadata(java_path(&path)) {
+                Ok(meta) => meta,
+                Err(error) => {
+                    eprintln!("[GetFileAttributesEx0] MISSING {path:?}: {error}");
+                    return Err(win32_error(loader, &error));
+                }
+            };
+            {
                 let file_attrs = if meta.is_dir() { 0x10u32 } else { 0x80 };
                 data[0..4].copy_from_slice(&file_attrs.to_le_bytes());
+                let len = meta.len();
+                data[28..32].copy_from_slice(&((len >> 32) as u32).to_le_bytes());
+                data[32..36].copy_from_slice(&(len as u32).to_le_bytes());
                 if let Ok(modified) = meta.modified()
                     && let Ok(duration) = modified.duration_since(std::time::UNIX_EPOCH)
                 {
@@ -536,6 +785,48 @@ pub(crate) fn dispatcher<'a>(
         (b"RemoveDirectory0", b"(J)V") => {
             let path = read_wide_path(arg(0))?;
             std::fs::remove_dir(java_path(&path)).map_err(|e| win32_error(loader, &e))?;
+            return Ok(Some(Value::Null));
+        }
+        (b"CopyFileEx0", b"(JJJI)V") => {
+            let source = read_wide_path(arg(0))?;
+            let dest = read_wide_path(arg(1))?;
+            let flags = arg(2) as u32;
+            let _cancel = arg(3);
+            const COPY_FILE_FAIL_IF_EXISTS: u32 = 0x1;
+            let dest_path = java_path(&dest);
+            if flags & COPY_FILE_FAIL_IF_EXISTS != 0
+                && std::path::Path::new(&dest_path).exists()
+            {
+                return Err(windows_exception(
+                    loader,
+                    80,
+                    "Cannot create a file when that file already exists",
+                ));
+            }
+            std::fs::copy(java_path(&source), &dest_path)
+                .map_err(|e| win32_error(loader, &e))?;
+            return Ok(Some(Value::Null));
+        }
+        (b"MoveFileEx0", b"(JJI)V") => {
+            let source = read_wide_path(arg(0))?;
+            let dest = read_wide_path(arg(1))?;
+            let flags = arg(2) as u32;
+            let src = java_path(&source);
+            let dst = java_path(&dest);
+            // MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED | MOVEFILE_WRITE_THROUGH
+            let _ = flags;
+            if std::path::Path::new(&dst).exists() {
+                let _ = std::fs::remove_file(&dst);
+            }
+            if std::fs::rename(&src, &dst).is_err() {
+                // Cross-volume fallback: copy then remove.
+                let fallback = if std::fs::metadata(&src).map(|m| m.is_dir()).unwrap_or(false) {
+                    copy_dir_all(&src, &dst).and_then(|_| std::fs::remove_dir_all(&src))
+                } else {
+                    std::fs::copy(&src, &dst).and_then(|_| std::fs::remove_file(&src))
+                };
+                fallback.map_err(|e| win32_error(loader, &e))?;
+            }
             return Ok(Some(Value::Null));
         }
         (b"GetFileSizeEx", b"(J)J") => {
@@ -625,7 +916,30 @@ pub(crate) fn dispatcher<'a>(
         | (b"OpenThreadToken", b"(JIZ)J")
         | (b"DuplicateTokenEx", b"(JII)J") => Value::Long(alloc_handle(EntryKind::Other, String::new()) as i64),
         (b"CreateIoCompletionPort", b"(JJJ)J") => {
-            Value::Long(alloc_handle(EntryKind::Other, String::new()) as i64)
+            let file = arg(0) as u64;
+            let existing = arg(1) as u64;
+            let _key = arg(2);
+            if existing != 0 {
+                let (lock, _) = iocp_sync();
+                let ports = lock.lock().unwrap();
+                if !ports.contains_key(&existing) {
+                    return Err(windows_exception(loader, 6, "The handle is invalid"));
+                }
+                if file != 0 && !table().lock().unwrap().entries.contains_key(&file) {
+                    return Err(windows_exception(loader, 6, "The handle is invalid"));
+                }
+                Value::Long(existing as i64)
+            } else {
+                if file != 0 && !table().lock().unwrap().entries.contains_key(&file) {
+                    return Err(windows_exception(loader, 6, "The handle is invalid"));
+                }
+                let handle = iocp_alloc();
+                let (lock, _) = iocp_sync();
+                lock.lock()
+                    .unwrap()
+                    .insert(handle, IocpState { queue: VecDeque::new(), closed: false });
+                Value::Long(handle as i64)
+            }
         }
         (b"ConvertSidToStringSid", b"(J)Ljava/lang/String;") => Value::Null,
         (b"GetSecurityDescriptorOwner", b"(J)J") => Value::Long(0),
@@ -635,6 +949,10 @@ pub(crate) fn dispatcher<'a>(
         (b"GetLengthSid", b"(J)I") => Value::Int(0),
         (b"FindFirstFile0", b"(JLsun/nio/fs/WindowsNativeDispatcher$FirstFile;)V") => {
             let search = read_wide_path(arg(0))?;
+            let stack = loader.call_stack.snapshot();
+            let depth = stack.len();
+            let tail: Vec<String> = stack.iter().rev().take(24).map(|n| String::from_utf8_lossy(n).into_owned()).collect();
+            eprintln!("[FindFirstFile0] search={search:?} depth={depth} stack(top->bottom)={tail:?}");
             let (dir, pattern) = split_search_path(&search);
             let dir = if dir.is_empty() { ".".to_string() } else { dir };
             let (handle, first) = match dir_open(&dir, &pattern) {
@@ -663,6 +981,10 @@ pub(crate) fn dispatcher<'a>(
         }
         (b"FindFirstFile1", b"(JJ)J") => {
             let search = read_wide_path(arg(0))?;
+            let stack = loader.call_stack.snapshot();
+            let depth = stack.len();
+            let tail: Vec<String> = stack.iter().rev().take(24).map(|n| String::from_utf8_lossy(n).into_owned()).collect();
+            eprintln!("[FindFirstFile1] search={search:?} depth={depth} stack(top->bottom)={tail:?}");
             let (dir, pattern) = split_search_path(&search);
             let dir = if dir.is_empty() { ".".to_string() } else { dir };
             let (handle, first) = match dir_open(&dir, &pattern) {
@@ -697,11 +1019,224 @@ pub(crate) fn dispatcher<'a>(
             dir_table().lock().unwrap().remove(&(arg(0) as u64));
             return Ok(Some(Value::Null));
         }
-        (b"GetQueuedCompletionStatus0", b"(JJJ)I") => Value::Int(0),
+        (b"GetQueuedCompletionStatus0", b"(JLsun/nio/fs/WindowsNativeDispatcher$CompletionStatus;)V") => {
+            let port = arg(0) as u64;
+            let status_value = arguments.get(1).copied().unwrap_or(Value::Null);
+            let (lock, cvar) = iocp_sync();
+            let mut ports = lock.lock().unwrap();
+            let (bytes, key) = loop {
+                match ports.get_mut(&port) {
+                    None => {
+                        return Err(windows_exception(loader, 6, "The handle is invalid"));
+                    }
+                    Some(state) => {
+                        if let Some(entry) = state.queue.pop_front() {
+                            break (entry.bytes as i32, entry.key);
+                        }
+                        if state.closed {
+                            return Err(windows_exception(loader, 6, "The handle is invalid"));
+                        }
+                    }
+                }
+                ports = cvar
+                    .wait(ports)
+                    .map_err(|_| invalid("IOCP wait failed"))?;
+            };
+            drop(ports);
+            set_completion_fields(loader, status_value, 0, bytes, key)?;
+            return Ok(Some(Value::Null));
+        }
+        (b"PostQueuedCompletionStatus", b"(JJ)V") => {
+            let port = arg(0) as u64;
+            let key = arg(1);
+            let (lock, cvar) = iocp_sync();
+            let mut ports = lock.lock().unwrap();
+            let state = ports
+                .get_mut(&port)
+                .ok_or_else(|| windows_exception(loader, 6, "The handle is invalid"))?;
+            if state.closed {
+                return Err(windows_exception(loader, 6, "The handle is invalid"));
+            }
+            state.queue.push_back(CompletionEntry { bytes: 0, key });
+            cvar.notify_one();
+            return Ok(Some(Value::Null));
+        }
         (b"GetOverlappedResult", b"(JJ)I") => Value::Int(0),
         _ => return Ok(None),
     };
     Ok(Some(result))
+}
+
+/// `sun.nio.ch.FileDispatcher` lock status codes.
+const LOCK_NO_LOCK: i32 = -1;
+const LOCK_LOCKED: i32 = 0;
+
+/// Byte-range file lock; mirrors `LockFileEx`/`UnlockFileEx` on Windows.
+/// Returns `LOCK_LOCKED` on success, `LOCK_NO_LOCK` when a non-blocking
+/// request cannot be satisfied, and an `io::Error` for real failures.
+#[cfg(windows)]
+fn lock_range(file: &std::fs::File, pos: i64, size: i64, block: bool, shared: bool) -> io::Result<i32> {
+    use std::os::windows::io::AsRawHandle;
+    #[repr(C)]
+    struct Overlapped {
+        internal: usize,
+        internal_high: usize,
+        offset: u32,
+        offset_high: u32,
+        event: *mut core::ffi::c_void,
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn LockFileEx(
+            file: *mut core::ffi::c_void,
+            flags: u32,
+            reserved: u32,
+            low: u32,
+            high: u32,
+            overlapped: *mut Overlapped,
+        ) -> i32;
+        fn GetOverlappedResult(
+            file: *mut core::ffi::c_void,
+            overlapped: *mut Overlapped,
+            transferred: *mut u32,
+            wait: i32,
+        ) -> i32;
+    }
+    const LOCKFILE_FAIL_IMMEDIATELY: u32 = 0x1;
+    const LOCKFILE_EXCLUSIVE_LOCK: u32 = 0x2;
+    const ERROR_LOCK_VIOLATION: i32 = 33;
+    const ERROR_IO_PENDING: i32 = 997;
+
+    let handle = file.as_raw_handle() as *mut core::ffi::c_void;
+    let mut overlapped = Overlapped {
+        internal: 0,
+        internal_high: 0,
+        offset: pos as u32,
+        offset_high: (pos >> 32) as u32,
+        event: core::ptr::null_mut(),
+    };
+    let mut flags = 0u32;
+    if !block {
+        flags |= LOCKFILE_FAIL_IMMEDIATELY;
+    }
+    if !shared {
+        flags |= LOCKFILE_EXCLUSIVE_LOCK;
+    }
+    let ok = unsafe {
+        LockFileEx(
+            handle,
+            flags,
+            0,
+            size as u32,
+            (size >> 32) as u32,
+            &mut overlapped,
+        )
+    };
+    if ok != 0 {
+        return Ok(LOCK_LOCKED);
+    }
+    let mut error = io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    if error == ERROR_IO_PENDING {
+        let mut transferred = 0u32;
+        let waited = unsafe { GetOverlappedResult(handle, &mut overlapped, &mut transferred, 1) };
+        if waited != 0 {
+            return Ok(LOCK_LOCKED);
+        }
+        error = io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    }
+    if error != ERROR_LOCK_VIOLATION {
+        return Err(io::Error::last_os_error());
+    }
+    if !block {
+        return Ok(LOCK_NO_LOCK);
+    }
+    Err(io::Error::other("Lock failed"))
+}
+
+#[cfg(windows)]
+fn unlock_range(file: &std::fs::File, pos: i64, size: i64) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    #[repr(C)]
+    struct Overlapped {
+        internal: usize,
+        internal_high: usize,
+        offset: u32,
+        offset_high: u32,
+        event: *mut core::ffi::c_void,
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn UnlockFileEx(
+            file: *mut core::ffi::c_void,
+            reserved: u32,
+            low: u32,
+            high: u32,
+            overlapped: *mut Overlapped,
+        ) -> i32;
+        fn GetOverlappedResult(
+            file: *mut core::ffi::c_void,
+            overlapped: *mut Overlapped,
+            transferred: *mut u32,
+            wait: i32,
+        ) -> i32;
+    }
+    const ERROR_NOT_LOCKED: i32 = 158;
+    const ERROR_IO_PENDING: i32 = 997;
+
+    let handle = file.as_raw_handle() as *mut core::ffi::c_void;
+    let mut overlapped = Overlapped {
+        internal: 0,
+        internal_high: 0,
+        offset: pos as u32,
+        offset_high: (pos >> 32) as u32,
+        event: core::ptr::null_mut(),
+    };
+    let ok = unsafe {
+        UnlockFileEx(handle, 0, size as u32, (size >> 32) as u32, &mut overlapped)
+    };
+    if ok != 0 {
+        return Ok(());
+    }
+    let mut error = io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    if error == ERROR_IO_PENDING {
+        let mut transferred = 0u32;
+        let waited = unsafe { GetOverlappedResult(handle, &mut overlapped, &mut transferred, 1) };
+        if waited != 0 {
+            return Ok(());
+        }
+        error = io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    }
+    if error != ERROR_NOT_LOCKED {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn lock_range(file: &std::fs::File, _pos: i64, _size: i64, block: bool, shared: bool) -> io::Result<i32> {
+    use std::fs::TryLockError;
+    let acquired = if shared {
+        if block {
+            file.lock_shared().map(|_| true)
+        } else {
+            file.try_lock_shared().map(|ok| ok)
+        }
+    } else if block {
+        file.lock().map(|_| true)
+    } else {
+        file.try_lock().map(|ok| ok)
+    };
+    match acquired {
+        Ok(true) => Ok(LOCK_LOCKED),
+        Ok(false) => Ok(LOCK_NO_LOCK),
+        Err(TryLockError::WouldBlock) => Ok(LOCK_NO_LOCK),
+        Err(TryLockError::Error(error)) => Err(error),
+    }
+}
+
+#[cfg(not(windows))]
+fn unlock_range(file: &std::fs::File, _pos: i64, _size: i64) -> io::Result<()> {
+    file.unlock()
 }
 
 /// `sun.nio.ch.FileDispatcherImpl` static natives.
@@ -756,24 +1291,28 @@ pub(crate) fn dispatcher_impl<'a>(
             let handle = file_descriptor_handle(loader, arguments.first().copied().unwrap_or(Value::Null))?;
             let address = arg(1);
             let len = arg(2) as usize;
-            let _blocking = arg(3) != 0;
+            let append = arg(3) != 0;
             let data = read_buffer(address, len)?;
             let written = with_entry(handle, |entry| {
-                let pos = entry.pos;
+                let start = if append {
+                    file_of(entry)?.seek(SeekFrom::End(0))?
+                } else {
+                    entry.pos
+                };
                 let file = file_of(entry)?;
-                file.seek(SeekFrom::Start(pos))?;
+                file.seek(SeekFrom::Start(start))?;
                 let n = file.write(&data)?;
-                entry.pos = pos + n as u64;
+                entry.pos = start + n as u64;
                 Ok(n)
             })?;
             Value::Int(written as i32)
         }
-        (b"pwrite0", b"(Ljava/io/FileDescriptor;JIJZ)I") => {
+        (b"pwrite0", b"(Ljava/io/FileDescriptor;JIJ)I")
+        | (b"pwrite0", b"(Ljava/io/FileDescriptor;JIJZ)I") => {
             let handle = file_descriptor_handle(loader, arguments.first().copied().unwrap_or(Value::Null))?;
             let address = arg(1);
             let len = arg(2) as usize;
             let position = arg(3) as u64;
-            let _blocking = arg(4) != 0;
             let data = read_buffer(address, len)?;
             let written = with_entry(handle, |entry| {
                 let file = file_of(entry)?;
@@ -823,35 +1362,45 @@ pub(crate) fn dispatcher_impl<'a>(
             )?;
             let iov = arg(1) as u64;
             let count = arg(2) as usize;
-            let _blocking = arg(3) != 0;
+            let append = arg(3) != 0;
             let mut total = 0usize;
             with_entry(handle, |entry| {
-                let pos = entry.pos;
-                let file = file_of(entry)?;
-                file.seek(SeekFrom::Start(pos))?;
+                let mut pos = entry.pos;
+                if append {
+                    let file = file_of(entry)?;
+                    pos = file.seek(SeekFrom::End(0))?;
+                }
                 for index in 0..count {
                     let base = iov + (index * 16) as u64;
                     let ptr = OffHeapMemory::global().get_long(base)? as u64;
                     let len = OffHeapMemory::global().get_long(base + 8)? as usize;
                     let data = read_buffer(ptr as i64, len)?;
-                    let n = file.write(&data)?;
+                    let n = {
+                        let file = file_of(entry)?;
+                        file.seek(SeekFrom::Start(pos))?;
+                        file.write(&data)?
+                    };
+                    pos += n as u64;
                     total += n;
                     if n < len {
                         break;
                     }
                 }
-                entry.pos = pos + total as u64;
+                entry.pos = pos;
                 Ok(())
             })?;
             Value::Long(total as i64)
         }
         (b"seek0", b"(Ljava/io/FileDescriptor;J)J") => {
             let handle = file_descriptor_handle(loader, arguments.first().copied().unwrap_or(Value::Null))?;
-            let position = arg(1) as u64;
+            let offset = arg(1);
             Value::Long(with_entry(handle, |entry| {
                 let current = entry.pos;
-                file_of(entry)?.seek(SeekFrom::Start(position))?;
-                entry.pos = position;
+                if offset < 0 {
+                    return Ok(current as i64);
+                }
+                file_of(entry)?.seek(SeekFrom::Start(offset as u64))?;
+                entry.pos = offset as u64;
                 Ok(current as i64)
             })?)
         }
@@ -870,8 +1419,40 @@ pub(crate) fn dispatcher_impl<'a>(
             Value::Int(0)
         }
         (b"force0", b"(Ljava/io/FileDescriptor;Z)I") => {
-            let _handle = file_descriptor_handle(loader, arguments.first().copied().unwrap_or(Value::Null))?;
+            let handle = file_descriptor_handle(loader, arguments.first().copied().unwrap_or(Value::Null))?;
+            with_entry(handle, |entry| {
+                let file = file_of(entry)?;
+                file.sync_all().or_else(|error| {
+                    if error.kind() == io::ErrorKind::PermissionDenied {
+                        Ok(())
+                    } else {
+                        Err(io_exception(loader, &error.to_string()))
+                    }
+                })
+            })?;
             Value::Int(0)
+        }
+        (b"available0", b"(Ljava/io/FileDescriptor;)I") => {
+            let handle = file_descriptor_handle(loader, arguments.first().copied().unwrap_or(Value::Null))?;
+            let available = with_entry(handle, |entry| {
+                let file = file_of(entry)?;
+                let meta = file.metadata()?;
+                if !meta.is_file() {
+                    return Ok(0i64);
+                }
+                Ok((meta.len() as i64).saturating_sub(entry.pos as i64).clamp(0, i32::MAX as i64))
+            })?;
+            Value::Int(available as i32)
+        }
+        (b"isOther0", b"(Ljava/io/FileDescriptor;)Z") => {
+            let handle = file_descriptor_handle(loader, arguments.first().copied().unwrap_or(Value::Null))?;
+            let other = with_entry(handle, |entry| {
+                let file = file_of(entry)?;
+                let meta = file.metadata()?;
+                let kind = meta.file_type();
+                Ok(!(kind.is_file() || kind.is_symlink()))
+            })?;
+            Value::Int(i32::from(other))
         }
         (b"close0", b"(Ljava/io/FileDescriptor;)V") => {
             let handle = file_descriptor_handle(loader, arguments.first().copied().unwrap_or(Value::Null))?;
@@ -899,15 +1480,181 @@ pub(crate) fn dispatcher_impl<'a>(
             Value::Long(handle as i64)
         }
         (b"allocationGranularity0", b"()J") => Value::Long(65_536),
-        (b"maxDirectTransferSize0", b"()I") => Value::Int(0x7FFF_F000),
-        (b"lock0", b"(Ljava/io/FileDescriptor;ZJJZ)I")
-        | (b"release0", b"(Ljava/io/FileDescriptor;JJ)V") => {
-            if name == b"lock0" {
-                Value::Int(0)
-            } else {
-                return Ok(Some(Value::Null));
-            }
+        (b"maxDirectTransferSize0", b"()I") => Value::Int(i32::MAX - 1),
+        (b"lock0", b"(Ljava/io/FileDescriptor;ZJJZ)I") => {
+            let handle = file_descriptor_handle(loader, arguments.first().copied().unwrap_or(Value::Null))?;
+            let block = arg(1) != 0;
+            let pos = arg(2);
+            let size = arg(3);
+            let shared = arg(4) != 0;
+            let result = with_entry(handle, |entry| {
+                lock_range(file_of(entry)?, pos, size, block, shared)
+            })?;
+            Value::Int(result)
         }
+        (b"release0", b"(Ljava/io/FileDescriptor;JJ)V") => {
+            let handle = file_descriptor_handle(loader, arguments.first().copied().unwrap_or(Value::Null))?;
+            let pos = arg(1);
+            let size = arg(2);
+            with_entry(handle, |entry| {
+                unlock_range(file_of(entry)?, pos, size)
+                    .map_err(|e| io_exception(loader, &e.to_string()))
+            })?;
+            return Ok(Some(Value::Null));
+        }
+        (b"map0", b"(Ljava/io/FileDescriptor;IJJZ)J") => {
+            flush_maps_for_fd(file_descriptor_handle(
+                loader,
+                arguments.first().copied().unwrap_or(Value::Null),
+            )?);
+            let fd = file_descriptor_handle(
+                loader,
+                arguments.first().copied().unwrap_or(Value::Null),
+            )?;
+            let prot = arg(1);
+            let position = arg(2).max(0) as u64;
+            let length = arg(3).max(0) as u64;
+            let is_sync = arg(4) != 0;
+            if is_sync {
+                return Err(throw_java(loader, b"java/lang/InternalError", "should never call map on platform where MAP_SYNC is unimplemented"));
+            }
+            const MAP_RO: i64 = 0;
+            const MAP_RW: i64 = 1;
+            const MAP_PV: i64 = 2;
+            if !(MAP_RO..=MAP_PV).contains(&prot) {
+                return Err(invalid("Invalid map protection"));
+            }
+            if length == 0 || length > i32::MAX as u64 {
+                return Err(invalid("Invalid map size"));
+            }
+            // Read the region into off-heap memory (zero-padded past EOF).
+            let data = with_entry(fd, |entry| {
+                let file = file_of(entry)?;
+                #[cfg(windows)]
+                {
+                    let mut buf = vec![0u8; length as usize];
+                    let mut done = 0usize;
+                    while done < buf.len() {
+                        let n = file.seek_read(&mut buf[done..], position + done as u64)?;
+                        if n == 0 {
+                            break;
+                        }
+                        done += n;
+                    }
+                    Ok(buf)
+                }
+                #[cfg(not(windows))]
+                {
+                    file.seek(SeekFrom::Start(position))?;
+                    let mut buf = vec![0u8; length as usize];
+                    let mut done = 0usize;
+                    while done < buf.len() {
+                        let n = file.read(&mut buf[done..])?;
+                        if n == 0 {
+                            break;
+                        }
+                        done += n;
+                    }
+                    Ok(buf)
+                }
+            })?;
+            let addr = OffHeapMemory::global().allocate_memory(length as usize);
+            OffHeapMemory::global().write_bytes(addr, &data)?;
+            file_maps().lock().unwrap().insert(
+                addr,
+                FileMap {
+                    fd,
+                    path: entry_path(fd).unwrap_or_default(),
+                    file_pos: position,
+                    len: length,
+                    writable: prot == MAP_RW,
+                },
+            );
+            Value::Long(addr as i64)
+        }
+        (b"unmap0", b"(JJ)I") => {
+            let addr = arg(0).max(0) as u64;
+            let len = arg(1).max(0) as u64;
+            if let Some(m) = file_maps().lock().unwrap().remove(&addr) {
+                if m.writable {
+                    flush_map(addr, &FileMap {
+                        fd: m.fd,
+                        path: m.path.clone(),
+                        file_pos: m.file_pos,
+                        len: m.len.min(len.max(m.len)),
+                        writable: true,
+                    });
+                }
+                OffHeapMemory::global().free_memory(addr);
+            }
+            Value::Int(0)
+        }
+        (b"transferTo0", b"(Ljava/io/FileDescriptor;JJLjava/io/FileDescriptor;JZ)J") => {
+            let src = file_descriptor_handle(
+                loader,
+                arguments.first().copied().unwrap_or(Value::Null),
+            )?;
+            let position = arg(1).max(0) as u64;
+            let dst = file_descriptor_handle(
+                loader,
+                arguments.get(3).copied().unwrap_or(Value::Null),
+            )?;
+            let count = arg(2).max(0) as u64;
+            let append = matches!(arguments.get(4), Some(Value::Int(i)) if *i != 0);
+            flush_maps_for_fd(src);
+            flush_maps_for_fd(dst);
+            let mut pos = position;
+            let mut remaining = count;
+            let mut total = 0u64;
+            while remaining > 0 {
+                let chunk = remaining.min(1 << 20) as usize;
+                let buf = with_entry(src, |entry| {
+                    let file = file_of(entry)?;
+                    #[cfg(windows)]
+                    {
+                        let mut buf = vec![0u8; chunk];
+                        let n = file.seek_read(&mut buf, pos)?;
+                        buf.truncate(n);
+                        Ok(buf)
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        file.seek(SeekFrom::Start(pos))?;
+                        let mut buf = vec![0u8; chunk];
+                        let n = file.read(&mut buf)?;
+                        buf.truncate(n);
+                        Ok(buf)
+                    }
+                })?;
+                if buf.is_empty() {
+                    break;
+                }
+                let n = buf.len() as u64;
+                with_entry(dst, |entry| {
+                    let pos = entry.pos;
+                    let file = file_of(entry)?;
+                    if append {
+                        file.seek(SeekFrom::End(0))?;
+                    }
+                    #[cfg(windows)]
+                    {
+                        file.seek_write(&buf, pos)?;
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        file.seek(SeekFrom::Start(pos))?;
+                        file.write_all(&buf)?;
+                    }
+                    entry.pos += n;
+                    Ok(())
+                })?;
+                pos += n;
+                remaining -= n;
+                total += n;
+            }
+            Value::Long(total as i64)
+        }
+        (b"setDirect0", b"(Ljava/io/FileDescriptor;Ljava/nio/CharBuffer;)I") => Value::Int(0),
         _ => return Ok(None),
     };
     Ok(Some(result))
@@ -936,19 +1683,12 @@ pub(crate) fn io_util<'a>(
                     .get_mut(handle)
                     .ok_or_else(|| invalid("Invalid array"))?;
                 if let crate::share::oops::typeArrayOop::TypeArrayOop::Byte(bytes) = array {
-                    use std::time::{SystemTime, UNIX_EPOCH};
-                    let seed = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .map(|d| d.subsec_nanos() as u64 ^ d.as_secs())
-                        .unwrap_or(0x9E37_79B9);
-                    let mut state = seed | 1;
-                    for byte in bytes.iter_mut() {
-                        state ^= state << 13;
-                        state ^= state >> 7;
-                        state ^= state << 17;
-                        *byte = state as i8;
+                    let mut random = vec![0u8; bytes.len()];
+                    let filled = fill_random(&mut random);
+                    for (slot, &byte) in bytes.iter_mut().zip(random.iter()) {
+                        *slot = byte as i8;
                     }
-                    return Ok(Some(Value::Int(1)));
+                    return Ok(Some(Value::Int(i32::from(filled))));
                 }
             }
             Value::Int(0)
@@ -1026,3 +1766,25 @@ pub(crate) fn remove_handle(handle: u64) -> bool {
     free_handle(handle).is_some()
 }
 
+
+/// `java.nio.MappedMemoryUtils` statics (msync/madvise equivalents).
+pub(crate) fn mapped_memory_utils<'a>(
+    loader: &ClassLoader<'a>,
+    name: &[u8],
+    descriptor: &[u8],
+    arguments: &[Value<'a>],
+) -> io::Result<Option<Value<'a>>> {
+    match (name, descriptor) {
+        (b"force0", b"(Ljava/io/FileDescriptor;JJ)V") => {
+            let fd = file_descriptor_handle(
+                loader,
+                arguments.first().copied().unwrap_or(Value::Null),
+            )?;
+            flush_maps_for_fd(fd);
+            Ok(Some(Value::Null))
+        }
+        (b"load0", b"(JJ)V") | (b"unload0", b"(JJ)V") => Ok(Some(Value::Null)),
+        (b"isLoaded0", b"(JJJ)Z") => Ok(Some(Value::Int(1))),
+        _ => Ok(None),
+    }
+}

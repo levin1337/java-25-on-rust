@@ -1,18 +1,18 @@
 use super::instanceKlass::InstanceKlass;
 use crate::share::interpreter::bytecodeInterpreter::Value;
-use std::{io, rc::Rc};
+use std::{io, sync::Arc};
 
 pub struct InstanceOop<'a> {
-    pub klass: Rc<InstanceKlass<'a>>,
+    pub klass: Arc<InstanceKlass<'a>>,
     pub fields: Vec<Value<'a>>,
 }
 
 impl<'a> InstanceOop<'a> {
-    pub fn new(klass: Rc<InstanceKlass<'a>>) -> io::Result<Self> {
+    pub fn new(klass: Arc<InstanceKlass<'a>>) -> io::Result<Self> {
         let total = klass.total_instance_fields;
         let mut fields = Vec::with_capacity(total);
         fields.resize(total, Value::Null);
-        let mut current = Some(Rc::clone(&klass));
+        let mut current = Some(Arc::clone(&klass));
         while let Some(owner) = current {
             for field in &owner.instance_field_infos {
                 fields[field.slot] = match field.descriptor {

@@ -15,6 +15,7 @@ use crate::share::classfile::systemDictionary::SystemDictionary;
 use crate::share::interpreter::bootstrapInfo::BootstrapArg;
 use crate::share::oops::instanceOop::InstanceOop;
 use crate::share::oops::{arrayKlass::ArrayKlass, typeArrayOop::Element};
+use crate::share::runtime::javaCalls::{JavaCallArguments, JavaCalls};
 use crate::share::runtime::signature;
 use crate::{
     classfile::Constant,
@@ -25,7 +26,29 @@ use crate::{
 };
 use std::cell::RefCell;
 use std::io::{self, Error, Write};
-use std::rc::Rc;
+use std::sync::Arc;
+
+fn env_flag(name: &str) -> bool {
+    static FLAGS: std::sync::OnceLock<std::collections::HashMap<String, bool>> =
+        std::sync::OnceLock::new();
+    FLAGS
+        .get_or_init(|| {
+            [
+                "JVM25_DUMP",
+                "JVM25_MEMSTAT",
+                "JVM25_TRACE",
+                "JVM25_TRACE_EXC",
+                "JVM25_BLOCKTRACE",
+                "JVM25_TRACE_CALLS",
+            ]
+            .into_iter()
+            .map(|key| (key.to_string(), std::env::var_os(key).is_some()))
+            .collect()
+        })
+        .get(name)
+        .copied()
+        .unwrap_or(false)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Value<'a> {
@@ -121,11 +144,31 @@ impl std::fmt::Display for JavaThrowable {
 
 impl std::error::Error for JavaThrowable {}
 
+/// Uncaught Java exception that keeps both the human-readable description
+/// (so `error.to_string()` still yields `name: message`) and the live
+/// throwable object handle for stack-trace/cause inspection.
+#[derive(Debug)]
+pub struct JavaFailure {
+    pub description: String,
+    pub throwable: usize,
+}
+
+impl std::fmt::Display for JavaFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.description)
+    }
+}
+
+impl std::error::Error for JavaFailure {}
+
 pub(crate) fn throwable_of(error: &Error) -> Option<usize> {
-    error
-        .get_ref()
-        .and_then(|inner| inner.downcast_ref::<JavaThrowable>())
-        .map(|throwable| throwable.0)
+    let inner = error.get_ref()?;
+    if let Some(throwable) = inner.downcast_ref::<JavaThrowable>() {
+        return Some(throwable.0);
+    }
+    inner
+        .downcast_ref::<JavaFailure>()
+        .map(|failure| failure.throwable)
 }
 
 thread_local! {
@@ -415,7 +458,42 @@ impl<'a> Frame<'a> {
                     self.pc = entry.handler_pc;
                     return true;
                 }
+                if env_flag("JVM25_TRACE_EXC") {
+                    let exc_name = match exc {
+                        Value::Object(h) => loader
+                            .borrow_objects()
+                            .get(h)
+                            .map(|o| dotted(&o.klass.class.name))
+                            .unwrap_or_else(|| "?".into()),
+                        _ => format!("{exc:?}"),
+                    };
+                    eprintln!(
+                        "[exc-nomatch] {}.{}{} pc={} range={}..{} catch_type={} exc={}",
+                        dotted(&klass.class.name),
+                        String::from_utf8_lossy(self.code.name),
+                        String::from_utf8_lossy(self.code.descriptor),
+                        pc,
+                        entry.start_pc,
+                        entry.end_pc,
+                        entry.catch_type,
+                        exc_name,
+                    );
+                }
             }
+        }
+        if env_flag("JVM25_TRACE_EXC")
+            && !self.code.exception_table.is_empty()
+        {
+            eprintln!(
+                "[exc-noframe] {} pc={} table={:?}",
+                dotted(&klass.class.name),
+                pc,
+                self.code
+                    .exception_table
+                    .iter()
+                    .map(|e| (e.start_pc, e.end_pc, e.handler_pc, e.catch_type))
+                    .collect::<Vec<_>>()
+            );
         }
         false
     }
@@ -488,7 +566,7 @@ fn describeValueKind<'a>(
             }
             let klass = {
                 let objects = loader.borrow_objects();
-                objects.get(handle).map(|object| Rc::clone(&object.klass))
+                objects.get(handle).map(|object| Arc::clone(&object.klass))
             };
             let Some(klass) = klass else {
                 return Ok(format!("Object@{handle:x}"));
@@ -501,7 +579,7 @@ fn describeValueKind<'a>(
                         Ok(Some(result)) => describeValue(loader, result, output, depth + 1),
                         Ok(None) => Ok("null".to_owned()),
                         Err(error) => {
-                            if std::env::var_os("JVM25_TRACE").is_some() {
+                            if env_flag("JVM25_TRACE") {
                                 eprintln!(
                                     "[describeValue] toString failed for {}: {error}",
                                     dotted(klass.class.name)
@@ -512,7 +590,7 @@ fn describeValueKind<'a>(
                     }
                 }
                 Err(error) => {
-                    if std::env::var_os("JVM25_TRACE").is_some() {
+                    if env_flag("JVM25_TRACE") {
                         eprintln!(
                             "[describeValue] resolve toString failed for {}: {error}",
                             dotted(klass.class.name)
@@ -533,8 +611,9 @@ pub(crate) fn initialize<'a>(
     depth: usize,
 ) -> io::Result<()> {
     let _rg = crate::share::recprobe::Guard::enter("initialize");
+    let tid = crate::share::runtime::threading::current_tid(loader);
     match klass.state.get() {
-        InitState::FullyInitialized | InitState::BeingInitialized => return Ok(()),
+        InitState::FullyInitialized => return Ok(()),
         InitState::InitializationError => {
             return Err(jex(
                 loader,
@@ -548,6 +627,43 @@ pub(crate) fn initialize<'a>(
             ));
         }
         _ => {}
+    }
+    // JVMS §12.4.2: exactly one thread runs <clinit>; concurrent requests
+    // block on the class's init gate until the state leaves
+    // BeingInitialized; a recursive request by the initializing thread
+    // returns immediately.
+    let (init_lock, init_cond) = &*klass.init_gate;
+    {
+        let mut owner = init_lock.lock().unwrap();
+        loop {
+            match klass.state.get() {
+                InitState::FullyInitialized => return Ok(()),
+                InitState::InitializationError => {
+                    return Err(jex(
+                        loader,
+                        output,
+                        depth,
+                        b"java/lang/NoClassDefFoundError",
+                        Some(&format!(
+                            "Could not initialize class {}",
+                            dotted(klass.class.name)
+                        )),
+                    ));
+                }
+                _ => {}
+            }
+            if *owner == Some(tid) {
+                return Ok(());
+            }
+            if owner.is_none() {
+                *owner = Some(tid);
+                break;
+            }
+            if env_flag("JVM25_BLOCKTRACE") {
+                eprintln!("[block] init-wait tid={tid} class={}", dotted(klass.class.name));
+            }
+            owner = init_cond.wait(owner).unwrap();
+        }
     }
     klass.state.set(InitState::BeingInitialized);
     let result = (|| {
@@ -575,11 +691,21 @@ pub(crate) fn initialize<'a>(
         }
         Ok(())
     })();
+    if let Err(error) = &result
+        && env_flag("JVM25_TRACE")
+    {
+        eprintln!(
+            "[clinit-fail] {}: {error}",
+            String::from_utf8_lossy(klass.class.name)
+        );
+    }
     klass.state.set(if result.is_ok() {
         InitState::FullyInitialized
     } else {
         InitState::InitializationError
     });
+    *init_lock.lock().unwrap() = None;
+    init_cond.notify_all();
     result
 }
 
@@ -614,19 +740,12 @@ pub fn execute_labeled<'a>(
     access_flags: u16,
     method: Option<(&'a [u8], &'a [u8])>,
 ) -> io::Result<Option<Value<'a>>> {
-    let owner = match method {
-        Some((name, descriptor)) => {
-            let text = format!(
-                "{}.{}{}",
-                String::from_utf8_lossy(klass.class.name).replace('/', "."),
-                String::from_utf8_lossy(name),
-                String::from_utf8_lossy(descriptor)
-            );
-            loader.storage.alloc_str(&text).as_bytes()
-        }
-        None => klass.class.name,
-    };
-    loader.call_stack.borrow_mut().push(klass.class.name);
+    // `owner` is the declaring class's internal name; method name and
+    // descriptor are already available through `code`, and `stackWalkInfo`
+    // relies on `owner` being a real class name.
+    let owner = klass.class.name;
+    let _ = method;
+    loader.call_stack.push(klass.class.name);
     let monitor = if access_flags & 0x0020 != 0 {
         let target = if access_flags & 0x0008 != 0 {
             Some(Value::ClassMirror(klass.class.name))
@@ -637,7 +756,7 @@ pub fn execute_labeled<'a>(
             Some(value) => match monitorEnter(loader, output, depth, value) {
                 Ok(_) => Some(value),
                 Err(error) => {
-                    loader.call_stack.borrow_mut().pop();
+                    loader.call_stack.pop();
                     return Err(error);
                 }
             },
@@ -650,15 +769,15 @@ pub fn execute_labeled<'a>(
     if let Some(value) = monitor {
         let _ = monitorExit(loader, output, depth, value);
     }
-    loader.call_stack.borrow_mut().pop();
+    loader.call_stack.pop();
     if depth == 0
         && let Err(error) = &result
         && let Some(handle) = throwable_of(error)
     {
-        if std::env::var_os("JVM25_TRACE").is_some() {
+        if env_flag("JVM25_TRACE") {
             let stack: Vec<String> = loader
                 .call_stack
-                .borrow()
+                .snapshot()
                 .iter()
                 .map(|name| String::from_utf8_lossy(name).into_owned())
                 .collect();
@@ -667,7 +786,10 @@ pub fn execute_labeled<'a>(
                 throwableDescription(loader, handle)
             );
         }
-        return Err(Error::other(throwableDescription(loader, handle)));
+        return Err(Error::other(JavaFailure {
+            description: throwableDescription(loader, handle),
+            throwable: handle,
+        }));
     }
     result
 }
@@ -740,10 +862,47 @@ fn executeFrame<'a>(
         safepoint_tick = safepoint_tick.wrapping_add(1);
         if safepoint_tick & 0x3ff == 0 {
             crate::share::runtime::threading::schedule(loader, output, depth)?;
+            crate::share::memory::heap::safepoint();
+        }
+        if env_flag("JVM25_DUMP") {
+            static LAST_DUMP: std::sync::Mutex<Option<std::time::Instant>> =
+                std::sync::Mutex::new(None);
+            let dump_now = safepoint_tick & 0x3fff == 0
+                || LAST_DUMP
+                    .lock()
+                    .map(|mut last| {
+                        let due = last.map_or(true, |t| t.elapsed() > std::time::Duration::from_secs(1));
+                        if due {
+                            *last = Some(std::time::Instant::now());
+                        }
+                        due
+                    })
+                    .unwrap_or(false);
+            if dump_now {
+                let mut frames = Vec::new();
+                for_each_active_frame(&mut |f| frames.push(f.site()));
+                crate::share::runtime::threading::debug_frames(
+                    frames.iter().map(|s| s.to_string()).collect(),
+                );
+                eprintln!("[dump @{safepoint_tick} tid={:?} native={}] {frames:?}", std::thread::current().id(), crate::share::prims::nativeLookup::current_native());
+            }
         }
         if loader.gc_due() {
             loader.reset_allocations();
             let _ = crate::share::memory::heap::collect(loader);
+            if env_flag("JVM25_MEMSTAT") {
+                static TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                if TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 200 == 0 {
+                    eprintln!(
+                        "[memstat] objects={} arrays={} obj_arrays={} bump={}MB classes={}",
+                        loader.borrow_objects().len(),
+                        loader.arrays.borrow().len(),
+                        loader.obj_arrays.borrow().len(),
+                        loader.storage.allocated_bytes() / (1024 * 1024),
+                        loader.classes.borrow().len(),
+                    );
+                }
+            }
         }
         let insn_pc = frame.pc;
         frame.instructionPc = insn_pc;
@@ -760,7 +919,7 @@ fn executeFrame<'a>(
                 Some(handle) => {
                     let exc = Value::Object(handle);
                     if !frame.handle_exception(insn_pc, exc, loader, klass) {
-                        if std::env::var_os("JVM25_TRACE").is_some() {
+                        if env_flag("JVM25_TRACE") {
                             let mut frames = Vec::new();
                             for_each_active_frame(&mut |f| frames.push(f.site()));
                             eprintln!("[uncaught-in-frame] stack={frames:?}");
@@ -770,7 +929,7 @@ fn executeFrame<'a>(
                     }
                 }
                 None => {
-                    if std::env::var_os("JVM25_TRACE").is_some() {
+                    if env_flag("JVM25_TRACE") {
                         let mut frames = Vec::new();
                         for_each_active_frame(&mut |f| frames.push(f.site()));
                         eprintln!("[fatal] {error} stack={frames:?}");
@@ -804,13 +963,14 @@ pub(crate) fn throwableObject<'a>(
     class_name: &[u8],
     message: Option<&str>,
 ) -> io::Result<usize> {
-    if std::env::var_os("JVM25_TRACE").is_some() {
+    if env_flag("JVM25_TRACE") {
         eprintln!(
-            "[npe] creating {} in {}",
+            "[npe] creating {} msg={:?} in {}",
             dotted(class_name),
+            message,
             loader
                 .call_stack
-                .borrow()
+                .snapshot()
                 .iter()
                 .rev()
                 .take(8)
@@ -890,10 +1050,14 @@ fn jex<'a>(
     class_name: &[u8],
     message: Option<&str>,
 ) -> Error {
-    if std::env::var_os("JVM25_TRACE").is_some() {
+    if env_flag("JVM25_TRACE") {
         let mut frames = Vec::new();
         for_each_active_frame(&mut |frame| frames.push(frame.site()));
-        eprintln!("[jex] {} stack={frames:?}", dotted(class_name));
+        eprintln!(
+            "[jex] {} msg={:?} stack={frames:?}",
+            dotted(class_name),
+            message
+        );
     }
     match throwableObject(loader, output, depth, class_name, message) {
         Ok(handle) => Error::other(JavaThrowable(handle)),
@@ -1039,21 +1203,19 @@ fn monitorEnter<'a>(
     let Some(key) = monitorKey(value) else {
         return Err(Error::other("Expected reference for monitor"));
     };
-    // Contended monitors block cooperatively: keep trying while driving
-    // other queued Java threads until the lock is acquired.
-    loop {
-        let acquired = {
-            loader.synchronizer.borrow_mut().try_enter_thread(
-                key as usize,
-                crate::share::runtime::threading::current_tid(loader),
-            )
-        };
-        if acquired {
-            break;
-        }
-        if !crate::share::runtime::threading::run_next(loader, output, depth)? {
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
+    // Fast path first; on contention the monitor's condition variable
+    // blocks this OS thread until the owner releases it.
+    let acquired = {
+        loader.synchronizer.borrow_mut().try_enter(
+            key as usize,
+            crate::share::runtime::threading::current_tid(loader),
+        )
+    };
+    if !acquired {
+        let monitor = loader.synchronizer.borrow_mut().monitor(key as usize);
+        crate::share::memory::heap::quiesce();
+        monitor.enter_blocking(crate::share::runtime::threading::current_tid(loader));
+        crate::share::memory::heap::unquiesce();
     }
     Ok(key)
 }
@@ -1080,7 +1242,7 @@ fn monitorExit<'a>(
         loader
             .synchronizer
             .borrow_mut()
-            .exit_thread(
+            .exit(
                 key as usize,
                 crate::share::runtime::threading::current_tid(loader),
             )
@@ -1104,7 +1266,7 @@ fn release_frame_monitors(loader: &ClassLoader<'_>, frame: &Frame<'_>) {
     }
     let mut synchronizer = loader.synchronizer.borrow_mut();
     for &key in &frame.monitors {
-        let _ = synchronizer.exit_thread(
+        let _ = synchronizer.exit(
             key as usize,
             crate::share::runtime::threading::current_tid(loader),
         );
@@ -1768,7 +1930,7 @@ fn step<'a>(
                 receiver = materialized;
             }
             if matches!(receiver, Value::Null) {
-                if std::env::var_os("JVM25_TRACE").is_some() {
+                if env_flag("JVM25_TRACE") {
                     eprintln!(
                         "[npe-site] field {}.{}{} pc={} in {} [{}]",
                         String::from_utf8_lossy(owner),
@@ -1866,7 +2028,10 @@ fn step<'a>(
             }
             if opcode == 0xb6
                 && owner == b"java/io/PrintStream"
-                && (name == b"println" || name == b"print")
+                && (name == b"println"
+                    || name == b"print"
+                    || name == b"flush"
+                    || name == b"close")
                 && frame
                     .stack
                     .len()
@@ -1899,7 +2064,7 @@ fn step<'a>(
                     _ => false,
                 };
                 if !is_output {
-                    if std::env::var_os("JVM25_TRACE").is_some() {
+                    if env_flag("JVM25_TRACE") {
                         eprintln!("[print-receiver] {receiver:?}");
                     }
                     return Err(Error::other("Invalid print receiver"));
@@ -2019,6 +2184,19 @@ fn step<'a>(
                     }
                     _ => return Err(Error::other("Unsupported println/print signature")),
                 }
+                return Ok(Step::Continue);
+            }
+            if opcode == 0xb6
+                && owner == b"java/io/PrintStream"
+                && name == b"checkError"
+                && descriptor == b"()Z"
+                && frame
+                    .stack
+                    .last()
+                    .is_some_and(|value| is_print_stream(loader, *value))
+            {
+                frame.pop()?;
+                frame.push(Value::Int(0))?;
                 return Ok(Step::Continue);
             }
 
@@ -2545,7 +2723,7 @@ fn step<'a>(
                 }
                 let receiver = frame.stack[start];
                 if matches!(receiver, Value::Null) {
-                    if std::env::var_os("JVM25_TRACE").is_some() {
+                    if env_flag("JVM25_TRACE") {
                         eprintln!(
                             "[npe-site] {}.{}{} pc={} in {}",
                             String::from_utf8_lossy(owner),
@@ -2569,7 +2747,7 @@ fn step<'a>(
                         let object = objects
                             .get(handle)
                             .ok_or_else(|| Error::other("Invalid object reference"))?;
-                        std::rc::Rc::clone(&object.klass)
+                        std::sync::Arc::clone(&object.klass)
                     }
                     // Arrays are objects too: they only expose java.lang.Object
                     // methods (wait/notify/hashCode/toString/getClass; clone is
@@ -2578,6 +2756,17 @@ fn step<'a>(
                         loader.load(b"java/lang/Object")?
                     }
                     _ => {
+                        if env_flag("JVM25_TRACE") {
+                            eprintln!(
+                                "[icce-site] {}.{}{} pc={} in {} recv={:?}",
+                                String::from_utf8_lossy(owner),
+                                String::from_utf8_lossy(name),
+                                String::from_utf8_lossy(descriptor),
+                                pc,
+                                String::from_utf8_lossy(klass.class.name),
+                                receiver,
+                            );
+                        }
                         return Err(jex(
                             loader,
                             output,
@@ -2641,6 +2830,22 @@ fn step<'a>(
             };
 
             let flags = methodAccessFlags(&target, name, descriptor, opcode == 0xb8);
+            if env_flag("JVM25_TRACE_CALLS")
+                && (owner == b"net/fabricmc/loader/impl/launch/FabricLauncherBase"
+                    || owner == b"net/fabricmc/loader/impl/launch/knot/FabricGlobalPropertyService"
+                    || owner == b"org/spongepowered/asm/mixin/MixinEnvironment"
+                    || owner == b"org/spongepowered/asm/mixin/MixinEnvironment$Phase"
+                    || owner == b"org/spongepowered/asm/launch/GlobalProperties")
+            {
+                eprintln!(
+                    "[call] {}.{}{} op={:#x} depth={}",
+                    String::from_utf8_lossy(owner),
+                    String::from_utf8_lossy(name),
+                    String::from_utf8_lossy(descriptor),
+                    opcode,
+                    depth
+                );
+            }
             let ret_val = execute_labeled(
                 loader,
                 &target,
@@ -2677,7 +2882,7 @@ fn step<'a>(
             let name = klass.utf8(*name_idx)?;
             let descriptor = klass.utf8(*desc_idx)?;
 
-            let caller_rc = Rc::new(InstanceKlass::new(
+            let caller_rc = Arc::new(InstanceKlass::new(
                 klass.class.clone(),
                 klass.super_klass(),
                 klass.interfaces.clone(),
@@ -2828,8 +3033,25 @@ fn step<'a>(
                 ));
             }
             initialize(loader, &target, output, depth + 1)?;
+            // HotSpot registers finalizable instances with
+            // java.lang.ref.Finalizer at allocation time.
+            let needs_finalizer = target.has_finalizer();
             let object = InstanceOop::new(target)?;
-            Value::Object(loader.alloc_object(object))
+            let handle = loader.alloc_object(object);
+            if needs_finalizer {
+                let finalizer = loader.load(b"java/lang/ref/Finalizer")?;
+                let mut args = JavaCallArguments::new();
+                args.push_oop(Value::Object(handle));
+                JavaCalls::call_static(
+                    loader,
+                    &finalizer,
+                    b"register",
+                    b"(Ljava/lang/Object;)V",
+                    &args,
+                    output,
+                )?;
+            }
+            Value::Object(handle)
         }
         0xbc => {
             let kind = frame.byte()?;
@@ -2915,7 +3137,7 @@ fn step<'a>(
             let throwable = match exc {
                 Value::Object(handle) => {
                     let objects = loader.borrow_objects();
-                    objects.get(handle).map(|object| Rc::clone(&object.klass))
+                    objects.get(handle).map(|object| Arc::clone(&object.klass))
                 }
                 _ => None,
             };
@@ -2932,11 +3154,22 @@ fn step<'a>(
                     Some("athrow operand is not a Throwable"),
                 ));
             }
-            if std::env::var_os("JVM25_TRACE").is_some() {
-                let thrown = throwable
-                    .as_ref()
-                    .map(|klass| dotted(klass.class.name))
-                    .unwrap_or_default();
+            let trace_throw = env_flag("JVM25_TRACE");
+            let is_oom = throwable.as_ref().is_some_and(|klass| {
+                klass
+                    .class
+                    .name
+                    .windows(b"OutOfMemoryError".len())
+                    .any(|window| window == b"OutOfMemoryError")
+            });
+            if trace_throw || is_oom {
+                let thrown = match exc {
+                    Value::Object(handle) => throwableDescription(loader, handle),
+                    _ => throwable
+                        .as_ref()
+                        .map(|klass| dotted(klass.class.name))
+                        .unwrap_or_default(),
+                };
                 let mut frames = Vec::new();
                 for_each_active_frame(&mut |frame| frames.push(frame.site()));
                 eprintln!("[athrow] {thrown} stack={frames:?}");
@@ -2961,7 +3194,7 @@ fn step<'a>(
                 ))
             } else {
                 if !loader.referenceAssignable(value, target)? {
-                    if std::env::var_os("JVM25_TRACE").is_some() {
+                    if env_flag("JVM25_TRACE") {
                         eprintln!(
                             "[trace] checkcast fail pc={pc} in {} target={} value={value:?}",
                             String::from_utf8_lossy(klass.class.name),

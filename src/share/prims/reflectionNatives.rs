@@ -12,11 +12,12 @@
 
 use super::stringNatives;
 use crate::share::{
-    classfile::{classFileParser::Constant, classFileParser::Member, classLoader::ClassLoader},
+    classfile::{classFileParser::{Attribute, Constant, Member}, classLoader::ClassLoader},
     interpreter::{
         bytecodeInterpreter::{self, JavaThrowable, Value},
         linkResolver::LinkResolver,
     },
+    memory::oopFactory::OopFactory,
     oops::{
         instanceKlass::InstanceKlass, instanceOop::InstanceOop, objArrayOop::ObjArrayOop,
         typeArrayOop::TypeArrayOop,
@@ -1204,6 +1205,18 @@ fn parameter_mirrors<'a>(member: &Member<'a>) -> io::Result<Vec<&'a [u8]>> {
     Ok(parameters.iter().map(|parameter| descriptor_mirror(parameter)).collect())
 }
 
+fn annotationBytes<'a>(
+    loader: &ClassLoader<'a>,
+    attributes: &[Attribute<'a>],
+    name: &[u8],
+) -> io::Result<Value<'a>> {
+    let Some(attribute) = attributes.iter().find(|attribute| attribute.name == name) else {
+        return Ok(Value::Null);
+    };
+    let array = OopFactory::new_byte_array_from_bytes(attribute.bytes)?;
+    Ok(Value::PrimitiveArray(loader.alloc_type_array(array)))
+}
+
 /// Creates a `java.lang.reflect.Method` object for a declared method.
 pub(crate) fn new_method_object<'a>(
     loader: &ClassLoader<'a>,
@@ -1216,7 +1229,7 @@ pub(crate) fn new_method_object<'a>(
     let parameter_types = class_array(loader, &parameters)?;
     let exceptions = exception_mirrors(klass, member);
     let exception_types = class_array(loader, &exceptions)?;
-    let name = string_value(loader, &String::from_utf8_lossy(member.name));
+    let name = Value::String(member.name);
     let fields: Vec<(&[u8], &[u8], Value<'a>)> = vec![
         (b"clazz", b"Ljava/lang/Class;", Value::ClassMirror(klass.class.name)),
         (b"slot", b"I", Value::Int(slot)),
@@ -1229,6 +1242,9 @@ pub(crate) fn new_method_object<'a>(
         (b"parameterTypes", b"[Ljava/lang/Class;", parameter_types),
         (b"exceptionTypes", b"[Ljava/lang/Class;", exception_types),
         (b"modifiers", b"I", Value::Int(i32::from(member.accessFlags))),
+        (b"annotations", b"[B", annotationBytes(loader, &member.attributes, b"RuntimeVisibleAnnotations")?),
+        (b"parameterAnnotations", b"[B", annotationBytes(loader, &member.attributes, b"RuntimeVisibleParameterAnnotations")?),
+        (b"annotationDefault", b"[B", annotationBytes(loader, &member.attributes, b"AnnotationDefault")?),
     ];
     new_member_object(loader, b"java/lang/reflect/Method", &fields)
 }
@@ -1260,6 +1276,7 @@ pub(crate) fn new_field_object<'a>(
         ),
         (b"modifiers", b"I", Value::Int(i32::from(member.accessFlags))),
         (b"trustedFinal", b"Z", Value::Int(i32::from(trusted_final))),
+        (b"annotations", b"[B", annotationBytes(loader, &member.attributes, b"RuntimeVisibleAnnotations")?),
     ];
     new_member_object(loader, b"java/lang/reflect/Field", &fields)
 }
@@ -1281,6 +1298,8 @@ pub(crate) fn new_constructor_object<'a>(
         (b"parameterTypes", b"[Ljava/lang/Class;", parameter_types),
         (b"exceptionTypes", b"[Ljava/lang/Class;", exception_types),
         (b"modifiers", b"I", Value::Int(i32::from(member.accessFlags))),
+        (b"annotations", b"[B", annotationBytes(loader, &member.attributes, b"RuntimeVisibleAnnotations")?),
+        (b"parameterAnnotations", b"[B", annotationBytes(loader, &member.attributes, b"RuntimeVisibleParameterAnnotations")?),
     ];
     new_member_object(loader, b"java/lang/reflect/Constructor", &fields)
 }
@@ -1448,7 +1467,11 @@ fn find_public_method<'a>(
         if let Some(index) = find_declared_method(&klass, name, parameters, true) {
             return Ok(Some((klass, index)));
         }
-        current = klass.super_klass();
+        current = if klass.class.accessFlags & ACC_INTERFACE == 0 {
+            klass.super_klass()
+        } else {
+            None
+        };
     }
     // Interface methods (including defaults) are only visible when no
     // class in the hierarchy provides the method.
@@ -1498,7 +1521,11 @@ fn public_methods<'a>(
     let mut current = Some(Arc::clone(&root));
     while let Some(klass) = current {
         push(&klass, &mut result, &mut seen);
-        current = klass.super_klass();
+        current = if klass.class.accessFlags & ACC_INTERFACE == 0 {
+            klass.super_klass()
+        } else {
+            None
+        };
     }
     let mut pending: Vec<Arc<InstanceKlass<'a>>> = root.interfaces.clone();
     let mut visited: std::collections::HashSet<&'a [u8]> = std::collections::HashSet::new();
@@ -1903,19 +1930,12 @@ fn class_java_method<'a>(
                 class_array(loader, &[class]).ok()
             }
         }
-        (b"getPermittedSubclasses", b"()[Ljava/lang/Class;") => {
-            class_array(loader, &[]).ok()
-        }
         (b"getRecordComponents", b"()[Ljava/lang/reflect/RecordComponent;") => {
             class_array(loader, &[]).ok()
         }
-        (b"getAnnotations", b"()[Ljava/lang/annotation/Annotation;")
-        | (b"getDeclaredAnnotations", b"()[Ljava/lang/annotation/Annotation;") => {
-            member_array(loader, b"java/lang/annotation/Annotation", Vec::new()).ok()
-        }
-        (b"getTypeParameters", b"()[Ljava/lang/reflect/TypeVariable;") => {
-            member_array(loader, b"java/lang/reflect/TypeVariable", Vec::new()).ok()
-        }
+        // NOTE: getTypeParameters is intentionally NOT intercepted — the JDK
+        // implementation parses the Signature attribute via ClassRepository
+        // and must return real TypeVariable objects for generics reification.
         (b"getAnnotatedSuperclass", b"()Ljava/lang/reflect/AnnotatedType;") => Some(Value::Null),
         (b"getAnnotatedInterfaces", b"()[Ljava/lang/reflect/AnnotatedType;") => {
             member_array(loader, b"java/lang/reflect/AnnotatedType", Vec::new()).ok()
@@ -2565,13 +2585,36 @@ pub(crate) fn class_invoke<'a>(
                 });
                 match signature {
                     Some(signature) => {
+                        if std::env::var_os("JVM25_DEBUG_SIG").is_some() {
+                            eprintln!(
+                                "[gsig] {} -> [{}]",
+                                String::from_utf8_lossy(class),
+                                String::from_utf8_lossy(signature)
+                            );
+                        }
                         string_value(loader, &String::from_utf8_lossy(signature))
                     }
-                    None => Value::Null,
+                    None => {
+                        if std::env::var_os("JVM25_DEBUG_SIG").is_some() {
+                            eprintln!(
+                                "[gsig-null] {} attrs={}",
+                                String::from_utf8_lossy(class),
+                                klass
+                                    .as_ref()
+                                    .map(|k| k.class.attributes.len())
+                                    .unwrap_or(0)
+                            );
+                        }
+                        Value::Null
+                    }
                 }
             }
         }
-        (b"getRawAnnotations", b"()[B") | (b"getRawTypeAnnotations", b"()[B") => Value::Null,
+        (b"getRawAnnotations", b"()[B") => match &klass {
+            Some(klass) => annotationBytes(loader, &klass.class.attributes, b"RuntimeVisibleAnnotations")?,
+            None => Value::Null,
+        },
+        (b"getRawTypeAnnotations", b"()[B") => Value::Null,
         (b"getConstantPool", b"()Ljava/lang/constant/ConstantPool;")
         | (b"getConstantPool", b"()Ljdk/internal/reflect/ConstantPool;") => {
             if is_array || is_primitive {
@@ -2620,7 +2663,32 @@ pub(crate) fn class_invoke<'a>(
                 class_array(loader, &names)?
             }
         }
-        (b"getPermittedSubclasses0", b"()[Ljava/lang/Class;") => Value::Null,
+        (b"getPermittedSubclasses0", b"()[Ljava/lang/Class;") => {
+            if std::env::var_os("JVM25_TRACE_PERMIT").is_some()
+                && let Some(k) = klass.as_ref()
+            {
+                eprintln!(
+                    "[permit] {} attrs={:?}",
+                    String::from_utf8_lossy(&k.class.name),
+                    k.class
+                        .attributes
+                        .iter()
+                        .map(|a| String::from_utf8_lossy(a.name).into_owned())
+                        .collect::<Vec<_>>()
+                );
+            }
+            let entries = klass.as_ref().and_then(|klass| {
+                let attribute = klass.class.attributes.iter().find(|attribute| attribute.name == b"PermittedSubclasses")?;
+                let bytes = attribute.bytes.get(2..)?;
+                Some(bytes.chunks_exact(2)
+                    .filter_map(|index| class_name_at(klass, u16::from_be_bytes([index[0], index[1]])))
+                    .collect::<Vec<_>>())
+            });
+            match entries {
+                Some(entries) => class_array(loader, &entries)?,
+                None => Value::Null,
+            }
+        }
         (b"getClassFileVersion0", b"()I") => Value::Int(i32::from(
             klass.as_ref().map_or(0, |klass| klass.class.majorVersion),
         )),
@@ -3289,10 +3357,11 @@ pub(crate) fn invoke_static<'a>(
             Ok(Some(None))
         }
         (b"java/lang/reflect/Array", b"newArray", b"(Ljava/lang/Class;I)Ljava/lang/Object;") => {
-            let Value::ClassMirror(component) = arguments.first().copied().unwrap_or(Value::Null)
-            else {
-                return Err(array_iae(loader, "Argument is not a Class"));
-            };
+            let component = match arguments.first() {
+                Some(Value::ClassMirror(component)) => Some(*component),
+                Some(Value::Object(handle)) => loader.class_object_names.borrow().get(handle).copied(),
+                _ => None,
+            }.ok_or_else(|| array_iae(loader, "Argument is not a Class"))?;
             let length = match arguments.get(1) {
                 Some(Value::Int(length)) => *length,
                 _ => return Err(array_iae(loader, "Invalid length")),
@@ -3301,10 +3370,11 @@ pub(crate) fn invoke_static<'a>(
             Ok(Some(Some(value)))
         }
         (b"java/lang/reflect/Array", b"multiNewArray", b"(Ljava/lang/Class;[I)Ljava/lang/Object;") => {
-            let Value::ClassMirror(component) = arguments.first().copied().unwrap_or(Value::Null)
-            else {
-                return Err(array_iae(loader, "Argument is not a Class"));
-            };
+            let component = match arguments.first() {
+                Some(Value::ClassMirror(component)) => Some(*component),
+                Some(Value::Object(handle)) => loader.class_object_names.borrow().get(handle).copied(),
+                _ => None,
+            }.ok_or_else(|| array_iae(loader, "Argument is not a Class"))?;
             let dims = dims_values(loader, arguments.get(1).copied().unwrap_or(Value::Null))?;
             if dims.is_empty() {
                 return Err(array_iae(loader, "Empty dimensions array"));

@@ -1506,11 +1506,11 @@ mod tests {
         assert!(b.is_wide);
         assert_eq!(b.code, Code::Iload);
         assert_eq!(b.local_index, Some(0x0102));
-        let b = decode_operands(&code, 5).unwrap();
+        let b = decode_operands(&code, 4).unwrap();
         assert_eq!(b.code, Code::Iinc);
         assert_eq!(b.local_index, Some(0x0102));
         assert_eq!(b.const_value, Some(5));
-        let b = decode_operands(&code, 12).unwrap();
+        let b = decode_operands(&code, 10).unwrap();
         assert_eq!(b.code, Code::Ret);
         assert_eq!(b.local_index, Some(0x0102));
     }
@@ -1523,14 +1523,14 @@ mod tests {
         code.extend_from_slice(&5i32.to_be_bytes()); // low
         code.extend_from_slice(&5i32.to_be_bytes()); // high
         code.extend_from_slice(&7i32.to_be_bytes()); // offset
-        assert_eq!(bytes::special_length_at(&code, 0), 16);
+        assert_eq!(bytes::special_length_at(&code, 0), 20);
         // lookupswitch: 1 pair -> 8+8+8=24 plus padding.
         let mut code = vec![0xab, 0, 0, 0];
         code.extend_from_slice(&0i32.to_be_bytes());
         code.extend_from_slice(&1i32.to_be_bytes()); // npairs
         code.extend_from_slice(&9i32.to_be_bytes());
         code.extend_from_slice(&3i32.to_be_bytes());
-        assert_eq!(bytes::special_length_at(&code, 0), 28);
+        assert_eq!(bytes::special_length_at(&code, 0), 20);
         let targets = switch_targets(&code, 0).unwrap();
         assert_eq!(targets, vec![0, 3]);
     }

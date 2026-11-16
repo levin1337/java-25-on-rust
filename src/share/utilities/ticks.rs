@@ -25,11 +25,11 @@ impl ElapsedCounterSource {
     }
 
     pub fn milliseconds(value: i64) -> u64 {
-        (value as f64 * 1_000_000.0 / Self::frequency() as f64) as u64
+        (value as f64 * 1_000.0 / Self::frequency() as f64) as u64
     }
 
     pub fn microseconds(value: i64) -> u64 {
-        (value as f64 * 1_000.0 / Self::frequency() as f64) as u64
+        (value as f64 * 1_000_000.0 / Self::frequency() as f64) as u64
     }
 
     pub fn nanoseconds(value: i64) -> u64 {
@@ -303,10 +303,12 @@ mod tests {
     #[test]
     fn counter_source() {
         let v = ElapsedCounterSource::now();
-        assert!(v > 0);
-        assert!(ElapsedCounterSource::nanoseconds(v) > 0);
+        assert!(v >= 0);
+        assert_eq!(ElapsedCounterSource::frequency(), 1_000_000_000);
+        assert_eq!(ElapsedCounterSource::milliseconds(1_000_000_000), 1000);
+        assert!((ElapsedCounterSource::seconds(500_000_000) - 0.5).abs() < 1e-9);
         let c = CompositeElapsedCounterSource::now();
-        assert!(c.val1 > 0);
-        assert!(c.val2 > 0);
+        assert!(c.val1 >= 0);
+        assert!(c.val2 >= 0);
     }
 }

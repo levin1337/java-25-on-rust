@@ -201,7 +201,7 @@ pub(super) fn object_field<'a>(
     Ok(object.fields.get(slot).copied().unwrap_or(Value::Empty))
 }
 
-fn set_object_field<'a>(
+pub(super) fn set_object_field<'a>(
     loader: &ClassLoader<'a>,
     handle: usize,
     name: &[u8],
@@ -219,7 +219,7 @@ fn set_object_field<'a>(
     Ok(())
 }
 
-fn object_klass<'a>(loader: &ClassLoader<'a>, handle: usize) -> io::Result<Arc<InstanceKlass<'a>>> {
+pub(super) fn object_klass<'a>(loader: &ClassLoader<'a>, handle: usize) -> io::Result<Arc<InstanceKlass<'a>>> {
     let objects = loader.borrow_objects();
     let object = objects
         .get(handle)
@@ -231,10 +231,12 @@ fn object_klass<'a>(loader: &ClassLoader<'a>, handle: usize) -> io::Result<Arc<I
 fn class_name<'a>(loader: &ClassLoader<'a>, value: Value<'a>) -> io::Result<Vec<u8>> {
     match value {
         Value::ClassMirror(name) => Ok(name.to_vec()),
-        Value::Object(handle) => {
-            let name = object_field(loader, handle, b"name", b"Ljava/lang/String;")?;
-            java_string(loader, name).map(|text| text.into_bytes())
-        }
+        Value::Object(handle) => loader
+            .class_object_names
+            .borrow()
+            .get(&handle)
+            .map(|name| name.to_vec())
+            .ok_or_else(|| invalid("Expected java.lang.Class")),
         _ => Err(invalid("Expected java.lang.Class")),
     }
 }
@@ -991,13 +993,19 @@ fn resolve_var_target<'a>(
     vh: usize,
     mode_args: &[Value<'a>],
 ) -> io::Result<(VarTarget<'a>, usize)> {
-    // IndirectVarHandle delegates to its resolved target VarHandle.
+    // VarHandle wrappers that delegate to a resolved target VarHandle
+    // (IndirectVarHandle, LazyInitializingVarHandle, ...).
     let klass = object_klass(loader, vh)?;
     if klass.class.name == b"java/lang/invoke/IndirectVarHandle" {
         let target = object_field(loader, vh, b"target", b"Ljava/lang/invoke/VarHandle;")?;
         let Value::Object(target_handle) = target else {
             return Err(invalid("IndirectVarHandle without target"));
         };
+        return resolve_var_target(loader, target_handle, mode_args);
+    }
+    if let Ok(Value::Object(target_handle)) =
+        object_field(loader, vh, b"target", b"Ljava/lang/invoke/VarHandle;")
+    {
         return resolve_var_target(loader, target_handle, mode_args);
     }
     // Array-shaped VarHandles carry `abase`/`ashift`.
@@ -2064,7 +2072,9 @@ pub(crate) fn method_handle_invoke<'a>(
                 String::from_utf8_lossy(&expected)
             );
         }
-        if expected != descriptor {
+        if expected != descriptor
+            && (name != b"invokeBasic" || descriptor_kinds(&expected)? != descriptor_kinds(descriptor)?)
+        {
             return Err(wrong_method_type(loader));
         }
     }

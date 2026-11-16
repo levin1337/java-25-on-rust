@@ -461,6 +461,13 @@ pub(crate) fn invokeInstance<'a>(
         (b"java/util/zip/ZipCoder$UTF8ZipCoder", b"compare", b"(Ljava/lang/String;[BIIZ)B") => {
             compareZipName(loader, args)
         }
+        (b"sun/security/provider/DigestBase", b"implCompressMultiBlock0", b"([BII)I")
+        | (b"sun/security/provider/SHA", b"implCompressMultiBlock0", b"([BII)I")
+        | (b"sun/security/provider/SHA2", b"implCompressMultiBlock0", b"([BII)I")
+        | (b"sun/security/provider/SHA3", b"implCompressMultiBlock0", b"([BII)I")
+        | (b"sun/security/provider/SHA5", b"implCompressMultiBlock0", b"([BII)I") => {
+            digestMultiBlock(loader, args)
+        }
         (b"java/util/zip/ZipFile$Source", b"nextEntryPos", b"(III)I") => {
             let [
                 Value::Object(receiver),
@@ -488,48 +495,297 @@ pub(crate) fn invokeInstance<'a>(
     }
 }
 
-pub(crate) fn invokeVoidInstance(
-    loader: &ClassLoader<'_>,
+pub(crate) fn invokeVoidInstance<'a>(
+    loader: &ClassLoader<'a>,
     owner: &[u8],
     name: &[u8],
     descriptor: &[u8],
-    args: &[Value<'_>],
+    args: &[Value<'a>],
 ) -> bool {
-    if (owner, name, descriptor) != (b"sun/security/provider/SHA", b"implCompress0", b"([BI)V") {
-        return false;
+    match (owner, name, descriptor) {
+        (b"sun/security/provider/SHA", b"implCompress0", b"([BI)V") => {
+            let ok = compressSha1(loader, args).is_some();
+            if !ok && std::env::var_os("JVM25_SHA_DEBUG").is_some() {
+                eprintln!("[sha1] compressSha1 returned None");
+            }
+            ok
+        }
+        (b"sun/security/provider/SHA2", b"implCompress0", b"([BI)V") => {
+            compressSha256(loader, args).is_some()
+        }
+        (b"sun/security/provider/SHA5", b"implCompress0", b"([BI)V") => {
+            compressSha512(loader, args).is_some()
+        }
+        (b"sun/security/provider/DigestBase", b"engineUpdate", b"([BII)V")
+        | (b"sun/security/provider/SHA", b"engineUpdate", b"([BII)V")
+        | (b"sun/security/provider/SHA2", b"engineUpdate", b"([BII)V")
+        | (b"sun/security/provider/SHA3", b"engineUpdate", b"([BII)V")
+        | (b"sun/security/provider/SHA5", b"engineUpdate", b"([BII)V") => {
+            digestEngineUpdate(loader, args).is_some()
+        }
+        _ => false,
     }
-    compressSha1(loader, args).is_some()
 }
 
-fn compressSha1(loader: &ClassLoader<'_>, args: &[Value<'_>]) -> Option<()> {
-    let [
-        Value::Object(receiver),
-        Value::PrimitiveArray(input),
-        Value::Int(offset),
-    ] = args
+/// Shared argument extraction for `implCompress0([BI)V`: receiver object,
+/// byte[] input, int offset. Returns the input block bytes and the state
+/// array handle.
+fn digestBlockArgs<'a>(
+    loader: &ClassLoader<'a>,
+    args: &[Value<'a>],
+    state_desc: &[u8],
+    block_len: usize,
+) -> Option<(usize, usize, Vec<i8>)> {
+    let [Value::Object(receiver), Value::PrimitiveArray(input), Value::Int(offset)] = args
     else {
         return None;
     };
     let Value::PrimitiveArray(state) =
-        super::methodHandleNatives::object_field(loader, *receiver, b"state", b"[I").ok()?
+        super::methodHandleNatives::object_field(loader, *receiver, b"state", state_desc).ok()?
     else {
         return None;
     };
     let offset = usize::try_from(*offset).ok()?;
-    let mut arrays = loader.arrays.borrow_mut();
-    let TypeArrayOop::Byte(input) = arrays.get(*input)? else {
+    let mut arrays = loader.arrays.borrow();
+    let TypeArrayOop::Byte(bytes) = arrays.get(*input)? else {
         return None;
     };
-    let block = input.get(offset..offset + 64)?;
+    let block = bytes.get(offset..offset.checked_add(block_len)?)?;
+    Some((*input, state, block.to_vec()))
+}
+
+/// `DigestBase.implCompressMultiBlock0([BII)I`: compresses every full block in
+/// `[off, end]` and returns the offset past the last compressed block.
+fn digestMultiBlock<'a>(loader: &ClassLoader<'a>, args: &[Value<'a>]) -> Option<Value<'a>> {
+    let [
+        Value::Object(receiver),
+        Value::PrimitiveArray(input),
+        Value::Int(off),
+        Value::Int(end),
+    ] = args
+    else {
+        return None;
+    };
+    let klass = super::methodHandleNatives::object_klass(loader, *receiver).ok()?;
+    let name = klass.class.name;
+    let has = |needle: &[u8]| name.windows(needle.len()).any(|w| w == needle);
+    let (state_desc, block_size, algo): (&[u8], i32, u8) = if has(b"SHA5") {
+        (b"[J", 128, 2)
+    } else if has(b"SHA2") {
+        (b"[I", 64, 1)
+    } else if has(b"SHA") {
+        (b"[I", 64, 0)
+    } else {
+        return None;
+    };
+    // Resolve the digest state array once; per-block field lookups dominated
+    // the multi-block loop.
+    let Value::PrimitiveArray(state) =
+        super::methodHandleNatives::object_field(loader, *receiver, b"state", state_desc).ok()?
+    else {
+        return None;
+    };
+    let dbg = std::env::var_os("JVM25_SHA_DEBUG").is_some();
+    let t0 = std::time::Instant::now();
+    let mut off = *off;
+    let mut nblocks = 0u64;
+    while off <= *end {
+        let ok = match algo {
+            0 => sha1Block(loader, state, *input, off),
+            1 => sha256Block(loader, state, *input, off),
+            _ => sha512Block(loader, state, *input, off),
+        };
+        if ok.is_none() {
+            if dbg {
+                eprintln!("[sha-mb] block failed klass={} off={} end={}", String::from_utf8_lossy(name), off, end);
+            }
+            return None;
+        }
+        nblocks += 1;
+        off = off.wrapping_add(block_size);
+    }
+    if dbg {
+        eprintln!("[sha-mb] blocks={} took={:?}", nblocks, t0.elapsed());
+    }
+    Some(Value::Int(off))
+}
+
+/// Resolves the digest algorithm, block size and state-array handle for a
+/// `DigestBase` subclass instance (SHA/SHA2/SHA3/SHA5).
+fn digestState<'a>(
+    loader: &ClassLoader<'a>,
+    receiver: usize,
+) -> Option<(usize, i32, u8)> {
+    let klass = super::methodHandleNatives::object_klass(loader, receiver).ok()?;
+    let name = klass.class.name;
+    let has = |needle: &[u8]| name.windows(needle.len()).any(|w| w == needle);
+    let (state_desc, block_size, algo): (&[u8], i32, u8) = if has(b"SHA5") {
+        (b"[J", 128, 2)
+    } else if has(b"SHA2") {
+        (b"[I", 64, 1)
+    } else if has(b"SHA") {
+        (b"[I", 64, 0)
+    } else {
+        return None;
+    };
+    let Value::PrimitiveArray(state) =
+        super::methodHandleNatives::object_field(loader, receiver, b"state", state_desc).ok()?
+    else {
+        return None;
+    };
+    Some((state, block_size, algo))
+}
+
+fn compressBlock<'a>(loader: &ClassLoader<'a>, algo: u8, state: usize, input: usize, off: i32) -> Option<()> {
+    match algo {
+        0 => sha1Block(loader, state, input, off),
+        1 => sha256Block(loader, state, input, off),
+        _ => sha512Block(loader, state, input, off),
+    }
+}
+
+/// `DigestBase.engineUpdate([BII)V`: byte-for-byte port of the JDK buffering
+/// logic with native block compression.
+fn digestEngineUpdate<'a>(loader: &ClassLoader<'a>, args: &[Value<'a>]) -> Option<()> {
+    let [
+        Value::Object(receiver),
+        Value::PrimitiveArray(input),
+        Value::Int(ofs),
+        Value::Int(len),
+    ] = args
+    else {
+        return None;
+    };
+    if *len == 0 {
+        return Some(());
+    }
+    let dbg = std::env::var_os("JVM25_SHA_DEBUG").is_some();
+    let t0 = std::time::Instant::now();
+    if dbg {
+        eprintln!("[engineUpdate] enter ofs={} len={}", ofs, len);
+    }
+    let (state, block_size, algo) = match digestState(loader, *receiver) {
+        Some(v) => v,
+        None => {
+            if dbg { eprintln!("[engineUpdate] digestState failed"); }
+            return None;
+        }
+    };
+    let field = |name: &[u8], desc: &[u8]| -> Option<Value<'a>> {
+        match super::methodHandleNatives::object_field(loader, *receiver, name, desc) {
+            Ok(v) => Some(v),
+            Err(_) => {
+                if dbg { eprintln!("[engineUpdate] field {}{} missing", String::from_utf8_lossy(name), String::from_utf8_lossy(desc)); }
+                None
+            }
+        }
+    };
+    let buffer = match field(b"buffer", b"[B") {
+        Some(Value::PrimitiveArray(h)) => h,
+        _ => return None,
+    };
+    let mut buf_ofs = match field(b"bufOfs", b"I") {
+        Some(Value::Int(v)) => v,
+        _ => return None,
+    };
+    let mut ofs = *ofs;
+    let mut len = *len;
+
+    // bytesProcessed += len (field is package-visible `long`)
+    if let Some(Value::Long(processed)) = field(b"bytesProcessed", b"J") {
+        super::methodHandleNatives::set_object_field(
+            loader,
+            *receiver,
+            b"bytesProcessed",
+            b"J",
+            Value::Long(processed.wrapping_add(i64::from(len))),
+        )
+        .ok()?;
+    }
+
+    // Fill the pending partial block first.
+    if buf_ofs != 0 {
+        let n = len.min(block_size - buf_ofs);
+        if copy_bytes(loader, *input, usize::try_from(ofs).ok()?, buffer, usize::try_from(buf_ofs).ok()?, usize::try_from(n).ok()?).is_none() {
+            if dbg { eprintln!("[engineUpdate] copy_bytes(fill) failed"); }
+            return None;
+        }
+        buf_ofs += n;
+        ofs += n;
+        len -= n;
+        if buf_ofs >= block_size {
+            if compressBlock(loader, algo, state, buffer, 0).is_none() {
+                if dbg { eprintln!("[engineUpdate] compressBlock(buffer) failed"); }
+                return None;
+            }
+            buf_ofs = 0;
+        }
+    }
+    // Compress every complete block in [ofs, ofs+len).
+    if len >= block_size {
+        let limit = ofs + len;
+        let mut o = ofs;
+        while o <= limit - block_size {
+            if compressBlock(loader, algo, state, *input, o).is_none() {
+                if dbg { eprintln!("[engineUpdate] compressBlock(input) failed o={}", o); }
+                return None;
+            }
+            o = o.wrapping_add(block_size);
+        }
+        len = limit - o;
+        ofs = o;
+    }
+    // Stash the remainder into the pending buffer.
+    if len > 0 {
+        if copy_bytes(loader, *input, usize::try_from(ofs).ok()?, buffer, 0, usize::try_from(len).ok()?).is_none() {
+            if dbg { eprintln!("[engineUpdate] copy_bytes failed"); }
+            return None;
+        }
+        buf_ofs = len;
+    }
+    if super::methodHandleNatives::set_object_field(loader, *receiver, b"bufOfs", b"I", Value::Int(buf_ofs)).is_err() {
+        if dbg { eprintln!("[engineUpdate] set bufOfs failed"); }
+        return None;
+    }
+    if dbg {
+        eprintln!("[engineUpdate] len={} took={:?}", len, t0.elapsed());
+    }
+    Some(())
+}
+
+/// Copies `n` bytes between two byte[] primitive arrays.
+fn copy_bytes<'a>(
+    loader: &ClassLoader<'a>,
+    src: usize,
+    src_off: usize,
+    dst: usize,
+    dst_off: usize,
+    n: usize,
+) -> Option<()> {
+    let src_end = src_off.checked_add(n)?;
+    let dst_end = dst_off.checked_add(n)?;
+    let bytes = {
+        let arrays = loader.arrays.borrow();
+        let TypeArrayOop::Byte(src_bytes) = arrays.get(src)? else {
+            return None;
+        };
+        src_bytes.get(src_off..src_end)?.to_vec()
+    };
+    let mut arrays = loader.arrays.borrow_mut();
+    let TypeArrayOop::Byte(dst_bytes) = arrays.get_mut(dst)? else {
+        return None;
+    };
+    dst_bytes.get_mut(dst_off..dst_end)?.copy_from_slice(&bytes);
+    Some(())
+}
+
+fn compressSha1<'a>(loader: &ClassLoader<'a>, args: &[Value<'a>]) -> Option<()> {
+    let (_input, state, block) = digestBlockArgs(loader, args, b"[I", 64)?;
     let mut words = [0u32; 80];
     for (word, bytes) in words.iter_mut().zip(block.chunks_exact(4)) {
-        *word = u32::from_be_bytes([
-            bytes[0] as u8,
-            bytes[1] as u8,
-            bytes[2] as u8,
-            bytes[3] as u8,
-        ]);
+        *word = u32::from_be_bytes([bytes[0] as u8, bytes[1] as u8, bytes[2] as u8, bytes[3] as u8]);
     }
+    let mut arrays = loader.arrays.borrow_mut();
     let TypeArrayOop::Int(state) = arrays.get_mut(state)? else {
         return None;
     };
@@ -557,6 +813,315 @@ fn compressSha1(loader: &ClassLoader<'_>, args: &[Value<'_>]) -> Option<()> {
     }
     for (state, word) in state.iter_mut().zip([a, b, c, d, e]) {
         *state = state.wrapping_add(word as i32);
+    }
+    Some(())
+}
+
+const SHA256_K: [u32; 64] = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+    0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+    0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+    0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+    0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+    0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+    0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+    0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+    0xc67178f2,
+];
+
+fn compressSha256<'a>(loader: &ClassLoader<'a>, args: &[Value<'a>]) -> Option<()> {
+    let (_input, state, block) = digestBlockArgs(loader, args, b"[I", 64)?;
+    let mut words = [0u32; 64];
+    for (word, bytes) in words.iter_mut().zip(block.chunks_exact(4)) {
+        *word = u32::from_be_bytes([bytes[0] as u8, bytes[1] as u8, bytes[2] as u8, bytes[3] as u8]);
+    }
+    for round in 16..64 {
+        let s0 = words[round - 15].rotate_right(7)
+            ^ words[round - 15].rotate_right(18)
+            ^ (words[round - 15] >> 3);
+        let s1 = words[round - 2].rotate_right(17)
+            ^ words[round - 2].rotate_right(19)
+            ^ (words[round - 2] >> 10);
+        words[round] = words[round - 16]
+            .wrapping_add(s0)
+            .wrapping_add(words[round - 7])
+            .wrapping_add(s1);
+    }
+    let mut arrays = loader.arrays.borrow_mut();
+    let TypeArrayOop::Int(state) = arrays.get_mut(state)? else {
+        return None;
+    };
+    let state = state.first_chunk_mut::<8>()?;
+    let mut vars: [u32; 8] = state.map(|word| word as u32);
+    for round in 0..64 {
+        let big_s1 = vars[4].rotate_right(6) ^ vars[4].rotate_right(11) ^ vars[4].rotate_right(25);
+        let choice = (vars[4] & vars[5]) ^ (!vars[4] & vars[6]);
+        let temp1 = vars[7]
+            .wrapping_add(big_s1)
+            .wrapping_add(choice)
+            .wrapping_add(SHA256_K[round])
+            .wrapping_add(words[round]);
+        let big_s0 = vars[0].rotate_right(2) ^ vars[0].rotate_right(13) ^ vars[0].rotate_right(22);
+        let majority = (vars[0] & vars[1]) ^ (vars[0] & vars[2]) ^ (vars[1] & vars[2]);
+        let temp2 = big_s0.wrapping_add(majority);
+        vars = [
+            temp1.wrapping_add(temp2),
+            vars[0],
+            vars[1],
+            vars[2],
+            vars[3].wrapping_add(temp1),
+            vars[4],
+            vars[5],
+            vars[6],
+        ];
+    }
+    for (state, word) in state.iter_mut().zip(vars) {
+        *state = state.wrapping_add(word as i32);
+    }
+    Some(())
+}
+
+const SHA512_K: [u64; 80] = [
+    0x428a2f98d728ae22, 0x7137449123ef65cd, 0xb5c0fbcfec4d3b2f, 0xe9b5dba58189dbbc,
+    0x3956c25bf348b538, 0x59f111f1b605d019, 0x923f82a4af194f9b, 0xab1c5ed5da6d8118,
+    0xd807aa98a3030242, 0x12835b0145706fbe, 0x243185be4ee4b28c, 0x550c7dc3d5ffb4e2,
+    0x72be5d74f27b896f, 0x80deb1fe3b1696b1, 0x9bdc06a725c71235, 0xc19bf174cf692694,
+    0xe49b69c19ef14ad2, 0xefbe4786384f25e3, 0x0fc19dc68b8cd5b5, 0x240ca1cc77ac9c65,
+    0x2de92c6f592b0275, 0x4a7484aa6ea6e483, 0x5cb0a9dcbd41fbd4, 0x76f988da831153b5,
+    0x983e5152ee66dfab, 0xa831c66d2db43210, 0xb00327c898fb213f, 0xbf597fc7beef0ee4,
+    0xc6e00bf33da88fc2, 0xd5a79147930aa725, 0x06ca6351e003826f, 0x142929670a0e6e70,
+    0x27b70a8546d22ffc, 0x2e1b21385c26c926, 0x4d2c6dfc5ac42aed, 0x53380d139d95b3df,
+    0x650a73548baf63de, 0x766a0abb3c77b2a8, 0x81c2c92e47edaee6, 0x92722c851482353b,
+    0xa2bfe8a14cf10364, 0xa81a664bbc423001, 0xc24b8b70d0f89791, 0xc76c51a30654be30,
+    0xd192e819d6ef5218, 0xd69906245565a910, 0xf40e35855771202a, 0x106aa07032bbd1b8,
+    0x19a4c116b8d2d0c8, 0x1e376c085141ab53, 0x2748774cdf8eeb99, 0x34b0bcb5e19b48a8,
+    0x391c0cb3c5c95a63, 0x4ed8aa4ae3418acb, 0x5b9cca4f7763e373, 0x682e6ff3d6b2b8a3,
+    0x748f82ee5defb2fc, 0x78a5636f43172f60, 0x84c87814a1f0ab72, 0x8cc702081a6439ec,
+    0x90befffa23631e28, 0xa4506cebde82bde9, 0xbef9a3f7b2c67915, 0xc67178f2e372532b,
+    0xca273eceea26619c, 0xd186b8c721c0c207, 0xeada7dd6cde0eb1e, 0xf57d4f7fee6ed178,
+    0x06f067aa72176fba, 0x0a637dc5a2c898a6, 0x113f9804bef90dae, 0x1b710b35131c471b,
+    0x28db77f523047d84, 0x32caab7b40c72493, 0x3c9ebe0a15c9bebc, 0x431d67c49c100d4c,
+    0x4cc5d4becb3e42b6, 0x597f299cfc657e2a, 0x5fcb6fab3ad6faec, 0x6c44198c4a475817,
+];
+
+fn compressSha512<'a>(loader: &ClassLoader<'a>, args: &[Value<'a>]) -> Option<()> {
+    let (_input, state, block) = digestBlockArgs(loader, args, b"[J", 128)?;
+    let mut words = [0u64; 80];
+    for (word, bytes) in words.iter_mut().zip(block.chunks_exact(8)) {
+        *word = u64::from_be_bytes([
+            bytes[0] as u8, bytes[1] as u8, bytes[2] as u8, bytes[3] as u8,
+            bytes[4] as u8, bytes[5] as u8, bytes[6] as u8, bytes[7] as u8,
+        ]);
+    }
+    for round in 16..80 {
+        let s0 = words[round - 15].rotate_right(1)
+            ^ words[round - 15].rotate_right(8)
+            ^ (words[round - 15] >> 7);
+        let s1 = words[round - 2].rotate_right(19)
+            ^ words[round - 2].rotate_right(61)
+            ^ (words[round - 2] >> 6);
+        words[round] = words[round - 16]
+            .wrapping_add(s0)
+            .wrapping_add(words[round - 7])
+            .wrapping_add(s1);
+    }
+    let mut arrays = loader.arrays.borrow_mut();
+    let TypeArrayOop::Long(state) = arrays.get_mut(state)? else {
+        return None;
+    };
+    let state = state.first_chunk_mut::<8>()?;
+    let mut vars: [u64; 8] = state.map(|word| word as u64);
+    for round in 0..80 {
+        let big_s1 = vars[4].rotate_right(14) ^ vars[4].rotate_right(18) ^ vars[4].rotate_right(41);
+        let choice = (vars[4] & vars[5]) ^ (!vars[4] & vars[6]);
+        let temp1 = vars[7]
+            .wrapping_add(big_s1)
+            .wrapping_add(choice)
+            .wrapping_add(SHA512_K[round])
+            .wrapping_add(words[round]);
+        let big_s0 = vars[0].rotate_right(28) ^ vars[0].rotate_right(34) ^ vars[0].rotate_right(39);
+        let majority = (vars[0] & vars[1]) ^ (vars[0] & vars[2]) ^ (vars[1] & vars[2]);
+        let temp2 = big_s0.wrapping_add(majority);
+        vars = [
+            temp1.wrapping_add(temp2),
+            vars[0],
+            vars[1],
+            vars[2],
+            vars[3].wrapping_add(temp1),
+            vars[4],
+            vars[5],
+            vars[6],
+        ];
+    }
+    for (state, word) in state.iter_mut().zip(vars) {
+        *state = state.wrapping_add(word as i64);
+    }
+    Some(())
+}
+
+/// Fast per-block compressors used by `digestMultiBlock`: the state array
+/// handle and input array handle are resolved once by the caller, so each
+/// block only pays for the array borrow plus the round function.
+fn sha1Block<'a>(loader: &ClassLoader<'a>, state: usize, input: usize, off: i32) -> Option<()> {
+    let mut arrays = loader.arrays.borrow_mut();
+    let mut words = [0u32; 80];
+    {
+        let TypeArrayOop::Byte(bytes) = arrays.get(input)? else {
+            return None;
+        };
+        let start = usize::try_from(off).ok()?;
+        let block = bytes.get(start..start.checked_add(64)?)?;
+        for (word, b) in words.iter_mut().zip(block.chunks_exact(4)) {
+            *word = u32::from_be_bytes([b[0] as u8, b[1] as u8, b[2] as u8, b[3] as u8]);
+        }
+    }
+    let TypeArrayOop::Int(state_arr) = arrays.get_mut(state)? else {
+        return None;
+    };
+    let state_arr = state_arr.first_chunk_mut::<5>()?;
+    let [mut a, mut b, mut c, mut d, mut e] = state_arr.map(|word| word as u32);
+    for round in 0..80 {
+        if round >= 16 {
+            words[round] =
+                (words[round - 3] ^ words[round - 8] ^ words[round - 14] ^ words[round - 16])
+                    .rotate_left(1);
+        }
+        let (mix, constant) = match round {
+            0..=19 => ((b & c) | (!b & d), 0x5a827999),
+            20..=39 => (b ^ c ^ d, 0x6ed9eba1),
+            40..=59 => ((b & c) | (b & d) | (c & d), 0x8f1bbcdc),
+            _ => (b ^ c ^ d, 0xca62c1d6),
+        };
+        let next = a
+            .rotate_left(5)
+            .wrapping_add(mix)
+            .wrapping_add(e)
+            .wrapping_add(constant)
+            .wrapping_add(words[round]);
+        [a, b, c, d, e] = [next, a, b.rotate_left(30), c, d];
+    }
+    for (state, word) in state_arr.iter_mut().zip([a, b, c, d, e]) {
+        *state = state.wrapping_add(word as i32);
+    }
+    Some(())
+}
+
+fn sha256Block<'a>(loader: &ClassLoader<'a>, state: usize, input: usize, off: i32) -> Option<()> {
+    let mut arrays = loader.arrays.borrow_mut();
+    let mut words = [0u32; 64];
+    {
+        let TypeArrayOop::Byte(bytes) = arrays.get(input)? else {
+            return None;
+        };
+        let start = usize::try_from(off).ok()?;
+        let block = bytes.get(start..start.checked_add(64)?)?;
+        for (word, b) in words.iter_mut().zip(block.chunks_exact(4)) {
+            *word = u32::from_be_bytes([b[0] as u8, b[1] as u8, b[2] as u8, b[3] as u8]);
+        }
+    }
+    for round in 16..64 {
+        let s0 = words[round - 15].rotate_right(7)
+            ^ words[round - 15].rotate_right(18)
+            ^ (words[round - 15] >> 3);
+        let s1 = words[round - 2].rotate_right(17)
+            ^ words[round - 2].rotate_right(19)
+            ^ (words[round - 2] >> 10);
+        words[round] = words[round - 16]
+            .wrapping_add(s0)
+            .wrapping_add(words[round - 7])
+            .wrapping_add(s1);
+    }
+    let TypeArrayOop::Int(state_arr) = arrays.get_mut(state)? else {
+        return None;
+    };
+    let state_arr = state_arr.first_chunk_mut::<8>()?;
+    let mut vars: [u32; 8] = state_arr.map(|word| word as u32);
+    for round in 0..64 {
+        let big_s1 = vars[4].rotate_right(6) ^ vars[4].rotate_right(11) ^ vars[4].rotate_right(25);
+        let choice = (vars[4] & vars[5]) ^ (!vars[4] & vars[6]);
+        let temp1 = vars[7]
+            .wrapping_add(big_s1)
+            .wrapping_add(choice)
+            .wrapping_add(SHA256_K[round])
+            .wrapping_add(words[round]);
+        let big_s0 = vars[0].rotate_right(2) ^ vars[0].rotate_right(13) ^ vars[0].rotate_right(22);
+        let majority = (vars[0] & vars[1]) ^ (vars[0] & vars[2]) ^ (vars[1] & vars[2]);
+        let temp2 = big_s0.wrapping_add(majority);
+        vars = [
+            temp1.wrapping_add(temp2),
+            vars[0],
+            vars[1],
+            vars[2],
+            vars[3].wrapping_add(temp1),
+            vars[4],
+            vars[5],
+            vars[6],
+        ];
+    }
+    for (state, word) in state_arr.iter_mut().zip(vars) {
+        *state = state.wrapping_add(word as i32);
+    }
+    Some(())
+}
+
+fn sha512Block<'a>(loader: &ClassLoader<'a>, state: usize, input: usize, off: i32) -> Option<()> {
+    let mut arrays = loader.arrays.borrow_mut();
+    let mut words = [0u64; 80];
+    {
+        let TypeArrayOop::Byte(bytes) = arrays.get(input)? else {
+            return None;
+        };
+        let start = usize::try_from(off).ok()?;
+        let block = bytes.get(start..start.checked_add(128)?)?;
+        for (word, b) in words.iter_mut().zip(block.chunks_exact(8)) {
+            *word = u64::from_be_bytes([
+                b[0] as u8, b[1] as u8, b[2] as u8, b[3] as u8,
+                b[4] as u8, b[5] as u8, b[6] as u8, b[7] as u8,
+            ]);
+        }
+    }
+    for round in 16..80 {
+        let s0 = words[round - 15].rotate_right(1)
+            ^ words[round - 15].rotate_right(8)
+            ^ (words[round - 15] >> 7);
+        let s1 = words[round - 2].rotate_right(19)
+            ^ words[round - 2].rotate_right(61)
+            ^ (words[round - 2] >> 6);
+        words[round] = words[round - 16]
+            .wrapping_add(s0)
+            .wrapping_add(words[round - 7])
+            .wrapping_add(s1);
+    }
+    let TypeArrayOop::Long(state_arr) = arrays.get_mut(state)? else {
+        return None;
+    };
+    let state_arr = state_arr.first_chunk_mut::<8>()?;
+    let mut vars: [u64; 8] = state_arr.map(|word| word as u64);
+    for round in 0..80 {
+        let big_s1 = vars[4].rotate_right(14) ^ vars[4].rotate_right(18) ^ vars[4].rotate_right(41);
+        let choice = (vars[4] & vars[5]) ^ (!vars[4] & vars[6]);
+        let temp1 = vars[7]
+            .wrapping_add(big_s1)
+            .wrapping_add(choice)
+            .wrapping_add(SHA512_K[round])
+            .wrapping_add(words[round]);
+        let big_s0 = vars[0].rotate_right(28) ^ vars[0].rotate_right(34) ^ vars[0].rotate_right(39);
+        let majority = (vars[0] & vars[1]) ^ (vars[0] & vars[2]) ^ (vars[1] & vars[2]);
+        let temp2 = big_s0.wrapping_add(majority);
+        vars = [
+            temp1.wrapping_add(temp2),
+            vars[0],
+            vars[1],
+            vars[2],
+            vars[3].wrapping_add(temp1),
+            vars[4],
+            vars[5],
+            vars[6],
+        ];
+    }
+    for (state, word) in state_arr.iter_mut().zip(vars) {
+        *state = state.wrapping_add(word as i64);
     }
     Some(())
 }

@@ -401,6 +401,16 @@ pub fn invokeInstance<'a>(
     output: &mut dyn std::io::Write,
     depth: usize,
 ) -> io::Result<Option<Option<crate::share::interpreter::bytecodeInterpreter::Value<'a>>>> {
+    if (owner.starts_with(b"java/net/")
+        || owner.starts_with(b"sun/net/www/protocol/")
+        || owner == b"java/lang/ClassLoader"
+        || owner.starts_with(b"jvm25/"))
+        && let Some(result) =
+            super::urlNatives::invoke_instance(loader, owner, name, descriptor, arguments)?
+    {
+        return Ok(Some(result));
+    }
+
     if native_miss_contains(owner, name, descriptor) {
         return Ok(None);
     }
@@ -499,17 +509,6 @@ fn invokeInstanceInner<'a>(
         return Ok(Some(result));
     }
 
-    // TEST-ONLY wiring for urlNatives (to be placed by orchestrator).
-    if (owner.starts_with(b"java/net/")
-        || owner.starts_with(b"sun/net/www/protocol/")
-        || owner == b"java/lang/ClassLoader"
-        || owner.starts_with(b"jvm25/"))
-        && let Some(result) =
-            super::urlNatives::invoke_instance(loader, owner, name, descriptor, arguments)?
-    {
-        return Ok(Some(result));
-    }
-
     if owner.starts_with(b"java/net/")
         && let Some(result) =
             super::netNatives::invoke_instance(loader, owner, name, descriptor, arguments)?
@@ -604,6 +603,23 @@ fn invokeInstanceInner<'a>(
     }
 
     let result = match (owner, name, descriptor) {
+        (b"sun/management/MemoryImpl", b"getMemoryUsage0", b"(Z)Ljava/lang/management/MemoryUsage;") => {
+            use crate::share::runtime::javaCalls::{JavaCallArguments, JavaCalls};
+            use crate::share::services::management::Management;
+
+            let heap = matches!(arguments.get(1), Some(Value::Int(1)));
+            let usage = Management::global().totalMemoryUsage(heap);
+            let klass = loader.load(b"java/lang/management/MemoryUsage")?;
+            super::super::interpreter::bytecodeInterpreter::initialize(loader, &klass, output, depth + 1)?;
+            let handle = raw_instance(loader, b"java/lang/management/MemoryUsage")?;
+            let value = Value::Object(handle);
+            let mut call = JavaCallArguments::with_receiver(value);
+            for amount in [usage.init, usage.used, usage.committed, usage.max] {
+                call.push_long(amount as i64);
+            }
+            JavaCalls::call_special(loader, &klass, b"<init>", b"(JJJJ)V", &call, output)?;
+            Some(value)
+        }
         (b"java/lang/Runtime", b"availableProcessors", b"()I") => {
             let cpus = std::thread::available_parallelism()
                 .map(|count| count.get())
@@ -1627,6 +1643,10 @@ fn invokeStaticInner<'a>(
         None => owner,
     };
 
+    if owner == b"sun/nio/ch/FileKey" && name == b"init" && descriptor == b"(Ljava/io/FileDescriptor;[I)V" {
+        super::nioFileNatives::file_key_init(loader, arguments)?;
+        return Ok(Some(None));
+    }
     let result = match (owner, name, descriptor) {
         (b"java/lang/ProcessEnvironment", b"environmentBlock", b"()Ljava/lang/String;") if cfg!(windows) => {
             let mut variables: Vec<_> = std::env::vars_os()

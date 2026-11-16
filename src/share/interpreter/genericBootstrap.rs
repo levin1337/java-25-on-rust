@@ -102,11 +102,6 @@ fn class_object<'a>(loader: &ClassLoader<'a>, internal_name: &str) -> io::Result
     }
 }
 
-/// Creates a `MethodHandles.Lookup` for `caller` with all access modes
-/// (TRUSTED). The VM does not enforce lookup-mode checks, so the caller's
-/// real privilege set is approximated by the trusted mask; bootstraps that
-/// legitimately need caller access (defineClass, privateLookupIn) still
-/// receive the correct lookup class.
 fn lookup_object<'a>(
     loader: &ClassLoader<'a>,
     caller: &InstanceKlass<'a>,
@@ -127,12 +122,11 @@ fn lookup_object<'a>(
         loader,
         &String::from_utf8_lossy(caller.class.name),
     )?);
-    call.push_int(-1); // Lookup.TRUSTED
     JavaCalls::call_special(
         loader,
         &lookup_klass,
         b"<init>",
-        b"(Ljava/lang/Class;I)V",
+        b"(Ljava/lang/Class;)V",
         &call,
         output,
     )?;
@@ -220,6 +214,48 @@ fn bootstrap_arg_value<'a>(
     }
 }
 
+/// Materializes the static bootstrap arguments for a call to `bsm_descriptor`.
+/// Per JVMS §5.4.3.6 a variable-arity bootstrap collects its trailing static
+/// arguments into an array of the last parameter type; `Object...` bootstraps
+/// (e.g. `SwitchBootstraps.typeSwitch`) therefore receive a single
+/// `Object[]` instead of one slot per argument.
+fn bootstrap_tail_args<'a>(
+    loader: &ClassLoader<'a>,
+    klass: &InstanceKlass<'a>,
+    bs_info: &BootstrapInfo,
+    lookup: Value<'a>,
+    bsm_descriptor: &[u8],
+    output: &mut dyn Write,
+    depth: usize,
+) -> io::Result<Vec<Value<'a>>> {
+    let mut values = Vec::with_capacity(bs_info.arguments().len());
+    for arg in bs_info.arguments() {
+        values.push(bootstrap_arg_value(
+            loader,
+            klass,
+            arg,
+            lookup,
+            output,
+            depth + 1,
+        )?);
+    }
+    let params_end = bsm_descriptor
+        .iter()
+        .position(|byte| *byte == b')')
+        .unwrap_or(bsm_descriptor.len());
+    if bsm_descriptor.len() > params_end + 1
+        && bsm_descriptor[1..params_end].ends_with(b"[Ljava/lang/Object;")
+    {
+        let mut array = crate::share::oops::objArrayOop::ObjArrayOop::withComponent(
+            values.len() as i32,
+            b"java/lang/Object",
+        )?;
+        array.elements.copy_from_slice(&values);
+        return Ok(vec![Value::ObjectArray(loader.alloc_obj_array(array))]);
+    }
+    Ok(values)
+}
+
 /// Runs the real bootstrap method for an invokedynamic call site and
 /// returns the linked target `MethodHandle` object.
 fn link_call_site<'a>(
@@ -258,8 +294,7 @@ fn link_call_site<'a>(
     call.push_oop(lookup);
     call.push_oop(name_value);
     call.push_oop(type_value);
-    for arg in bs_info.arguments() {
-        let value = bootstrap_arg_value(loader, klass, arg, lookup, output, depth + 1)?;
+    for value in bootstrap_tail_args(loader, klass, bs_info, lookup, descriptor, output, depth + 1)? {
         call.push_oop(value);
     }
 
@@ -390,8 +425,7 @@ pub fn resolve_condy<'a>(
     call.push_oop(lookup);
     call.push_oop(name_value);
     call.push_oop(type_value);
-    for arg in bs_info.arguments() {
-        let value = bootstrap_arg_value(loader, klass, arg, lookup, output, depth + 1)?;
+    for value in bootstrap_tail_args(loader, klass, &bs_info, lookup, bsm_desc, output, depth + 1)? {
         call.push_oop(value);
     }
 

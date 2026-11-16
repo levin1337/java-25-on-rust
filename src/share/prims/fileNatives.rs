@@ -373,10 +373,17 @@ pub(crate) fn invoke<'a>(
             };
             let path = java_path(&path);
             let exists = Path::new(&path).exists();
-            let writable = std::fs::OpenOptions::new()
-                .write(true)
-                .open(&path)
-                .is_ok();
+            #[cfg(windows)]
+            let writable = {
+                use std::os::windows::fs::OpenOptionsExt;
+                std::fs::OpenOptions::new()
+                    .access_mode(0x0002)
+                    .custom_flags(0x0200_0000)
+                    .open(&path)
+                    .is_ok()
+            };
+            #[cfg(not(windows))]
+            let writable = std::fs::OpenOptions::new().write(true).open(&path).is_ok();
             #[cfg(unix)]
             let executable = {
                 use std::os::unix::fs::PermissionsExt;

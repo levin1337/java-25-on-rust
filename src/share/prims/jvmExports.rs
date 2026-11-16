@@ -20,7 +20,7 @@
 use super::jni::{
     JNI_EEXIST, JNI_ERR, JNI_EVERSION, JNI_OK, JNI_VERSION_1_1,
     JNI_VERSION_1_2, JNI_VERSION_1_4, JNI_VERSION_1_6, JNI_VERSION_1_8, JNI_VERSION_9,
-    JNI_VERSION_19, JNI_VERSION_21, JNI_VERSION_25,
+    JNI_VERSION_19, JNI_VERSION_21, JNI_VERSION_24, JNI_VERSION_25,
 };
 use super::jniInvocation::JavaVm;
 use crate::share::runtime::init::VMInit;
@@ -33,7 +33,6 @@ use std::sync::Mutex;
 const JNI_VERSION_10: i32 = 0x000a0000;
 const JNI_VERSION_17: i32 = 0x00110000;
 const JNI_VERSION_20: i32 = 0x00140000;
-const JNI_VERSION_24: i32 = 0x00180000;
 
 const JNI_VERSION_MAX: i32 = JNI_VERSION_25;
 

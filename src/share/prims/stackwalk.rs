@@ -85,34 +85,31 @@ fn fillFrames<'a>(
             flags |= 0x400000;
         }
         let mirror = Value::ClassMirror(class.class.name);
-        // Method identity is recorded even for class-only frames: Java-side
-        // `StackFrameInfo.getMethodName/getMethodType` read these fields
-        // lazily (the VM's `expandStackFrameInfo` equivalent).
-        set_instance_field(
-            loader,
-            handle,
-            b"name",
-            b"Ljava/lang/String;",
-            Value::String(method.name),
-        )?;
-        set_instance_field(
-            loader,
-            handle,
-            b"type",
-            b"Ljava/lang/Object;",
-            Value::String(method.descriptor),
-        )?;
-        set_instance_field(loader, handle, b"bci", b"I", Value::Int(frame.bci))?;
-        set_instance_field(
-            loader,
-            handle,
-            b"ste",
-            b"Ljava/lang/StackTraceElement;",
-            Value::Null,
-        )?;
         let classOrMethod = if walk.classOnly {
             mirror
         } else {
+            set_instance_field(
+                loader,
+                handle,
+                b"name",
+                b"Ljava/lang/String;",
+                Value::String(method.name),
+            )?;
+            set_instance_field(
+                loader,
+                handle,
+                b"type",
+                b"Ljava/lang/Object;",
+                Value::String(method.descriptor),
+            )?;
+            set_instance_field(loader, handle, b"bci", b"I", Value::Int(frame.bci))?;
+            set_instance_field(
+                loader,
+                handle,
+                b"ste",
+                b"Ljava/lang/StackTraceElement;",
+                Value::Null,
+            )?;
             let resolved = loader.load(b"java/lang/invoke/ResolvedMethodName")?;
             let holderSlot = resolved.instanceField(b"vmholder", b"Ljava/lang/Class;")?;
             let mut token = InstanceOop::new(resolved)?;

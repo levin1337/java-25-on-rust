@@ -36,16 +36,6 @@ pub fn bytecode_count() -> u64 {
 }
 
 pub static NATIVE_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub static JIT_OSR_INVOKES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub static JIT_OSR_FALLBACKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-pub fn jit_osr_invokes() -> u64 {
-    JIT_OSR_INVOKES.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-pub fn jit_osr_fallbacks() -> u64 {
-    JIT_OSR_FALLBACKS.load(std::sync::atomic::Ordering::Relaxed)
-}
 
 pub fn frame_count() -> u64 {
     FRAME_COUNT.load(std::sync::atomic::Ordering::Relaxed)
@@ -113,10 +103,15 @@ fn sampleThreadFrames(bytecodeCount: u64) {
     }
     let mut frames = Vec::new();
     for_each_active_frame(&mut |frame| frames.push(frame.site()));
+    let (att, ok, deopt, thrown, unsup) = crate::share::jitruntime::jit_stats();
+    let cc = crate::share::code::codeCache::CodeCache::global();
     eprintln!(
-        "[dump @{bytecodeCount} tid={:?} native={}] {frames:?}",
+        "[dump @{bytecodeCount} tid={:?} native={}] jit(att={} ok={} deopt={} thr={} unsup={}) nmethods={} osr={} {frames:?}",
         std::thread::current().id(),
         crate::share::prims::nativeLookup::current_native(),
+        att, ok, deopt, thrown, unsup,
+        cc.nmethods_count(),
+        cc.osr_nmethods_count(),
     );
     crate::share::runtime::threading::debug_frames(frames);
 }
@@ -299,9 +294,6 @@ pub(crate) struct Frame<'a> {
     stackSlots: usize,
     owner: &'a [u8],
     monitors: Vec<u64>,
-    osr_bci: Option<i32>,
-    osr_disabled: bool,
-    osr_probe: u32,
     /// Raw pointer/length to the declaring class's constant pool, used by
     /// `stackWalkInfo` to resolve LineNumberTable entries. The `InstanceKlass`
     /// `Arc` owning the `ClassFile` (and thus this `Vec`'s buffer) is kept
@@ -431,13 +423,6 @@ impl<'a> Frame<'a> {
         if target < self.pc && !env_flag("JVM25_NO_JIT") && !jit_skip(self.owner, &self.code)
         {
             let key = self.code.bytes.as_ptr() as usize;
-            self.osr_probe = self.osr_probe.wrapping_sub(1);
-            if self.osr_probe == u32::MAX {
-                self.osr_probe = 255;
-                if crate::share::oops::methodCounters::compiled_addr(key) != 0 {
-                    self.osr_bci = Some(target as i32);
-                }
-            }
             if crate::share::oops::methodCounters::backedge_tick(key) {
                 if env_flag("JVM25_TRACE_COMPILE") {
                     eprintln!(
@@ -912,6 +897,17 @@ pub fn execute_labeled<'a>(
             compiled_addr = nm.entry_point();
         }
     }
+    if compiled_addr != 0 {
+        // The published dispatch entry can outlive its nmethod
+        // (deoptimization, sweeping): validate before calling into it.
+        let live = crate::share::code::codeCache::CodeCache::global()
+            .find_nmethod_at_address(compiled_addr)
+            .is_some_and(|nm| nm.is_in_use());
+        if !live {
+            crate::share::oops::methodCounters::clear_compiled(code_key);
+            compiled_addr = 0;
+        }
+    }
     if compiled_addr != 0
         && access_flags & (0x0100 | 0x0400 | 0x0020) == 0
     {
@@ -1070,13 +1066,9 @@ fn executeFrame<'a>(
 ) -> io::Result<Option<Value<'a>>> {
     FRAME_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if depth >= 128 {
-        return Err(jex(
-            loader,
-            output,
-            depth,
-            b"java/lang/StackOverflowError",
-            None,
-        ));
+        let errorClass = loader.load(b"java/lang/StackOverflowError")?;
+        let error = loader.alloc_object(InstanceOop::new(errorClass)?);
+        return Err(Error::other(JavaThrowable(error)));
     }
     let mut locals = vec![Value::Empty; code.maxLocals];
     let mut index = 0;
@@ -1097,9 +1089,6 @@ fn executeFrame<'a>(
         locals,
         owner,
         monitors: Vec::new(),
-        osr_bci: None,
-        osr_disabled: false,
-        osr_probe: 0,
         constants_ptr: klass.class.constants.as_ptr(),
         constants_len: klass.class.constants.len(),
     };
@@ -1177,67 +1166,6 @@ fn executeFrame<'a>(
                     return Err(error);
                 }
             },
-        }
-        if let Some(bci) = frame.osr_bci.take()
-            && frame.pc as i32 == bci
-            && !frame.osr_disabled
-            && frame.monitors.is_empty()
-            && let Some(value) = osr_invoke(&mut frame, arguments, access_flags, depth, bci)
-        {
-            return Ok(value);
-        }
-    }
-}
-
-fn osr_invoke<'a>(
-    frame: &mut Frame<'a>,
-    arguments: &[Value<'a>],
-    access_flags: u16,
-    depth: usize,
-    bci: i32,
-) -> Option<Option<Value<'a>>> {
-    let code_key = frame.code.bytes.as_ptr() as usize;
-    let addr = crate::share::oops::methodCounters::compiled_addr(code_key);
-    let in_use = addr != 0
-        && crate::share::code::codeCache::CodeCache::global()
-            .find_nmethod_at_address(addr)
-            .is_some_and(|nm| nm.is_in_use());
-    if !in_use {
-        if addr != 0 {
-            crate::share::oops::methodCounters::clear_compiled(code_key);
-        }
-        frame.osr_disabled = true;
-        return None;
-    }
-    if std::env::var_os("JVM25_TRACE_COMPILE").is_some() {
-        eprintln!("[osr-invoke] {}.{}{} bci={}", dotted(&frame.owner), String::from_utf8_lossy(frame.code.name), String::from_utf8_lossy(frame.code.descriptor), bci);
-    }
-    match crate::share::jitruntime::try_invoke(
-        addr,
-        frame.code.descriptor,
-        access_flags & 0x0008 != 0,
-        arguments,
-        depth,
-    ) {
-        Some(crate::share::jitruntime::CompiledResult::Value(value)) => {
-            JIT_OSR_INVOKES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Some(value)
-        }
-        Some(crate::share::jitruntime::CompiledResult::Thrown(_)) | None => {
-            JIT_OSR_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            frame.osr_disabled = true;
-            None
-        }
-        Some(crate::share::jitruntime::CompiledResult::Deoptimize) => {
-            JIT_OSR_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if let Some(nm) = crate::share::code::codeCache::CodeCache::global()
-                .find_nmethod_at_address(addr)
-            {
-                nm.make_not_entrant();
-            }
-            crate::share::oops::methodCounters::clear_compiled(code_key);
-            frame.osr_disabled = true;
-            None
         }
     }
 }
@@ -2192,7 +2120,16 @@ fn step<'a>(
                 (Value::Object(a), Value::Object(b)) => a == b,
                 (Value::PrimitiveArray(a), Value::PrimitiveArray(b)) => a == b,
                 (Value::ObjectArray(a), Value::ObjectArray(b)) => a == b,
+                (literal @ Value::String(_), object @ Value::Object(_))
+                | (object @ Value::Object(_), literal @ Value::String(_)) => {
+                    crate::share::prims::stringNatives::materialize(loader, literal, output, depth)?
+                        == Some(object)
+                }
                 (Value::String(a), Value::String(b)) => a == b,
+                (Value::ClassMirror(name), Value::Object(handle))
+                | (Value::Object(handle), Value::ClassMirror(name)) => {
+                    loader.class_object_names.borrow().get(&handle).copied() == Some(name)
+                }
                 (Value::ClassMirror(a), Value::ClassMirror(b)) => a == b,
                 (Value::HostString(a), Value::HostString(b)) => a == b,
                 (Value::Arguments(a), Value::Arguments(b)) => {
@@ -2525,12 +2462,9 @@ fn step<'a>(
                 return Ok(Step::Continue);
             }
             if matches!(opcode, 0xb6 | 0xb9)
-                && matches!(
-                    owner,
-                    b"java/lang/String" | b"java/lang/CharSequence" | b"java/lang/Object"
-                )
-                && let Some(value) = crate::share::prims::stringNatives::invoke(
+                && let Some(value) = crate::share::prims::stringNatives::invokeVirtual(
                     loader,
+                    owner,
                     name,
                     descriptor,
                     &frame.stack[start..],
@@ -3037,7 +2971,11 @@ fn step<'a>(
                         output,
                         depth,
                         b"java/lang/IncompatibleClassChangeError",
-                        Some("Receiver does not implement interface"),
+                        Some(&format!(
+                            "{} does not implement {}",
+                            dotted(object_klass.class.name),
+                            dotted(owner),
+                        )),
                     ));
                 }
 
@@ -3513,6 +3451,31 @@ fn step<'a>(
                 let mut frames = Vec::new();
                 for_each_active_frame(&mut |frame| frames.push(frame.site()));
                 eprintln!("[athrow] {thrown} stack={frames:?}");
+            }
+            if env_flag("JVM25_TRACE_SCE")
+                && let Value::Object(handle) = exc
+                && let Some(klass) = throwable.as_ref()
+                && klass.class.name == b"java/util/ServiceConfigurationError"
+            {
+                let mut cause = Some(handle);
+                let mut depth_guard = 0;
+                while let Some(h) = cause
+                    && depth_guard < 8
+                {
+                    depth_guard += 1;
+                    eprintln!("[sce] {}", throwableDescription(loader, h));
+                    let objects = loader.borrow_objects();
+                    let Some(object) = objects.get(h) else { break };
+                    cause = object
+                        .klass
+                        .instanceField(b"cause", b"Ljava/lang/Throwable;")
+                        .ok()
+                        .and_then(|slot| object.fields.get(slot).copied())
+                        .and_then(|v| match v {
+                            Value::Object(next) if next != h => Some(next),
+                            _ => None,
+                        });
+                }
             }
             if frame.handle_exception(pc, exc, loader, klass) {
                 return Ok(Step::Continue);

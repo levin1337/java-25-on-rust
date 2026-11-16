@@ -48,6 +48,9 @@ fn define_from_window<'a>(
     let name = class.name;
     loader.define_class(class)?;
     if let Value::Object(handle) = protection_domain {
+        if std::env::var_os("JVM25_TRACE_PD").is_some() {
+            crate::share::prims::classNatives::trace_pd_url(loader, handle, name);
+        }
         loader.record_class_protection_domain(name, handle);
     }
     Ok(Value::ClassMirror(name))
@@ -149,6 +152,9 @@ pub(crate) fn define_class2<'a>(
     loader.define_class(class)?;
     let protection_domain = arguments.get(5).copied().unwrap_or(Value::Null);
     if let Value::Object(handle) = protection_domain {
+        if std::env::var_os("JVM25_TRACE_PD").is_some() {
+            crate::share::prims::classNatives::trace_pd_url(loader, handle, name);
+        }
         loader.record_class_protection_domain(name, handle);
     }
     Ok(Some(Value::ClassMirror(name)))

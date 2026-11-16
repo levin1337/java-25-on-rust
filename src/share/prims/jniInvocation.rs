@@ -17,7 +17,7 @@
 use super::jni::{
     JNI_EDETACHED, JNI_EEXIST, JNI_EINVAL, JNI_ENOMEM, JNI_ERR, JNI_EVERSION, JNI_OK,
     JNI_VERSION_1_1, JNI_VERSION_1_2, JNI_VERSION_1_4, JNI_VERSION_1_6, JNI_VERSION_1_8,
-    JNI_VERSION_9, JNI_VERSION_19, JNI_VERSION_21, JNI_VERSION_25,
+    JNI_VERSION_9, JNI_VERSION_19, JNI_VERSION_21, JNI_VERSION_24, JNI_VERSION_25,
 };
 use super::jniReferences::{JniRefTarget, JniRefType, JniReference, JniReferences};
 use super::jniTrampoline::{
@@ -107,6 +107,7 @@ struct JvmState {
     methods: HashMap<u64, JniMethodId>,
     fields: HashMap<u64, JniFieldId>,
     next_id: u64,
+    next_class_id: u64,
     natives: HashMap<(Vec<u8>, Vec<u8>, Vec<u8>), NativeCode>,
     /// (owner, name, descriptor, is_static) -> whether the Java method is
     /// declared `native`. Keys are (ptr, len) of the class-file slices —
@@ -355,6 +356,7 @@ fn supported_version(version: i32) -> bool {
             | 0x00140000
             | JNI_VERSION_21
             | 0x00180000
+            | JNI_VERSION_24
             | JNI_VERSION_25
     )
 }
@@ -775,6 +777,11 @@ fn set_pending(env: *mut NativeEnvironment, exc: PendingException) {
 }
 
 fn throw_error(env: *mut NativeEnvironment, class: &[u8], message: Option<&str>) {
+    eprintln!(
+        "[jni-throw] {} {}",
+        String::from_utf8_lossy(class),
+        message.unwrap_or("")
+    );
     set_pending(
         env,
         PendingException::New {
@@ -791,6 +798,7 @@ fn clear_pending(env: *mut NativeEnvironment) {
 }
 
 fn io_to_pending(env: *mut NativeEnvironment, error: &Error) {
+    eprintln!("[jni-io-throw] {error}");
     let msg = error.to_string();
     let (class, rest) = if let Some((c, m)) = msg.split_once(": ") {
         (c.as_bytes().to_vec(), Some(m.to_string()))
@@ -906,8 +914,8 @@ fn class_id_of(vm: &JavaVm, name: &[u8]) -> u64 {
     if let Some(&id) = state.class_ids.get(name) {
         return id;
     }
-    let id = state.next_id;
-    state.next_id += 1;
+    let id = state.next_class_id;
+    state.next_class_id += 1;
     state.classes.push(ClassEntry {
         name: name.to_vec(),
         primitive: name.starts_with(b":"),
@@ -1242,7 +1250,7 @@ fn field_id_of(env: *mut NativeEnvironment, token: *mut c_void) -> Option<JniFie
 // ---------------------------------------------------------------------------
 
 unsafe extern "system" fn jni_get_version(_env: *mut NativeEnvironment) -> i32 {
-    JNI_VERSION_25
+    JNI_VERSION_24
 }
 
 unsafe extern "system" fn jni_define_class(
@@ -1282,7 +1290,11 @@ unsafe extern "system" fn jni_find_class(
     };
     match loader.load(name) {
         Ok(_) => class_token(env, name),
-        Err(_) => {
+        Err(error) => {
+            eprintln!(
+                "[jni] FindClass failed {}: {error}",
+                String::from_utf8_lossy(name)
+            );
             throw_error(
                 env,
                 b"java/lang/NoClassDefFoundError",
@@ -1707,7 +1719,7 @@ unsafe fn jni_get_method_id_impl(
     let (Some(name), Some(sig)) = (cstr_bytes(name), cstr_bytes(sig)) else {
         return ptr::null_mut();
     };
-    if name == b"<init>" || name == b"<clinit>" {
+    if name == b"<clinit>" {
         throw_error(env, b"java/lang/NoSuchMethodError", None);
         return ptr::null_mut();
     }
@@ -1773,11 +1785,22 @@ unsafe fn jni_get_field_id_impl(
     let Some(loader) = vm.class_loader() else {
         return ptr::null_mut();
     };
-    let Ok(class_name) = class_name_of(env, clazz) else {
-        return ptr::null_mut();
+    let class_name = match class_name_of(env, clazz) {
+        Ok(name) => name,
+        Err(_) => return ptr::null_mut(),
     };
     let found = match class_klass(loader, &class_name) {
         Ok(Some(klass)) => {
+            if let Err(error) = crate::share::interpreter::bytecodeInterpreter::initialize(
+                loader, &klass, &mut io::sink(), 0,
+            ) {
+                eprintln!(
+                    "[jni] init {} failed: {error}",
+                    String::from_utf8_lossy(&class_name)
+                );
+                io_to_pending(env, &error);
+                return ptr::null_mut();
+            }
             if is_static {
                 klass.staticField(name, sig).is_ok()
             } else {
@@ -1786,6 +1809,14 @@ unsafe fn jni_get_field_id_impl(
         }
         _ => false,
     };
+    if !found {
+        eprintln!(
+            "[jni] field id miss {} {}{} static={is_static}",
+            String::from_utf8_lossy(&class_name),
+            String::from_utf8_lossy(name),
+            String::from_utf8_lossy(sig),
+        );
+    }
     if found {
         register_field_id(env, class_name, name.to_vec(), sig.to_vec(), is_static)
     } else {
@@ -2018,6 +2049,7 @@ unsafe extern "system" fn jni_get_object_field(
 
 unsafe extern "system" fn jni_get_static_object_field(
     env: *mut NativeEnvironment,
+    _clazz: JniClass,
     id: JniFieldID,
 ) -> JniObject {
     if pending(env) {
@@ -2036,13 +2068,31 @@ unsafe extern "system" fn jni_get_static_object_field(
         return ptr::null_mut();
     };
     let Ok(klass) = loader.load(&field.class) else {
+        eprintln!("[jni] static field class load failed {}", String::from_utf8_lossy(&field.class));
         return ptr::null_mut();
     };
     let Ok(cell) = klass.staticField(&field.name, &field.desc) else {
+        eprintln!(
+            "[jni] static field miss {} {}{}",
+            String::from_utf8_lossy(&field.class),
+            String::from_utf8_lossy(&field.name),
+            String::from_utf8_lossy(&field.desc),
+        );
         return ptr::null_mut();
     };
     let value = cell.get();
-    value_to_token(env, loader, value).unwrap_or(ptr::null_mut())
+    match value_to_token(env, loader, value) {
+        Ok(token) => token,
+        Err(error) => {
+            eprintln!(
+                "[jni] static field token failed {} {}{}: {error}",
+                String::from_utf8_lossy(&field.class),
+                String::from_utf8_lossy(&field.name),
+                String::from_utf8_lossy(&field.desc),
+            );
+            ptr::null_mut()
+        }
+    }
 }
 
 macro_rules! scalar_field_accessors {
@@ -2070,6 +2120,7 @@ macro_rules! scalar_field_accessors {
         }
         unsafe extern "system" fn $static_get(
             env: *mut NativeEnvironment,
+            _clazz: JniClass,
             id: JniFieldID,
         ) -> $get_ret {
             if pending(env) {
@@ -2079,6 +2130,7 @@ macro_rules! scalar_field_accessors {
         }
         unsafe extern "system" fn $static_set(
             env: *mut NativeEnvironment,
+            _clazz: JniClass,
             id: JniFieldID,
             value: $set_val,
         ) {
@@ -2202,6 +2254,7 @@ unsafe extern "system" fn jni_set_object_field(
 
 unsafe extern "system" fn jni_set_static_object_field(
     env: *mut NativeEnvironment,
+    _clazz: JniClass,
     id: JniFieldID,
     value: JniObject,
 ) {
@@ -2517,6 +2570,9 @@ fn invoke_java_method(
             let Some(value) = value else {
                 return 0;
             };
+            if call_kind == VAR_CALL_NEWOBJECT {
+                return value_to_token_quiet(env, value);
+            }
             match ret_kind {
                 None => 0,
                 Some(4) => value_to_token_quiet(env, value),
@@ -2524,6 +2580,13 @@ fn invoke_java_method(
             }
         }
         Err(error) => {
+            eprintln!(
+                "[jni-call] {} {}{} kind={} failed: {error}",
+                String::from_utf8_lossy(&method_id.class),
+                String::from_utf8_lossy(&method_id.name),
+                String::from_utf8_lossy(&method_id.sig),
+                call_kind,
+            );
             io_to_pending(env, &error);
             // Also try to surface as interpreter error on next boundary.
             0
@@ -3875,8 +3938,17 @@ unsafe extern "system" fn jni_new_weak_global_ref(
         return ptr::null_mut();
     }
     match resolve_target(env, obj) {
-        Ok(target) => new_global(env, target, true),
-        Err(_) => ptr::null_mut(),
+        Ok(target) => {
+            let result = new_global(env, target, true);
+            if result.is_null() {
+                eprintln!("[jni-weak] new weak global failed for {obj:?}");
+            }
+            result
+        }
+        Err(error) => {
+            eprintln!("[jni-weak] resolve failed for {obj:?}: {error}");
+            ptr::null_mut()
+        }
     }
 }
 

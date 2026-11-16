@@ -68,6 +68,14 @@ pub(crate) fn string<'a>(
                         .map_err(|error| Error::new(io::ErrorKind::InvalidData, error))?
                 }
                 _ => {
+                    let dump = object
+                        .fields
+                        .iter()
+                        .enumerate()
+                        .map(|(i, f)| format!("{i}={f:?}"))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    eprintln!("[bad-coder] coder={coder} coder_index={coder_index} value_index={value_index} fields=[{dump}] klass={}", std::str::from_utf8(&object.klass.class.name).unwrap_or("?"));
                     return Err(Error::other(format!(
                         "Invalid java.lang.String coder: {coder} site={}",
                         site()
@@ -89,6 +97,16 @@ pub(crate) fn materialize<'a>(
     output: &mut dyn Write,
     depth: usize,
 ) -> io::Result<Option<Value<'a>>> {
+    let literal = match value {
+        Value::String(bytes) => Some(bytes),
+        _ => None,
+    };
+    if let Some(bytes) = literal
+        && let Some(handle) = loader.stringLiterals.borrow().get(bytes).copied()
+    {
+        return Ok(Some(Value::Object(handle)));
+    }
+
     let units = match value {
         Value::String(bytes) => crate::classfile::decodeUtf16Units(bytes)?,
         Value::HostString(text) => text.encode_utf16().collect(),
@@ -116,7 +134,31 @@ pub(crate) fn materialize<'a>(
         object.fields[hash_index] = Value::Int(0);
     }
 
-    Ok(Some(Value::Object(loader.alloc_object(object))))
+    let candidate = loader.alloc_object(object);
+    let handle = if let Some(bytes) = literal {
+        *loader.stringLiterals.borrow_mut().entry(bytes).or_insert_with(|| {
+            loader.gc_extra_roots.borrow_mut().push(Value::Object(candidate));
+            candidate
+        })
+    } else {
+        candidate
+    };
+    Ok(Some(Value::Object(handle)))
+}
+
+pub(crate) fn invokeVirtual<'a>(
+    loader: &ClassLoader<'a>,
+    owner: &[u8],
+    name: &[u8],
+    descriptor: &[u8],
+    arguments: &[Value<'a>],
+) -> io::Result<Option<Option<Value<'a>>>> {
+    match owner {
+        b"java/lang/String" | b"java/lang/CharSequence" | b"java/lang/Object" => {
+            invoke(loader, name, descriptor, arguments)
+        }
+        _ => Ok(None),
+    }
 }
 
 pub(crate) fn invoke<'a>(
@@ -192,14 +234,24 @@ pub(crate) fn invoke<'a>(
             }
             return Ok(Some(None));
         }
-        (b"length", b"()I", []) => Value::Int(text.encode_utf16().count() as i32),
+        (b"length", b"()I", []) => {
+            if std::env::var("JVM25_DEBUG_SIG").is_ok() && text.starts_with('<') && text.len() > 10 {
+                eprintln!("[strlen] len={} text={:?}", text.encode_utf16().count(), &text[..text.len().min(60)]);
+            }
+            Value::Int(text.encode_utf16().count() as i32)
+        }
         (b"isEmpty", b"()Z", []) => Value::Int(i32::from(text.is_empty())),
-        (b"charAt", b"(I)C", [Value::Int(index)]) => Value::Int(
-            text.encode_utf16()
-                .nth(*index as usize)
-                .map(i32::from)
-                .ok_or_else(|| Error::other("StringIndexOutOfBoundsException"))?,
-        ),
+        (b"charAt", b"(I)C", [Value::Int(index)]) => {
+            if std::env::var("JVM25_DEBUG_SIG").is_ok() && *index == 0 && text.starts_with('<') && text.len() > 10 {
+                eprintln!("[charAt0] text={:?}", &text[..text.len().min(60)]);
+            }
+            Value::Int(
+                text.encode_utf16()
+                    .nth(*index as usize)
+                    .map(i32::from)
+                    .ok_or_else(|| Error::other("StringIndexOutOfBoundsException"))?,
+            )
+        }
         (b"hashCode", b"()I", []) => Value::Int(text.encode_utf16().fold(0i32, |hash, unit| {
             hash.wrapping_mul(31).wrapping_add(i32::from(unit))
         })),

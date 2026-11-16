@@ -341,26 +341,25 @@ fn split_search_path(path: &str) -> (String, String) {
 
 /// Reads a directory and returns snapshot entries matching `pattern`.
 fn scan_directory(dir: &str, pattern: &str) -> io::Result<Vec<DirEntry>> {
+    let directory = std::path::Path::new(dir);
+    let items = std::fs::read_dir(directory)?;
     let mut entries = Vec::new();
-    for item in std::fs::read_dir(dir)? {
+    if !directory.has_root() || directory.parent().is_some() {
+        for name in [".", ".."] {
+            if wildcard_match(pattern, name) {
+                entries.push(DirEntry::fromMetadata(
+                    name.to_owned(),
+                    std::fs::metadata(directory.join(name))?,
+                ));
+            }
+        }
+    }
+    for item in items {
         let item = item?;
         let name = item.file_name().to_string_lossy().into_owned();
-        if name == "." || name == ".." {
-            continue;
+        if wildcard_match(pattern, &name) {
+            entries.push(DirEntry::fromMetadata(name, item.metadata()?));
         }
-        if !wildcard_match(pattern, &name) {
-            continue;
-        }
-        let meta = item.metadata()?;
-        let is_dir = meta.is_dir();
-        let attrs = if is_dir { 0x10u32 } else { 0x80 | 0x20 };
-        entries.push(DirEntry {
-            name,
-            is_dir,
-            size: meta.len(),
-            modified: meta.modified().ok(),
-            attrs,
-        });
     }
     Ok(entries)
 }
@@ -393,6 +392,17 @@ fn dir_next(handle: u64) -> io::Result<Option<DirEntry>> {
 }
 
 impl DirEntry {
+    fn fromMetadata(name: String, metadata: std::fs::Metadata) -> Self {
+        let isDirectory = metadata.is_dir();
+        Self {
+            name,
+            is_dir: isDirectory,
+            size: metadata.len(),
+            modified: metadata.modified().ok(),
+            attrs: if isDirectory { 0x10 } else { 0x80 | 0x20 },
+        }
+    }
+
     fn clone_name_only(&self) -> DirEntry {
         DirEntry {
             name: self.name.clone(),
@@ -1809,79 +1819,66 @@ fn unlock_range(file: &std::fs::File, _pos: i64, _size: i64) -> io::Result<()> {
     file.unlock()
 }
 
-/// `sun.nio.ch.FileKey.init(FileDescriptor)` — fills volume serial number and
-/// 64-bit file index from the descriptor's file metadata.
-pub(crate) fn file_key_init<'a>(
-    loader: &ClassLoader<'a>,
-    arguments: &[Value<'a>],
-) -> io::Result<()> {
-    let receiver = match arguments.first().copied().unwrap_or(Value::Null) {
-        Value::Object(handle) => handle,
-        _ => return Err(invalid("Expected FileKey receiver")),
-    };
-    let fd = file_descriptor_handle(
-        loader,
-        arguments.get(1).copied().unwrap_or(Value::Null),
-    )?;
-    #[cfg(windows)]
-    {
-        use std::os::windows::io::AsRawHandle;
-        #[repr(C)]
-        struct ByHandleFileInformation {
-            attrs: u32,
-            creation: u64,
-            last_access: u64,
-            last_write: u64,
-            volume_serial: u32,
-            size_high: u32,
-            size_low: u32,
-            links: u32,
-            index_high: u32,
-            index_low: u32,
+#[cfg(windows)]
+fn fileKey<'a>(loader: &ClassLoader<'a>, descriptor: Value<'a>) -> io::Result<[i32; 3]> {
+    use std::os::windows::io::AsRawHandle;
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct FileInformation {
+        attributes: u32,
+        creation: [u32; 2],
+        lastAccess: [u32; 2],
+        lastWrite: [u32; 2],
+        volumeSerial: u32,
+        sizeHigh: u32,
+        sizeLow: u32,
+        links: u32,
+        indexHigh: u32,
+        indexLow: u32,
+    }
+
+    unsafe extern "system" {
+        fn GetFileInformationByHandle(handle: *mut core::ffi::c_void, info: *mut FileInformation) -> i32;
+    }
+
+    let descriptor = file_descriptor_handle(loader, descriptor)?;
+    with_entry(descriptor, |entry| {
+        let raw = file_of(entry)?.as_raw_handle();
+        let mut information = FileInformation::default();
+        if unsafe { GetFileInformationByHandle(raw, &mut information) } == 0 {
+            return Err(io::Error::last_os_error());
         }
-        unsafe extern "system" {
-            fn GetFileInformationByHandle(handle: *mut core::ffi::c_void, info: *mut ByHandleFileInformation) -> i32;
+        Ok([information.volumeSerial as i32, information.indexHigh as i32, information.indexLow as i32])
+    }).map_err(|error| io_exception(loader, &error.to_string()))
+}
+
+#[cfg(not(windows))]
+fn fileKey<'a>(loader: &ClassLoader<'a>, _: Value<'a>) -> io::Result<[i32; 3]> {
+    Err(io_exception(loader, "Windows file identifiers are unavailable"))
+}
+
+pub(crate) fn file_key_init<'a>(loader: &ClassLoader<'a>, arguments: &[Value<'a>]) -> io::Result<()> {
+    match *arguments {
+        [descriptor, Value::PrimitiveArray(handle)] => {
+            let values = fileKey(loader, descriptor)?;
+            let mut arrays = loader.arrays.borrow_mut();
+            let Some(crate::share::oops::typeArrayOop::TypeArrayOop::Int(array)) = arrays.get_mut(handle) else {
+                return Err(invalid("Expected FileKey int array"));
+            };
+            array.get_mut(..values.len()).ok_or_else(|| invalid("Invalid FileKey array length"))?
+                .copy_from_slice(&values);
         }
-        let mut info = ByHandleFileInformation {
-            attrs: 0, creation: 0, last_access: 0, last_write: 0,
-            volume_serial: 0, size_high: 0, size_low: 0, links: 0,
-            index_high: 0, index_low: 0,
-        };
-        let ok = with_entry(fd, |entry| {
-            let file = file_of(entry)?;
-            let raw = file.as_raw_handle() as *mut core::ffi::c_void;
-            Ok(unsafe { GetFileInformationByHandle(raw, &mut info) != 0 })
-        })
-        .unwrap_or(false);
-        if ok {
-            let index = ((info.index_high as u64) << 32) | info.index_low as u64;
-            let fields: [(&[u8], &[u8], i64); 3] = [
-                (b"dwVolumeSerialNumber", b"J", info.volume_serial as i64),
-                (b"nFileIndexHigh", b"J", (index >> 32) as i64),
-                (b"nFileIndexLow", b"J", (index & 0xFFFF_FFFF) as i64),
-            ];
-        let klass = {
-            let objects = loader.borrow_objects();
-            objects
-                .get(receiver)
-                .map(|o| o.klass.clone())
-                .ok_or_else(|| invalid("Invalid FileKey object"))?
-        };
-        for (name, descriptor, value) in fields {
-            if let Ok(slot) = klass.instanceField(name, descriptor) {
-                let mut objects = loader.borrow_objects_mut();
-                if let Some(object) = objects.get_mut(receiver)
-                    && slot < object.fields.len()
-                {
-                    object.fields[slot] = Value::Long(value);
-                }
+        [Value::Object(receiver), descriptor] => {
+            let values = fileKey(loader, descriptor)?;
+            let mut objects = loader.borrow_objects_mut();
+            let object = objects.get_mut(receiver).ok_or_else(|| invalid("Invalid FileKey object"))?;
+            for (name, value) in [b"dwVolumeSerialNumber".as_slice(), b"nFileIndexHigh", b"nFileIndexLow"].into_iter().zip(values) {
+                let slot = object.klass.instanceField(name, b"J")?;
+                object.fields[slot] = Value::Long(i64::from(value as u32));
             }
         }
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = (receiver, fd);
+        _ => return Err(invalid("Invalid FileKey arguments")),
     }
     Ok(())
 }

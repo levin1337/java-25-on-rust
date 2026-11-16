@@ -399,7 +399,51 @@ unsafe fn invoke_raw(_args: &CallArgs) -> (u64, u64) {
 ///  - `Some(CompiledResult::Value(v))` — executed normally.
 ///  - `Some(CompiledResult::Thrown(h))` — a Java throwable handle.
 ///  - `Some(CompiledResult::Deoptimize)` — resume in the interpreter.
+static JIT_ATTEMPTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static JIT_OK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static JIT_DEOPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static JIT_THROWN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static JIT_UNSUPPORTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn jit_stats() -> (u64, u64, u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        JIT_ATTEMPTS.load(Relaxed),
+        JIT_OK.load(Relaxed),
+        JIT_DEOPT.load(Relaxed),
+        JIT_THROWN.load(Relaxed),
+        JIT_UNSUPPORTED.load(Relaxed),
+    )
+}
+
 pub fn try_invoke<'a>(
+    addr: usize,
+    descriptor: &[u8],
+    is_static: bool,
+    arguments: &[Value<'a>],
+    depth: usize,
+) -> Option<CompiledResult<'a>> {
+    JIT_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let result = try_invoke_inner(addr, descriptor, is_static, arguments, depth);
+    use std::sync::atomic::Ordering::Relaxed;
+    match &result {
+        Some(CompiledResult::Value(_)) => {
+            JIT_OK.fetch_add(1, Relaxed);
+        }
+        Some(CompiledResult::Deoptimize) => {
+            JIT_DEOPT.fetch_add(1, Relaxed);
+        }
+        Some(CompiledResult::Thrown(_)) => {
+            JIT_THROWN.fetch_add(1, Relaxed);
+        }
+        None => {
+            JIT_UNSUPPORTED.fetch_add(1, Relaxed);
+        }
+    }
+    result
+}
+
+fn try_invoke_inner<'a>(
     addr: usize,
     descriptor: &[u8],
     is_static: bool,
@@ -467,6 +511,7 @@ pub fn try_invoke<'a>(
     // Arm the outcome channel: stubs record pending results here and
     // unwind through the trampoline back to the post-call site.
     take_pending();
+    let previousDepth = current_depth();
     set_depth(depth);
     let prev_frame_qwords = current_frame_qwords();
     set_frame_qwords(stubs::frame_qwords_for(addr));
@@ -479,7 +524,9 @@ pub fn try_invoke<'a>(
     };
     let (raw, xmm_raw) = unsafe { invoke_raw(&call_args) };
     set_frame_qwords(prev_frame_qwords);
-    if std::env::var_os("JVM25_JIT_DEBUG").is_some() {
+    set_depth(previousDepth);
+    static JIT_DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *JIT_DEBUG.get_or_init(|| std::env::var_os("JVM25_JIT_DEBUG").is_some()) {
         eprintln!("[jit] ret={:?} raw={:016x} xmm_raw={:016x}", sig.ret, raw, xmm_raw);
     }
     match take_pending() {

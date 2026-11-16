@@ -3,7 +3,7 @@
  * (share/prims/unsafe.cpp, share/memory/allocation.hpp)
  *
  * Implements off-heap native memory allocation, address generation,
- * and primitive memory reads/writes in 100% safe Rust.
+ * and bounds-checked primitive memory reads/writes.
  * Essential for LWJGL vertex buffers, OpenGL direct pointers, and Netty byte buffers.
  */
 
@@ -13,29 +13,45 @@ use std::sync::{Mutex, OnceLock};
 
 #[derive(Debug)]
 struct MemoryBlock {
-    data: Vec<u8>,
+    storage: Vec<u128>,
+    len: usize,
+}
+
+impl MemoryBlock {
+    fn new(len: usize) -> Self {
+        Self {
+            storage: vec![0; len.div_ceil(size_of::<u128>()).max(1)],
+            len,
+        }
+    }
+
+    fn address(&mut self) -> u64 {
+        self.storage.as_mut_ptr() as u64
+    }
+
+    fn bytes(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.storage.as_ptr().cast(), self.len) }
+    }
+
+    fn bytesMut(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.storage.as_mut_ptr().cast(), self.len) }
+    }
 }
 
 #[derive(Debug, Default)]
 pub struct OffHeapMemory {
-    // BTreeMap keyed by base address: addresses are handed out
-    // monotonically, so lookups are O(log n) via range instead of a
-    // linear scan of every block per access.
     blocks: Mutex<BTreeMap<u64, MemoryBlock>>,
-    next_address: Mutex<u64>,
 }
 
 static GLOBAL_OFF_HEAP: OnceLock<OffHeapMemory> = OnceLock::new();
 
 impl OffHeapMemory {
-    pub const BASE_ADDRESS: u64 = 0x0000_7FFF_0000_0000; // Realistic 64-bit off-heap virtual base
     pub const PAGE_SIZE: usize = 4096;
     pub const ADDRESS_SIZE: usize = 8;
 
     pub fn new() -> Self {
         Self {
             blocks: Mutex::new(BTreeMap::new()),
-            next_address: Mutex::new(Self::BASE_ADDRESS),
         }
     }
 
@@ -45,17 +61,10 @@ impl OffHeapMemory {
 
     /// Allocates unmanaged off-heap memory block aligned to 8 bytes
     pub fn allocate_memory(&self, bytes: usize) -> u64 {
-        let aligned_bytes = (bytes + 7) & !7;
-        let mut next_guard = self.next_address.lock().unwrap();
-        let addr = *next_guard;
-        *next_guard += aligned_bytes as u64 + 64; // pad to avoid overlaps
-
-        let block = MemoryBlock {
-            data: vec![0u8; bytes],
-        };
-        let mut blocks = self.blocks.lock().unwrap();
-        blocks.insert(addr, block);
-        addr
+        let mut block = MemoryBlock::new(bytes);
+        let address = block.address();
+        self.blocks.lock().unwrap().insert(address, block);
+        address
     }
 
     /// Reallocates an existing memory block to a new size
@@ -65,13 +74,13 @@ impl OffHeapMemory {
         }
 
         let mut blocks = self.blocks.lock().unwrap();
-        if let Some(mut block) = blocks.remove(&addr) {
-            block.data.resize(new_size, 0);
-            blocks.insert(addr, block);
-            Ok(addr)
-        } else {
-            Err(Error::other("Invalid memory address for reallocate"))
-        }
+        let previous = blocks.remove(&addr).ok_or_else(|| Error::other("Invalid memory address for reallocate"))?;
+        let mut block = MemoryBlock::new(new_size);
+        let length = previous.len.min(new_size);
+        block.bytesMut()[..length].copy_from_slice(&previous.bytes()[..length]);
+        let address = block.address();
+        blocks.insert(address, block);
+        Ok(address)
     }
 
     /// Frees an allocated off-heap block
@@ -88,9 +97,9 @@ impl OffHeapMemory {
         size: usize,
     ) -> io::Result<(&'a [u8], usize)> {
         if let Some((&base, block)) = blocks.range(..=addr).next_back() {
-            if addr + (size as u64) <= base + (block.data.len() as u64) {
+            if addr - base <= block.len as u64 && size <= block.len - (addr - base) as usize {
                 let offset = (addr - base) as usize;
-                return Ok((&block.data, offset));
+                return Ok((block.bytes(), offset));
             }
         }
         Err(Error::other(format!(
@@ -107,9 +116,9 @@ impl OffHeapMemory {
         let base = blocks.range(..=addr).next_back().map(|(&b, _)| b);
         if let Some(base) = base {
             let block = blocks.get_mut(&base).unwrap();
-            if addr + (size as u64) <= base + (block.data.len() as u64) {
+            if addr - base <= block.len as u64 && size <= block.len - (addr - base) as usize {
                 let offset = (addr - base) as usize;
-                return Ok((&mut block.data, offset));
+                return Ok((block.bytesMut(), offset));
             }
         }
         Err(Error::other(format!(
@@ -221,19 +230,35 @@ impl OffHeapMemory {
         Ok(())
     }
 
-    /// Reads `bytes.len()` bytes starting at `addr` in one lock acquisition.
     pub fn read_bytes(&self, addr: u64, bytes: usize) -> io::Result<Vec<u8>> {
         let blocks = self.blocks.lock().unwrap();
-        let (data, offset) = Self::find_block_and_offset(&blocks, addr, bytes)?;
-        Ok(data[offset..offset + bytes].to_vec())
+        if let Ok((data, offset)) = Self::find_block_and_offset(&blocks, addr, bytes) {
+            return Ok(data[offset..offset + bytes].to_vec());
+        }
+        if Self::ownsAddress(&blocks, addr) {
+            return Err(Error::other("Off-heap read exceeds allocation"));
+        }
+        drop(blocks);
+        let mut data = vec![0; bytes];
+        nativeMemory(addr, &mut data, None)?;
+        Ok(data)
     }
 
-    /// Writes a byte slice into an existing off-heap block.
     pub fn write_bytes(&self, addr: u64, bytes: &[u8]) -> io::Result<()> {
         let mut blocks = self.blocks.lock().unwrap();
-        let (data, offset) = Self::find_block_and_offset_mut(&mut blocks, addr, bytes.len())?;
-        data[offset..offset + bytes.len()].copy_from_slice(bytes);
-        Ok(())
+        if let Ok((data, offset)) = Self::find_block_and_offset_mut(&mut blocks, addr, bytes.len()) {
+            data[offset..offset + bytes.len()].copy_from_slice(bytes);
+            return Ok(());
+        }
+        if Self::ownsAddress(&blocks, addr) {
+            return Err(Error::other("Off-heap write exceeds allocation"));
+        }
+        drop(blocks);
+        nativeMemory(addr, &mut [], Some(bytes))
+    }
+
+    fn ownsAddress(blocks: &BTreeMap<u64, MemoryBlock>, addr: u64) -> bool {
+        blocks.range(..=addr).next_back().is_some_and(|(&base, block)| addr - base <= block.len as u64)
     }
 
     pub fn set_memory(&self, addr: u64, bytes: usize, value: u8) -> io::Result<()> {
@@ -242,4 +267,33 @@ impl OffHeapMemory {
         data[offset..offset + bytes].fill(value);
         Ok(())
     }
+}
+
+#[cfg(windows)]
+fn nativeMemory(address: u64, destination: &mut [u8], source: Option<&[u8]>) -> io::Result<()> {
+    use core::ffi::c_void;
+    unsafe extern "system" {
+        fn ReadProcessMemory(process: isize, base: *const c_void, buffer: *mut c_void, size: usize, count: *mut usize) -> i32;
+        fn WriteProcessMemory(process: isize, base: *mut c_void, buffer: *const c_void, size: usize, count: *mut usize) -> i32;
+    }
+    let mut count = 0;
+    let (result, expected) = if let Some(source) = source {
+        let size = source.len();
+        (unsafe { WriteProcessMemory(-1, address as *mut c_void, source.as_ptr().cast(), size, &mut count) }, size)
+    } else {
+        let size = destination.len();
+        (unsafe { ReadProcessMemory(-1, address as *const c_void, destination.as_mut_ptr().cast(), size, &mut count) }, size)
+    };
+    if result == 0 {
+        return Err(Error::last_os_error());
+    }
+    if count != expected {
+        return Err(Error::other("Incomplete native memory operation"));
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn nativeMemory(_: u64, _: &mut [u8], _: Option<&[u8]>) -> io::Result<()> {
+    Err(Error::other("Address is outside the JVM allocations"))
 }

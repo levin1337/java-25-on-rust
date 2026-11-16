@@ -14,8 +14,10 @@ use super::opcodes::LAST_OPCODE;
 
 // Root operand types that never get match lists (C++ inspectOperands).
 fn is_special_root_op(root_op: &str) -> bool {
-    matches!(root_op,
-        "Universe" | "label" | "sRegI" | "sRegP" | "sRegF" | "sRegD" | "sRegL")
+    matches!(
+        root_op,
+        "Universe" | "label" | "sRegI" | "sRegP" | "sRegF" | "sRegD" | "sRegL"
+    )
 }
 
 fn attr_int_val(val: &str) -> i64 {
@@ -34,7 +36,10 @@ fn attr_int_val(val: &str) -> i64 {
     let neg = t.starts_with('-');
     let digits = t.strip_prefix('-').unwrap_or(t);
     if !digits.is_empty() && digits.bytes().all(|c| c.is_ascii_digit()) {
-        digits.parse::<i64>().map(|v| if neg { -v } else { v }).unwrap_or(0)
+        digits
+            .parse::<i64>()
+            .map(|v| if neg { -v } else { v })
+            .unwrap_or(0)
     } else {
         0
     }
@@ -50,17 +55,22 @@ impl ArchDesc {
     }
 
     //------------------------------inspectOperands-----------------------------
-    fn inspect_operands(&mut self,
-                        globals: &HashMap<String, FormRef>,
-                        ideal_index: &HashMap<String, usize>) {
-        let default_op_cost = globals.get(OP_COST)
-            .and_then(|f| f.borrow().code.clone());
+    fn inspect_operands(
+        &mut self,
+        globals: &HashMap<String, FormRef>,
+        ideal_index: &HashMap<String, usize>,
+    ) {
+        let default_op_cost = globals.get(OP_COST).and_then(|f| f.borrow().code.clone());
         for op in self.operands.clone() {
             self.build_components(&op, globals);
             let (has_mrule, root_op, pred, cost_attr) = {
                 let b = op.borrow();
-                (b.matrule.is_some(), b.ident.clone(),
-                 b.predicate.clone(), b.op_cost())
+                (
+                    b.matrule.is_some(),
+                    b.ident.clone(),
+                    b.predicate.clone(),
+                    b.op_cost(),
+                )
             };
             if !has_mrule {
                 continue;
@@ -69,24 +79,34 @@ impl ArchDesc {
             if is_special_root_op(&root_op) {
                 continue;
             }
-            let cost = cost_attr.or_else(|| default_op_cost.clone()).unwrap_or_default();
+            let cost = cost_attr
+                .or_else(|| default_op_cost.clone())
+                .unwrap_or_default();
             let result = root_op.clone();
             let mut rule = op.borrow().matrule.clone();
             while let Some(r) = rule {
                 r.borrow_mut().mach_type = Some(root_op.clone());
-                self.build_match_list(&r, &result, &root_op,
-                                      pred.as_deref(), &cost, globals, ideal_index);
+                self.build_match_list(
+                    &r,
+                    &result,
+                    &root_op,
+                    pred.as_deref(),
+                    &cost,
+                    globals,
+                    ideal_index,
+                );
                 rule = r.borrow().next.clone();
             }
         }
     }
 
     //------------------------------inspectInstructions------------------------
-    fn inspect_instructions(&mut self,
-                             globals: &HashMap<String, FormRef>,
-                             ideal_index: &HashMap<String, usize>) {
-        let default_ins_cost = globals.get(INS_COST)
-            .and_then(|f| f.borrow().code.clone());
+    fn inspect_instructions(
+        &mut self,
+        globals: &HashMap<String, FormRef>,
+        ideal_index: &HashMap<String, usize>,
+    ) {
+        let default_ins_cost = globals.get(INS_COST).and_then(|f| f.borrow().code.clone());
         for instr in self.instructions.clone() {
             {
                 let b = instr.borrow();
@@ -97,13 +117,20 @@ impl ArchDesc {
             self.build_components(&instr, globals);
             let (has_mrule, root_op, cost_attr, linenum, is_short) = {
                 let b = instr.borrow();
-                (b.matrule.is_some(), b.ident.clone(),
-                 b.ins_cost(), b.linenum, b.is_short_branch)
+                (
+                    b.matrule.is_some(),
+                    b.ident.clone(),
+                    b.ins_cost(),
+                    b.linenum,
+                    b.is_short_branch,
+                )
             };
             if !has_mrule {
                 continue;
             }
-            let cost = cost_attr.or_else(|| default_ins_cost.clone()).unwrap_or_default();
+            let cost = cost_attr
+                .or_else(|| default_ins_cost.clone())
+                .unwrap_or_default();
             let result = {
                 let b = instr.borrow();
                 b.reduce_result()
@@ -118,8 +145,11 @@ impl ArchDesc {
                 b.is_ideal_branch()
             };
             if (is_branch && label_pos == -1) || (!is_branch && label_pos != -1) {
-                self.parse_err(SEMERR, linenum,
-                    &format!("{}: Only branches to a label are supported\n", root_op));
+                self.parse_err(
+                    SEMERR,
+                    linenum,
+                    &format!("{}: Only branches to a label are supported\n", root_op),
+                );
             }
             // attributes: ins_short_branch / ins_alignment
             let mut set_short = false;
@@ -130,8 +160,14 @@ impl ArchDesc {
                 while let Some(a) = cur {
                     if a.ident == "ins_short_branch" && attr_int_val(&a.val) != 0 {
                         if !is_branch || label_pos == -1 {
-                            self.parse_err(SEMERR, linenum,
-                                &format!("{}: Only short branch to a label is supported\n", root_op));
+                            self.parse_err(
+                                SEMERR,
+                                linenum,
+                                &format!(
+                                    "{}: Only short branch to a label is supported\n",
+                                    root_op
+                                ),
+                            );
                         }
                         set_short = true;
                     } else if a.ident == "ins_alignment" {
@@ -153,17 +189,22 @@ impl ArchDesc {
             if do_build {
                 let mr = instr.borrow().matrule.clone().unwrap();
                 mr.borrow_mut().mach_type = Some(root_op.clone());
-                self.build_match_list(&mr, &result, &root_op,
-                                      instr.borrow().predicate.as_deref(),
-                                      &cost, globals, ideal_index);
+                self.build_match_list(
+                    &mr,
+                    &result,
+                    &root_op,
+                    instr.borrow().predicate.as_deref(),
+                    &cost,
+                    globals,
+                    ideal_index,
+                );
             }
         }
     }
 
     //------------------------------build_components----------------------------
     // Port of InstructForm::build_components / OperandForm::build_components.
-    fn build_components(&mut self, form: &FormRef,
-                        globals: &HashMap<String, FormRef>) {
+    fn build_components(&mut self, form: &FormRef, globals: &HashMap<String, FormRef>) {
         let kind = form.borrow().kind;
         match kind {
             FormKind::Operand => self.build_operand_components(form, globals),
@@ -172,19 +213,23 @@ impl ArchDesc {
         }
     }
 
-    fn build_operand_components(&mut self, form: &FormRef,
-                                globals: &HashMap<String, FormRef>) {
+    fn build_operand_components(&mut self, form: &FormRef, globals: &HashMap<String, FormRef>) {
         {
             let mut b = form.borrow_mut();
             b.components = ComponentList::default();
             let mr = b.matrule.clone();
             if let Some(mr) = mr {
-                mr.borrow().m.append_components(globals, &mut b.components, false);
+                mr.borrow()
+                    .m
+                    .append_components(globals, &mut b.components, false);
             }
         }
         let params = form.borrow().parameters.clone();
         for name in params {
-            let type_ident = form.borrow().local_names.get(&name)
+            let type_ident = form
+                .borrow()
+                .local_names
+                .get(&name)
                 .map(|f| f.borrow().ident.clone())
                 .unwrap_or_default();
             let mut b = form.borrow_mut();
@@ -194,8 +239,7 @@ impl ArchDesc {
         }
     }
 
-    fn build_instruct_components(&mut self, form: &FormRef,
-                                 globals: &HashMap<String, FormRef>) {
+    fn build_instruct_components(&mut self, form: &FormRef, globals: &HashMap<String, FormRef>) {
         let (ident, linenum) = {
             let b = form.borrow();
             (b.ident.clone(), b.linenum)
@@ -207,23 +251,36 @@ impl ArchDesc {
             b.components = ComponentList::default();
             let mr = b.matrule.clone();
             if let Some(mr) = mr {
-                mr.borrow().m.append_components(globals, &mut b.components, false);
+                mr.borrow()
+                    .m
+                    .append_components(globals, &mut b.components, false);
             }
         }
         let params = form.borrow().parameters.clone();
         for name in params {
-            let type_ident = form.borrow().local_names.get(&name)
+            let type_ident = form
+                .borrow()
+                .local_names
+                .get(&name)
                 .map(|f| f.borrow().ident.clone())
                 .unwrap_or_default();
-            let e_use_def = form.borrow().effects.get(&name)
+            let e_use_def = form
+                .borrow()
+                .effects
+                .get(&name)
                 .map(|ef| ef.borrow().use_def);
             if let Some(ud) = e_use_def {
                 has_temp |= (ud & TEMP) == TEMP;
                 // KILLs must be declared after any TEMPs (C++ ordering check)
                 if kill_name.is_some() && (ud & TEMP) == TEMP && (ud & DEF) == 0 {
-                    self.parse_err(SYNERR, linenum,
-                        &format!("{}: {} {} must be at the end of the argument list\n",
-                                 ident, type_ident, name));
+                    self.parse_err(
+                        SYNERR,
+                        linenum,
+                        &format!(
+                            "{}: {} {} must be at the end of the argument list\n",
+                            ident, type_ident, name
+                        ),
+                    );
                 } else if (ud & KILL) != 0 && (ud & USE) == 0 {
                     kill_name = Some(name.clone());
                 }
@@ -251,15 +308,17 @@ impl ArchDesc {
         }
         let has_mrule = form.borrow().matrule.is_some();
         if !has_mrule && has_temp {
-            self.parse_err(SEMERR, linenum,
-                &format!("{}: TEMPs without match rule isn't supported\n", ident));
+            self.parse_err(
+                SEMERR,
+                linenum,
+                &format!("{}: TEMPs without match rule isn't supported\n", ident),
+            );
         }
     }
 
     //------------------------------build_chain_rule-----------------------------
     // Port of ArchDesc::build_chain_rule (operand chain rules).
-    fn build_chain_rule(&mut self, oper: &FormRef,
-                        globals: &HashMap<String, FormRef>) {
+    fn build_chain_rule(&mut self, oper: &FormRef, globals: &HashMap<String, FormRef>) {
         let mut rules_to_add: Vec<(String, String, String)> = Vec::new(); // (src, cost, result)
         {
             let b = oper.borrow();
@@ -270,8 +329,11 @@ impl ArchDesc {
                 if let Some(form) = globals.get(&mr.m.op_type) {
                     let f = form.borrow();
                     if f.kind == FormKind::Operand && !f.ideal_only() {
-                        rules_to_add.push((mr.m.op_type.clone(),
-                            b.op_cost().unwrap_or_default(), b.ident.clone()));
+                        rules_to_add.push((
+                            mr.m.op_type.clone(),
+                            b.op_cost().unwrap_or_default(),
+                            b.ident.clone(),
+                        ));
                     }
                 }
                 // additional chain rules
@@ -281,8 +343,11 @@ impl ArchDesc {
                     if let Some(form) = globals.get(&rb.m.op_type) {
                         let f = form.borrow();
                         if f.kind == FormKind::Operand && !f.ideal_only() {
-                            rules_to_add.push((rb.m.op_type.clone(),
-                                b.op_cost().unwrap_or_default(), b.ident.clone()));
+                            rules_to_add.push((
+                                rb.m.op_type.clone(),
+                                b.op_cost().unwrap_or_default(),
+                                b.ident.clone(),
+                            ));
                         }
                     }
                     next = rb.next.clone();
@@ -294,8 +359,11 @@ impl ArchDesc {
                     if let Some(form) = globals.get(&rb.m.op_type) {
                         let f = form.borrow();
                         if f.kind == FormKind::Operand && !f.ideal_only() {
-                            rules_to_add.push((rb.m.op_type.clone(),
-                                b.op_cost().unwrap_or_default(), b.ident.clone()));
+                            rules_to_add.push((
+                                rb.m.op_type.clone(),
+                                b.op_cost().unwrap_or_default(),
+                                b.ident.clone(),
+                            ));
                         }
                     }
                     next = rb.next.clone();
@@ -307,12 +375,22 @@ impl ArchDesc {
         }
     }
 
-    fn add_chain_rule_entry(&mut self, src: &str, cost: &str, result: &str,
-                            globals: &HashMap<String, FormRef>) {
-        let default_cost = globals.get(OP_COST)
+    fn add_chain_rule_entry(
+        &mut self,
+        src: &str,
+        cost: &str,
+        result: &str,
+        globals: &HashMap<String, FormRef>,
+    ) {
+        let default_cost = globals
+            .get(OP_COST)
             .and_then(|f| f.borrow().code.clone())
             .unwrap_or_default();
-        let cost = if cost.is_empty() { default_cost.as_str() } else { cost };
+        let cost = if cost.is_empty() {
+            default_cost.as_str()
+        } else {
+            cost
+        };
         let entry = self.chain_rules.entry(src.to_string()).or_default();
         if !entry.search(result) {
             entry.insert(result, cost, result);
@@ -320,10 +398,16 @@ impl ArchDesc {
     }
 
     //------------------------------buildMatchList-------------------------------
-    fn build_match_list(&mut self, mrule: &MatchRuleRef, result_str: &str,
-                        root_op: &str, pred: Option<&str>, cost: &str,
-                        globals: &HashMap<String, FormRef>,
-                        ideal_index: &HashMap<String, usize>) {
+    fn build_match_list(
+        &mut self,
+        mrule: &MatchRuleRef,
+        result_str: &str,
+        root_op: &str,
+        pred: Option<&str>,
+        cost: &str,
+        globals: &HashMap<String, FormRef>,
+        ideal_index: &HashMap<String, usize>,
+    ) {
         {
             let mr = mrule.borrow();
             if mr.is_chain_rule(globals) {
@@ -340,8 +424,7 @@ impl ArchDesc {
                 return;
             };
             if index >= LAST_OPCODE {
-                eprintln!("Invalid match rule {} <-- ( {} )",
-                          result_str, root_op);
+                eprintln!("Invalid match rule {} <-- ( {} )", result_str, root_op);
                 return;
             }
             if mr.m.op_type == "Set" {
@@ -349,8 +432,15 @@ impl ArchDesc {
                     // Recurse on the child node of the Set rule
                     let rc = (**rc).clone();
                     drop(mr);
-                    self.build_mlist_node(&rc, Some(root_op), Some(result_str),
-                                          pred, Some(cost), globals, ideal_index);
+                    self.build_mlist_node(
+                        &rc,
+                        Some(root_op),
+                        Some(result_str),
+                        pred,
+                        Some(cost),
+                        globals,
+                        ideal_index,
+                    );
                     return;
                 }
                 return;
@@ -369,19 +459,30 @@ impl ArchDesc {
                 rightstr = Some(r.internalop.clone().unwrap_or_else(|| r.op_type.clone()));
             }
             drop(mr);
-            self.insert_mlist(index, root_op, result_str,
-                              leftstr.as_deref(), rightstr.as_deref(),
-                              pred, cost);
+            self.insert_mlist(
+                index,
+                root_op,
+                result_str,
+                leftstr.as_deref(),
+                rightstr.as_deref(),
+                pred,
+                cost,
+            );
         }
     }
 
     //------------------------------buildMList-----------------------------------
     // Recursive helper operating on an owned MatchNode clone.
-    fn build_mlist_node(&mut self, node: &MatchNode,
-                        root_op: Option<&str>, result_op: Option<&str>,
-                        pred: Option<&str>, cost: Option<&str>,
-                        globals: &HashMap<String, FormRef>,
-                        ideal_index: &HashMap<String, usize>) {
+    fn build_mlist_node(
+        &mut self,
+        node: &MatchNode,
+        root_op: Option<&str>,
+        result_op: Option<&str>,
+        pred: Option<&str>,
+        cost: Option<&str>,
+        globals: &HashMap<String, FormRef>,
+        ideal_index: &HashMap<String, usize>,
+    ) {
         // Do not process leaves of the Match Tree if they are not ideal
         if node.l_child.is_none() && node.r_child.is_none() {
             if let Some(form) = globals.get(&node.op_type) {
@@ -406,26 +507,48 @@ impl ArchDesc {
             self.build_mlist_node(r, None, None, None, None, globals, ideal_index);
             rightstr = Some(r.internalop.clone().unwrap_or_else(|| r.op_type.clone()));
         }
-        let opcode = root_op.map(|s| s.to_string())
+        let opcode = root_op
+            .map(|s| s.to_string())
             .or_else(|| node.internalop.clone())
             .unwrap_or_else(|| node.op_type.clone());
-        let resultop = result_op.map(|s| s.to_string())
+        let resultop = result_op
+            .map(|s| s.to_string())
             .or_else(|| node.internalop.clone())
             .unwrap_or_else(|| node.op_type.clone());
-        self.insert_mlist_opt(index, &opcode, &resultop,
-                              leftstr.as_deref(), rightstr.as_deref(),
-                              pred, cost);
+        self.insert_mlist_opt(
+            index,
+            &opcode,
+            &resultop,
+            leftstr.as_deref(),
+            rightstr.as_deref(),
+            pred,
+            cost,
+        );
     }
 
-    fn insert_mlist(&mut self, index: usize, opcode: &str, result_str: &str,
-                    lchild: Option<&str>, rchild: Option<&str>,
-                    pred: Option<&str>, cost: &str) {
+    fn insert_mlist(
+        &mut self,
+        index: usize,
+        opcode: &str,
+        result_str: &str,
+        lchild: Option<&str>,
+        rchild: Option<&str>,
+        pred: Option<&str>,
+        cost: &str,
+    ) {
         self.insert_mlist_opt(index, opcode, result_str, lchild, rchild, pred, Some(cost));
     }
 
-    fn insert_mlist_opt(&mut self, index: usize, opcode: &str, result_str: &str,
-                        lchild: Option<&str>, rchild: Option<&str>,
-                        pred: Option<&str>, cost: Option<&str>) {
+    fn insert_mlist_opt(
+        &mut self,
+        index: usize,
+        opcode: &str,
+        result_str: &str,
+        lchild: Option<&str>,
+        rchild: Option<&str>,
+        pred: Option<&str>,
+        cost: Option<&str>,
+    ) {
         if index >= self.mlistab.len() {
             return;
         }

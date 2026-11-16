@@ -307,6 +307,7 @@ pub struct ClassLoader<'a> {
     pub(crate) suspend_streak: Share<u32>,
     /// Materialized `java.lang.Class` objects keyed by internal class name.
     pub(crate) class_objects: Share<HashMap<Vec<u8>, usize>>,
+    pub(crate) stringLiterals: Share<HashMap<&'a [u8], usize>>,
     /// Reverse lookup: materialized Class object handle -> internal name.
     pub(crate) class_object_names: Share<HashMap<usize, &'a [u8]>>,
     /// Classpath origin of each loaded class, used to synthesize the
@@ -369,6 +370,15 @@ impl<'a> ClassLoader<'a> {
     /// Lazily creates the shared unnamed `java.lang.Module` instance used for
     /// `Class.getModule()` and `ClassLoader.getUnnamedModule()`.
     pub(crate) fn unnamedModuleObject(&self) -> io::Result<usize> {
+        if let Some(handle) = *self.class_loader_object.borrow() {
+            let objects = self.borrow_objects();
+            if let Some(loader) = objects.get(handle)
+                && let Ok(slot) = loader.klass.instanceField(b"unnamedModule", b"Ljava/lang/Module;")
+                && let Some(Value::Object(module)) = loader.fields.get(slot)
+            {
+                return Ok(*module);
+            }
+        }
         if let Some(handle) = *self.unnamed_module_object.borrow() {
             return Ok(handle);
         }
@@ -623,6 +633,7 @@ impl<'a> ClassLoader<'a> {
             schedule_depth: Share::new(0),
             suspend_streak: Share::new(0),
             class_objects: Share::new(HashMap::new()),
+            stringLiterals: Share::new(HashMap::new()),
             class_object_names: Share::new(HashMap::new()),
             class_origins: Share::new(HashMap::new()),
             class_protection_domains: Share::new(HashMap::new()),
@@ -718,6 +729,7 @@ impl<'a> ClassLoader<'a> {
             schedule_depth: Share::new(0),
             suspend_streak: Share::new(0),
             class_objects: Share::new(HashMap::new()),
+            stringLiterals: Share::new(HashMap::new()),
             class_object_names: Share::new(HashMap::new()),
             class_origins: Share::new(HashMap::new()),
             class_protection_domains: Share::new(HashMap::new()),
@@ -733,7 +745,14 @@ impl<'a> ClassLoader<'a> {
     }
 
     pub(crate) fn gc_due(&self) -> bool {
-        self.allocations_since_gc.load(Ordering::Relaxed) >= 2048
+        static THRESHOLD: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let threshold = *THRESHOLD.get_or_init(|| {
+            std::env::var("JVM25_GC_EVERY")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(262_144)
+        });
+        self.allocations_since_gc.load(Ordering::Relaxed) >= threshold
     }
 
     pub(crate) fn reset_allocations(&self) {

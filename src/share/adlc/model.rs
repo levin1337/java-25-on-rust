@@ -207,8 +207,9 @@ pub fn is_load_from_memory(op_type: &str) -> DataType {
         "LoadP" => DataType::IdealP,
         "LoadN" => DataType::IdealN,
         "LoadS" => DataType::IdealS,
-        "LoadVector" | "LoadVectorGather" | "LoadVectorGatherMasked"
-        | "LoadVectorMasked" => DataType::IdealV,
+        "LoadVector" | "LoadVectorGather" | "LoadVectorGatherMasked" | "LoadVectorMasked" => {
+            DataType::IdealV
+        }
         _ => DataType::None,
     }
 }
@@ -224,8 +225,9 @@ pub fn is_store_to_memory(op_type: &str) -> DataType {
         "StoreP" => DataType::IdealP,
         "StoreN" => DataType::IdealN,
         "StoreNKlass" => DataType::IdealNKlass,
-        "StoreVector" | "StoreVectorScatter" | "StoreVectorScatterMasked"
-        | "StoreVectorMasked" => DataType::IdealV,
+        "StoreVector" | "StoreVectorScatter" | "StoreVectorScatterMasked" | "StoreVectorMasked" => {
+            DataType::IdealV
+        }
         _ => DataType::None,
     }
 }
@@ -481,7 +483,10 @@ pub fn name_list_search(list: &[String], name: &str) -> bool {
 }
 
 pub fn name_list_index(list: &[String], name: &str) -> i32 {
-    list.iter().position(|n| n == name).map(|i| i as i32).unwrap_or(-1)
+    list.iter()
+        .position(|n| n == name)
+        .map(|i| i as i32)
+        .unwrap_or(-1)
 }
 
 //------------------------------MatchNode / MatchRule--------------------------
@@ -498,21 +503,37 @@ pub struct MatchNode {
 }
 
 impl MatchNode {
-    pub fn new(result: Option<String>, name: Option<String>, op_type: String,
-               l_child: Option<Box<MatchNode>>, r_child: Option<Box<MatchNode>>) -> MatchNode {
+    pub fn new(
+        result: Option<String>,
+        name: Option<String>,
+        op_type: String,
+        l_child: Option<Box<MatchNode>>,
+        r_child: Option<Box<MatchNode>>,
+    ) -> MatchNode {
         let num_leaves = l_child.as_ref().map_or(0, |c| c.num_leaves)
             + r_child.as_ref().map_or(0, |c| c.num_leaves);
         MatchNode {
-            result, name, op_type, l_child, r_child, num_leaves,
-            internalop: None, commutative_id: 0,
+            result,
+            name,
+            op_type,
+            l_child,
+            r_child,
+            num_leaves,
+            internalop: None,
+            commutative_id: 0,
         }
     }
 
     pub fn leaf(result: Option<String>, name: Option<String>, op_type: String) -> MatchNode {
         MatchNode {
-            result, name, op_type,
-            l_child: None, r_child: None, num_leaves: 0,
-            internalop: None, commutative_id: 0,
+            result,
+            name,
+            op_type,
+            l_child: None,
+            r_child: None,
+            num_leaves: 0,
+            internalop: None,
+            commutative_id: 0,
         }
     }
 
@@ -535,15 +556,17 @@ impl MatchNode {
     }
 
     // Port of MatchNode::append_components
-    pub fn append_components(&self, globals: &HashMap<String, FormRef>,
-                             components: &mut ComponentList, def_flag: bool) {
+    pub fn append_components(
+        &self,
+        globals: &HashMap<String, FormRef>,
+        components: &mut ComponentList,
+        def_flag: bool,
+    ) {
         let usedef = if def_flag { DEF } else { USE };
         if self.l_child.is_none() && self.r_child.is_none() {
             if let Some(f) = globals.get(&self.op_type) {
                 let f = f.borrow();
-                if !f.ideal_only()
-                    && (f.kind == FormKind::OpClass || f.kind == FormKind::Operand)
-                {
+                if !f.ideal_only() && (f.kind == FormKind::OpClass || f.kind == FormKind::Operand) {
                     if let Some(n) = &self.name {
                         components.insert(n, &self.op_type, usedef, true);
                     }
@@ -561,9 +584,14 @@ impl MatchNode {
     }
 
     // Port of MatchNode::base_operand (recursive through user-defined match rules)
-    pub fn base_operand(&self, position: &mut u32, globals: &HashMap<String, FormRef>,
-                        result: &mut Option<String>, name: &mut Option<String>,
-                        op_type: &mut Option<String>) -> bool {
+    pub fn base_operand(
+        &self,
+        position: &mut u32,
+        globals: &HashMap<String, FormRef>,
+        result: &mut Option<String>,
+        name: &mut Option<String>,
+        op_type: &mut Option<String>,
+    ) -> bool {
         if self.l_child.is_none() && self.r_child.is_none() {
             if self.op_type == "Universe" || self.op_type == "label" {
                 if *position == 0 {
@@ -611,21 +639,17 @@ impl MatchNode {
 
     pub fn count_commutative_op(&mut self, count: &mut i32, globals: &HashMap<String, FormRef>) {
         const COMMUT_OP_LIST: &[&str] = &[
-            "AddI", "AddL", "AddHF", "AddF", "AddD",
-            "AndI", "AndL",
-            "MaxI", "MinI", "MaxHF", "MinHF", "MaxF", "MinF", "MaxD", "MinD",
-            "MulI", "MulL", "MulHF", "MulF", "MulD",
-            "OrI", "OrL",
-            "XorI", "XorL",
-            "UMax", "UMin",
+            "AddI", "AddL", "AddHF", "AddF", "AddD", "AndI", "AndL", "MaxI", "MinI", "MaxHF",
+            "MinHF", "MaxF", "MinF", "MaxD", "MinD", "MulI", "MulL", "MulHF", "MulF", "MulD",
+            "OrI", "OrL", "XorI", "XorL", "UMax", "UMin",
         ];
         const COMMUT_VECTOR_OP_LIST: &[&str] = &[
-            "AddVB", "AddVS", "AddVI", "AddVL", "AddVHF", "AddVF", "AddVD",
-            "MulVB", "MulVS", "MulVI", "MulVL", "MulVHF", "MulVF", "MulVD",
-            "AndV", "OrV", "XorV",
-            "MaxVHF", "MinVHF", "MaxV", "MinV", "UMax", "UMin",
+            "AddVB", "AddVS", "AddVI", "AddVL", "AddVHF", "AddVF", "AddVD", "MulVB", "MulVS",
+            "MulVI", "MulVL", "MulVHF", "MulVF", "MulVD", "AndV", "OrV", "XorV", "MaxVHF",
+            "MinVHF", "MaxV", "MinV", "UMax", "UMin",
         ];
-        if self.l_child.is_some() && self.r_child.is_some()
+        if self.l_child.is_some()
+            && self.r_child.is_some()
             && (self.l_child.as_ref().unwrap().l_child.is_some()
                 || self.r_child.as_ref().unwrap().l_child.is_some())
         {
@@ -667,7 +691,12 @@ impl MatchNode {
         }
     }
 
-    pub fn swap_commutative_op(&mut self, atroot: bool, id: i32, globals: &HashMap<String, FormRef>) {
+    pub fn swap_commutative_op(
+        &mut self,
+        atroot: bool,
+        id: i32,
+        globals: &HashMap<String, FormRef>,
+    ) {
         if self.commutative_id == id {
             std::mem::swap(&mut self.l_child, &mut self.r_child);
         }
@@ -685,12 +714,19 @@ impl MatchNode {
 
     // Port of MatchNode::build_internalop; needs access to AD internal op tables,
     // passed via globals + a callback-free approach: caller supplies maps.
-    pub fn build_internalop_with(&mut self, internal_ops: &mut HashMap<String, String>,
-                                 internal_match: &mut HashMap<String, MatchNodeRef>) {
-        let lstr = self.l_child.as_ref()
+    pub fn build_internalop_with(
+        &mut self,
+        internal_ops: &mut HashMap<String, String>,
+        internal_match: &mut HashMap<String, MatchNodeRef>,
+    ) {
+        let lstr = self
+            .l_child
+            .as_ref()
             .map(|c| c.internalop.clone().unwrap_or_else(|| c.op_type.clone()))
             .unwrap_or_default();
-        let rstr = self.r_child.as_ref()
+        let rstr = self
+            .r_child
+            .as_ref()
             .map(|c| c.internalop.clone().unwrap_or_else(|| c.op_type.clone()))
             .unwrap_or_default();
         let subtree = format!("_{}_{}_{}", self.op_type, lstr, rstr);
@@ -707,10 +743,14 @@ impl MatchNode {
 
     pub fn build_internalop(&mut self, globals: &HashMap<String, FormRef>) {
         // Fallback without AD tables: generate name and store only locally.
-        let lstr = self.l_child.as_ref()
+        let lstr = self
+            .l_child
+            .as_ref()
             .map(|c| c.internalop.clone().unwrap_or_else(|| c.op_type.clone()))
             .unwrap_or_default();
-        let rstr = self.r_child.as_ref()
+        let rstr = self
+            .r_child
+            .as_ref()
             .map(|c| c.internalop.clone().unwrap_or_else(|| c.op_type.clone()))
             .unwrap_or_default();
         let subtree = format!("_{}_{}_{}", self.op_type, lstr, rstr);
@@ -763,11 +803,21 @@ pub struct MatchRule {
 }
 
 impl MatchRule {
-    pub fn new(m: MatchNode, depth: i32, construct: Option<String>, num_leaves: usize) -> MatchRule {
-        let numchilds = (if m.l_child.is_some() { 1 } else { 0 })
-            + (if m.r_child.is_some() { 1 } else { 0 });
+    pub fn new(
+        m: MatchNode,
+        depth: i32,
+        construct: Option<String>,
+        num_leaves: usize,
+    ) -> MatchRule {
+        let numchilds =
+            (if m.l_child.is_some() { 1 } else { 0 }) + (if m.r_child.is_some() { 1 } else { 0 });
         MatchRule {
-            m, mach_type: None, depth, construct, numchilds, next: None,
+            m,
+            mach_type: None,
+            depth,
+            construct,
+            numchilds,
+            next: None,
         }
     }
 
@@ -803,21 +853,43 @@ impl MatchRule {
     }
     pub fn is_ideal_fastlock(&self) -> bool {
         self.m.op_type == "Set"
-            && self.m.r_child.as_ref().map_or(false, |r| r.op_type == "FastLock")
+            && self
+                .m
+                .r_child
+                .as_ref()
+                .map_or(false, |r| r.op_type == "FastLock")
     }
     pub fn is_ideal_membar(&self) -> bool {
-        matches!(self.m.op_type.as_str(),
-            "MemBarAcquire" | "MemBarRelease" | "MemBarAcquireLock" | "MemBarReleaseLock"
-            | "LoadFence" | "StoreFence" | "StoreStoreFence" | "MemBarVolatile"
-            | "MemBarCPUOrder" | "MemBarStoreStore" | "OnSpinWait")
+        matches!(
+            self.m.op_type.as_str(),
+            "MemBarAcquire"
+                | "MemBarRelease"
+                | "MemBarAcquireLock"
+                | "MemBarReleaseLock"
+                | "LoadFence"
+                | "StoreFence"
+                | "StoreStoreFence"
+                | "MemBarVolatile"
+                | "MemBarCPUOrder"
+                | "MemBarStoreStore"
+                | "OnSpinWait"
+        )
     }
     pub fn is_ideal_loadpc(&self) -> bool {
         self.m.op_type == "Set"
-            && self.m.r_child.as_ref().map_or(false, |r| r.op_type == "LoadPC")
+            && self
+                .m
+                .r_child
+                .as_ref()
+                .map_or(false, |r| r.op_type == "LoadPC")
     }
     pub fn is_ideal_box(&self) -> bool {
         self.m.op_type == "Set"
-            && self.m.r_child.as_ref().map_or(false, |r| r.op_type == "Box")
+            && self
+                .m
+                .r_child
+                .as_ref()
+                .map_or(false, |r| r.op_type == "Box")
     }
     pub fn is_ideal_goto(&self) -> bool {
         self.m.op_type == "Goto"
@@ -854,37 +926,159 @@ impl MatchRule {
     }
     pub fn is_vector(&self) -> bool {
         const VECTOR_LIST: &[&str] = &[
-            "AddVB","AddVS","AddVI","AddVL","AddVHF","AddVF","AddVD",
-            "SubVB","SubVS","SubVI","SubVL","SubVHF","SubVF","SubVD",
-            "MulVB","MulVS","MulVI","MulVL","MulVHF","MulVF","MulVD",
-            "DivVHF","DivVF","DivVD",
-            "AbsVB","AbsVS","AbsVI","AbsVL","AbsVF","AbsVD",
-            "NegVF","NegVD","NegVI","NegVL",
-            "SqrtVD","SqrtVF","SqrtVHF",
-            "AndV","XorV","OrV",
-            "MaxV","MinV","MinVHF","MaxVHF","UMinV","UMaxV",
-            "CompressV","ExpandV","CompressM","CompressBitsV","ExpandBitsV",
-            "AddReductionVI","AddReductionVL","AddReductionVF","AddReductionVD",
-            "MulReductionVI","MulReductionVL","MulReductionVF","MulReductionVD",
-            "MaxReductionV","MinReductionV","AndReductionV","OrReductionV","XorReductionV",
-            "MulAddVS2VI","MacroLogicV","LShiftCntV","RShiftCntV",
-            "LShiftVB","LShiftVS","LShiftVI","LShiftVL",
-            "RShiftVB","RShiftVS","RShiftVI","RShiftVL",
-            "URShiftVB","URShiftVS","URShiftVI","URShiftVL",
-            "Replicate","ReverseV","ReverseBytesV",
-            "RoundDoubleModeV","RotateLeftV","RotateRightV","LoadVector","StoreVector",
-            "LoadVectorGather","StoreVectorScatter","LoadVectorGatherMasked","StoreVectorScatterMasked",
-            "SelectFromTwoVector","VectorTest","VectorLoadMask","VectorStoreMask","VectorBlend","VectorInsert",
-            "VectorRearrange","VectorLoadShuffle","VectorLoadConst",
-            "VectorCastB2X","VectorCastS2X","VectorCastI2X","VectorCastL2X","VectorCastF2X","VectorCastD2X","VectorCastF2HF","VectorCastHF2F",
-            "VectorUCastB2X","VectorUCastS2X","VectorUCastI2X",
-            "VectorMaskWrapper","VectorMaskCmp","VectorReinterpret","LoadVectorMasked","StoreVectorMasked",
-            "FmaVD","FmaVF","FmaVHF","PopCountVI","PopCountVL","PopulateIndex","VectorLongToMask",
-            "CountLeadingZerosV","CountTrailingZerosV","SignumVF","SignumVD","SaturatingAddV","SaturatingSubV",
-            "MaskAll","AndVMask","OrVMask","XorVMask","VectorMaskCast",
-            "RoundVF","RoundVD",
-            "PackB","PackS","PackI","PackL","PackF","PackD","Pack2L","Pack2D",
-            "ExtractB","ExtractUB","ExtractC","ExtractS","ExtractI","ExtractL","ExtractF","ExtractD",
+            "AddVB",
+            "AddVS",
+            "AddVI",
+            "AddVL",
+            "AddVHF",
+            "AddVF",
+            "AddVD",
+            "SubVB",
+            "SubVS",
+            "SubVI",
+            "SubVL",
+            "SubVHF",
+            "SubVF",
+            "SubVD",
+            "MulVB",
+            "MulVS",
+            "MulVI",
+            "MulVL",
+            "MulVHF",
+            "MulVF",
+            "MulVD",
+            "DivVHF",
+            "DivVF",
+            "DivVD",
+            "AbsVB",
+            "AbsVS",
+            "AbsVI",
+            "AbsVL",
+            "AbsVF",
+            "AbsVD",
+            "NegVF",
+            "NegVD",
+            "NegVI",
+            "NegVL",
+            "SqrtVD",
+            "SqrtVF",
+            "SqrtVHF",
+            "AndV",
+            "XorV",
+            "OrV",
+            "MaxV",
+            "MinV",
+            "MinVHF",
+            "MaxVHF",
+            "UMinV",
+            "UMaxV",
+            "CompressV",
+            "ExpandV",
+            "CompressM",
+            "CompressBitsV",
+            "ExpandBitsV",
+            "AddReductionVI",
+            "AddReductionVL",
+            "AddReductionVF",
+            "AddReductionVD",
+            "MulReductionVI",
+            "MulReductionVL",
+            "MulReductionVF",
+            "MulReductionVD",
+            "MaxReductionV",
+            "MinReductionV",
+            "AndReductionV",
+            "OrReductionV",
+            "XorReductionV",
+            "MulAddVS2VI",
+            "MacroLogicV",
+            "LShiftCntV",
+            "RShiftCntV",
+            "LShiftVB",
+            "LShiftVS",
+            "LShiftVI",
+            "LShiftVL",
+            "RShiftVB",
+            "RShiftVS",
+            "RShiftVI",
+            "RShiftVL",
+            "URShiftVB",
+            "URShiftVS",
+            "URShiftVI",
+            "URShiftVL",
+            "Replicate",
+            "ReverseV",
+            "ReverseBytesV",
+            "RoundDoubleModeV",
+            "RotateLeftV",
+            "RotateRightV",
+            "LoadVector",
+            "StoreVector",
+            "LoadVectorGather",
+            "StoreVectorScatter",
+            "LoadVectorGatherMasked",
+            "StoreVectorScatterMasked",
+            "SelectFromTwoVector",
+            "VectorTest",
+            "VectorLoadMask",
+            "VectorStoreMask",
+            "VectorBlend",
+            "VectorInsert",
+            "VectorRearrange",
+            "VectorLoadShuffle",
+            "VectorLoadConst",
+            "VectorCastB2X",
+            "VectorCastS2X",
+            "VectorCastI2X",
+            "VectorCastL2X",
+            "VectorCastF2X",
+            "VectorCastD2X",
+            "VectorCastF2HF",
+            "VectorCastHF2F",
+            "VectorUCastB2X",
+            "VectorUCastS2X",
+            "VectorUCastI2X",
+            "VectorMaskWrapper",
+            "VectorMaskCmp",
+            "VectorReinterpret",
+            "LoadVectorMasked",
+            "StoreVectorMasked",
+            "FmaVD",
+            "FmaVF",
+            "FmaVHF",
+            "PopCountVI",
+            "PopCountVL",
+            "PopulateIndex",
+            "VectorLongToMask",
+            "CountLeadingZerosV",
+            "CountTrailingZerosV",
+            "SignumVF",
+            "SignumVD",
+            "SaturatingAddV",
+            "SaturatingSubV",
+            "MaskAll",
+            "AndVMask",
+            "OrVMask",
+            "XorVMask",
+            "VectorMaskCast",
+            "RoundVF",
+            "RoundVD",
+            "PackB",
+            "PackS",
+            "PackI",
+            "PackL",
+            "PackF",
+            "PackD",
+            "Pack2L",
+            "Pack2D",
+            "ExtractB",
+            "ExtractUB",
+            "ExtractC",
+            "ExtractS",
+            "ExtractI",
+            "ExtractL",
+            "ExtractF",
+            "ExtractD",
         ];
         if let Some(r) = &self.m.r_child {
             return VECTOR_LIST.contains(&r.op_type.as_str());
@@ -1017,7 +1211,7 @@ pub struct Form {
     pub may_have_no_code: bool,
     pub pipe_instructs: NameList,
     pub local_usage: HashMap<String, FormRef>, // name -> PipeClassOperandForm
-    pub res_usage: Vec<FormRef>,              // PipeClassResourceForm
+    pub res_usage: Vec<FormRef>,               // PipeClassResourceForm
 
     // encode
     pub eclasses: NameList,
@@ -1207,7 +1401,10 @@ impl Form {
         self.kind == FormKind::MachNode
     }
     pub fn is_regclass(&self) -> bool {
-        matches!(self.kind, FormKind::RegClass | FormKind::CodeSnippetRegClass | FormKind::ConditionalRegClass)
+        matches!(
+            self.kind,
+            FormKind::RegClass | FormKind::CodeSnippetRegClass | FormKind::ConditionalRegClass
+        )
     }
 
     // interface_type: for Operand returns its interface kind; for OpClass
@@ -1241,14 +1438,24 @@ impl Form {
 
     // InstructForm predicate helpers
     pub fn is_ideal_control(&self) -> bool {
-        self.is_ideal_return() || self.is_ideal_branch()
-            || self.matrule.as_ref().map_or(false, |m| m.borrow().m.op_type == "Jump")
+        self.is_ideal_return()
+            || self.is_ideal_branch()
+            || self
+                .matrule
+                .as_ref()
+                .map_or(false, |m| m.borrow().m.op_type == "Jump")
             || self.is_ideal_halt()
     }
     pub fn is_ideal_return(&self) -> bool {
         if let Some(m) = &self.matrule {
             let m = m.borrow();
-            for ty in ["Return", "Rethrow", "TailCall", "TailJump", "ForwardException"] {
+            for ty in [
+                "Return",
+                "Rethrow",
+                "TailCall",
+                "TailJump",
+                "ForwardException",
+            ] {
                 if m.m.find_type(ty) {
                     return true;
                 }
@@ -1257,10 +1464,14 @@ impl Form {
         false
     }
     pub fn is_ideal_halt(&self) -> bool {
-        self.matrule.as_ref().map_or(false, |m| m.borrow().m.find_type("Halt"))
+        self.matrule
+            .as_ref()
+            .map_or(false, |m| m.borrow().m.find_type("Halt"))
     }
     pub fn is_ideal_safepoint(&self) -> bool {
-        self.matrule.as_ref().map_or(false, |m| m.borrow().m.find_type("SafePoint"))
+        self.matrule
+            .as_ref()
+            .map_or(false, |m| m.borrow().m.find_type("SafePoint"))
     }
     pub fn is_ideal_branch(&self) -> bool {
         if let Some(m) = &self.matrule {
@@ -1276,7 +1487,9 @@ impl Form {
         false
     }
     pub fn is_ideal_call(&self) -> CallType {
-        let Some(m) = &self.matrule else { return CallType::Invalid };
+        let Some(m) = &self.matrule else {
+            return CallType::Invalid;
+        };
         let m = m.borrow();
         for (ty, ct) in [
             ("CallStaticJava", CallType::JavaStatic),
@@ -1311,19 +1524,32 @@ impl Form {
         if self.is_ideal_safepoint() {
             return "MachSafePointNode";
         }
-        if self.is_ideal_branch() && self.matrule.as_ref().map_or(false, |m| m.borrow().is_ideal_if()) {
+        if self.is_ideal_branch()
+            && self
+                .matrule
+                .as_ref()
+                .map_or(false, |m| m.borrow().is_ideal_if())
+        {
             return "MachIfNode";
         }
         if self.is_ideal_goto_name() {
             return "MachGotoNode";
         }
-        if self.matrule.as_ref().map_or(false, |m| m.borrow().is_ideal_fastlock()) {
+        if self
+            .matrule
+            .as_ref()
+            .map_or(false, |m| m.borrow().is_ideal_fastlock())
+        {
             return "MachFastLockNode";
         }
         if self.ident.starts_with("Nop_") {
             return "MachNopNode";
         }
-        if self.matrule.as_ref().map_or(false, |m| m.borrow().is_ideal_membar()) {
+        if self
+            .matrule
+            .as_ref()
+            .map_or(false, |m| m.borrow().is_ideal_membar())
+        {
             return "MachMemBarNode";
         }
         if self.is_ideal_jump() {
@@ -1335,11 +1561,15 @@ impl Form {
         "MachNode"
     }
     fn is_ideal_goto_name(&self) -> bool {
-        self.matrule.as_ref().map_or(false, |m| m.borrow().is_ideal_goto())
+        self.matrule
+            .as_ref()
+            .map_or(false, |m| m.borrow().is_ideal_goto())
     }
     pub fn expands(&self) -> bool {
-        !self.expand_newopers.is_empty() || !self.expand_instrs.is_empty()
-            || self.rewrite_block.is_some() || self.expand_has_rules()
+        !self.expand_newopers.is_empty()
+            || !self.expand_instrs.is_empty()
+            || self.rewrite_block.is_some()
+            || self.expand_has_rules()
     }
     fn expand_has_rules(&self) -> bool {
         self.has_expand_rule
@@ -1556,8 +1786,8 @@ impl ArchDesc {
         for j in (LAST_MACHINE_LEAF + 1)..LAST_OPCODE {
             let ident = NODE_CLASS_NAMES[j];
             match ident {
-                "ConI" | "ConP" | "ConN" | "ConNKlass" | "ConH" | "ConF" | "ConD"
-                | "ConL" | "Con" | "Bool" => {
+                "ConI" | "ConP" | "ConN" | "ConNKlass" | "ConH" | "ConF" | "ConD" | "ConL"
+                | "Con" | "Bool" => {
                     self.construct_operand(ident, true);
                 }
                 "_last_class_name" => {}
@@ -1581,7 +1811,9 @@ impl ArchDesc {
         }
         self.construct_operand("method", false);
         // Effects
-        for e in ["USE", "DEF", "USE_DEF", "KILL", "USE_KILL", "TEMP", "TEMP_DEF", "CALL"] {
+        for e in [
+            "USE", "DEF", "USE_DEF", "KILL", "USE_KILL", "TEMP", "TEMP_DEF", "CALL",
+        ] {
             let mut f = Form::new(FormKind::Effect);
             f.ident = e.to_string();
             f.effect_name = e.to_string();
@@ -1602,13 +1834,19 @@ impl ArchDesc {
     }
 
     pub fn operand_form_count(&self) -> usize {
-        self.operands.iter().filter(|o| o.borrow().matrule.is_some()).count()
+        self.operands
+            .iter()
+            .filter(|o| o.borrow().matrule.is_some())
+            .count()
     }
     pub fn opclass_form_count(&self) -> usize {
         self.opclass.len()
     }
     pub fn instruct_form_count(&self) -> usize {
-        self.instructions.iter().filter(|o| o.borrow().matrule.is_some()).count()
+        self.instructions
+            .iter()
+            .filter(|o| o.borrow().matrule.is_some())
+            .count()
     }
 
     pub fn emit_msg(&self, flag: i32, linenum: i32, msg: &str) -> i32 {
@@ -1635,14 +1873,48 @@ impl ArchDesc {
 fn init_keywords(names: &mut HashMap<String, FormRef>) {
     // Keywords are stored with a null form; we use a sentinel empty Form.
     for kw in [
-        "instruct", "operand", "attribute", "source", "register", "pipeline",
-        "constraint", "predicate", "encode", "enc_class", "interface", "opcode",
-        "ins_encode", "match", "effect", "expand", "rewrite", "reg_def",
-        "reg_class", "alloc_class", "resource", "pipe_class", "pipe_desc",
-        "postalloc_expand", "size", "ins_pipe", "flag", "format", "peephole",
-        "definitions", "source_hpp", "frame", "int_def", "opclass",
-        "ins_attrib", "op_attrib", "enc_class", "reg_class_dynamic",
+        "instruct",
+        "operand",
+        "attribute",
+        "source",
+        "register",
+        "pipeline",
+        "constraint",
+        "predicate",
+        "encode",
+        "enc_class",
+        "interface",
+        "opcode",
+        "ins_encode",
+        "match",
+        "effect",
+        "expand",
+        "rewrite",
+        "reg_def",
+        "reg_class",
+        "alloc_class",
+        "resource",
+        "pipe_class",
+        "pipe_desc",
+        "postalloc_expand",
+        "size",
+        "ins_pipe",
+        "flag",
+        "format",
+        "peephole",
+        "definitions",
+        "source_hpp",
+        "frame",
+        "int_def",
+        "opclass",
+        "ins_attrib",
+        "op_attrib",
+        "enc_class",
+        "reg_class_dynamic",
     ] {
-        names.insert(kw.to_string(), Rc::new(RefCell::new(Form::new(FormKind::ExprDef))));
+        names.insert(
+            kw.to_string(),
+            Rc::new(RefCell::new(Form::new(FormKind::ExprDef))),
+        );
     }
 }

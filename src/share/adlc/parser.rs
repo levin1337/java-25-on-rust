@@ -71,12 +71,22 @@ impl<'a> AdlParser<'a> {
     }
     fn parse_err_at(&mut self, flag: i32, line: i32, fmt: &str) {
         // skip to end of current line, like C++ parse_err
+        let was_eol = self.byte_at(self.ptr) == b'\n';
         let mut p = self.ptr;
         while self.byte_at(p) != b'\n' && self.byte_at(p) != 0 {
             p += 1;
         }
         self.ptr = p;
-        self.curchar = b'\n';
+        self.curchar = self.byte(0);
+        if was_eol {
+            // Already at end of line: advance line tracking so callers make
+            // progress instead of looping on the same position.
+            self.next_line();
+            if let Some(cl) = self.curline {
+                self.ptr = cl;
+            }
+            self.curchar = self.byte(0);
+        }
         self.ad.parse_err(flag, line, fmt);
     }
     fn synerr(&mut self, fmt: &str) {
@@ -263,7 +273,11 @@ impl<'a> AdlParser<'a> {
             let flag = self.get_ident_no_preproc().unwrap_or_default();
             self.ensure_end_of_line();
             let flag_def = self.preproc_taken() && self.ad.get_preproc_def(&flag).is_some();
-            let now_taken = if ident == "ifdef" { flag_def } else { !flag_def };
+            let now_taken = if ident == "ifdef" {
+                flag_def
+            } else {
+                !flag_def
+            };
             self.begin_if_def(now_taken);
         } else if ident == "if" {
             if self.preproc_taken() {
@@ -308,7 +322,10 @@ impl<'a> AdlParser<'a> {
         if let Some(cl) = self.curline {
             for i in cl..self.ptr {
                 if self.byte_at(i) > b' ' {
-                    self.synerr(&format!("'{}' must be at beginning of line\n", self.curchar as char));
+                    self.synerr(&format!(
+                        "'{}' must be at beginning of line\n",
+                        self.curchar as char
+                    ));
                     break;
                 }
             }
@@ -318,7 +335,10 @@ impl<'a> AdlParser<'a> {
     fn ensure_end_of_line(&mut self) {
         self.skipws_no_preproc();
         if self.curchar != b'\n' && self.curchar != 0 {
-            self.synerr(&format!("garbage char '{}' at end of line\n", self.curchar as char));
+            self.synerr(&format!(
+                "garbage char '{}' at end of line\n",
+                self.curchar as char
+            ));
         } else {
             self.next_char_or_line();
         }
@@ -334,8 +354,12 @@ impl<'a> AdlParser<'a> {
         let mut end = start;
         loop {
             let c = self.byte_at(end);
-            if (c.is_ascii_lowercase() || c.is_ascii_uppercase() || c.is_ascii_digit()
-                || c == b'_' || c == b':' || c == b'#')
+            if (c.is_ascii_lowercase()
+                || c.is_ascii_uppercase()
+                || c.is_ascii_digit()
+                || c == b'_'
+                || c == b':'
+                || c == b'#')
                 && c != 0
             {
                 end += 1;
@@ -344,6 +368,13 @@ impl<'a> AdlParser<'a> {
             }
         }
         if start == end {
+            // A '%' begins a %{ %} code-block delimiter.  Return None
+            // silently so callers can detect the block terminator via
+            // curchar() == '%' without a spurious diagnostic (and without
+            // the error-recovery line skip eating the "%}").
+            if self.byte_at(start) == b'%' {
+                return None;
+            }
             let tail: String = self.buf.buf[start..]
                 .iter()
                 .take(24)
@@ -362,11 +393,14 @@ impl<'a> AdlParser<'a> {
                     let def1 = def.clone();
                     if let Some(def2) = self.ad.get_preproc_def(&def1).map(|s| s.to_string()) {
                         if def2 != def1 {
-                            if let Some(def3) = self.ad.get_preproc_def(&def2).map(|s| s.to_string()) {
+                            if let Some(def3) =
+                                self.ad.get_preproc_def(&def2).map(|s| s.to_string())
+                            {
                                 if def3 != def2 && def3 != def1 {
                                     self.synerr(&format!(
                                         "unimplemented: using {} defined as {} => {} => {}",
-                                        result, def1, def2, def3));
+                                        result, def1, def2, def3
+                                    ));
                                 }
                             }
                             result = def2;
@@ -473,7 +507,10 @@ impl<'a> AdlParser<'a> {
             }
         }
         if start == end {
-            self.synerr(&format!("integer expected at {}\n", self.byte_at(end) as char));
+            self.synerr(&format!(
+                "integer expected at {}\n",
+                self.byte_at(end) as char
+            ));
             return 0;
         }
         self.curchar = self.byte_at(end);
@@ -494,10 +531,16 @@ impl<'a> AdlParser<'a> {
                 let s = String::from_utf8_lossy(&self.buf.buf[start..self.ptr]).into_owned();
                 return Some(s);
             }
-            self.synerr(&format!("relational operator expected at {}\n", self.rest_of_line()));
+            self.synerr(&format!(
+                "relational operator expected at {}\n",
+                self.rest_of_line()
+            ));
             return None;
         }
-        self.synerr(&format!("relational operator expected at {}\n", self.rest_of_line()));
+        self.synerr(&format!(
+            "relational operator expected at {}\n",
+            self.rest_of_line()
+        ));
         None
     }
 
@@ -514,7 +557,10 @@ impl<'a> AdlParser<'a> {
                     self.next_char();
                 } else if c == b')' {
                     if paren == 0 {
-                        self.synerr(&format!("too many )'s, did not find {} after {}\n", stop_chars, desc));
+                        self.synerr(&format!(
+                            "too many )'s, did not find {} after {}\n",
+                            stop_chars, desc
+                        ));
                         return None;
                     }
                     paren -= 1;
@@ -536,7 +582,11 @@ impl<'a> AdlParser<'a> {
                         }
                     }
                 } else if c == b'%' && (self.byte(1) == b'{' || self.byte(1) == b'}') {
-                    self.synerr(&format!("unexpected %{} in {}\n", self.byte(1) as char, desc));
+                    self.synerr(&format!(
+                        "unexpected %{} in {}\n",
+                        self.byte(1) as char,
+                        desc
+                    ));
                     return None;
                 } else if c == 0 {
                     self.synerr(&format!("unexpected EOF in {}\n", desc));
@@ -635,7 +685,13 @@ impl<'a> AdlParser<'a> {
             }
             self.skipws();
             let ident = self.get_ident();
-            let Some(ident) = ident else { continue };
+            let Some(ident) = ident else {
+                // No top-level construct on this line: advance to the next
+                // line (the `continue` below would otherwise skip the
+                // next_line() at the bottom of the loop and spin forever).
+                self.next_line();
+                continue;
+            };
             match ident.as_str() {
                 "instruct" => self.instr_parse(),
                 "operand" => self.oper_parse(),
@@ -683,7 +739,9 @@ impl<'a> AdlParser<'a> {
     }
 
     fn instr_parse(&mut self) {
-        let Some(ident) = self.get_unique_ident_local("instruction") else { return };
+        let Some(ident) = self.get_unique_ident_local("instruction") else {
+            return;
+        };
         let mut f = Form::new(FormKind::Instruct);
         f.ident = ident.clone();
         f.linenum = self.linenum();
@@ -710,7 +768,13 @@ impl<'a> AdlParser<'a> {
         loop {
             let kw = self.get_ident();
             let Some(kw) = kw else {
-                self.synerr(&format!("keyword identifier expected at {}\n", self.curchar as char));
+                if self.curchar == b'%' {
+                    break;
+                }
+                self.synerr(&format!(
+                    "keyword identifier expected at {}\n",
+                    self.curchar as char
+                ));
                 continue;
             };
             match kw.as_str() {
@@ -764,8 +828,10 @@ impl<'a> AdlParser<'a> {
                                 if is_control {
                                     let nm = nrb.m.name.clone().unwrap_or_default();
                                     drop(nrb);
-                                    self.parse_err(SYNERR,
-                                        &format!("unique match rule expected for {}\n", nm));
+                                    self.parse_err(
+                                        SYNERR,
+                                        &format!("unique match rule expected for {}\n", nm),
+                                    );
                                     continue;
                                 }
                             }
@@ -888,8 +954,10 @@ impl<'a> AdlParser<'a> {
                         b.ident));
                 }
             } else if b.ins_pipe.is_none() {
-                self.parse_err(WARN, &format!(
-                    "No ins_pipe specified for instruction \"{}\"\n", b.ident));
+                self.parse_err(
+                    WARN,
+                    &format!("No ins_pipe specified for instruction \"{}\"\n", b.ident),
+                );
             }
         }
         self.ad.add_form(instr.clone());
@@ -975,7 +1043,12 @@ impl<'a> AdlParser<'a> {
         Rc::new(RefCell::new(f))
     }
 
-    fn matchrule_clone_and_swap(&mut self, rule: MatchRuleRef, instr_ident: &str, match_rules_cnt: &mut i32) {
+    fn matchrule_clone_and_swap(
+        &mut self,
+        rule: MatchRuleRef,
+        instr_ident: &str,
+        match_rules_cnt: &mut i32,
+    ) {
         let mut count = 0i32;
         {
             let mut rb = rule.borrow_mut();
@@ -986,8 +1059,13 @@ impl<'a> AdlParser<'a> {
         }
     }
 
-    fn matchrule_swap_commutative_op(&mut self, rule: MatchRuleRef, instr_ident: &str,
-                                      count: i32, match_rules_cnt: &mut i32) {
+    fn matchrule_swap_commutative_op(
+        &mut self,
+        rule: MatchRuleRef,
+        instr_ident: &str,
+        count: i32,
+        match_rules_cnt: &mut i32,
+    ) {
         // clone the rule (deep copy of the match tree)
         let clone_rule = {
             let r = rule.borrow();
@@ -998,7 +1076,10 @@ impl<'a> AdlParser<'a> {
         // swap operands of commutative op with id == count
         {
             let globals = &self.ad.global_names;
-            clone_rule.borrow_mut().m.swap_commutative_op(true, count, globals);
+            clone_rule
+                .borrow_mut()
+                .m
+                .swap_commutative_op(true, count, globals);
         }
         let buf = format!("{}_{}", instr_ident, *match_rules_cnt);
         *match_rules_cnt += 1;
@@ -1009,7 +1090,12 @@ impl<'a> AdlParser<'a> {
         rule.borrow_mut().next = Some(clone_rule.clone());
         let new_count = count - 1;
         if new_count > 0 {
-            self.matchrule_swap_commutative_op(rule.clone(), instr_ident, new_count, match_rules_cnt);
+            self.matchrule_swap_commutative_op(
+                rule.clone(),
+                instr_ident,
+                new_count,
+                match_rules_cnt,
+            );
             self.matchrule_swap_commutative_op(clone_rule, instr_ident, new_count, match_rules_cnt);
         }
     }
@@ -1047,8 +1133,13 @@ impl<'a> AdlParser<'a> {
             let mrb = mr.borrow();
             mrb.m.r_child.as_ref().unwrap().clone()
         };
-        let ok = right.base_operand(&mut position, &self.ad.global_names,
-                                    &mut result, &mut name, &mut optype);
+        let ok = right.base_operand(
+            &mut position,
+            &self.ad.global_names,
+            &mut result,
+            &mut name,
+            &mut optype,
+        );
         if !ok {
             return;
         }
@@ -1057,11 +1148,19 @@ impl<'a> AdlParser<'a> {
         let mut name2 = None;
         let mut optype2 = None;
         let right2 = right.clone();
-        let ok2 = right2.base_operand(&mut position, &self.ad.global_names,
-                                      &mut result2, &mut name2, &mut optype2);
-        let cost = instr.borrow().ins_cost()
-            .or_else(|| self.ad.global_names.get(INS_COST)
-                .and_then(|f| f.borrow().code.clone()));
+        let ok2 = right2.base_operand(
+            &mut position,
+            &self.ad.global_names,
+            &mut result2,
+            &mut name2,
+            &mut optype2,
+        );
+        let cost = instr.borrow().ins_cost().or_else(|| {
+            self.ad
+                .global_names
+                .get(INS_COST)
+                .and_then(|f| f.borrow().code.clone())
+        });
         if !ok2 {
             if instr.borrow().predicate.is_some() {
                 self.synerr("ADLC does not support instruction chain rules with predicates");
@@ -1115,7 +1214,9 @@ impl<'a> AdlParser<'a> {
 
     //------------------------------oper_parse----------------------------------
     fn oper_parse(&mut self) {
-        let Some(ident) = self.get_unique_ident_local("operand") else { return };
+        let Some(ident) = self.get_unique_ident_local("operand") else {
+            return;
+        };
         let mut f = Form::new(FormKind::Operand);
         f.ident = ident.clone();
         f.linenum = self.linenum();
@@ -1140,7 +1241,13 @@ impl<'a> AdlParser<'a> {
         loop {
             let kw = self.get_ident();
             let Some(kw) = kw else {
-                self.synerr(&format!("keyword identifier expected at {}\n", self.curchar as char));
+                if self.curchar == b'%' {
+                    break;
+                }
+                self.synerr(&format!(
+                    "keyword identifier expected at {}\n",
+                    self.curchar as char
+                ));
                 continue;
             };
             match kw.as_str() {
@@ -1262,7 +1369,9 @@ impl<'a> AdlParser<'a> {
     }
 
     fn opclass_parse(&mut self) {
-        let Some(ident) = self.get_unique_ident_local("opclass") else { return };
+        let Some(ident) = self.get_unique_ident_local("opclass") else {
+            return;
+        };
         let mut f = Form::new(FormKind::OpClass);
         f.ident = ident.clone();
         f.linenum = self.linenum();
@@ -1280,7 +1389,10 @@ impl<'a> AdlParser<'a> {
             self.next_char();
             let kw = self.get_ident();
             let Some(kw) = kw else {
-                self.synerr(&format!("keyword identifier expected at {}\n", self.curchar as char));
+                self.synerr(&format!(
+                    "keyword identifier expected at {}\n",
+                    self.curchar as char
+                ));
                 continue;
             };
             let form = self.ad.global_names.get(&kw).cloned();
@@ -1323,7 +1435,9 @@ impl<'a> AdlParser<'a> {
     }
     fn ins_or_op_attr_parse(&mut self, is_ins: bool) {
         let desc = if is_ins { "inst_attrib" } else { "op_attrib" };
-        let Some(ident) = self.get_unique_ident_local(desc) else { return };
+        let Some(ident) = self.get_unique_ident_local(desc) else {
+            return;
+        };
         self.skipws();
         let Some(aexpr) = self.get_paren_expr_simple("attribute default expression string") else {
             self.synerr(&format!("missing '(' in {} definition\n", desc));
@@ -1446,7 +1560,11 @@ impl<'a> AdlParser<'a> {
             return;
         };
         let has_registers = self.ad.register.is_some();
-        let kind = if has_registers { FormKind::Header } else { FormKind::PreHeader };
+        let kind = if has_registers {
+            FormKind::Header
+        } else {
+            FormKind::PreHeader
+        };
         let mut f = Form::new(kind);
         f.code = Some(rule);
         let r = Rc::new(RefCell::new(f));
@@ -1547,13 +1665,19 @@ impl<'a> AdlParser<'a> {
                 }
                 let ptype = self.get_ident();
                 let Some(ptype) = ptype else {
-                    self.synerr(&format!("parameter type expected at {}\n", self.curchar as char));
+                    self.synerr(&format!(
+                        "parameter type expected at {}\n",
+                        self.curchar as char
+                    ));
                     return;
                 };
                 self.skipws();
                 let pname = self.get_ident();
                 let Some(pname) = pname else {
-                    self.synerr(&format!("parameter name expected at {}\n", self.curchar as char));
+                    self.synerr(&format!(
+                        "parameter name expected at {}\n",
+                        self.curchar as char
+                    ));
                     return;
                 };
                 {
@@ -1590,9 +1714,7 @@ impl<'a> AdlParser<'a> {
             }
             // (1) string to pass through
             let start = self.ptr;
-            while !(self.curchar == b'$'
-                || (self.curchar == b'%' && self.byte(1) == b'}'))
-            {
+            while !(self.curchar == b'$' || (self.curchar == b'%' && self.byte(1) == b'}')) {
                 if self.curchar == b'/' && (self.byte(1) == b'/' || self.byte(1) == b'*') {
                     self.skipws_no_preproc();
                 } else {
@@ -1675,9 +1797,12 @@ impl<'a> AdlParser<'a> {
                             frame.borrow_mut().frame_inline_cache_reg = Some(v);
                         }
                     }
-                    "compiler_method_oop_reg" | "interpreter_method_oop_reg"
-                    | "interpreter_method_reg" | "in_preserve_stack_slots"
-                    | "out_preserve_stack_slots" | "calling_convention"
+                    "compiler_method_oop_reg"
+                    | "interpreter_method_oop_reg"
+                    | "interpreter_method_reg"
+                    | "in_preserve_stack_slots"
+                    | "out_preserve_stack_slots"
+                    | "calling_convention"
                     | "c_calling_convention" => {
                         self.parse_err(WARN, &format!("Using obsolete Token, {}", token));
                         self.skipws();
@@ -1726,7 +1851,10 @@ impl<'a> AdlParser<'a> {
         {
             let mut b = frame.borrow_mut();
             if b.frame_pointer.is_none() {
-                self.parse_err(SYNERR, "missing frame pointer definition in frame section.\n");
+                self.parse_err(
+                    SYNERR,
+                    "missing frame pointer definition in frame section.\n",
+                );
                 return;
             }
             if b.alignment_str.is_none() {
@@ -1734,15 +1862,24 @@ impl<'a> AdlParser<'a> {
                 return;
             }
             if b.return_addr.is_none() {
-                self.parse_err(SYNERR, "missing return address location in frame section.\n");
+                self.parse_err(
+                    SYNERR,
+                    "missing return address location in frame section.\n",
+                );
                 return;
             }
             if b.varargs_c_out_slots_killed.is_none() {
-                self.parse_err(SYNERR, "missing varargs C out slots killed definition in frame section.\n");
+                self.parse_err(
+                    SYNERR,
+                    "missing varargs C out slots killed definition in frame section.\n",
+                );
                 return;
             }
             if b.return_value.is_none() {
-                self.parse_err(SYNERR, "missing return value definition in frame section.\n");
+                self.parse_err(
+                    SYNERR,
+                    "missing return value definition in frame section.\n",
+                );
                 return;
             }
             if b.c_frame_pointer.is_none() {
@@ -1813,7 +1950,10 @@ impl<'a> AdlParser<'a> {
         self.next_char();
         let ident = self.get_ident();
         let Some(ident) = ident else {
-            self.synerr(&format!("keyword identifier expected at {}\n", self.curchar as char));
+            self.synerr(&format!(
+                "keyword identifier expected at {}\n",
+                self.curchar as char
+            ));
             return;
         };
         self.skipws();
@@ -1828,9 +1968,11 @@ impl<'a> AdlParser<'a> {
         }
         self.next_char();
         // validate pipe class exists
-        let valid = self.ad.pipeline.as_ref().map_or(false, |p| {
-            p.borrow().classlist.iter().any(|c| c == &ident)
-        });
+        let valid = self
+            .ad
+            .pipeline
+            .as_ref()
+            .map_or(false, |p| p.borrow().classlist.iter().any(|c| c == &ident));
         if self.ad.pipeline.is_some() && !valid {
             self.synerr(&format!("\"{}\" is not a valid pipeline class\n", ident));
             return;
@@ -1840,7 +1982,9 @@ impl<'a> AdlParser<'a> {
             let pb = p.borrow();
             if let Some(pc) = pb.classdict.get(&ident).cloned() {
                 drop(pb);
-                pc.borrow_mut().pipe_instructs.push(instr.borrow().ident.clone());
+                pc.borrow_mut()
+                    .pipe_instructs
+                    .push(instr.borrow().ident.clone());
             }
         }
         instr.borrow_mut().ins_pipe = Some(ident);
@@ -1857,10 +2001,17 @@ impl<'a> AdlParser<'a> {
             return;
         }
         self.next_char();
+        self.next_char();
         loop {
             let kw = self.get_ident();
             let Some(kw) = kw else {
-                self.synerr(&format!("keyword identifier expected at {}\n", self.curchar as char));
+                if self.curchar == b'%' {
+                    break;
+                }
+                self.synerr(&format!(
+                    "keyword identifier expected at {}\n",
+                    self.curchar as char
+                ));
                 continue;
             };
             match kw.as_str() {
@@ -1898,9 +2049,13 @@ impl<'a> AdlParser<'a> {
             return;
         }
         self.next_char();
+        self.next_char();
         self.skipws();
         let Some(node_class) = self.get_ident() else {
-            self.synerr(&format!("expected identifier, found \"{}\"\n", self.curchar as char));
+            self.synerr(&format!(
+                "expected identifier, found \"{}\"\n",
+                self.curchar as char
+            ));
             return;
         };
         self.skipws();
@@ -1911,7 +2066,10 @@ impl<'a> AdlParser<'a> {
         self.next_char();
         self.skipws();
         let Some(pipe_class) = self.get_ident() else {
-            self.synerr(&format!("expected identifier, found \"{}\"\n", self.curchar as char));
+            self.synerr(&format!(
+                "expected identifier, found \"{}\"\n",
+                self.curchar as char
+            ));
             return;
         };
         if self.curchar != b';' {
@@ -1921,13 +2079,20 @@ impl<'a> AdlParser<'a> {
         self.next_char();
         self.skipws();
         if !(self.curchar == b'%' && self.byte(1) == b'}') {
-            self.synerr(&format!("expected '%}}', found \"{}\"\n", self.curchar as char));
+            self.synerr(&format!(
+                "expected '%}}', found \"{}\"\n",
+                self.curchar as char
+            ));
             return;
         }
         self.next_char();
+        self.next_char();
         let valid = pipeline.borrow().classlist.iter().any(|c| c == &pipe_class);
         if !valid {
-            self.synerr(&format!("\"{}\" is not a valid pipeline class\n", pipe_class));
+            self.synerr(&format!(
+                "\"{}\" is not a valid pipeline class\n",
+                pipe_class
+            ));
             return;
         }
         if let Some(pc) = pipeline.borrow().classdict.get(&pipe_class).cloned() {
@@ -1946,6 +2111,7 @@ impl<'a> AdlParser<'a> {
             self.synerr("expected '%{{'\n");
             return;
         }
+        self.next_char();
         self.next_char();
         self.skipws();
         let mut vsi_seen = false;
@@ -1984,9 +2150,12 @@ impl<'a> AdlParser<'a> {
                     pipeline.borrow_mut().branch_has_delay_slot = true;
                     continue;
                 }
-                "max_instructions_per_bundle" | "max_bundles_per_cycle"
-                | "instruction_unit_size" | "bundle_unit_size"
-                | "instruction_fetch_unit_size" | "instruction_fetch_units" => {
+                "max_instructions_per_bundle"
+                | "max_bundles_per_cycle"
+                | "instruction_unit_size"
+                | "bundle_unit_size"
+                | "instruction_fetch_unit_size"
+                | "instruction_fetch_units" => {
                     self.skipws();
                     if self.curchar != b'=' {
                         self.synerr("expected `=`\n");
@@ -2027,7 +2196,10 @@ impl<'a> AdlParser<'a> {
                             break;
                         }
                         let Some(n) = self.get_ident() else {
-                            self.synerr(&format!("expected identifier for nop instruction, found '{}'\n", self.curchar as char));
+                            self.synerr(&format!(
+                                "expected identifier for nop instruction, found '{}'\n",
+                                self.curchar as char
+                            ));
                             break;
                         };
                         {
@@ -2055,7 +2227,10 @@ impl<'a> AdlParser<'a> {
             }
         }
         if !(self.curchar == b'%' && self.byte(1) == b'}') {
-            self.synerr(&format!("expected '%}}}}', found \"{}\"\n", self.curchar as char));
+            self.synerr(&format!(
+                "expected '%}}}}', found \"{}\"\n",
+                self.curchar as char
+            ));
             return;
         }
         self.next_char();
@@ -2076,7 +2251,9 @@ impl<'a> AdlParser<'a> {
                 self.synerr("\"instruction_fetch_units\" unspecified\n");
             }
             if !vsi_seen {
-                self.synerr("\"variable_size_instruction\" or \"fixed_size_instruction\" unspecified\n");
+                self.synerr(
+                    "\"variable_size_instruction\" or \"fixed_size_instruction\" unspecified\n",
+                );
             }
         }
     }
@@ -2093,7 +2270,10 @@ impl<'a> AdlParser<'a> {
         loop {
             self.next_char();
             let Some(ident) = self.get_ident() else {
-                self.synerr(&format!("keyword identifier expected at \"{}\"\n", self.curchar as char));
+                self.synerr(&format!(
+                    "keyword identifier expected at \"{}\"\n",
+                    self.curchar as char
+                ));
                 return;
             };
             self.skipws();
@@ -2105,25 +2285,41 @@ impl<'a> AdlParser<'a> {
                 self.next_char();
                 self.skipws();
                 let Some(expr) = self.get_ident() else {
-                    self.synerr(&format!("keyword identifier expected at \"{}\"\n", self.curchar as char));
+                    self.synerr(&format!(
+                        "keyword identifier expected at \"{}\"\n",
+                        self.curchar as char
+                    ));
                     return;
                 };
-                let mut mask = pipeline.borrow().resdict.get(&expr).copied().unwrap_or_else(|| {
-                    self.synerr(&format!("resource \"{}\" is not defined\n", expr));
-                    0
-                });
+                let mut mask = pipeline
+                    .borrow()
+                    .resdict
+                    .get(&expr)
+                    .copied()
+                    .unwrap_or_else(|| {
+                        self.synerr(&format!("resource \"{}\" is not defined\n", expr));
+                        0
+                    });
                 self.skipws();
                 while self.curchar == b'|' {
                     self.next_char();
                     self.skipws();
                     let Some(e2) = self.get_ident() else {
-                        self.synerr(&format!("keyword identifier expected at \"{}\"\n", self.curchar as char));
+                        self.synerr(&format!(
+                            "keyword identifier expected at \"{}\"\n",
+                            self.curchar as char
+                        ));
                         return;
                     };
-                    let m2 = pipeline.borrow().resdict.get(&e2).copied().unwrap_or_else(|| {
-                        self.synerr(&format!("resource \"{}\" is not defined\n", e2));
-                        0
-                    });
+                    let m2 = pipeline
+                        .borrow()
+                        .resdict
+                        .get(&e2)
+                        .copied()
+                        .unwrap_or_else(|| {
+                            self.synerr(&format!("resource \"{}\" is not defined\n", e2));
+                            0
+                        });
                     mask |= m2;
                     self.skipws();
                 }
@@ -2158,7 +2354,10 @@ impl<'a> AdlParser<'a> {
         loop {
             self.next_char();
             let Some(ident) = self.get_ident() else {
-                self.synerr(&format!("keyword identifier expected at \"{}\"\n", self.curchar as char));
+                self.synerr(&format!(
+                    "keyword identifier expected at \"{}\"\n",
+                    self.curchar as char
+                ));
                 return;
             };
             {
@@ -2184,7 +2383,10 @@ impl<'a> AdlParser<'a> {
     fn pipe_class_parse(&mut self, pipeline: &FormRef) {
         self.skipws();
         let Some(ident) = self.get_ident() else {
-            self.synerr(&format!("keyword identifier expected at \"{}\"\n", self.curchar as char));
+            self.synerr(&format!(
+                "keyword identifier expected at \"{}\"\n",
+                self.curchar as char
+            ));
             return;
         };
         let mut f = Form::new(FormKind::PipeClass);
@@ -2220,10 +2422,17 @@ impl<'a> AdlParser<'a> {
             return;
         }
         self.next_char();
+        self.next_char();
         loop {
             let kw = self.get_ident();
             let Some(kw) = kw else {
-                self.synerr(&format!("keyword identifier expected at \"{}\"\n", self.curchar as char));
+                if self.curchar == b'%' {
+                    break;
+                }
+                self.synerr(&format!(
+                    "keyword identifier expected at \"{}\"\n",
+                    self.curchar as char
+                ));
                 continue;
             };
             self.skipws();
@@ -2237,7 +2446,10 @@ impl<'a> AdlParser<'a> {
                     self.next_char();
                     self.skipws();
                     if !self.curchar.is_ascii_digit() {
-                        self.synerr(&format!("number expected for \"{}\" in latency definition\n", self.curchar as char));
+                        self.synerr(&format!(
+                            "number expected for \"{}\" in latency definition\n",
+                            self.curchar as char
+                        ));
                         return;
                     }
                     let lat = self.get_int();
@@ -2376,7 +2588,10 @@ impl<'a> AdlParser<'a> {
                             continue;
                         }
                         if self.curchar != b';' {
-                            self.synerr(&format!("\";\" expected at \"{}\"\n", self.curchar as char));
+                            self.synerr(&format!(
+                                "\";\" expected at \"{}\"\n",
+                                self.curchar as char
+                            ));
                             continue;
                         }
                         self.next_char();
@@ -2390,7 +2605,10 @@ impl<'a> AdlParser<'a> {
                             continue;
                         }
                         if self.curchar != b';' {
-                            self.synerr(&format!("\";\" expected at \"{}\"\n", self.curchar as char));
+                            self.synerr(&format!(
+                                "\";\" expected at \"{}\"\n",
+                                self.curchar as char
+                            ));
                             continue;
                         }
                         self.next_char();
@@ -2422,7 +2640,10 @@ impl<'a> AdlParser<'a> {
         self.next_char();
         self.skipws();
         let Some(stage) = self.get_ident() else {
-            self.synerr(&format!("pipeline stage identifier expected at \"{}\"\n", self.curchar as char));
+            self.synerr(&format!(
+                "pipeline stage identifier expected at \"{}\"\n",
+                self.curchar as char
+            ));
             return;
         };
         self.skipws();
@@ -2432,14 +2653,20 @@ impl<'a> AdlParser<'a> {
         }
         self.next_char();
         let Some(row) = self.get_ident() else {
-            self.synerr(&format!("\"read\" or \"write\" expected at \"{}\"\n", self.curchar as char));
+            self.synerr(&format!(
+                "\"read\" or \"write\" expected at \"{}\"\n",
+                self.curchar as char
+            ));
             return;
         };
         let is_write = match row.as_str() {
             "read" => false,
             "write" => true,
             _ => {
-                self.synerr(&format!("\"read\" or \"write\" expected at \"{}\"\n", self.curchar as char));
+                self.synerr(&format!(
+                    "\"read\" or \"write\" expected at \"{}\"\n",
+                    self.curchar as char
+                ));
                 return;
             }
         };
@@ -2455,7 +2682,10 @@ impl<'a> AdlParser<'a> {
             self.next_char();
             self.skipws();
             if !self.curchar.is_ascii_digit() {
-                self.synerr(&format!("<number> expected at \"{}\"\n", self.curchar as char));
+                self.synerr(&format!(
+                    "<number> expected at \"{}\"\n",
+                    self.curchar as char
+                ));
                 return;
             }
             while self.curchar.is_ascii_digit() {
@@ -2469,7 +2699,10 @@ impl<'a> AdlParser<'a> {
         f.use_def = is_write as i32;
         f.register_num = more_instrs as u32;
         let r = Rc::new(RefCell::new(f));
-        pipe_class.borrow_mut().local_usage.insert(ident.to_string(), r);
+        pipe_class
+            .borrow_mut()
+            .local_usage
+            .insert(ident.to_string(), r);
     }
 
     fn pipe_class_resource_parse(&mut self, pipe_class: &FormRef, pipeline: &FormRef, ident: &str) {
@@ -2482,7 +2715,10 @@ impl<'a> AdlParser<'a> {
         self.next_char();
         self.skipws();
         let Some(stage) = self.get_ident() else {
-            self.synerr(&format!("pipeline stage identifier expected at \"{}\"\n", self.curchar as char));
+            self.synerr(&format!(
+                "pipeline stage identifier expected at \"{}\"\n",
+                self.curchar as char
+            ));
             return;
         };
         self.skipws();
@@ -2503,7 +2739,13 @@ impl<'a> AdlParser<'a> {
         f.use_def = cyclecnt as i32;
         let r = Rc::new(RefCell::new(f));
         {
-            let stagenum = pipeline.borrow().stages.iter().position(|s| s == &stage).map(|p| p as i64).unwrap_or(-1);
+            let stagenum = pipeline
+                .borrow()
+                .stages
+                .iter()
+                .position(|s| s == &stage)
+                .map(|p| p as i64)
+                .unwrap_or(-1);
             let mut pb = pipeline.borrow_mut();
             if pb.maxcycleused < (stagenum + cyclecnt) as i32 {
                 pb.maxcycleused = (stagenum + cyclecnt) as i32;
@@ -2579,7 +2821,7 @@ impl<'a> AdlParser<'a> {
             self.synerr("missing '(' at start of peepmatch rule.\n");
             return;
         }
-        self.next_char();   // skip '('
+        self.next_char(); // skip '('
         let parent: i32 = -1;
         let mut position: i32 = 0;
         let input: i32 = 0;
@@ -2593,13 +2835,13 @@ impl<'a> AdlParser<'a> {
             self.synerr("missing ')' at end of peepmatch.\n");
             return;
         }
-        self.next_char();   // skip ')'
+        self.next_char(); // skip ')'
         self.skipws();
         if self.curchar != b';' {
             self.synerr("missing ';' at end of peepmatch.\n");
             return;
         }
-        self.next_char();   // skip ';'
+        self.next_char(); // skip ';'
         {
             let mut b = peep.borrow_mut();
             b.peep_match_instrs = match_list;
@@ -2628,8 +2870,13 @@ impl<'a> AdlParser<'a> {
     // Port of peep_match_child_parse.  `position` is shared by reference
     // through the recursion; `parent` and `input` are by value.
     // match_list collects (parent, position, instr_name, input) tuples.
-    fn peep_match_child_parse(&mut self, match_list: &mut Vec<(i32, i32, String, i32)>,
-                              mut parent: i32, position: &mut i32, input: i32) -> Option<FormRef> {
+    fn peep_match_child_parse(
+        &mut self,
+        match_list: &mut Vec<(i32, i32, String, i32)>,
+        mut parent: i32,
+        position: &mut i32,
+        input: i32,
+    ) -> Option<FormRef> {
         let mut lparen: i32 = 0;
         let mut rparen: i32 = 0;
         let mut inst_seen: Option<FormRef> = None;
@@ -2671,7 +2918,10 @@ impl<'a> AdlParser<'a> {
                         parent = *position;
                         *position += 1;
                     } else {
-                        self.synerr(&format!("instruction name expected at identifier {}.\n", token));
+                        self.synerr(&format!(
+                            "instruction name expected at identifier {}.\n",
+                            token
+                        ));
                         return inst_seen;
                     }
                 } else {
@@ -2757,7 +3007,12 @@ impl<'a> AdlParser<'a> {
                 return;
             };
             peep.borrow_mut().peep_constraints.push((
-                left_inst as i32, left_op, relation, right_inst as i32, right_op));
+                left_inst as i32,
+                left_op,
+                relation,
+                right_inst as i32,
+                right_op,
+            ));
             self.skipws();
             if self.curchar == b',' {
                 self.next_char();
@@ -2787,7 +3042,10 @@ impl<'a> AdlParser<'a> {
             self.synerr("Instruction name expected at start of peepreplace.\n");
             return;
         };
-        let is_inst = self.ad.global_names.get(&inst)
+        let is_inst = self
+            .ad
+            .global_names
+            .get(&inst)
             .map_or(false, |f| f.borrow().kind == FormKind::Instruct);
         if !is_inst {
             self.synerr("Instruction name expected at start of peepreplace.\n");
@@ -2819,7 +3077,9 @@ impl<'a> AdlParser<'a> {
                 self.synerr("missing operand identifier in peepreplace.\n");
                 return;
             };
-            peep.borrow_mut().peep_replace_operands.push((inst_num as i32, inst_op));
+            peep.borrow_mut()
+                .peep_replace_operands
+                .push((inst_num as i32, inst_op));
             self.skipws();
         }
         self.next_char();
@@ -2877,8 +3137,13 @@ impl<'a> AdlParser<'a> {
         Some(Rc::new(RefCell::new(rule)))
     }
 
-    fn match_node_parse(&mut self, operands: &HashMap<String, FormRef>, depth: &mut i32,
-                         numleaves: &mut i32, atroot: bool) -> Option<MatchNode> {
+    fn match_node_parse(
+        &mut self,
+        operands: &HashMap<String, FormRef>,
+        depth: &mut i32,
+        numleaves: &mut i32,
+        atroot: bool,
+    ) -> Option<MatchNode> {
         let l_parens = *depth;
         let r_parens = *depth;
         let mut l_child = None;
@@ -2900,10 +3165,13 @@ impl<'a> AdlParser<'a> {
         let mut name: Option<String> = Some(token.clone());
         let mut operation = token.clone();
         let form = operands.get(&token).cloned();
-        let opc_form = form.as_ref().filter(|f| {
-            let f = f.borrow();
-            f.kind == FormKind::OpClass || f.kind == FormKind::Operand
-        }).cloned();
+        let opc_form = form
+            .as_ref()
+            .filter(|f| {
+                let f = f.borrow();
+                f.kind == FormKind::OpClass || f.kind == FormKind::Operand
+            })
+            .cloned();
         if let Some(of) = opc_form {
             let ofb = of.borrow();
             if !ofb.ideal_only {
@@ -2954,18 +3222,26 @@ impl<'a> AdlParser<'a> {
         Some(mroot)
     }
 
-    fn match_child_parse(&mut self, operands: &HashMap<String, FormRef>, parens: &mut i32,
-                          numleaves: &mut i32, atroot: bool) -> Option<MatchNode> {
+    fn match_child_parse(
+        &mut self,
+        operands: &HashMap<String, FormRef>,
+        parens: &mut i32,
+        numleaves: &mut i32,
+        atroot: bool,
+    ) -> Option<MatchNode> {
         if self.cur_char() == b'(' {
             *parens += 1;
             self.match_node_parse(operands, parens, numleaves, atroot)
         } else {
             let token = self.get_ident()?;
             let form = operands.get(&token).cloned();
-            let opc_form = form.as_ref().filter(|f| {
-                let f = f.borrow();
-                f.kind == FormKind::OpClass || f.kind == FormKind::Operand
-            }).cloned();
+            let opc_form = form
+                .as_ref()
+                .filter(|f| {
+                    let f = f.borrow();
+                    f.kind == FormKind::OpClass || f.kind == FormKind::Operand
+                })
+                .cloned();
             let Some(of) = opc_form else {
                 self.synerr(&format!("undefined operand {} in match rule\n", token));
                 return None;
@@ -2997,7 +3273,10 @@ impl<'a> AdlParser<'a> {
                 if ident.as_deref() == Some("$$template") {
                     return self.template_parse();
                 }
-                self.synerr(&format!("Unknown \"{}\" directive in format", ident.unwrap_or_default()));
+                self.synerr(&format!(
+                    "Unknown \"{}\" directive in format",
+                    ident.unwrap_or_default()
+                ));
                 return None;
             }
             if self.curchar == b'"' {
@@ -3016,8 +3295,10 @@ impl<'a> AdlParser<'a> {
                     }
                     // (1) string passed through to output
                     let start = self.ptr;
-                    while !(self.curchar == b'$' || self.curchar == b'"'
-                        || self.curchar == b'%' || self.curchar == b'\n')
+                    while !(self.curchar == b'$'
+                        || self.curchar == b'"'
+                        || self.curchar == b'%'
+                        || self.curchar == b'\n')
                     {
                         if self.curchar == b'\\' {
                             self.next_char();
@@ -3086,9 +3367,7 @@ impl<'a> AdlParser<'a> {
             // (1) string passed through to output
             {
                 let start = self.ptr;
-                while !(self.curchar == b'$'
-                    || (self.curchar == b'%' && self.byte(1) == b'}'))
-                {
+                while !(self.curchar == b'$' || (self.curchar == b'%' && self.byte(1) == b'}')) {
                     if self.curchar == b'/' && (self.byte(1) == b'/' || self.byte(1) == b'*') {
                         self.skipws_no_preproc();
                     } else {
@@ -3126,8 +3405,10 @@ impl<'a> AdlParser<'a> {
                                 return None;
                             }
                             let start = self.ptr;
-                            while !(self.curchar == b'$' || self.curchar == b'"'
-                                || self.curchar == b'%' || self.curchar == b'\n')
+                            while !(self.curchar == b'$'
+                                || self.curchar == b'"'
+                                || self.curchar == b'%'
+                                || self.curchar == b'\n')
                             {
                                 if self.curchar == b'\\' {
                                     self.next_char();
@@ -3142,7 +3423,8 @@ impl<'a> AdlParser<'a> {
                             }
                             if start != self.ptr {
                                 let end = self.ptr;
-                                let s = String::from_utf8_lossy(&self.buf.buf[start..end]).into_owned();
+                                let s =
+                                    String::from_utf8_lossy(&self.buf.buf[start..end]).into_owned();
                                 self.buf.buf[end] = 0;
                                 format_strings.push(s);
                             }
@@ -3234,19 +3516,29 @@ impl<'a> AdlParser<'a> {
         Some(names)
     }
 
-    fn expand_parse(&mut self, instr: &FormRef) -> Option<(NameList, HashMap<String, String>, Vec<(String, NameList)>)> {
+    fn expand_parse(
+        &mut self,
+        instr: &FormRef,
+    ) -> Option<(NameList, HashMap<String, String>, Vec<(String, NameList)>)> {
         self.skipws();
         if !(self.curchar == b'%' && self.byte(1) == b'{') {
             self.synerr("missing '%%{' in expand definition\n");
             return None;
         }
         self.next_char();
+        self.next_char();
         let mut newopers: NameList = Vec::new();
         let mut newopconst: HashMap<String, String> = HashMap::new();
         let mut instrs: Vec<(String, NameList)> = Vec::new();
         loop {
             let Some(ident) = self.get_ident() else {
-                self.synerr(&format!("identifier expected at {}\n", self.curchar as char));
+                if self.curchar == b'%' {
+                    break;
+                }
+                self.synerr(&format!(
+                    "identifier expected at {}\n",
+                    self.curchar as char
+                ));
                 continue;
             };
             let form = self.ad.global_names.get(&ident).cloned();
@@ -3273,11 +3565,17 @@ impl<'a> AdlParser<'a> {
                 self.skipws();
                 let local = instr.borrow().local_names.clone();
                 let Some(new_ident) = self.get_unique_ident_local_in("Operand", &local) else {
-                    self.synerr(&format!("identifier expected at {}\n", self.curchar as char));
+                    self.synerr(&format!(
+                        "identifier expected at {}\n",
+                        self.curchar as char
+                    ));
                     continue;
                 };
                 newopers.push(new_ident.clone());
-                instr.borrow_mut().local_names.insert(new_ident.clone(), oper_form);
+                instr
+                    .borrow_mut()
+                    .local_names
+                    .insert(new_ident.clone(), oper_form);
                 self.skipws();
                 if self.curchar == b'%' {
                     let c = self.find_cpp_block("Operand Constructor");
@@ -3312,7 +3610,10 @@ impl<'a> AdlParser<'a> {
                         break;
                     }
                     let Some(ident2) = self.get_ident() else {
-                        self.synerr(&format!("identifier expected at {}\n", self.curchar as char));
+                        self.synerr(&format!(
+                            "identifier expected at {}\n",
+                            self.curchar as char
+                        ));
                         continue;
                     };
                     self.skipws();
@@ -3410,7 +3711,10 @@ impl<'a> AdlParser<'a> {
         if self.curchar != b')' {
             primary = self.get_ident_or_literal_constant("primary opcode");
             if primary.is_none() {
-                self.synerr(&format!("primary hex opcode expected at {}\n", self.curchar as char));
+                self.synerr(&format!(
+                    "primary hex opcode expected at {}\n",
+                    self.curchar as char
+                ));
                 return None;
             }
             self.skipws();
@@ -3419,7 +3723,10 @@ impl<'a> AdlParser<'a> {
                 self.skipws();
                 secondary = self.get_ident_or_literal_constant("secondary opcode");
                 if secondary.is_none() {
-                    self.synerr(&format!("secondary hex opcode expected at {}\n", self.curchar as char));
+                    self.synerr(&format!(
+                        "secondary hex opcode expected at {}\n",
+                        self.curchar as char
+                    ));
                     return None;
                 }
                 self.skipws();
@@ -3428,7 +3735,10 @@ impl<'a> AdlParser<'a> {
                     self.skipws();
                     tertiary = self.get_ident_or_literal_constant("tertiary opcode");
                     if tertiary.is_none() {
-                        self.synerr(&format!("tertiary hex opcode expected at {}\n", self.curchar as char));
+                        self.synerr(&format!(
+                            "tertiary hex opcode expected at {}\n",
+                            self.curchar as char
+                        ));
                         return None;
                     }
                     self.skipws();
@@ -3455,7 +3765,10 @@ impl<'a> AdlParser<'a> {
         self.skipws();
         let size = self.get_paren_expr_simple("size expression");
         if size.is_none() {
-            self.synerr(&format!("size of opcode expected at {}\n", self.curchar as char));
+            self.synerr(&format!(
+                "size of opcode expected at {}\n",
+                self.curchar as char
+            ));
             return None;
         }
         self.skipws();
@@ -3503,23 +3816,53 @@ impl<'a> AdlParser<'a> {
             self.next_char();
             if iface_name == "REG_INTER" {
                 inter = Some(Interface {
-                    kind: InterfaceKind::Reg, name: iface_name,
-                    base: None, index: None, scale: None, disp: None,
-                    equal: None, not_equal: None, less: None, greater_equal: None,
-                    less_equal: None, greater: None, overflow: None, no_overflow: None,
-                    equal_format: None, not_equal_format: None, less_format: None,
-                    greater_equal_format: None, less_equal_format: None, greater_format: None,
-                    overflow_format: None, no_overflow_format: None,
+                    kind: InterfaceKind::Reg,
+                    name: iface_name,
+                    base: None,
+                    index: None,
+                    scale: None,
+                    disp: None,
+                    equal: None,
+                    not_equal: None,
+                    less: None,
+                    greater_equal: None,
+                    less_equal: None,
+                    greater: None,
+                    overflow: None,
+                    no_overflow: None,
+                    equal_format: None,
+                    not_equal_format: None,
+                    less_format: None,
+                    greater_equal_format: None,
+                    less_equal_format: None,
+                    greater_format: None,
+                    overflow_format: None,
+                    no_overflow_format: None,
                 });
             } else if iface_name == "CONST_INTER" {
                 inter = Some(Interface {
-                    kind: InterfaceKind::Const, name: iface_name,
-                    base: None, index: None, scale: None, disp: None,
-                    equal: None, not_equal: None, less: None, greater_equal: None,
-                    less_equal: None, greater: None, overflow: None, no_overflow: None,
-                    equal_format: None, not_equal_format: None, less_format: None,
-                    greater_equal_format: None, less_equal_format: None, greater_format: None,
-                    overflow_format: None, no_overflow_format: None,
+                    kind: InterfaceKind::Const,
+                    name: iface_name,
+                    base: None,
+                    index: None,
+                    scale: None,
+                    disp: None,
+                    equal: None,
+                    not_equal: None,
+                    less: None,
+                    greater_equal: None,
+                    less_equal: None,
+                    greater: None,
+                    overflow: None,
+                    no_overflow: None,
+                    equal_format: None,
+                    not_equal_format: None,
+                    less_format: None,
+                    greater_equal_format: None,
+                    less_equal_format: None,
+                    greater_format: None,
+                    overflow_format: None,
+                    no_overflow_format: None,
                 });
             }
         }
@@ -3548,7 +3891,9 @@ impl<'a> AdlParser<'a> {
                 break;
             }
             let Some(field) = self.get_ident() else {
-                self.synerr("Expected keyword, base|index|scale|disp,  or '%%}' ending interface.\n");
+                self.synerr(
+                    "Expected keyword, base|index|scale|disp,  or '%%}' ending interface.\n",
+                );
                 return None;
             };
             let v = self.interface_field_parse(None);
@@ -3558,7 +3903,9 @@ impl<'a> AdlParser<'a> {
                 "scale" => scale = v,
                 "disp" => disp = v,
                 _ => {
-                    self.synerr("Expected keyword, base|index|scale|disp,  or '%%}' ending interface.\n");
+                    self.synerr(
+                        "Expected keyword, base|index|scale|disp,  or '%%}' ending interface.\n",
+                    );
                     return None;
                 }
             }
@@ -3570,13 +3917,28 @@ impl<'a> AdlParser<'a> {
         }
         self.next_char();
         Some(Interface {
-            kind: InterfaceKind::Mem, name: "MEMORY_INTER".to_string(),
-            base, index, scale, disp,
-            equal: None, not_equal: None, less: None, greater_equal: None,
-            less_equal: None, greater: None, overflow: None, no_overflow: None,
-            equal_format: None, not_equal_format: None, less_format: None,
-            greater_equal_format: None, less_equal_format: None, greater_format: None,
-            overflow_format: None, no_overflow_format: None,
+            kind: InterfaceKind::Mem,
+            name: "MEMORY_INTER".to_string(),
+            base,
+            index,
+            scale,
+            disp,
+            equal: None,
+            not_equal: None,
+            less: None,
+            greater_equal: None,
+            less_equal: None,
+            greater: None,
+            overflow: None,
+            no_overflow: None,
+            equal_format: None,
+            not_equal_format: None,
+            less_format: None,
+            greater_equal_format: None,
+            less_equal_format: None,
+            greater_format: None,
+            overflow_format: None,
+            no_overflow_format: None,
         })
     }
 
@@ -3613,20 +3975,30 @@ impl<'a> AdlParser<'a> {
                 break;
             }
             let Some(field) = self.get_ident() else {
-                self.synerr("Expected keyword, base|index|scale|disp,  or '%%}' ending interface.\n");
+                self.synerr(
+                    "Expected keyword, base|index|scale|disp,  or '%%}' ending interface.\n",
+                );
                 return None;
             };
             match field.as_str() {
                 "equal" => equal = self.interface_field_parse(Some(&mut equal_format)),
                 "not_equal" => not_equal = self.interface_field_parse(Some(&mut not_equal_format)),
                 "less" => less = self.interface_field_parse(Some(&mut less_format)),
-                "greater_equal" => greater_equal = self.interface_field_parse(Some(&mut greater_equal_format)),
-                "less_equal" => less_equal = self.interface_field_parse(Some(&mut less_equal_format)),
+                "greater_equal" => {
+                    greater_equal = self.interface_field_parse(Some(&mut greater_equal_format))
+                }
+                "less_equal" => {
+                    less_equal = self.interface_field_parse(Some(&mut less_equal_format))
+                }
                 "greater" => greater = self.interface_field_parse(Some(&mut greater_format)),
                 "overflow" => overflow = self.interface_field_parse(Some(&mut overflow_format)),
-                "no_overflow" => no_overflow = self.interface_field_parse(Some(&mut no_overflow_format)),
+                "no_overflow" => {
+                    no_overflow = self.interface_field_parse(Some(&mut no_overflow_format))
+                }
                 _ => {
-                    self.synerr("Expected keyword, base|index|scale|disp,  or '%%}' ending interface.\n");
+                    self.synerr(
+                        "Expected keyword, base|index|scale|disp,  or '%%}' ending interface.\n",
+                    );
                     return None;
                 }
             }
@@ -3638,11 +4010,28 @@ impl<'a> AdlParser<'a> {
         }
         self.next_char();
         Some(Interface {
-            kind: InterfaceKind::Cond, name: "COND_INTER".to_string(),
-            base: None, index: None, scale: None, disp: None,
-            equal, not_equal, less, greater_equal, less_equal, greater, overflow, no_overflow,
-            equal_format, not_equal_format, less_format, greater_equal_format,
-            less_equal_format, greater_format, overflow_format, no_overflow_format,
+            kind: InterfaceKind::Cond,
+            name: "COND_INTER".to_string(),
+            base: None,
+            index: None,
+            scale: None,
+            disp: None,
+            equal,
+            not_equal,
+            less,
+            greater_equal,
+            less_equal,
+            greater,
+            overflow,
+            no_overflow,
+            equal_format,
+            not_equal_format,
+            less_format,
+            greater_equal_format,
+            less_equal_format,
+            greater_format,
+            overflow_format,
+            no_overflow_format,
         })
     }
 
@@ -3738,13 +4127,19 @@ impl<'a> AdlParser<'a> {
             self.next_char();
             self.skipws();
             let Some(a) = self.get_ident() else {
-                self.synerr(&format!("missing argument for constraint function {}\n", func));
+                self.synerr(&format!(
+                    "missing argument for constraint function {}\n",
+                    func
+                ));
                 return None;
             };
             arg = a;
             self.skipws();
             if self.curchar != b')' {
-                self.synerr(&format!("missing ')' after constraint function argument {}\n", arg));
+                self.synerr(&format!(
+                    "missing ')' after constraint function argument {}\n",
+                    arg
+                ));
                 return None;
             }
             self.next_char();
@@ -3828,14 +4223,18 @@ impl<'a> AdlParser<'a> {
                         } else {
                             let is_local = inst.borrow().local_names.contains_key(&param);
                             let is_lit = Self::is_literal_constant(&param);
-                            let is_opcode = matches!(param.as_str(), "primary" | "secondary" | "tertiary");
-                            let is_reg = self.ad.register.as_ref().map_or(false, |r| {
-                                r.borrow().reg_def.contains_key(&param)
-                            });
+                            let is_opcode =
+                                matches!(param.as_str(), "primary" | "secondary" | "tertiary");
+                            let is_reg = self
+                                .ad
+                                .register
+                                .as_ref()
+                                .map_or(false, |r| r.borrow().reg_def.contains_key(&param));
                             if !is_local && !is_lit && !is_opcode && !is_reg {
                                 self.synerr(&format!(
                                     "Using non-locally defined parameter {} for encoding {}.\n",
-                                    param, ec_name));
+                                    param, ec_name
+                                ));
                                 return;
                             }
                         }
@@ -3847,13 +4246,19 @@ impl<'a> AdlParser<'a> {
                         } else if self.curchar == b')' {
                             // done
                         } else {
-                            self.synerr(&format!("expected ',' or ')' after parameter {}.\n", ec_name));
+                            self.synerr(&format!(
+                                "expected ',' or ')' after parameter {}.\n",
+                                ec_name
+                            ));
                             return;
                         }
                     } else {
                         self.skipws();
                         if self.curchar == b',' {
-                            self.synerr(&format!("Expected encode parameter before ',' in encoding {}.\n", ec_name));
+                            self.synerr(&format!(
+                                "Expected encode parameter before ',' in encoding {}.\n",
+                                ec_name
+                            ));
                             return;
                         }
                         if self.curchar != b')' {
@@ -3920,9 +4325,13 @@ impl<'a> AdlParser<'a> {
             for param in &b.parameters {
                 if let Some(pf) = b.local_names.get(param) {
                     let pfb = pf.borrow();
-                    let ptype = if pfb.kind == FormKind::Operand { pfb.ident.clone() }
-                        else if pfb.kind == FormKind::OpClass { pfb.ident.clone() }
-                        else { String::new() };
+                    let ptype = if pfb.kind == FormKind::Operand {
+                        pfb.ident.clone()
+                    } else if pfb.kind == FormKind::OpClass {
+                        pfb.ident.clone()
+                    } else {
+                        String::new()
+                    };
                     let mut eb = encoding.borrow_mut();
                     eb.parameter_type.push(ptype);
                     eb.parameter_name.push(param.clone());
@@ -3950,9 +4359,7 @@ impl<'a> AdlParser<'a> {
                 break;
             }
             let start = self.ptr;
-            while !(self.curchar == b'$'
-                || (self.curchar == b'%' && self.byte(1) == b'}'))
-            {
+            while !(self.curchar == b'$' || (self.curchar == b'%' && self.byte(1) == b'}')) {
                 if self.curchar == b'/' && (self.byte(1) == b'/' || self.byte(1) == b'*') {
                     self.skipws_no_preproc();
                 } else {
@@ -4056,14 +4463,18 @@ impl<'a> AdlParser<'a> {
                         } else {
                             let is_local = inst.borrow().local_names.contains_key(&param);
                             let is_lit = Self::is_literal_constant(&param);
-                            let is_opcode = matches!(param.as_str(), "primary" | "secondary" | "tertiary");
-                            let is_reg = self.ad.register.as_ref().map_or(false, |r| {
-                                r.borrow().reg_def.contains_key(&param)
-                            });
+                            let is_opcode =
+                                matches!(param.as_str(), "primary" | "secondary" | "tertiary");
+                            let is_reg = self
+                                .ad
+                                .register
+                                .as_ref()
+                                .map_or(false, |r| r.borrow().reg_def.contains_key(&param));
                             if !is_local && !is_lit && !is_opcode && !is_reg {
                                 self.synerr(&format!(
                                     "Using non-locally defined parameter {} for encoding {}.\n",
-                                    param, ec_name));
+                                    param, ec_name
+                                ));
                                 return;
                             }
                         }
@@ -4074,13 +4485,19 @@ impl<'a> AdlParser<'a> {
                             self.skipws();
                         } else if self.curchar == b')' {
                         } else {
-                            self.synerr(&format!("expected ',' or ')' after parameter {}.\n", ec_name));
+                            self.synerr(&format!(
+                                "expected ',' or ')' after parameter {}.\n",
+                                ec_name
+                            ));
                             return;
                         }
                     } else {
                         self.skipws();
                         if self.curchar == b',' {
-                            self.synerr(&format!("Expected encode parameter before ',' in postalloc_expand {}.\n", ec_name));
+                            self.synerr(&format!(
+                                "Expected encode parameter before ',' in postalloc_expand {}.\n",
+                                ec_name
+                            ));
                             return;
                         }
                         if self.curchar != b')' {
@@ -4093,7 +4510,10 @@ impl<'a> AdlParser<'a> {
             }
             self.skipws();
             if self.curchar != b')' {
-                self.synerr(&format!("Expected ')' after postalloc_expand {}.\n", ec_name));
+                self.synerr(&format!(
+                    "Expected ')' after postalloc_expand {}.\n",
+                    ec_name
+                ));
                 return;
             }
         }
@@ -4141,9 +4561,14 @@ impl<'a> AdlParser<'a> {
 
     fn constant_parse_expression(&mut self, encoding: &FormRef, _ec_name: &str) {
         self.skipws();
-        encoding.borrow_mut().code_strings.push(
-            "    _constant = C->output()->constant_table().add".to_string());
-        encoding.borrow_mut().code_strings.push("(this, ".to_string());
+        encoding
+            .borrow_mut()
+            .code_strings
+            .push("    _constant = C->output()->constant_table().add".to_string());
+        encoding
+            .borrow_mut()
+            .code_strings
+            .push("(this, ".to_string());
         self.next_char(); // skip '('
         let mut parens_depth = 1i32;
         while parens_depth > 0 {
@@ -4159,9 +4584,7 @@ impl<'a> AdlParser<'a> {
                 self.next_char_or_line();
             } else {
                 let start = self.ptr;
-                while !(self.curchar == b'$' || self.curchar == b'('
-                    || self.curchar == b')')
-                {
+                while !(self.curchar == b'$' || self.curchar == b'(' || self.curchar == b')') {
                     self.next_char_or_line();
                     if self.curchar == 0 && self.curline.is_none() {
                         break;
@@ -4319,7 +4742,10 @@ impl<'a> AdlParser<'a> {
                         rc.borrow_mut().reg_def.insert(rname.clone(), rd);
                     }
                     None => {
-                        self.synerr(&format!("unknown identifier {} inside reg_class list.\n", rname));
+                        self.synerr(&format!(
+                            "unknown identifier {} inside reg_class list.\n",
+                            rname
+                        ));
                     }
                 }
                 self.skipws();
@@ -4390,7 +4816,10 @@ impl<'a> AdlParser<'a> {
                     rc.borrow_mut().rclass_at[i] = Some(rcl);
                 }
                 None => {
-                    self.synerr(&format!("unknown identifier {} inside reg_class_dynamic list.\n", name));
+                    self.synerr(&format!(
+                        "unknown identifier {} inside reg_class_dynamic list.\n",
+                        name
+                    ));
                 }
             }
             self.skipws();
@@ -4414,7 +4843,9 @@ impl<'a> AdlParser<'a> {
                 }
             }
         } else {
-            self.synerr("missing %% at the beginning of code block in reg_class_dynamic definition\n");
+            self.synerr(
+                "missing %% at the beginning of code block in reg_class_dynamic definition\n",
+            );
             return;
         }
         self.skipws();
@@ -4464,7 +4895,10 @@ impl<'a> AdlParser<'a> {
                         ac.borrow_mut().reg_def.insert(rname, rd);
                     }
                     None => {
-                        self.synerr(&format!("name {} should be a previously defined reg_def.\n", rname));
+                        self.synerr(&format!(
+                            "name {} should be a previously defined reg_def.\n",
+                            rname
+                        ));
                         return;
                     }
                 }
@@ -4511,7 +4945,10 @@ impl<'a> AdlParser<'a> {
     fn get_oplist_for(&mut self, form: &FormRef) {
         let (mut params, mut locals) = {
             let mut b = form.borrow_mut();
-            (std::mem::take(&mut b.parameters), std::mem::take(&mut b.local_names))
+            (
+                std::mem::take(&mut b.parameters),
+                std::mem::take(&mut b.local_names),
+            )
         };
         self.get_oplist(&mut params, &mut locals);
         let mut b = form.borrow_mut();
@@ -4528,7 +4965,10 @@ impl<'a> AdlParser<'a> {
                 break;
             }
             let Some(ty) = self.get_ident() else {
-                self.synerr(&format!("optype identifier expected at {}\n", self.curchar as char));
+                self.synerr(&format!(
+                    "optype identifier expected at {}\n",
+                    self.curchar as char
+                ));
                 return;
             };
             let form = self.ad.global_names.get(&ty).cloned();
@@ -4573,7 +5013,10 @@ impl<'a> AdlParser<'a> {
                 break;
             }
             let Some(ident) = self.get_ident() else {
-                self.synerr(&format!("effect type identifier expected at {}\n", self.curchar as char));
+                self.synerr(&format!(
+                    "effect type identifier expected at {}\n",
+                    self.curchar as char
+                ));
                 return;
             };
             let form = self.ad.global_names.get(&ident).cloned();
@@ -4605,11 +5048,15 @@ impl<'a> AdlParser<'a> {
                     f.kind == FormKind::Operand
                 });
                 if !ok {
-                    let is_class = opform.as_ref().map_or(false, |f| f.borrow().kind == FormKind::OpClass);
+                    let is_class = opform
+                        .as_ref()
+                        .map_or(false, |f| f.borrow().kind == FormKind::OpClass);
                     if is_class {
                         let cname = opform.unwrap().borrow().ident.clone();
                         self.synerr(&format!(
-                            "operand classes are illegal in effect lists (found {} {})\n", cname, opname));
+                            "operand classes are illegal in effect lists (found {} {})\n",
+                            cname, opname
+                        ));
                     } else {
                         self.synerr(&format!("undefined operand {} in effect list\n", opname));
                     }
@@ -4686,7 +5133,11 @@ impl<'a> AdlParser<'a> {
         let names = self.ad.global_names.clone();
         self.get_unique_ident(&names, desc)
     }
-    fn get_unique_ident_local_in(&mut self, desc: &str, dict: &HashMap<String, FormRef>) -> Option<String> {
+    fn get_unique_ident_local_in(
+        &mut self,
+        desc: &str,
+        dict: &HashMap<String, FormRef>,
+    ) -> Option<String> {
         let ident = self.get_ident()?;
         if dict.contains_key(&ident) {
             self.synerr(&format!("duplicate name {} for {}\n", ident, desc));

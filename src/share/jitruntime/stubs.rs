@@ -945,6 +945,9 @@ unsafe extern "C" fn h_array_load(array: u64, index: u64, kind: u64, _d: u64, fr
     let Some(a) = arrays.get(handle) else {
         return deopt();
     };
+    if std::env::var_os("JVM25_JIT_OOB").is_some() && idx >= a.len() {
+        eprintln!("[arrayload-oob] idx={idx} len={} kind={kind} frame={frame:#x}", a.len());
+    }
     match a.load(kind as u8, idx) {
         Ok(element) => match element {
             Element::Int(v) => v as u32 as u64,
@@ -1192,7 +1195,36 @@ unsafe extern "C" fn h_call_method(
         }
         values.push(value);
     }
-    let depth = runtime::current_depth() + 1;
+    let callerDepth = runtime::current_depth();
+    let dispatched = (|| {
+        use crate::share::prims::{jdkIntrinsics, nativeLookup, stringNatives};
+
+        if is_static {
+            if let Some(value) = jdkIntrinsics::invoke(&loader, owner, name, descriptor, &values)? {
+                return Ok(Some(Some(value)));
+            }
+            nativeLookup::invokeStatic(&loader, owner, name, descriptor, &values, &mut io::sink(), callerDepth)
+        } else {
+            if matches!(op, 0xb6 | 0xb9)
+                && let Some(value) = stringNatives::invokeVirtual(&loader, owner, name, descriptor, &values)?
+            {
+                return Ok(Some(value));
+            }
+            nativeLookup::invokeInstance(&loader, owner, name, descriptor, &values, &mut io::sink(), callerDepth)
+        }
+    })();
+    match dispatched {
+        Ok(Some(value)) => return value.map_or(0, |value| call_result_raw(&loader, &value)),
+        Ok(None) => {}
+        Err(error) => {
+            if let Some(handle) = bytecodeInterpreter::throwable_of(&error) {
+                runtime::set_pending_throw(handle);
+                return 0;
+            }
+            return deopt();
+        }
+    }
+    let depth = callerDepth + 1;
     // Virtual/interface dispatch needs the receiver's runtime class;
     // resolve it up front so its NPE/ICCE outcomes propagate directly.
     let object_klass = if matches!(op, 0xb6 | 0xb9) {
@@ -1263,16 +1295,9 @@ unsafe extern "C" fn h_call_method(
             deopt()
         };
     }
-    // Compiled target?  The nmethod is keyed by the resolved holder's
-    // class name (what the broker used at install); the symbolic
-    // owner is tried as a fallback, mirroring the interpreter's hot
-    // lookup.
     let flags = method_access_flags(&target, name, descriptor, is_static);
-    let mut addr = compiled_entry(&target.class.name, name, descriptor);
-    if addr == 0 {
-        addr = compiled_entry(owner, name, descriptor);
-    }
-    if addr != 0 {
+    let addr = compiled_entry(&target.class.name, name, descriptor);
+    if addr != 0 && flags & (0x0100 | 0x0400 | 0x0020) == 0 {
         match runtime::try_invoke(addr, descriptor, is_static, &values, depth) {
             Some(runtime::CompiledResult::Value(value)) => {
                 return match value {

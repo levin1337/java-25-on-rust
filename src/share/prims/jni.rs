@@ -30,6 +30,7 @@ pub const JNI_VERSION_1_8: i32 = 0x00010008;
 pub const JNI_VERSION_9: i32 = 0x00090000;
 pub const JNI_VERSION_19: i32 = 0x00130000;
 pub const JNI_VERSION_21: i32 = 0x00150000;
+pub const JNI_VERSION_24: i32 = 0x00180000;
 pub const JNI_VERSION_25: i32 = 0x00190000;
 
 pub type NativeMethodFn = fn() -> i32;

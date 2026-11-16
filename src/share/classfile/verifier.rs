@@ -856,23 +856,11 @@ fn verify_class_structure<'a>(
         }
     }
 
-    // ACC_RECORD (JVMS §4.1 / §8.10): records were finalized in class file
-    // version 60.0; the flag and the Record attribute must agree.
-    let is_record_flag = (flags & ACC_RECORD) != 0;
-    if is_record_flag {
-        if class.majorVersion < 60 {
-            return Err(Error::other(
-                "UnsupportedClassVersionError: ACC_RECORD requires class file version 60.0",
-            ));
-        }
-        if !class.is_record_class() {
-            return Err(Error::other(
-                "ClassFormatError: ACC_RECORD class must have a Record attribute",
-            ));
-        }
-    } else if class.is_record_class() {
+    // The Record attribute (JVMS §4.7.30) is what marks a class as a
+    // record; it requires class file version 60.0 or later.
+    if class.is_record_class() && class.majorVersion < 60 {
         return Err(Error::other(
-            "ClassFormatError: Record attribute requires ACC_RECORD",
+            "UnsupportedClassVersionError: Record attribute requires class file version 60.0",
         ));
     }
 

@@ -393,9 +393,10 @@ impl JImageReader {
             )));
         }
         let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(stored_size as usize)
-            .map_err(Error::other)?;
+        if let Err(e) = bytes.try_reserve_exact(stored_size as usize) {
+            eprintln!("[jimage] reserve failed stored={stored_size} compressed={} off={}", location.compressed_size, location.offset);
+            return Err(Error::other(e));
+        }
         bytes.resize(stored_size as usize, 0);
         self.file
             .seek(SeekFrom::Start(self.data_offset + location.offset))?;

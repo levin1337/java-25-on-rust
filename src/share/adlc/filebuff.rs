@@ -9,8 +9,8 @@
 
 pub struct FileBuff {
     pub buf: Vec<u8>,
-    pub bufeol: usize,   // index of '\n' ending the last returned line
-    pub bufmax: usize,   // index of the sentinel '\n' appended after content
+    pub bufeol: usize, // index of '\n' ending the last returned line
+    pub bufmax: usize, // index of the sentinel '\n' appended after content
     pub linenum: usize,
     pub name: String,
 }

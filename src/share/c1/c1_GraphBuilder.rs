@@ -109,8 +109,6 @@ fn expr_needs_spill(expr: &HirInstruction) -> bool {
         HirInstruction::Add(l, r)
         | HirInstruction::Sub(l, r)
         | HirInstruction::Mul(l, r)
-        | HirInstruction::Div(l, r)
-        | HirInstruction::Rem(l, r)
         | HirInstruction::And(l, r)
         | HirInstruction::Or(l, r)
         | HirInstruction::Xor(l, r)
@@ -421,24 +419,22 @@ impl<'a> GraphBuilder<'a> {
                     if next < self.code.len() { leaders.insert(next); }
                 }
                 0xaa => {
-                    if let Some((_, _, _, targets)) = self.tableswitch_parts(bci) {
+                    if let Some((defaultBci, _, _, targets)) = self.tableswitch_parts(bci) {
                         for t in targets {
                             let tb = t as usize;
                             if tb < self.code.len() { leaders.insert(tb); }
                         }
+                        if defaultBci < self.code.len() { leaders.insert(defaultBci); }
                     }
-                    let db = self.tableswitch_default_bci(bci);
-                    if db < self.code.len() { leaders.insert(db); }
                 }
                 0xab => {
-                    if let Some((_, pairs)) = self.lookupswitch_parts(bci) {
+                    if let Some((defaultBci, pairs)) = self.lookupswitch_parts(bci) {
                         for (_, t) in pairs {
                             let tb = t as usize;
                             if tb < self.code.len() { leaders.insert(tb); }
                         }
+                        if defaultBci < self.code.len() { leaders.insert(defaultBci); }
                     }
-                    let db = self.lookupswitch_default_bci(bci);
-                    if db < self.code.len() { leaders.insert(db); }
                 }
                 0xac..=0xb1 | 0xbf => {
                     if next < self.code.len() { leaders.insert(next); }
@@ -460,15 +456,6 @@ impl<'a> GraphBuilder<'a> {
             let off = i16::from_be_bytes([self.code[bci + 1], self.code[bci + 2]]) as i32;
             Some(bci.wrapping_add_signed(off as isize))
         }
-    }
-
-    fn tableswitch_default_bci(&self, bci: usize) -> usize {
-        let base = bci + 1 + self.switch_padding(bci);
-        if base + 4 <= self.code.len() { i32::from_be_bytes(self.code[base..base + 4].try_into().unwrap()) as usize } else { self.code.len() }
-    }
-
-    fn lookupswitch_default_bci(&self, bci: usize) -> usize {
-        self.tableswitch_default_bci(bci)
     }
 
     fn block_range(&self, leaders: &[usize], id: usize) -> (usize, usize) {
@@ -534,11 +521,11 @@ impl<'a> GraphBuilder<'a> {
                 0x17 | 0x22..=0x25 => stack.push(AbsValue::new(ValueKind::Float32)),
                 0x18 | 0x26..=0x29 => stack.push(AbsValue::new(ValueKind::Float64)),
                 0x19 | 0x2a..=0x2d => stack.push(AbsValue::new(ValueKind::Ref)),
-                0x2e | 0x33..=0x35 => stack.push(AbsValue::new(ValueKind::Int32)),
-                0x2f => stack.push(AbsValue::new(ValueKind::Int64)),
-                0x30 => stack.push(AbsValue::new(ValueKind::Float32)),
-                0x31 => stack.push(AbsValue::new(ValueKind::Float64)),
-                0x32 => stack.push(AbsValue::new(ValueKind::Ref)),
+                0x2e..=0x35 => {
+                    self.abs_pop(&mut stack);
+                    self.abs_pop(&mut stack);
+                    stack.push(AbsValue::new(array_elem(op).value_kind()));
+                }
                 0x36..=0x3a | 0x3b..=0x3e => { self.abs_pop(&mut stack); }
                 0x37 | 0x3f..=0x42 => { self.abs_pop(&mut stack); }
                 0x38 | 0x43..=0x46 => { self.abs_pop(&mut stack); }
@@ -724,12 +711,10 @@ impl<'a> GraphBuilder<'a> {
         let mut out = Vec::new();
         match op {
             0xaa => {
-                if let Some((_, _, _, targets)) = self.tableswitch_parts(bci) { out.extend(targets.into_iter().map(|t| t as usize)); }
-                out.push(self.tableswitch_default_bci(bci));
+                if let Some((defaultBci, _, _, targets)) = self.tableswitch_parts(bci) { out.extend(targets.into_iter().map(|t| t as usize)); out.push(defaultBci); }
             }
             0xab => {
-                if let Some((_, pairs)) = self.lookupswitch_parts(bci) { out.extend(pairs.into_iter().map(|(_, t)| t as usize)); }
-                out.push(self.lookupswitch_default_bci(bci));
+                if let Some((defaultBci, pairs)) = self.lookupswitch_parts(bci) { out.extend(pairs.into_iter().map(|(_, t)| t as usize)); out.push(defaultBci); }
             }
             0xc8 => { if let Some(t) = self.branch_target(bci, true) { out.push(t); } }
             _ => { if let Some(t) = self.branch_target(bci, false) { out.push(t); } }
@@ -763,7 +748,7 @@ impl<'a> GraphBuilder<'a> {
             let op = self.code[bci];
             let next = self.next_bci(bci);
             match op {
-                0xc4 => self.build_wide(cfg, block_id, bci),
+                0xc4 => self.build_wide(cfg, block_id, &mut stack, bci),
                 0x00 => {}
                 0x01 => stack.push(StackValue::new(HirInstruction::ConstantNull, ValueKind::Ref)),
                 0x02..=0x08 => stack.push(StackValue::new(HirInstruction::ConstantInt(op as i32 - 0x03), ValueKind::Int32)),
@@ -779,8 +764,15 @@ impl<'a> GraphBuilder<'a> {
                 0x15..=0x19 => { let kind = load_kind_generic(op); let idx = self.load_index(bci, op); stack.push(StackValue::new(HirInstruction::LoadLocal { slot: idx, kind }, kind)); }
                 0x1a..=0x2d => { let (idx, kind) = load_n(op); stack.push(StackValue::new(HirInstruction::LoadLocal { slot: idx, kind }, kind)); }
                 0x2e..=0x35 => self.array_load(&mut stack, op),
-                0x36..=0x3a => { let (idx, kind) = self.store_info(bci, op); let val = self.pop(&mut stack).map(|v| v.expr).unwrap_or_else(|| self.default_for(kind)); cfg.blocks[block_id].push(HirInstruction::StoreLocal { slot: idx, kind, value: Box::new(val) }); }
-                0x3b..=0x4e => { let (idx, kind) = self.store_n(op); let val = self.pop(&mut stack).map(|v| v.expr).unwrap_or_else(|| self.default_for(kind)); cfg.blocks[block_id].push(HirInstruction::StoreLocal { slot: idx, kind, value: Box::new(val) }); }
+                0x36..=0x4e => {
+                    let (slot, kind) = if op <= 0x3a {
+                        self.store_info(bci, op)
+                    } else {
+                        self.store_n(op)
+                    };
+                    let value = self.pop(&mut stack).map_or_else(|| self.default_for(kind), |value| value.expr);
+                    self.storeLocal(cfg, block_id, &mut stack, slot, kind, value);
+                }
                 0x4f..=0x56 => self.array_store(cfg, block_id, &mut stack, op),
                 0x57 => { self.pop(&mut stack); }
                 0x58 => { self.pop2(&mut stack); }
@@ -806,9 +798,7 @@ impl<'a> GraphBuilder<'a> {
                     if bci + 2 < self.code.len() {
                         let idx = self.code[bci + 1] as usize;
                         let inc = self.code[bci + 2] as i8 as i32;
-                        let load = HirInstruction::LoadLocal { slot: idx, kind: ValueKind::Int32 };
-                        let add = HirInstruction::Add(Box::new(load), Box::new(HirInstruction::ConstantInt(inc)));
-                        cfg.blocks[block_id].push(HirInstruction::StoreLocal { slot: idx, kind: ValueKind::Int32, value: Box::new(add) });
+                        self.incrementLocal(cfg, block_id, &mut stack, idx, inc);
                     }
                 }
                 0x85..=0x93 => {
@@ -849,9 +839,8 @@ impl<'a> GraphBuilder<'a> {
                 0xaa => {
                     let index = self.pop(&mut stack).map(|x| x.expr).unwrap_or_else(|| HirInstruction::ConstantInt(0));
                     self.flush_stack(cfg, block_id, &mut stack);
-                    if let Some((_, low, high, targets)) = self.tableswitch_parts(bci) {
-                        let db = self.tableswitch_default_bci(bci);
-                        let default_block = bci_to_block_id.get(&db).copied().unwrap_or(block_id + 1);
+                    if let Some((defaultBci, low, high, targets)) = self.tableswitch_parts(bci) {
+                        let default_block = bci_to_block_id.get(&defaultBci).copied().unwrap_or(block_id + 1);
                         let target_blocks = targets.iter().map(|t| bci_to_block_id.get(&(*t as usize)).copied().unwrap_or(default_block)).collect();
                         cfg.blocks[block_id].push(HirInstruction::TableSwitch { index: Box::new(index), low, high, default_block, targets: target_blocks });
                     }
@@ -860,9 +849,8 @@ impl<'a> GraphBuilder<'a> {
                 0xab => {
                     let key = self.pop(&mut stack).map(|x| x.expr).unwrap_or_else(|| HirInstruction::ConstantInt(0));
                     self.flush_stack(cfg, block_id, &mut stack);
-                    if let Some((_, pairs)) = self.lookupswitch_parts(bci) {
-                        let db = self.lookupswitch_default_bci(bci);
-                        let default_block = bci_to_block_id.get(&db).copied().unwrap_or(block_id + 1);
+                    if let Some((defaultBci, pairs)) = self.lookupswitch_parts(bci) {
+                        let default_block = bci_to_block_id.get(&defaultBci).copied().unwrap_or(block_id + 1);
                         let out = pairs.into_iter().map(|(k, t)| (k, bci_to_block_id.get(&(t as usize)).copied().unwrap_or(default_block))).collect();
                         cfg.blocks[block_id].push(HirInstruction::LookupSwitch { key: Box::new(key), pairs: out, default_block });
                     }
@@ -927,7 +915,7 @@ impl<'a> GraphBuilder<'a> {
         }
     }
 
-    fn build_wide(&self, cfg: &mut ControlFlowGraph, block_id: usize, bci: usize) {
+    fn build_wide(&self, cfg: &mut ControlFlowGraph, block_id: usize, stack: &mut [StackValue], bci: usize) {
         let Some(&inner) = self.code.get(bci + 1) else { return };
         match inner {
             0x15 | 0x19 => { let idx = self.u2(bci + 2); cfg.blocks[block_id].instructions.push(HirInstruction::Unsupported { opcode: inner, bci, reason: format!("wide load {}", idx) }); }
@@ -938,31 +926,91 @@ impl<'a> GraphBuilder<'a> {
             0x84 => {
                 let idx = self.u2(bci + 2);
                 let inc = i16::from_be_bytes([self.code.get(bci + 4).copied().unwrap_or(0), self.code.get(bci + 5).copied().unwrap_or(0)]) as i32;
-                let load = HirInstruction::LoadLocal { slot: idx, kind: ValueKind::Int32 };
-                let add = HirInstruction::Add(Box::new(load), Box::new(HirInstruction::ConstantInt(inc)));
-                cfg.blocks[block_id].instructions.push(HirInstruction::StoreLocal { slot: idx, kind: ValueKind::Int32, value: Box::new(add) });
+                self.incrementLocal(cfg, block_id, stack, idx, inc);
             }
             _ => cfg.blocks[block_id].instructions.push(HirInstruction::Unsupported { opcode: inner, bci, reason: "wide".to_string() }),
         }
     }
 
-    fn build_invoke(&self, cfg: &mut ControlFlowGraph, block_id: usize, stack: &mut Vec<StackValue>, bci: usize, op: u8) {
-        let call = self.call_info_for(bci, op);
-        if !call.is_resolved() {
-            stack.push(StackValue::new(self.unsupported(bci, op, "unresolved invoke"), ValueKind::Ref));
+    fn incrementLocal(
+        &self,
+        cfg: &mut ControlFlowGraph,
+        blockId: usize,
+        stack: &mut [StackValue],
+        slot: usize,
+        increment: i32,
+    ) {
+        let kind = ValueKind::Int32;
+        let load = HirInstruction::LoadLocal { slot, kind };
+        let value = HirInstruction::Add(Box::new(load), Box::new(HirInstruction::ConstantInt(increment)));
+        self.storeLocal(cfg, blockId, stack, slot, kind, value);
+    }
+
+    fn storeLocal(
+        &self,
+        cfg: &mut ControlFlowGraph,
+        blockId: usize,
+        stack: &mut [StackValue],
+        slot: usize,
+        kind: ValueKind,
+        value: HirInstruction,
+    ) {
+        self.materializeStack(cfg, blockId, stack, |expr| {
+            !matches!(
+                expr,
+                HirInstruction::LoadStack { .. }
+                    | HirInstruction::ConstantInt(_)
+                    | HirInstruction::ConstantLong(_)
+                    | HirInstruction::ConstantFloat(_)
+                    | HirInstruction::ConstantDouble(_)
+                    | HirInstruction::ConstantNull
+            )
+        });
+        cfg.blocks[blockId].push(HirInstruction::StoreLocal {
+            slot,
+            kind,
+            value: Box::new(value),
+        });
+    }
+
+    fn materializeStack(
+        &self,
+        cfg: &mut ControlFlowGraph,
+        blockId: usize,
+        stack: &mut [StackValue],
+        needsSpill: impl Fn(&HirInstruction) -> bool,
+    ) {
+        for value in stack {
+            if needsSpill(&value.expr) {
+                let expr = std::mem::replace(&mut value.expr, HirInstruction::ConstantInt(0));
+                value.expr = self.spill_value(cfg, blockId, expr, value.kind);
+            }
+        }
+    }
+
+    fn build_invoke(&self, cfg: &mut ControlFlowGraph, blockId: usize, stack: &mut Vec<StackValue>, bci: usize, op: u8) {
+        let info = self.call_info_for(bci, op);
+        if !info.is_resolved() {
+            cfg.blocks[blockId].push(self.unsupported(bci, op, "unresolved invoke"));
             return;
         }
-        let total = call.arg_kinds.len() + usize::from(!call.is_static);
-        let mut operands = Vec::with_capacity(total);
-        for _ in 0..total {
-            operands.push(self.pop(stack).map(|x| x.expr).unwrap_or_else(|| HirInstruction::ConstantInt(0)));
+
+        let argumentCount = info.arg_kinds.len() + usize::from(!info.is_static);
+        let returnKind = info.return_kind;
+        let mut operands = Vec::with_capacity(argumentCount);
+        for _ in 0..argumentCount {
+            let value = self.pop(stack).map_or(HirInstruction::ConstantInt(0), |value| value.expr);
+            operands.push(Box::new(value));
         }
         operands.reverse();
-        if call.return_kind == ValueKind::Void {
-            cfg.blocks[block_id].push(HirInstruction::Call { info: call, operands: operands.into_iter().map(Box::new).collect() });
+        self.materializeStack(cfg, blockId, stack, expr_needs_spill);
+
+        let call = HirInstruction::Call { info, operands };
+        if returnKind == ValueKind::Void {
+            cfg.blocks[blockId].push(call);
         } else {
-            let ret = call.return_kind;
-            stack.push(StackValue::new(HirInstruction::Call { info: call, operands: operands.into_iter().map(Box::new).collect() }, ret));
+            let result = self.spill_value(cfg, blockId, call, returnKind);
+            stack.push(StackValue::new(result, returnKind));
         }
     }
 

@@ -250,12 +250,16 @@ impl Management {
     }
 
     pub fn total_heap_memory_usage(&self) -> MemoryUsage {
+        self.totalMemoryUsage(true)
+    }
+
+    pub(crate) fn totalMemoryUsage(&self, heap: bool) -> MemoryUsage {
         let pools = self.memory_pools.lock().unwrap();
         let mut init = 0;
         let mut used = 0;
         let mut committed = 0;
         let mut max = 0;
-        for p in pools.iter().filter(|p| p.is_heap) {
+        for p in pools.iter().filter(|p| p.is_heap == heap) {
             init += p.usage.init;
             used += p.usage.used;
             committed += p.usage.committed;

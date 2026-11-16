@@ -456,9 +456,10 @@ impl<'a> InstanceKlass<'a> {
             return super_k.instanceField(name, descriptor);
         }
         Err(Error::other(format!(
-            "Missing instance field {}{}",
+            "Missing instance field {}{} on {}",
             String::from_utf8_lossy(name),
-            String::from_utf8_lossy(descriptor)
+            String::from_utf8_lossy(descriptor),
+            String::from_utf8_lossy(&self.class.name)
         )))
     }
 

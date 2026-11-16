@@ -20,4 +20,5 @@ flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
 parking_lot = "0.12"
 
 [profile.release]
-debug = true
+debug = 1
+codegen-units = 16

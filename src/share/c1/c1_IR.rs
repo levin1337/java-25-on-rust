@@ -229,8 +229,9 @@ impl ControlFlowGraph {
 
             for instr in &mut block.instructions {
                 if instr.is_block_end() {
-                    let old_sux = instr.successors();
-                    for old_target in old_sux {
+                    let mut oldTargets = instr.successors();
+                    oldTargets.sort_unstable();
+                    for old_target in oldTargets {
                         if let Some(new_target) = new_id.get(old_target).copied().flatten() {
                             instr.substitute_successor(old_target, new_target);
                         }

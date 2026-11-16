@@ -414,14 +414,19 @@ pub(crate) fn materialize_class<'a>(
         .push(Value::Object(handle));
     loader.class_object_names.borrow_mut().insert(handle, name);
     loader.class_objects.borrow_mut().insert(key, handle);
-    let domain = loader
-        .class_protection_domain(name)
+    let recorded = loader.class_protection_domain(name);
+    let domain = recorded
         .map(Value::Object)
         .or_else(|| {
             loader
                 .class_origin(name)
                 .and_then(|origin| protection_domain_for_origin(loader, &origin).ok())
         });
+    if recorded.is_some() && std::env::var_os("JVM25_TRACE_PD").is_some() {
+        if let Some(Value::Object(handle)) = domain {
+            trace_pd_url(loader, handle, name);
+        }
+    }
     if let Some(domain) = domain
         && let Ok(slot) = klass.instanceField(
             b"protectionDomain",
@@ -463,6 +468,49 @@ fn new_java_object<'a>(
         &mut io::sink(),
     )?;
     Ok(Value::Object(handle))
+}
+
+pub(crate) fn trace_pd_url<'a>(loader: &ClassLoader<'a>, pd: usize, name: &[u8]) {
+    let field_str = |object: usize, fname: &[u8], fdesc: &[u8]| -> Option<String> {
+        let objects = loader.borrow_objects();
+        let obj = objects.get(object)?;
+        let slot = obj.klass.instanceField(fname, fdesc).ok()?;
+        match obj.fields.get(slot).copied()? {
+            Value::HostString(s) => Some(s.to_string()),
+            Value::String(bytes) => decodeString(bytes).ok(),
+            _ => None,
+        }
+    };
+    let field_obj = |object: usize, fname: &[u8], fdesc: &[u8]| -> Option<usize> {
+        let objects = loader.borrow_objects();
+        let obj = objects.get(object)?;
+        let slot = obj.klass.instanceField(fname, fdesc).ok()?;
+        match obj.fields.get(slot).copied()? {
+            Value::Object(h) => Some(h),
+            _ => None,
+        }
+    };
+    let Some(cs) = field_obj(pd, b"codesource", b"Ljava/security/CodeSource;") else {
+        eprintln!("[pd] {} codesource=<none>", String::from_utf8_lossy(name));
+        return;
+    };
+    let Some(url) = field_obj(cs, b"location", b"Ljava/net/URL;") else {
+        eprintln!("[pd] {} location=<none>", String::from_utf8_lossy(name));
+        return;
+    };
+    let proto = field_str(url, b"protocol", b"Ljava/lang/String;").unwrap_or_default();
+    let file = field_str(url, b"file", b"Ljava/lang/String;").unwrap_or_default();
+    let host = field_str(url, b"host", b"Ljava/lang/String;").unwrap_or_default();
+    let auth = field_str(url, b"authority", b"Ljava/lang/String;").unwrap_or_default();
+    eprintln!(
+        "[pd] {} -> {}://{}{} file=[{}] auth=[{}]",
+        String::from_utf8_lossy(name),
+        proto,
+        host,
+        file,
+        file,
+        auth
+    );
 }
 
 /// Builds `ProtectionDomain(CodeSource(URL(location), null), Permissions())`

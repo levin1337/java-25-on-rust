@@ -300,12 +300,22 @@ pub(crate) fn invoke<'a>(
             let bytes = usize::try_from(long_arg(arguments, 5)?)
                 .map_err(|_| Error::other("IllegalArgumentException"))?;
             let swap = long_arg(arguments, 6)?;
-            if swap != 0 {
-                return Err(Error::other("Unsupported Unsafe.copySwapMemory0 swap size"));
+            if swap == 0 {
+                copy_bytes(
+                    loader, src_object, src_offset, dst_object, dst_offset, bytes,
+                )?;
+            } else {
+                copy_swap_bytes(
+                    loader,
+                    src_object,
+                    src_offset,
+                    dst_object,
+                    dst_offset,
+                    bytes,
+                    usize::try_from(swap)
+                        .map_err(|_| invalid("Invalid Unsafe swap size"))?,
+                )?;
             }
-            copy_bytes(
-                loader, src_object, src_offset, dst_object, dst_offset, bytes,
-            )?;
             None
         }
         (b"objectFieldOffset0", b"(Ljava/lang/reflect/Field;)J") => {
@@ -492,8 +502,9 @@ fn class_arg<'a>(arguments: &[Value<'a>], index: usize) -> io::Result<&'a [u8]> 
     }
 }
 
-fn object_arg<'a>(arguments: &[Value<'a>], index: usize) -> io::Result<Value<'a>> {
-    argument(arguments, index)
+fn object_arg<'a>(loader: &ClassLoader<'a>, arguments: &[Value<'a>], index: usize) -> io::Result<Value<'a>> {
+    let value = argument(arguments, index)?;
+    Ok(stringNatives::materialize(loader, value, &mut io::sink(), 0)?.unwrap_or(value))
 }
 
 fn offset_arg(arguments: &[Value<'_>], index: usize) -> io::Result<i64> {
@@ -674,21 +685,15 @@ fn write_array_raw(array: &mut TypeArrayOop, offset: i64, size: usize, raw: u64)
 
 fn read_offheap_raw(address: i64, size: usize) -> io::Result<u64> {
     let base = u64::try_from(address).map_err(|_| invalid("Invalid Unsafe address"))?;
-    let mut result = 0u64;
-    for index in 0..size {
-        result |=
-            u64::from(OffHeapMemory::global().get_byte(base + index as u64)? as u8) << (index * 8);
-    }
-    Ok(result)
+    let bytes = OffHeapMemory::global().read_bytes(base, size)?;
+    let mut raw = [0; 8];
+    raw[..size].copy_from_slice(&bytes);
+    Ok(u64::from_le_bytes(raw))
 }
 
 fn write_offheap_raw(address: i64, size: usize, raw: u64) -> io::Result<()> {
     let base = u64::try_from(address).map_err(|_| invalid("Invalid Unsafe address"))?;
-    for index in 0..size {
-        OffHeapMemory::global()
-            .put_byte(base + index as u64, ((raw >> (index * 8)) as u8) as i8)?;
-    }
-    Ok(())
+    OffHeapMemory::global().write_bytes(base, &raw.to_le_bytes()[..size])
 }
 
 fn find_static_field<'a>(
@@ -716,7 +721,7 @@ fn read_raw<'a>(
     object_index: usize,
     size: usize,
 ) -> io::Result<Raw> {
-    let object = object_arg(arguments, object_index)?;
+    let object = object_arg(loader, arguments, object_index)?;
     let offset = offset_arg(arguments, object_index + 1)?;
     if std::env::var_os("JVM25_TRACE").is_some() && matches!(object, Value::Null) {
         eprintln!("[unsafe-null] offset={offset} args={arguments:?}");
@@ -769,7 +774,7 @@ fn write_raw<'a>(
     size: usize,
     value: Value<'static>,
 ) -> io::Result<()> {
-    let object = object_arg(arguments, object_index)?;
+    let object = object_arg(loader, arguments, object_index)?;
     let offset = offset_arg(arguments, object_index + 1)?;
     if matches!(object, Value::Null) && offset == THREAD_TID_SENTINEL_OFFSET {
         let raw = value_to_raw(value, size)?;
@@ -831,7 +836,7 @@ fn read_reference<'a>(
     arguments: &[Value<'a>],
     object_index: usize,
 ) -> io::Result<Value<'a>> {
-    let object = object_arg(arguments, object_index)?;
+    let object = object_arg(loader, arguments, object_index)?;
     let offset = offset_arg(arguments, object_index + 1)?;
     match object {
         Value::ClassMirror(class) => {
@@ -879,7 +884,7 @@ fn write_reference<'a>(
     object_index: usize,
     value: Value<'a>,
 ) -> io::Result<()> {
-    let object = object_arg(arguments, object_index)?;
+    let object = object_arg(loader, arguments, object_index)?;
     let offset = offset_arg(arguments, object_index + 1)?;
     match object {
         Value::ClassMirror(class) => {
@@ -974,7 +979,7 @@ fn write_reference_with_value<'a>(
     object_index: usize,
     value: Value<'a>,
 ) -> io::Result<()> {
-    let object = object_arg(arguments, object_index)?;
+    let object = object_arg(loader, arguments, object_index)?;
     let offset = offset_arg(arguments, object_index + 1)?;
     match object {
         Value::ClassMirror(class) => {
@@ -1398,12 +1403,54 @@ fn copy_bytes<'a>(
     if bytes == 0 {
         return Ok(());
     }
+    let buffer = if src_object == Value::Null {
+        OffHeapMemory::global().read_bytes(u64::try_from(src_offset).map_err(io::Error::other)?, bytes)?
+    } else {
+        let mut buffer = vec![0; bytes];
+        for (index, byte) in buffer.iter_mut().enumerate() {
+            let address = src_offset.checked_add(index as i64).ok_or_else(|| invalid("Unsafe address overflow"))?;
+            *byte = read_byte(loader, src_object, address)?;
+        }
+        buffer
+    };
+    if dst_object == Value::Null {
+        return OffHeapMemory::global().write_bytes(u64::try_from(dst_offset).map_err(io::Error::other)?, &buffer);
+    }
+    for (index, byte) in buffer.into_iter().enumerate() {
+        let address = dst_offset
+            .checked_add(index as i64)
+            .ok_or_else(|| invalid("Unsafe address overflow"))?;
+        write_byte(loader, dst_object, address, byte)?;
+    }
+    Ok(())
+}
+
+/// `Unsafe.copySwapMemory0` with a nonzero element size: copies `bytes`
+/// while reversing each `elem_size`-byte block (HotSpot `copy_swap_memory`).
+fn copy_swap_bytes<'a>(
+    loader: &ClassLoader<'a>,
+    src_object: Value<'a>,
+    src_offset: i64,
+    dst_object: Value<'a>,
+    dst_offset: i64,
+    bytes: usize,
+    elem_size: usize,
+) -> io::Result<()> {
+    if elem_size == 0 || bytes % elem_size != 0 {
+        return Err(invalid("Invalid Unsafe swap size"));
+    }
+    if bytes == 0 {
+        return Ok(());
+    }
     let mut buffer = vec![0u8; bytes];
     for index in 0..bytes {
         let address = src_offset
             .checked_add(index as i64)
             .ok_or_else(|| invalid("Unsafe address overflow"))?;
         buffer[index] = read_byte(loader, src_object, address)?;
+    }
+    for chunk in buffer.chunks_exact_mut(elem_size) {
+        chunk.reverse();
     }
     for (index, byte) in buffer.into_iter().enumerate() {
         let address = dst_offset

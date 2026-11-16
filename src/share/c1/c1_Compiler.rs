@@ -8,6 +8,7 @@ use crate::share::code::pcDesc::PcDesc;
 use crate::share::compiler::abstractCompiler::{AbstractCompiler, CompileError, CompilerType};
 use crate::share::compiler::compileTask::{CompileOutcome, CompileTask, FailureReason};
 use crate::share::compiler::compilerDefinitions::CompLevel;
+use crate::share::jitruntime::runtime::{SlotKind, parse_signature};
 use super::c1_Instruction::{HirInstruction, ValueKind};
 
 thread_local! {
@@ -88,57 +89,6 @@ impl C1Compiler {
 
 impl Default for C1Compiler {
     fn default() -> Self { Self::new() }
-}
-
-fn parse_descriptor_params(descriptor: &str, is_static: bool) -> Vec<ParamInfo> {
-    let bytes = descriptor.as_bytes();
-    let mut params = Vec::new();
-    let mut slot = 0usize;
-    if !is_static {
-        params.push(ParamInfo { local_slot: slot, kind: LirKind::Ref });
-        slot += 1;
-    }
-    if bytes.first() != Some(&b'(') { return params; }
-    let mut i = 1usize;
-    while i < bytes.len() && bytes[i] != b')' {
-        let (kind, width) = match bytes[i] {
-            b'B' | b'S' | b'C' | b'I' | b'Z' => (ValueKind::Int32, 1),
-            b'J' => (ValueKind::Int64, 2),
-            b'F' => (ValueKind::Float32, 1),
-            b'D' => (ValueKind::Float64, 2),
-            b'L' => {
-                let mut j = i + 1;
-                while j < bytes.len() && bytes[j] != b';' { j += 1; }
-                i = j;
-                (ValueKind::Ref, 1)
-            }
-            b'[' => {
-                let mut depth = 0usize;
-                let mut j = i;
-                while j < bytes.len() {
-                    match bytes[j] {
-                        b'[' => depth += 1,
-                        b'L' => {
-                            let mut k = j + 1;
-                            while k < bytes.len() && bytes[k] != b';' { k += 1; }
-                            j = k;
-                            break;
-                        }
-                        b';' if depth > 0 => break,
-                        _ => {}
-                    }
-                    j += 1;
-                }
-                i = j;
-                (ValueKind::Ref, 1)
-            }
-            _ => (ValueKind::Int32, 1),
-        };
-        params.push(ParamInfo { local_slot: slot, kind: LirKind::from_value_kind(kind) });
-        slot += width;
-        i += 1;
-    }
-    params
 }
 
 /// True when every instruction in the CFG stays within the executable
@@ -230,24 +180,39 @@ impl AbstractCompiler for C1Compiler {
             return Err(CompileError::new(FailureReason::MethodNotCompilable, "empty bytecode", CompLevel::Simple));
         }
         let max_locals = method.max_locals() as usize;
-        // The interpreter<->nmethod bridge can only marshal the
-        // executable signature subset (primitive int/long, no floats
-        // or references); refuse anything else up front instead of
-        // installing code that could never be invoked.
-        if !crate::share::jitruntime::signature_supported(
-            task.method.descriptor.as_str().as_bytes(),
-            method.is_static(),
-        ) {
+        let descriptor = task.method.descriptor.as_str();
+        let Some(signature) = parse_signature(descriptor.as_bytes(), method.is_static()) else {
             return Err(CompileError::new(
                 FailureReason::Unsupported,
-                format!(
-                    "signature {} outside executable subset",
-                    task.method.descriptor.as_str()
-                ),
+                format!("signature {descriptor} outside executable subset"),
                 CompLevel::Simple,
             ));
+        };
+        let mut params =
+            Vec::with_capacity(signature.params.len() + usize::from(signature.is_instance));
+        let mut slot = 0;
+        if signature.is_instance {
+            params.push(ParamInfo {
+                local_slot: slot,
+                kind: LirKind::Ref,
+            });
+            slot += 1;
         }
-        let params = parse_descriptor_params(task.method.descriptor.as_str(), method.is_static());
+        for kind in signature.params {
+            let (kind, width) = match kind {
+                SlotKind::Int32 => (ValueKind::Int32, 1),
+                SlotKind::Int64 => (ValueKind::Int64, 2),
+                SlotKind::Float32 => (ValueKind::Float32, 1),
+                SlotKind::Float64 => (ValueKind::Float64, 2),
+                SlotKind::Ref => (ValueKind::Ref, 1),
+                SlotKind::Void => unreachable!(),
+            };
+            params.push(ParamInfo {
+                local_slot: slot,
+                kind: LirKind::from_value_kind(kind),
+            });
+            slot += width;
+        }
         let mut metadata = task.jit_metadata.clone().unwrap_or_default();
         // Heap-op sites and field kinds are resolved from the owning
         // class here (the broker only pre-resolves `ldc` constants),

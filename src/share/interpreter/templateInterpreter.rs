@@ -100,13 +100,15 @@ pub fn tos_state_index(state: TosState) -> usize {
 /// `DispatchTable`: `number_of_states` dispatch tables of 256 entries.
 #[derive(Clone)]
 pub struct DispatchTable {
-    table: [[EntryPoint; 256]; NUMBER_OF_STATES],
+    // Heap-allocated: 10 states x 256 entries x EntryPoint is ~200 KiB,
+    // too large to build safely on the stack.
+    table: Box<[[EntryPoint; 256]; NUMBER_OF_STATES]>,
 }
 
 impl DispatchTable {
     pub fn new() -> Self {
         Self {
-            table: [[EntryPoint::ZERO; 256]; NUMBER_OF_STATES],
+            table: Box::new([[EntryPoint::ZERO; 256]; NUMBER_OF_STATES]),
         }
     }
 

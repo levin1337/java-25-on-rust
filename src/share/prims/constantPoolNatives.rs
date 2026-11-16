@@ -100,9 +100,11 @@ fn pool<'a>(
     loader: &ClassLoader<'a>,
     arguments: &[Value<'a>],
 ) -> io::Result<Arc<InstanceKlass<'a>>> {
-    let oop = arguments.get(1).copied().unwrap_or(Value::Null);
-    let Value::ClassMirror(name) = oop else {
-        return Err(invalid("Invalid constant pool object"));
+    let name = match arguments.get(1).copied() {
+        Some(Value::ClassMirror(name)) => name,
+        Some(Value::Object(handle)) => loader.class_object_names.borrow().get(&handle).copied()
+            .ok_or_else(|| invalid("Invalid constant pool object"))?,
+        _ => return Err(invalid("Invalid constant pool object")),
     };
     loader.load(name)
 }
@@ -231,6 +233,9 @@ pub(crate) fn invoke<'a>(
     arguments: &[Value<'a>],
 ) -> io::Result<Option<Value<'a>>> {
     let _ = descriptor;
+    if !name.ends_with(b"0") {
+        return Ok(None);
+    }
     let klass = pool(loader, arguments)?;
     let class = &klass.class;
     let index = index_of(arguments);

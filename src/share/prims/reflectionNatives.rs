@@ -2271,15 +2271,17 @@ fn enum_constants<'a>(loader: &ClassLoader<'a>, class: &'a [u8]) -> io::Result<V
 }
 
 fn primitive_array_kind(descriptor: &[u8]) -> Option<u8> {
+    // Tags follow the interpreter's `opcode - 0x2e` scheme that
+    // `TypeArrayOop::load/store` expects: 0=int, 1=long, 2=float, 3=double,
+    // 5=byte/boolean, 6=char, 7=short.
     match descriptor {
-        b"[Z" => Some(4),
-        b"[C" => Some(5),
-        b"[F" => Some(6),
-        b"[D" => Some(7),
-        b"[B" => Some(8),
-        b"[S" => Some(9),
-        b"[I" => Some(10),
-        b"[J" => Some(11),
+        b"[Z" | b"[B" => Some(5),
+        b"[C" => Some(6),
+        b"[S" => Some(7),
+        b"[I" => Some(0),
+        b"[J" => Some(1),
+        b"[F" => Some(2),
+        b"[D" => Some(3),
         _ => None,
     }
 }

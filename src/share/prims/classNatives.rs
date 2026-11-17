@@ -102,6 +102,30 @@ pub(crate) fn classOf<'a>(loader: &ClassLoader<'a>, value: Value<'a>) -> io::Res
     Ok(Value::ClassMirror(name))
 }
 
+/// Resolves a `java.lang.Class` value — either a `ClassMirror` literal or a
+/// materialized `java.lang.Class` object — to its internal class name.
+pub(crate) fn class_value_name<'a>(
+    loader: &ClassLoader<'a>,
+    value: Value<'a>,
+) -> io::Result<Option<&'a [u8]>> {
+    match value {
+        Value::ClassMirror(name) => Ok(Some(name)),
+        Value::Object(handle) => {
+            let is_class_object = {
+                let objects = loader.borrow_objects();
+                objects
+                    .get(handle)
+                    .is_some_and(|object| object.klass.class.name == b"java/lang/Class")
+            };
+            if !is_class_object {
+                return Ok(None);
+            }
+            Ok(loader.class_object_names.borrow().get(&handle).copied())
+        }
+        _ => Ok(None),
+    }
+}
+
 pub(crate) fn invoke<'a>(
     loader: &ClassLoader<'a>,
     name: &[u8],
@@ -113,24 +137,9 @@ pub(crate) fn invoke<'a>(
     };
     // Accept both `ClassMirror` literals and materialized `java.lang.Class`
     // objects (produced by `materialize_class` for field/method access).
-    let class = match *receiver {
-        Value::ClassMirror(class) => class,
-        Value::Object(handle) => {
-            let is_class_object = {
-                let objects = loader.borrow_objects();
-                objects.get(handle).is_some_and(|object| {
-                    object.klass.class.name == b"java/lang/Class"
-                })
-            };
-            if !is_class_object {
-                return Ok(None);
-            }
-            match loader.class_object_names.borrow().get(&handle) {
-                Some(name) => *name,
-                None => return Ok(None),
-            }
-        }
-        _ => return Ok(None),
+    let class = match class_value_name(loader, *receiver)? {
+        Some(class) => class,
+        None => return Ok(None),
     };
     if name == b"getResource" && descriptor == b"(Ljava/lang/String;)Ljava/net/URL;" {
         let resource = arguments.first().copied().ok_or_else(|| io::Error::other("Missing resource name"))?;
@@ -139,9 +148,11 @@ pub(crate) fn invoke<'a>(
     if name == b"isAssignableFrom" && descriptor == b"(Ljava/lang/Class;)Z" {
         let target = class;
         let source = match arguments.first().copied().unwrap_or(Value::Null) {
-            Value::ClassMirror(source) => source,
             Value::Null => return Err(io::Error::other("NullPointerException")),
-            _ => return Ok(Some(Value::Int(0))),
+            value => match class_value_name(loader, value)? {
+                Some(source) => source,
+                None => return Ok(Some(Value::Int(0))),
+            },
         };
         let assignable = if target == source {
             true
@@ -317,8 +328,8 @@ pub(crate) fn invoke<'a>(
             let arg = arguments.first().copied().unwrap_or(Value::Null);
             // thisClass.asSubclass(S) succeeds iff thisClass is a subclass of (or
             // equal to) S — the same relation as `S.isAssignableFrom(thisClass)`.
-            let ok = match arg {
-                Value::ClassMirror(other) => {
+            let ok = match class_value_name(loader, arg)? {
+                Some(other) => {
                     if class == other {
                         true
                     } else if class.starts_with(b":") || other.starts_with(b":") {

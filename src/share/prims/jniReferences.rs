@@ -71,6 +71,57 @@ impl Default for JniReferences {
     }
 }
 
+
+thread_local! {
+    /// Thread identity captured on first use, while the thread's TLS is
+    /// still alive. `std::thread::current()` panics after TLS destruction,
+    /// which happens when native shutdown callbacks (e.g. JNA disposers
+    /// during `LdrShutdownThread`) call back into the VM.
+    static THREAD_ID: std::cell::Cell<Option<ThreadId>> = const { std::cell::Cell::new(None) };
+}
+
+static SHUTDOWN_THREAD_ID: std::sync::OnceLock<ThreadId> = std::sync::OnceLock::new();
+
+/// Captures a dedicated fallback thread identity for callbacks that arrive
+/// after a thread's TLS was destroyed. The owner thread parks forever, so
+/// the bucket never collides with live thread state.
+pub fn init_shutdown_thread_id() {
+    let _ = SHUTDOWN_THREAD_ID.get_or_init(|| {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(thread::current().id());
+            loop {
+                std::thread::park();
+            }
+        });
+        receiver.recv().unwrap()
+    });
+}
+
+/// Panic-free `std::thread::current().id()`.
+pub fn current_thread_id() -> ThreadId {
+    match THREAD_ID.try_with(|cell| {
+        if let Some(id) = cell.get() {
+            return id;
+        }
+        let id = thread::current().id();
+        cell.set(Some(id));
+        id
+    }) {
+        Ok(id) => id,
+        Err(_) => *SHUTDOWN_THREAD_ID.get_or_init(|| {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = sender.send(thread::current().id());
+                loop {
+                    std::thread::park();
+                }
+            });
+            receiver.recv().unwrap()
+        }),
+    }
+}
+
 impl JniReferences {
     pub fn new() -> Self {
         Self::default()
@@ -119,7 +170,7 @@ impl JniReferences {
         self.insert(
             &mut self.state.lock().unwrap(),
             target,
-            Some(thread::current().id()),
+            Some(current_thread_id()),
             false,
         )
     }
@@ -147,7 +198,7 @@ impl JniReferences {
             .ok_or_else(|| Error::other("Invalid JNI reference"))?;
         if entry
             .owner
-            .is_some_and(|owner| owner != thread::current().id())
+            .is_some_and(|owner| owner != current_thread_id())
         {
             return Err(Error::other(
                 "JNI local reference belongs to another thread",
@@ -219,7 +270,7 @@ impl JniReferences {
             || entry.weak != weak
             || entry
                 .owner
-                .is_some_and(|owner| owner != thread::current().id())
+                .is_some_and(|owner| owner != current_thread_id())
         {
             return Err(Error::other("Invalid JNI reference kind or owner"));
         }
@@ -247,7 +298,7 @@ impl JniReferences {
             .lock()
             .unwrap()
             .frames
-            .entry(thread::current().id())
+            .entry(current_thread_id())
             .or_insert_with(|| vec![Vec::new()])
             .push(Vec::new());
     }
@@ -257,7 +308,7 @@ impl JniReferences {
         state.entries.try_reserve(capacity).map_err(Error::other)?;
         state
             .frames
-            .entry(thread::current().id())
+            .entry(current_thread_id())
             .or_insert_with(|| vec![Vec::new()])
             .last_mut()
             .unwrap()
@@ -266,7 +317,7 @@ impl JniReferences {
     }
 
     pub fn popFrame(&self, result: Option<JniReference>) -> io::Result<Option<JniReference>> {
-        let thread = thread::current().id();
+        let thread = current_thread_id();
         let mut state = self.state.lock().unwrap();
         let target = if let Some(reference) = result {
             let entry = state
@@ -298,7 +349,7 @@ impl JniReferences {
 
     /// Pops the top local frame without preserving a result object.
     pub fn popFrameVoid(&self) -> io::Result<()> {
-        let thread = thread::current().id();
+        let thread = current_thread_id();
         let mut state = self.state.lock().unwrap();
         let frames = state
             .frames
@@ -320,12 +371,12 @@ impl JniReferences {
             .lock()
             .unwrap()
             .frames
-            .entry(thread::current().id())
+            .entry(current_thread_id())
             .or_insert_with(|| vec![Vec::new()]);
     }
 
     pub fn detach(&self) {
-        let thread = thread::current().id();
+        let thread = current_thread_id();
         let mut state = self.state.lock().unwrap();
         if let Some(frames) = state.frames.remove(&thread) {
             for reference in frames.into_iter().flatten() {

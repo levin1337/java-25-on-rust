@@ -146,6 +146,7 @@ impl FieldType {
 struct KlassInfo {
     super_name: Option<Vec<u8>>,
     interfaces: Vec<Vec<u8>>,
+    is_interface: bool,
 }
 
 impl KlassInfo {
@@ -156,6 +157,7 @@ impl KlassInfo {
                 b"java/lang/Cloneable".to_vec(),
                 b"java/lang/Serializable".to_vec(),
             ],
+            is_interface: false,
         }
     }
 }
@@ -434,6 +436,7 @@ impl<'m, 'a> BytecodeVerifier<'m, 'a> {
             return Some(KlassInfo {
                 super_name: self.class.superName.map(|s| s.to_vec()),
                 interfaces: self.class.interfaces.iter().map(|i| i.to_vec()).collect(),
+                is_interface: self.class.accessFlags & 0x0200 != 0,
             });
         }
         let loader = self.loader?;
@@ -442,6 +445,7 @@ impl<'m, 'a> BytecodeVerifier<'m, 'a> {
         Some(KlassInfo {
             super_name: klass.super_klass.as_ref().map(|s| s.class.name.to_vec()),
             interfaces: klass.interfaces.iter().map(|i| i.class.name.to_vec()).collect(),
+            is_interface: klass.class.accessFlags & 0x0200 != 0,
         })
     }
 
@@ -463,6 +467,15 @@ impl<'m, 'a> BytecodeVerifier<'m, 'a> {
                 );
             }
             return false;
+        }
+        // HotSpot (resolve_and_check_assignability): an interface target is
+        // treated as java.lang.Object for class-hierarchy assignability —
+        // the strict array rules above already restricted array sources to
+        // Cloneable/Serializable.
+        if let Some(info) = self.klass_info(to)
+            && info.is_interface
+        {
+            return true;
         }
         // Class hierarchy DFS.
         let mut visited = HashSet::new();
@@ -486,34 +499,42 @@ impl<'m, 'a> BytecodeVerifier<'m, 'a> {
         false
     }
 
-    /// Element-wise assignability for two array descriptors.
+    /// Element-wise assignability for two array descriptors. JVMS §4.10.1.2:
+    /// `[S` is assignable to `[T` iff `S` is assignable to `T`, comparing
+    /// exactly one dimension at a time — `int[][]` is assignable to
+    /// `Object[]` because `int[]` is assignable to `Object`.
     fn array_element_assignable(&self, from: &[u8], to: &[u8]) -> bool {
-        fn strip_dim(d: &[u8]) -> &[u8] {
-            let mut i = 0;
-            while i < d.len() && d[i] == b'[' {
-                i += 1;
-            }
-            &d[i..]
-        }
-        let fe = strip_dim(from);
-        let te = strip_dim(to);
-        let fdims = from.len() - fe.len();
-        let tdims = to.len() - te.len();
-        if fdims != tdims {
-            return false;
-        }
-        if fe == te {
+        self.descriptor_assignable(&from[1..], &to[1..])
+    }
+
+    /// Assignability between two element descriptors: primitives (`I`),
+    /// object types (`Lpkg/Name;`) or nested array descriptors (`[...`).
+    fn descriptor_assignable(&self, from: &[u8], to: &[u8]) -> bool {
+        if from == to {
             return true;
         }
-        if fe.starts_with(b"L") || te.starts_with(b"L") {
-            let fname = normalize_object_name(fe).into_bytes();
-            let tname = normalize_object_name(te).into_bytes();
-            if fname == tname {
-                return true;
+        let from_arr = from.starts_with(b"[");
+        let to_arr = to.starts_with(b"[");
+        if from_arr || to_arr {
+            if from_arr && to_arr {
+                return self.array_element_assignable(from, to);
             }
-            return self.type_assignable(&fname, &tname);
+            if from_arr {
+                return matches!(
+                    to,
+                    b"Ljava/lang/Object;" | b"Ljava/lang/Cloneable;" | b"Ljava/lang/Serializable;"
+                );
+            }
+            return false;
         }
-        false
+        match (from.first(), to.first()) {
+            (Some(b'L'), Some(b'L')) => {
+                let fname = normalize_object_name(&from[1..from.len().saturating_sub(1)]);
+                let tname = normalize_object_name(&to[1..to.len().saturating_sub(1)]);
+                self.type_assignable(fname.as_bytes(), tname.as_bytes())
+            }
+            _ => false,
+        }
     }
 
     /// Is verification-type `actual` assignable to `expected`?

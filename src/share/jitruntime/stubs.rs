@@ -1143,6 +1143,23 @@ unsafe extern "C" fn h_call_method(
     let Some((owner, name, descriptor)) = site_slices(site_ptr) else {
         return deopt();
     };
+    {
+        static JIT_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *JIT_TRACE.get_or_init(|| std::env::var_os("JVM25_JIT_TRACE").is_some()) {
+            static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<u64>>> =
+                std::sync::OnceLock::new();
+            let seen = SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+            if seen.lock().map(|mut s| s.insert(site_ptr ^ opcode)).unwrap_or(false) {
+                eprintln!(
+                    "[callmethod-site] site={site_ptr:#x} op={:#x} {}.{}{}",
+                    opcode as u8,
+                    String::from_utf8_lossy(owner),
+                    String::from_utf8_lossy(name),
+                    String::from_utf8_lossy(descriptor)
+                );
+            }
+        }
+    }
     let op = opcode as u8;
     let is_static = op == 0xb8;
     let n = n_args as usize;

@@ -1178,7 +1178,11 @@ fn fill_in_stack_trace<'a>(
     };
     let frames = super::stackwalk::StackWalk::currentFrames(loader);
     if std::env::var_os("JVM25_TRACE_NATIVE").is_some() {
-        eprintln!("[fillInStackTrace] frames={}", frames.len());
+        eprintln!(
+            "[fillInStackTrace] frames={} site={}",
+            frames.len(),
+            crate::share::interpreter::bytecodeInterpreter::current_frame_site()
+        );
     }
     let component = loader
         .storage

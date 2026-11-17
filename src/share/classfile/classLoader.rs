@@ -1357,6 +1357,9 @@ impl<'a> ClassLoader<'a> {
     /// Java-loader delegate fallback performed by `load`.
     pub fn find_class(&self, name: &[u8]) -> io::Result<Arc<InstanceKlass<'a>>> {
         let _load_guard = self.load_lock.lock();
+        if let Some(klass) = self.classes.borrow().get(name) {
+            return Ok(Arc::clone(klass));
+        }
         self.loadClass(name)
     }
 

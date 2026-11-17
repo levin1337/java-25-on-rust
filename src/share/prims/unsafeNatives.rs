@@ -331,24 +331,24 @@ pub(crate) fn invoke<'a>(
             Some(static_field_base_from_field(loader, arguments, 1)?)
         }
         (b"shouldBeInitialized0", b"(Ljava/lang/Class;)Z") => Some(Value::Int(i32::from(
-            class_initialized(loader, class_arg(arguments, 1)?)?,
+            class_initialized(loader, class_arg(loader, arguments, 1)?)?,
         ))),
         (b"ensureClassInitialized0", b"(Ljava/lang/Class;)V") => {
-            ensure_class_initialized(loader, class_arg(arguments, 1)?)?;
+            ensure_class_initialized(loader, class_arg(loader, arguments, 1)?)?;
             None
         }
         (b"arrayBaseOffset0", b"(Ljava/lang/Class;)I") => {
-            let class = class_arg(arguments, 1)?;
+            let class = class_arg(loader, arguments, 1)?;
             Unsafe::arrayLayout(class)?;
             Some(Value::Int(0))
         }
         (b"arrayIndexScale0", b"(Ljava/lang/Class;)I") => {
-            let class = class_arg(arguments, 1)?;
+            let class = class_arg(loader, arguments, 1)?;
             Some(Value::Int(Unsafe::arrayLayout(class)?))
         }
         (b"getLoadAverage0", b"([DI)I") => Some(Value::Int(-1)),
         (b"allocateInstance", b"(Ljava/lang/Class;)Ljava/lang/Object;") => {
-            Some(allocate_instance(loader, class_arg(arguments, 1)?)?)
+            Some(allocate_instance(loader, class_arg(loader, arguments, 1)?)?)
         }
         (b"getUncompressedObject", b"(J)Ljava/lang/Object;") => Some(Value::Null),
         (
@@ -495,9 +495,33 @@ fn string_arg<'a>(loader: &ClassLoader<'a>, value: Value<'a>) -> io::Result<Stri
     Ok(text.into_owned())
 }
 
-fn class_arg<'a>(arguments: &[Value<'a>], index: usize) -> io::Result<&'a [u8]> {
+fn class_arg<'a>(
+    loader: &ClassLoader<'a>,
+    arguments: &[Value<'a>],
+    index: usize,
+) -> io::Result<&'a [u8]> {
     match argument(arguments, index)? {
         Value::ClassMirror(name) => Ok(name),
+        // Materialized `java.lang.Class` instances (see
+        // `classNatives::materialize_class`) carry their internal name in
+        // `class_object_names`.
+        Value::Object(handle) => {
+            let is_class_object = {
+                let objects = loader.borrow_objects();
+                objects
+                    .get(handle)
+                    .is_some_and(|object| object.klass.class.name == b"java/lang/Class")
+            };
+            if !is_class_object {
+                return Err(invalid("Expected java.lang.Class"));
+            }
+            loader
+                .class_object_names
+                .borrow()
+                .get(&handle)
+                .copied()
+                .ok_or_else(|| invalid("Expected java.lang.Class"))
+        }
         _ => Err(invalid("Expected java.lang.Class")),
     }
 }
@@ -1213,7 +1237,7 @@ fn field_offset_by_name<'a>(
     class_index: usize,
     name_index: usize,
 ) -> io::Result<i64> {
-    let class = class_arg(arguments, class_index)?;
+    let class = class_arg(loader, arguments, class_index)?;
     let name = string_arg(loader, argument(arguments, name_index)?)?;
     let klass = loader.load(class)?;
     let name = name.as_bytes();

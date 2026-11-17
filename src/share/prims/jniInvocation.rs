@@ -141,7 +141,11 @@ static nextVmId: AtomicU64 = AtomicU64::new(1);
 static GLOBAL_VM: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
-    static environments: RefCell<HashMap<u64, Box<NativeEnvironment>>> =
+    /// Environments are leaked (`Box::leak`) so the `JNIEnv*` handed to
+    /// native libraries stays valid even after this thread-local map is
+    /// destroyed during `LdrShutdownThread` — JNA/JVM shutdown callbacks
+    /// may still call back through the env pointer.
+    static environments: RefCell<HashMap<u64, &'static mut NativeEnvironment>> =
         RefCell::new(HashMap::new());
     static CURRENT_ENV: RefCell<usize> = const { RefCell::new(0) };
 }
@@ -312,7 +316,7 @@ impl Default for JavaVm {
 
 impl Drop for JavaVm {
     fn drop(&mut self) {
-        environments.with(|values| {
+        let _ = environments.try_with(|values| {
             values.borrow_mut().remove(&self.id);
         });
     }
@@ -366,7 +370,7 @@ unsafe extern "system" fn jni_destroy_java_vm(vm: *mut JavaVm) -> i32 {
         return JNI_EINVAL;
     }
     let attached = (*vm).state().attached.clone();
-    if attached.len() > 1 || (attached.len() == 1 && !attached.contains(&thread::current().id())) {
+    if attached.len() > 1 || (attached.len() == 1 && !attached.contains(&crate::share::prims::jniReferences::current_thread_id())) {
         return JNI_ERR;
     }
     (*vm).state().attached.clear();
@@ -405,47 +409,53 @@ unsafe extern "system" fn jni_attach_current_thread(
             name = cstr.to_string();
         }
     }
-    environments.with(|values| {
+    match environments.try_with(|values| {
         let mut values = values.borrow_mut();
         let id = unsafe { (*vm).id };
         let entry = values.entry(id).or_insert_with(|| {
-            Box::new(NativeEnvironment {
+            Box::leak(Box::new(NativeEnvironment {
                 functions: native_table(),
                 vm,
                 version,
                 exception: RefCell::new(PendingException::None),
                 pinned: RefCell::new(Vec::new()),
                 held_monitors: RefCell::new(Vec::new()),
-            })
+            }))
         });
-        let env_ptr = &mut **entry as *mut NativeEnvironment;
+        let env_ptr = *entry as *mut NativeEnvironment;
         unsafe { environment.write(env_ptr.cast()) };
         set_current_env(env_ptr);
         (*vm).references.ensureBaseFrame();
-        (*vm).state().attached.insert(thread::current().id());
+        (*vm).state().attached.insert(crate::share::prims::jniReferences::current_thread_id());
         if !Threads::global().find_by_id(id) {
             let mut jt = JavaThread::new(name, true);
             jt.set_thread_state(JavaThreadState::InNative);
             Threads::global().add(jt);
         }
-    });
-    JNI_OK
+        JNI_OK
+    }) {
+        Ok(code) => code,
+        Err(_) => JNI_ERR,
+    }
 }
 
 unsafe extern "system" fn jni_detach_current_thread(vm: *mut JavaVm) -> i32 {
     if vm.is_null() {
         return JNI_EINVAL;
     }
-    environments.with(|values| {
+    match environments.try_with(|values| {
         let id = unsafe { (*vm).id };
         if values.borrow_mut().remove(&id).is_none() {
             return JNI_EDETACHED;
         }
         (*vm).references.detach();
-        (*vm).state().attached.remove(&thread::current().id());
+        (*vm).state().attached.remove(&crate::share::prims::jniReferences::current_thread_id());
         clear_current_env();
         JNI_OK
-    })
+    }) {
+        Ok(code) => code,
+        Err(_) => JNI_EDETACHED,
+    }
 }
 
 unsafe extern "system" fn jni_get_env(
@@ -463,14 +473,18 @@ unsafe extern "system" fn jni_get_env(
     if !supported_version(version) || version > (*vm).state().version {
         return JNI_EVERSION;
     }
-    environments.with(|values| match values.borrow().get(&unsafe { (*vm).id }) {
+    match environments.try_with(|values| match values.borrow().get(&unsafe { (*vm).id }) {
         Some(env) => {
-            unsafe { environment.write((env.as_ref() as *const NativeEnvironment).cast_mut().cast()) };
-            set_current_env(unsafe { &**env } as *const NativeEnvironment as *mut NativeEnvironment);
+            let env_ptr = *env as *const NativeEnvironment as *mut NativeEnvironment;
+            unsafe { environment.write(env_ptr.cast()) };
+            set_current_env(env_ptr);
             JNI_OK
         }
         None => JNI_EDETACHED,
-    })
+    }) {
+        Ok(code) => code,
+        Err(_) => JNI_EDETACHED,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1090,7 +1104,9 @@ fn take_pending_error(env: *mut NativeEnvironment, loader: &ClassLoader<'static>
     match materialize_exception(env, loader) {
         Ok(Oop::Instance(handle)) => {
             clear_pending(env);
-            Some(Error::other(format!("Uncaught exception Object({handle})")))
+            Some(Error::other(
+                crate::share::interpreter::bytecodeInterpreter::JavaThrowable(handle),
+            ))
         }
         Ok(_) => {
             let pending = unsafe { &*env }.exception.borrow().clone();
@@ -2507,14 +2523,15 @@ fn invoke_java_method(
                         .get(*handle)
                         .map(|o| std::sync::Arc::clone(&o.klass))
                         .ok_or_else(|| Error::other("Invalid receiver"))?,
-                    Value::ObjectArray(handle) => {
-                        // Arrays only support clone(); handled by interpreter.
-                        return Err(Error::other("AbstractMethodError"));
+                    // Arrays expose java.lang.Object methods through ordinary
+                    // dispatch; the interpreter implements them.
+                    Value::ObjectArray(_) | Value::PrimitiveArray(_) => {
+                        loader.load(b"java/lang/Object")?
                     }
-                    Value::PrimitiveArray(_) => {
-                        return Err(Error::other("AbstractMethodError"));
-                    }
-                    Value::ClassMirror(name) => loader.load(name)?,
+                    // A jclass receiver is a `java.lang.Class` object: dispatch
+                    // on java.lang.Class; the interpreter handles the mirror
+                    // through the Class natives.
+                    Value::ClassMirror(_) => loader.load(b"java/lang/Class")?,
                     _ => loader.load(b"java/lang/Object")?,
                 };
                 if let Some(name) = declaring {
@@ -2563,8 +2580,9 @@ fn invoke_java_method(
 
     match result {
         Ok(value) => {
-            if let Some(err) = take_pending_error(env, loader) {
-                let _ = err;
+            if pending(env) {
+                // JNI contract: leave the exception pending so the caller
+                // observes it via ExceptionCheck/ExceptionOccurred.
                 return 0;
             }
             let Some(value) = value else {
@@ -3856,7 +3874,7 @@ unsafe extern "system" fn jni_monitor_enter(env: *mut NativeEnvironment, obj: Jn
     let Some(vm) = (unsafe { vm_of(env) }) else {
         return JNI_ERR;
     };
-    let owner = thread::current().id();
+    let owner = crate::share::prims::jniReferences::current_thread_id();
     {
         let mut held = unsafe { &*env }.held_monitors.borrow_mut();
         if let Some(hold) = held
@@ -3901,7 +3919,7 @@ unsafe extern "system" fn jni_monitor_exit(env: *mut NativeEnvironment, obj: Jni
     let Some(key) = monitor_key(env, obj) else {
         return JNI_ERR;
     };
-    let owner = thread::current().id();
+    let owner = crate::share::prims::jniReferences::current_thread_id();
     let mut held = unsafe { &*env }.held_monitors.borrow_mut();
     if let Some(pos) = held.iter().rposition(|h| h.key == key && h.owner == owner) {
         if held[pos].depth > 1 {
@@ -4354,6 +4372,9 @@ pub fn invoke_dll_native(
             let Some(func) = super::nativeLibraries::NativeLibraries::global()
                 .resolve_native_function(&class_name, &method_name, &sig)
             else {
+                if std::env::var_os("JVM25_JIT_TRACE").is_some() {
+                    eprintln!("[native-miss] {class_name}.{method_name}{sig}");
+                }
                 vm.state().native_misses.insert(key.clone());
                 return Ok(None);
             };

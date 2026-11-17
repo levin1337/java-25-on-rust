@@ -3,6 +3,9 @@ use jvm25_rust::share::{classfile::classLoader::ClassLoader, runtime::javaCalls}
 use std::{env, error::Error, fs, io, path::Path, process::ExitCode};
 
 fn inspect() -> Result<(), Box<dyn Error>> {
+    // Panic-free thread identity for JNI callbacks arriving after TLS
+    // destruction (native shutdown hooks).
+    jvm25_rust::share::prims::jniReferences::init_shutdown_thread_id();
     let mut raw: Vec<std::ffi::OsString> = env::args_os().skip(1).collect();
     // Java launcher @argument files: `@file` expands to the whitespace-
     // separated tokens inside (double quotes group, `\"`/`\\` escape).
@@ -105,6 +108,12 @@ fn inspect() -> Result<(), Box<dyn Error>> {
             .filter(|name| !name.is_empty() && !name.starts_with('-'))
             .ok_or_else(|| io::Error::other("Invalid main class"))?;
         eprintln!("[args] name={name:?} classpath={classpath:?}");
+        eprintln!(
+            "[env] TRACE_LABELED={:?} NO_JIT={:?} TRACE_NATIVE={:?}",
+            std::env::var_os("JVM25_TRACE_LABELED").is_some(),
+            std::env::var_os("JVM25_NO_JIT").is_some(),
+            std::env::var_os("JVM25_TRACE_NATIVE").is_some()
+        );
         let classpath = expand_classpath_wildcards(classpath);
         let mut loader = ClassLoader::open_classpath(&classpath, &storage)?;
         loader.setSystemProperty("java.class.path", &classpath)?;
@@ -255,11 +264,10 @@ fn main() -> ExitCode {
             .open(r"D:\jvm25-rust\panic.log")
         {
             use std::io::Write;
-            let _ = writeln!(
-                file,
-                "[panic] tid={:?} at {location}: {message}",
-                std::thread::current().id()
-            );
+            // Never touch std::thread::current() here: it panics after a
+            // thread's TLS was destroyed, which would panic inside this hook.
+            let _ = writeln!(file, "[panic] pid={} at {location}: {message}", std::process::id());
+            let _ = writeln!(file, "{}", std::backtrace::Backtrace::force_capture());
         }
         eprintln!("thread panicked at {location}: {message}");
     }));
@@ -272,7 +280,12 @@ fn main() -> ExitCode {
         .unwrap_or(1024);
     let worker = std::thread::Builder::new()
         .stack_size(stack_mb * 1024 * 1024)
-        .spawn(|| inspect().map_err(|error| error.to_string()));
+        .spawn(move || {
+            jvm25_rust::share::runtime::threading::install_stack_bounds(
+                stack_mb * 1024 * 1024,
+            );
+            inspect().map_err(|error| error.to_string())
+        });
     let result = match worker {
         Ok(handle) => handle.join().unwrap_or_else(|_| {
             eprintln!("Worker thread panicked");

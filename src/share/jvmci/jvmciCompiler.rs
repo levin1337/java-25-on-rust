@@ -446,7 +446,7 @@ fn jvmci_method_object(
 fn current_thread_id() -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    format!("{:?}", std::thread::current().id()).hash(&mut h);
+    format!("{:?}", crate::share::prims::jniReferences::current_thread_id()).hash(&mut h);
     h.finish() | 1
 }
 

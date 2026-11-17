@@ -28,10 +28,23 @@ pub(crate) fn invoke<'a>(
         }
         (b"getProperty", b"(Ljava/lang/String;)Ljava/lang/String;", [key])
         | (b"getProperty", b"(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;", [key, _]) => {
+            let key_str = propertyKey(loader, *key)?;
+            if std::env::var_os("JVM25_CPDBG").is_some()
+                && key_str == "java.class.path"
+                && let Some(value) = loader.systemProperties.borrow().get("java.class.path")
+            {
+                let text = *value;
+                eprintln!(
+                    "[cpdbg] len={} head={:?} tail={:?}",
+                    text.len(),
+                    &text[..text.len().min(60)],
+                    &text[text.len().saturating_sub(60)..]
+                );
+            }
             loader
                 .systemProperties
                 .borrow()
-                .get(propertyKey(loader, *key)?.as_ref())
+                .get(key_str.as_ref())
                 .copied()
         }
         (b"clearProperty", b"(Ljava/lang/String;)Ljava/lang/String;", [key]) => loader

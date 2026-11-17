@@ -57,34 +57,40 @@ fn field_value<'a>(
         .unwrap_or(Value::Null))
 }
 
-fn java_string_hash(bytes: &[u8]) -> i32 {
-    let mut hash = 0i32;
-    for &b in bytes {
-        hash = hash.wrapping_mul(31).wrapping_add(i32::from(b));
-    }
-    hash
+fn string_text<'a>(
+    loader: &ClassLoader<'a>,
+    value: Value<'a>,
+) -> Option<std::borrow::Cow<'a, str>> {
+    crate::share::prims::stringNatives::string(loader, value)
+        .ok()
+        .flatten()
 }
 
-fn field_hash(value: Value<'_>) -> i32 {
+fn string_hash(text: &str) -> i32 {
+    text.encode_utf16()
+        .fold(0i32, |hash, unit| {
+            hash.wrapping_mul(31).wrapping_add(i32::from(unit))
+        })
+}
+
+fn field_hash<'a>(loader: &ClassLoader<'a>, value: Value<'a>) -> i32 {
     match value {
         Value::Int(v) => v,
-        Value::Long(v) => (v ^ (v >> 32)) as i32,
+        Value::Long(v) => ((((v as u64) ^ ((v as u64) >> 32)) as u32) as i32),
         Value::Float(v) => v.to_bits() as i32,
         Value::Double(v) => {
             let bits = v.to_bits();
-            ((bits >> 32) as i32) ^ (bits as i32)
+            ((bits ^ (bits >> 32)) as u32) as i32
         }
         Value::Null => 0,
-        Value::String(bytes) => java_string_hash(bytes),
-        Value::HostString(text) => java_string_hash(text.as_bytes()),
-        Value::Object(handle) | Value::ObjectArray(handle) | Value::PrimitiveArray(handle) => {
-            (handle as i32).wrapping_mul(-1640531535i32)
-        }
-        _ => 0,
+        _ => match string_text(loader, value) {
+            Some(text) => string_hash(&text),
+            None => crate::share::prims::objectNatives::identity(value),
+        },
     }
 }
 
-fn values_equal(loader: &ClassLoader<'_>, a: Value<'_>, b: Value<'_>) -> bool {
+fn values_equal<'a>(loader: &ClassLoader<'a>, a: Value<'a>, b: Value<'a>) -> bool {
     use crate::share::interpreter::bytecodeInterpreter::Value as V;
     match (a, b) {
         (V::Null, V::Null) => true,
@@ -92,19 +98,18 @@ fn values_equal(loader: &ClassLoader<'_>, a: Value<'_>, b: Value<'_>) -> bool {
         (V::Long(x), V::Long(y)) => x == y,
         (V::Float(x), V::Float(y)) => x.to_bits() == y.to_bits(),
         (V::Double(x), V::Double(y)) => x.to_bits() == y.to_bits(),
-        (V::String(x), V::String(y)) => x == y,
-        (V::HostString(x), V::HostString(y)) => x == y,
-        (V::String(x), V::HostString(y)) | (V::HostString(y), V::String(x)) => {
-            x == y.as_bytes()
-        }
-        (V::Object(x), V::Object(y)) => {
-            let objects = loader.borrow_objects();
-            match (objects.get(x), objects.get(y)) {
-                (Some(ox), Some(oy)) => Arc::ptr_eq(&ox.klass, &oy.klass),
-                _ => x == y,
+        _ => {
+            if let (Some(sa), Some(sb)) = (string_text(loader, a), string_text(loader, b)) {
+                return sa == sb;
+            }
+            match (a, b) {
+                (V::Object(x), V::Object(y))
+                | (V::ObjectArray(x), V::ObjectArray(y))
+                | (V::PrimitiveArray(x), V::PrimitiveArray(y)) => x == y,
+                (V::String(x), V::String(y)) => x == y,
+                _ => false,
             }
         }
-        _ => false,
     }
 }
 
@@ -187,10 +192,10 @@ pub fn invoke<'a>(
             let Some(object) = object else {
                 return Ok(Some(Value::Int(0)));
             };
-            let mut hash = 0i32;
+            let mut hash = 1i32;
             for name in &field_names {
                 let value = field_value(loader, &object, &record, name.as_bytes())?;
-                hash = hash.wrapping_mul(31).wrapping_add(field_hash(value));
+                hash = hash.wrapping_mul(31).wrapping_add(field_hash(loader, value));
             }
             Ok(Some(Value::Int(hash)))
         }

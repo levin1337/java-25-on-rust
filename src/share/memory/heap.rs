@@ -432,7 +432,7 @@ fn snapshot_handles() -> Vec<Handle> {
 /// wakeup so a new cycle started while this thread was still parked
 /// cannot strand it.
 pub fn safepoint() {
-    let id = std::thread::current().id();
+    let id = crate::share::prims::jniReferences::current_thread_id();
     loop {
         let mut state = GC_STATE.lock();
         if !state.pending {
@@ -462,7 +462,7 @@ pub fn safepoint() {
 /// snapshot stays valid until `unquiesce`.
 pub fn quiesce() {
     let mut state = GC_STATE.lock();
-    let id = std::thread::current().id();
+    let id = crate::share::prims::jniReferences::current_thread_id();
     let roots = snapshot_handles();
     let entry = entry_mut(&mut state, id);
     entry.roots = roots;
@@ -473,7 +473,7 @@ pub fn quiesce() {
 /// Called when a previously blocked thread resumes execution.
 pub fn unquiesce() {
     let mut state = GC_STATE.lock();
-    let id = std::thread::current().id();
+    let id = crate::share::prims::jniReferences::current_thread_id();
     if let Some(entry) = state.threads.iter_mut().find(|entry| entry.id == id)
         && entry.state == ThreadGcState::Blocked
     {
@@ -485,7 +485,7 @@ pub fn unquiesce() {
 /// Removes the calling thread from the GC registry (thread exit).
 pub fn thread_finished() {
     let mut state = GC_STATE.lock();
-    let id = std::thread::current().id();
+    let id = crate::share::prims::jniReferences::current_thread_id();
     state.threads.retain(|entry| entry.id != id);
     GC_CV.notify_all();
 }
@@ -626,7 +626,7 @@ fn collect_cycle<'a>(
     total: usize,
     workers: usize,
 ) -> io::Result<()> {
-    let id = std::thread::current().id();
+    let id = crate::share::prims::jniReferences::current_thread_id();
     {
         let mut state = GC_STATE.lock();
         if state.pending {

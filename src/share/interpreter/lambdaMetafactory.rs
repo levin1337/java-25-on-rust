@@ -674,7 +674,10 @@ fn generate_class<'a>(
     }
 
     let sam_max_locals = 1 + sam_params.iter().map(Type::slots).sum::<usize>();
-    let sam_max_stack = capture_types.len() + sam_params.len() + 4;
+    // Every converted argument stays on the operand stack until the impl
+    // call; count slots (category-2 values take two) plus headroom for the
+    // `new`/`dup` pair, `aload_0`/`getfield` and conversion transients.
+    let sam_max_stack = effective_params.iter().map(Type::slots).sum::<usize>() + 8;
     let sam_member = Member {
         accessFlags: 0x0001, // public
         name: sam_method_name,

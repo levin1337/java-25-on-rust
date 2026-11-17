@@ -70,6 +70,37 @@ thread_local! {
     static JAVA_TID: Cell<u64> = const { Cell::new(0) };
     /// `java.lang.Thread` object handle of the current thread.
     static THREAD_OBJECT: Cell<Option<usize>> = const { Cell::new(None) };
+    /// Lowest usable stack address for the current OS thread; 0 = unknown.
+    static STACK_LIMIT: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Declares the OS stack size backing the current thread and derives the
+/// overflow limit. Called once per Java-capable OS thread right after it
+/// starts, while its stack pointer is still near the top.
+pub fn install_stack_bounds(stack_bytes: usize) {
+    let marker = 0u8;
+    let sp = std::hint::black_box(&marker) as *const u8 as usize;
+    let reserve = (stack_bytes / 8).clamp(8 * 1024 * 1024, 64 * 1024 * 1024);
+    let usable = stack_bytes.saturating_sub(reserve);
+    STACK_LIMIT.with(|cell| cell.set(sp.saturating_sub(usable)));
+}
+
+/// Whether the current thread declared its OS stack bounds.
+pub fn stack_bounds_known() -> bool {
+    STACK_LIMIT.with(|cell| cell.get() != 0)
+}
+
+/// True when the current thread's OS stack is nearly exhausted. Threads
+/// that never declared bounds (e.g. JNI-attached native threads) report
+/// false and rely on the interpreter depth fallback instead.
+pub fn stack_near_overflow() -> bool {
+    let limit = STACK_LIMIT.with(Cell::get);
+    if limit == 0 {
+        return false;
+    }
+    let marker = 0u8;
+    let sp = std::hint::black_box(&marker) as *const u8 as usize;
+    sp < limit
 }
 
 /// Process-wide `Arc` to the single VM `ClassLoader`, needed to move it
@@ -104,7 +135,7 @@ pub fn debug_native(label: String) {
     if std::env::var_os("JVM25_DUMP").is_none() {
         return;
     }
-    let id = std::thread::current().id();
+    let id = crate::share::prims::jniReferences::current_thread_id();
     THREAD_DEBUG.lock().entry(id).or_default().native = label;
 }
 
@@ -113,7 +144,7 @@ pub fn debug_frames(frames: Vec<String>) {
     if std::env::var_os("JVM25_DUMP").is_none() {
         return;
     }
-    let id = std::thread::current().id();
+    let id = crate::share::prims::jniReferences::current_thread_id();
     THREAD_DEBUG.lock().entry(id).or_default().frames = frames;
 }
 
@@ -122,7 +153,7 @@ pub fn debug_java_tid(tid: u64) {
     if std::env::var_os("JVM25_DUMP").is_none() {
         return;
     }
-    let id = std::thread::current().id();
+    let id = crate::share::prims::jniReferences::current_thread_id();
     THREAD_DEBUG.lock().entry(id).or_default().java_tid = tid;
 }
 
@@ -257,6 +288,7 @@ fn spawn_os_thread(
         .stack_size(stack_mb * 1024 * 1024)
         .spawn(move || {
             eprintln!("[jthread] start tid={tid} handle={handle}");
+            install_stack_bounds(stack_mb * 1024 * 1024);
             mark_java_thread(Some(handle), tid, Some(handle));
             {
                 let mut threads = loader.java_threads.borrow_mut();

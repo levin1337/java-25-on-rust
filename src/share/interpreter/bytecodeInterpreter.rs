@@ -107,7 +107,7 @@ fn sampleThreadFrames(bytecodeCount: u64) {
     let cc = crate::share::code::codeCache::CodeCache::global();
     eprintln!(
         "[dump @{bytecodeCount} tid={:?} native={}] jit(att={} ok={} deopt={} thr={} unsup={}) nmethods={} osr={} {frames:?}",
-        std::thread::current().id(),
+        crate::share::prims::jniReferences::current_thread_id(),
         crate::share::prims::nativeLookup::current_native(),
         att, ok, deopt, thrown, unsup,
         cc.nmethods_count(),
@@ -862,6 +862,50 @@ pub fn execute_labeled<'a>(
     // relies on `owner` being a real class name.
     let owner = klass.class.name;
     let _ = method;
+    if std::env::var_os("JVM25_TRACE_LABELED").is_some() && code.name == b"forAllBoxes" {
+        eprintln!(
+            "[labeled-in] {}.{}{} af={:#06x}",
+            String::from_utf8_lossy(owner),
+            String::from_utf8_lossy(code.name),
+            String::from_utf8_lossy(code.descriptor),
+            access_flags
+        );
+    }
+    // JDK intrinsics must be honored on every entry path, not only when
+    // the caller is interpreted: JIT-compiled callers reach this function
+    // through their call stubs and would otherwise run intrinsified
+    // methods (SHA block compression, UTF16 string ops, ...) in the
+    // bytecode interpreter.
+    if access_flags & 0x0008 != 0 {
+        if let Some(value) = crate::share::prims::jdkIntrinsics::invoke(
+            loader,
+            owner,
+            code.name,
+            code.descriptor,
+            arguments,
+        )? {
+            return Ok(Some(value));
+        }
+    } else {
+        if crate::share::prims::jdkIntrinsics::invokeVoidInstance(
+            loader,
+            owner,
+            code.name,
+            code.descriptor,
+            arguments,
+        ) {
+            return Ok(None);
+        }
+        if let Some(value) = crate::share::prims::jdkIntrinsics::invokeInstance(
+            loader,
+            klass,
+            code.name,
+            code.descriptor,
+            arguments,
+        ) {
+            return Ok(Some(value));
+        }
+    }
     // Tiered compilation: every interpreted entry bumps the method's
     // invocation counter; crossing the threshold flags it for the JIT.
     let code_key = code.bytes.as_ptr() as usize;
@@ -1031,7 +1075,7 @@ pub fn execute_labeled<'a>(
 }
 
 /// Renders an uncaught throwable as `fully.qualified.Name: message`.
-fn throwableDescription(loader: &ClassLoader<'_>, handle: usize) -> String {
+pub(crate) fn throwableDescription(loader: &ClassLoader<'_>, handle: usize) -> String {
     let objects = loader.borrow_objects();
     let Some(object) = objects.get(handle) else {
         return "Uncaught exception".to_owned();
@@ -1065,7 +1109,26 @@ fn executeFrame<'a>(
     access_flags: u16,
 ) -> io::Result<Option<Value<'a>>> {
     FRAME_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if depth >= 128 {
+    // Real JVMs throw StackOverflowError from a stack-pointer guard, not a
+    // fixed frame count: the interpreter recurses in Rust, so threads that
+    // declared their OS stack bounds are checked against the actual limit.
+    // Threads without bounds (JNI-attached natives) keep a conservative
+    // depth fallback.
+    if crate::share::runtime::threading::stack_near_overflow()
+        || (!crate::share::runtime::threading::stack_bounds_known() && depth >= 2048)
+    {
+        if env_flag("JVM25_SOE") {
+            let stack = loader.call_stack.snapshot();
+            let start = stack.len().saturating_sub(200);
+            eprintln!(
+                "[soe] depth={depth} frames={} tail={:?}",
+                stack.len(),
+                stack[start..]
+                    .iter()
+                    .map(|name| String::from_utf8_lossy(name).into_owned())
+                    .collect::<Vec<_>>()
+            );
+        }
         let errorClass = loader.load(b"java/lang/StackOverflowError")?;
         let error = loader.alloc_object(InstanceOop::new(errorClass)?);
         return Err(Error::other(JavaThrowable(error)));
@@ -1079,6 +1142,13 @@ fn executeFrame<'a>(
         locals[index] = value;
         index += value.slots();
     }
+    let labeled_trace = std::env::var_os("JVM25_TRACE_LABELED").is_some()
+        && (owner
+            .windows(b"VoxelShape".len())
+            .any(|w| w == b"VoxelShape")
+            || code.name == b"forAllBoxes");
+    let labeled_name = code.name;
+    let labeled_desc = code.descriptor;
     let mut frame = Frame {
         stack: Vec::with_capacity(code.maxStack),
         stackSlots: 0,
@@ -1093,6 +1163,18 @@ fn executeFrame<'a>(
         constants_len: klass.class.constants.len(),
     };
     let _registration = FrameRegistration::new(&frame);
+    if labeled_trace {
+        eprintln!(
+            "[labeled] {}.{}{} args={:?}",
+            String::from_utf8_lossy(owner),
+            String::from_utf8_lossy(labeled_name),
+            String::from_utf8_lossy(labeled_desc),
+            arguments
+                .iter()
+                .map(|v| format!("{v:?}").chars().take(60).collect::<String>())
+                .collect::<Vec<_>>()
+        );
+    }
     let mut safepoint_tick = 0u32;
     let dumpEnabled = env_flag("JVM25_DUMP");
     loop {
@@ -1381,6 +1463,7 @@ fn linkageExc<'a>(
             "AbstractMethodError" => b"java/lang/AbstractMethodError",
             "ClassCircularityError" => b"java/lang/ClassCircularityError",
             "ExceptionInInitializerError" => b"java/lang/ExceptionInInitializerError",
+            _ if message.contains("native method is not linked") => b"java/lang/UnsatisfiedLinkError",
             _ if message.contains("NoSuchMethod") || message.contains("Missing method") => {
                 b"java/lang/NoSuchMethodError"
             }
@@ -2477,16 +2560,32 @@ fn step<'a>(
                 }
                 return Ok(Step::Continue);
             }
-            if opcode == 0xb6
+            if matches!(opcode, 0xb6 | 0xb7)
                 && owner == b"java/lang/Object"
                 && name == b"hashCode"
                 && descriptor == b"()I"
-                && let Some(hash) =
-                    crate::share::prims::objectNatives::hashCode(loader, frame.stack[start])?
             {
-                frame.pop()?;
-                frame.push(Value::Int(hash))?;
-                return Ok(Step::Continue);
+                let receiver = frame.stack[start];
+                if matches!(receiver, Value::Null) {
+                    return Err(jex(
+                        loader,
+                        output,
+                        depth,
+                        b"java/lang/NullPointerException",
+                        None,
+                    ));
+                }
+                // invokespecial must bypass overrides: identity hash always.
+                let hash = if opcode == 0xb7 {
+                    Some(crate::share::prims::objectNatives::identity(receiver))
+                } else {
+                    crate::share::prims::objectNatives::hashCode(loader, receiver)?
+                };
+                if let Some(hash) = hash {
+                    frame.pop()?;
+                    frame.push(Value::Int(hash))?;
+                    return Ok(Step::Continue);
+                }
             }
             if opcode == 0xb6
                 && owner == b"java/lang/Class"
@@ -2575,7 +2674,15 @@ fn step<'a>(
                                 .any(|sub| canonical.starts_with(home.join(sub)))
                         });
                         if !builtin {
-                            libraries.load(library_path)?;
+                            if let Err(error) = libraries.load(library_path) {
+                                return Err(jex(
+                                    loader,
+                                    output,
+                                    depth,
+                                    b"java/lang/UnsatisfiedLinkError",
+                                    Some(&error.to_string()),
+                                ));
+                            }
                         }
                         return Ok(Step::Continue);
                     }
@@ -2601,9 +2708,27 @@ fn step<'a>(
                         }
                     }
                     match found {
-                        Some(candidate) => libraries.load(&candidate)?,
+                        Some(candidate) => {
+                            if let Err(error) = libraries.load(&candidate) {
+                                return Err(jex(
+                                    loader,
+                                    output,
+                                    depth,
+                                    b"java/lang/UnsatisfiedLinkError",
+                                    Some(&error.to_string()),
+                                ));
+                            }
+                        }
                         None => {
-                            return Err(Error::other(format!("Native library not found: {path}")));
+                            return Err(jex(
+                                loader,
+                                output,
+                                depth,
+                                b"java/lang/UnsatisfiedLinkError",
+                                Some(&format!(
+                                    "no {path} in java.library.path"
+                                )),
+                            ));
                         }
                     }
                     return Ok(Step::Continue);
@@ -2769,6 +2894,22 @@ fn step<'a>(
                 .map_err(methodError)
                 .map_err(|error| linkageExc(loader, output, depth, error))?;
                 initialize(loader, &target, output, depth + 1)?;
+                if std::env::var_os("JVM25_TRACE_LABELED").is_some()
+                    && owner
+                        .windows(b"VoxelShape".len())
+                        .any(|w| w == b"VoxelShape")
+                {
+                    eprintln!(
+                        "[invokestatic-resolve] {}.{}{} -> {}.{}{} pc={}",
+                        String::from_utf8_lossy(owner),
+                        String::from_utf8_lossy(name),
+                        String::from_utf8_lossy(descriptor),
+                        String::from_utf8_lossy(target.class.name),
+                        String::from_utf8_lossy(code.name),
+                        String::from_utf8_lossy(code.descriptor),
+                        pc
+                    );
+                }
                 (target, code, flags)
             } else {
                 if let Value::ClassMirror(class_name) = frame.stack[start] {

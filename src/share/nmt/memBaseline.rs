@@ -197,6 +197,11 @@ impl MemBaseline {
     }
 
     /// Malloc sites in the requested order (only detail baselines).
+    /// Read-only view of the recorded malloc sites (no re-sort).
+    pub fn malloc_sites_ref(&self) -> &[MallocSiteSnapshot] {
+        &self.malloc_sites
+    }
+
     pub fn malloc_sites(&mut self, order: SortingOrder) -> &[MallocSiteSnapshot] {
         self.sort_malloc_sites(order);
         &self.malloc_sites

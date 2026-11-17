@@ -2419,7 +2419,24 @@ fn step<'a>(
                     return Err(Error::other("Unsupported field receiver class"));
                 }
                 let ownerKlass = loader.load(owner)?;
-                let index = ownerKlass.instanceField(name, descriptor)?;
+                let index = match ownerKlass.instanceField(name, descriptor) {
+                    Ok(index) => index,
+                    Err(error) => {
+                        if env_flag("JVM25_TRACE_FIELD") {
+                            eprintln!(
+                                "[field-miss] owner={} name={} desc={} obj_klass={} in {}.{} pc={}",
+                                String::from_utf8_lossy(owner),
+                                String::from_utf8_lossy(name),
+                                String::from_utf8_lossy(descriptor),
+                                String::from_utf8_lossy(object.klass.class.name),
+                                String::from_utf8_lossy(frame.owner),
+                                String::from_utf8_lossy(frame.code.name),
+                                pc,
+                            );
+                        }
+                        return Err(error);
+                    }
+                };
                 if index >= object.fields.len() {
                     return Err(Error::other("Invalid instance field slot"));
                 }

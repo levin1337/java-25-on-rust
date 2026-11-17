@@ -515,6 +515,13 @@ fn try_invoke_inner<'a>(
     set_depth(depth);
     let prev_frame_qwords = current_frame_qwords();
     set_frame_qwords(stubs::frame_qwords_for(addr));
+    if std::env::var_os("JVM25_JIT_ARGS").is_some() {
+        eprintln!(
+            "[jit-args] {} regs={:016x},{:016x},{:016x},{:016x} nstack={}",
+            String::from_utf8_lossy(descriptor),
+            regs[0], regs[1], regs[2], regs[3], nstack
+        );
+    }
     let call_args = CallArgs {
         regs,
         xmm,

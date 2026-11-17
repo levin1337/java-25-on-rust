@@ -644,6 +644,92 @@ fn compressBlock<'a>(loader: &ClassLoader<'a>, algo: u8, state: usize, input: us
     }
 }
 
+/// `DigestBase.engineReset` equivalent for the fast path: restores the
+/// chaining state to its initial value and clears the message-schedule
+/// array `W`. `DigestBase.engineUpdate` invokes this whenever
+/// `bytesProcessed < 0` (the flag `engineDigest` leaves behind), so a
+/// `MessageDigest` instance stays reusable across `digest()` calls.
+fn reset_digest<'a>(loader: &ClassLoader<'a>, receiver: usize, algo: u8) -> Option<()> {
+    let state_desc: &[u8] = if algo == 2 { b"[J" } else { b"[I" };
+    let Value::PrimitiveArray(state) =
+        super::methodHandleNatives::object_field(loader, receiver, b"state", state_desc).ok()?
+    else {
+        return None;
+    };
+    if algo == 2 {
+        // SHA-384/512: state is long[8] seeded from `initialHashes` ([J).
+        let initial: Vec<i64> = match super::methodHandleNatives::object_field(
+            loader, receiver, b"initialHashes", b"[J",
+        ) {
+            Ok(Value::PrimitiveArray(h)) => {
+                let arrays = loader.arrays.borrow();
+                let TypeArrayOop::Long(words) = arrays.get(h)? else {
+                    return None;
+                };
+                words.to_vec()
+            }
+            _ => return None,
+        };
+        let mut arrays = loader.arrays.borrow_mut();
+        let TypeArrayOop::Long(state_words) = arrays.get_mut(state)? else {
+            return None;
+        };
+        for (slot, word) in state_words.iter_mut().zip(initial.iter()) {
+            *slot = *word;
+        }
+    } else if algo == 1 {
+        // SHA-224/256: state is int[8] seeded from `initialHashes` ([I).
+        let initial: Vec<i32> = match super::methodHandleNatives::object_field(
+            loader, receiver, b"initialHashes", b"[I",
+        ) {
+            Ok(Value::PrimitiveArray(h)) => {
+                let arrays = loader.arrays.borrow();
+                let TypeArrayOop::Int(words) = arrays.get(h)? else {
+                    return None;
+                };
+                words.to_vec()
+            }
+            _ => return None,
+        };
+        let mut arrays = loader.arrays.borrow_mut();
+        let TypeArrayOop::Int(state_words) = arrays.get_mut(state)? else {
+            return None;
+        };
+        for (slot, word) in state_words.iter_mut().zip(initial.iter()) {
+            *slot = *word;
+        }
+    } else {
+        // SHA-1: state is int[5] with fixed IV constants (SHA.resetHashes).
+        const SHA1_IV: [i32; 5] = [
+            0x67452301u32 as i32,
+            0xefcdab89u32 as i32,
+            0x98badcfeu32 as i32,
+            0x10325476u32 as i32,
+            0xc3d2e1f0u32 as i32,
+        ];
+        let mut arrays = loader.arrays.borrow_mut();
+        let TypeArrayOop::Int(state_words) = arrays.get_mut(state)? else {
+            return None;
+        };
+        for (slot, word) in state_words.iter_mut().zip(SHA1_IV.iter()) {
+            *slot = *word;
+        }
+    }
+    // implReset also clears W ([I for SHA/SHA2, [J for SHA5) when present.
+    let w_desc: &[u8] = if algo == 2 { b"[J" } else { b"[I" };
+    if let Ok(Value::PrimitiveArray(w)) =
+        super::methodHandleNatives::object_field(loader, receiver, b"W", w_desc)
+    {
+        let mut arrays = loader.arrays.borrow_mut();
+        match arrays.get_mut(w) {
+            Some(TypeArrayOop::Int(words)) => words.fill(0),
+            Some(TypeArrayOop::Long(words)) => words.fill(0),
+            _ => {}
+        }
+    }
+    Some(())
+}
+
 /// `DigestBase.engineUpdate([BII)V`: byte-for-byte port of the JDK buffering
 /// logic with native block compression.
 fn digestEngineUpdate<'a>(loader: &ClassLoader<'a>, args: &[Value<'a>]) -> Option<()> {
@@ -691,14 +777,22 @@ fn digestEngineUpdate<'a>(loader: &ClassLoader<'a>, args: &[Value<'a>]) -> Optio
     let mut ofs = *ofs;
     let mut len = *len;
 
-    // bytesProcessed += len (field is package-visible `long`)
+    // bytesProcessed += len. A negative value means the previous
+    // engineDigest() left the object un-reset; DigestBase.engineUpdate
+    // runs engineReset() first — mirror that here (DigestBase.java:111).
     if let Some(Value::Long(processed)) = field(b"bytesProcessed", b"J") {
+        let mut base = processed;
+        if processed < 0 {
+            reset_digest(loader, *receiver, algo)?;
+            buf_ofs = 0;
+            base = 0;
+        }
         super::methodHandleNatives::set_object_field(
             loader,
             *receiver,
             b"bytesProcessed",
             b"J",
-            Value::Long(processed.wrapping_add(i64::from(len))),
+            Value::Long(base.wrapping_add(i64::from(len))),
         )
         .ok()?;
     }

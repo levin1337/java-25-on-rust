@@ -86,6 +86,8 @@ pub enum RuntimeStub {
     ArrayLength,
     ArrayLoad,
     ArrayStore,
+    FloatRem,
+    FloatConvert,
     UnresolvedField,
     UnresolvedCall,
 }

@@ -397,7 +397,14 @@ impl<'a> X64Asm<'a> {
     pub fn movq_xmm_to_gp(&mut self, gp: Register, xmm: XMMRegister) -> Result<(), CodeBufferError> {
         self.buf.write_byte(0x66)?;
         self.emit_rex(true, xmm.needs_rex(), false, gp.needs_rex());
-        self.buf.write(&[0x0f, 0x7e, 0xc0 | ((gp.encoding() & 7) << 3) | (xmm.encoding() & 7)])?;
+        self.buf.write(&[0x0f, 0x7e, 0xc0 | ((xmm.encoding() & 7) << 3) | (gp.encoding() & 7)])?;
+        Ok(())
+    }
+
+    pub fn movd_xmm_to_gp(&mut self, gp: Register, xmm: XMMRegister) -> Result<(), CodeBufferError> {
+        self.buf.write_byte(0x66)?;
+        self.emit_rex(false, xmm.needs_rex(), false, gp.needs_rex());
+        self.buf.write(&[0x0f, 0x7e, 0xc0 | ((xmm.encoding() & 7) << 3) | (gp.encoding() & 7)])?;
         Ok(())
     }
 

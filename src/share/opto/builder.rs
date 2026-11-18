@@ -324,7 +324,16 @@ impl<'a> BytecodeGraphBuilder<'a> {
                             }
                             leaders.insert(next);
                         }
-                        Code::Goto | Code::GotoW | Code::Jsr | Code::JsrW => {
+                        Code::Goto | Code::Jsr => {
+                            if let Some(t) = bc.get_s2(1) {
+                                let tgt = (bci as i64 + t as i64) as usize;
+                                if tgt < code.len() {
+                                    leaders.insert(tgt);
+                                }
+                            }
+                            leaders.insert(next);
+                        }
+                        Code::GotoW | Code::JsrW => {
                             if let Some(t) = bc.get_s4(1) {
                                 let tgt = (bci as i64 + t as i64) as usize;
                                 if tgt < code.len() {
@@ -466,14 +475,29 @@ impl<'a> BytecodeGraphBuilder<'a> {
                                     succs[i].push((fb, SuccKind::False));
                                 }
                             }
-                            Code::Goto | Code::GotoW | Code::Jsr | Code::JsrW => {
+                            Code::Goto | Code::Jsr => {
+                                if let Some(t) = bc.get_s2(1) {
+                                    let tgt = bci as i64 + t as i64;
+                                    if let Some(tb) = self.target_block(tgt, code_len) {
+                                        succs[i].push((tb, SuccKind::Fall));
+                                    }
+                                }
+                                if matches!(c, Code::Jsr) {
+                                    if let Some(fb) =
+                                        self.target_block((bci + len) as i64, code_len)
+                                    {
+                                        succs[i].push((fb, SuccKind::Fall));
+                                    }
+                                }
+                            }
+                            Code::GotoW | Code::JsrW => {
                                 if let Some(t) = bc.get_s4(1) {
                                     let tgt = bci as i64 + t as i64;
                                     if let Some(tb) = self.target_block(tgt, code_len) {
                                         succs[i].push((tb, SuccKind::Fall));
                                     }
                                 }
-                                if matches!(c, Code::Jsr | Code::JsrW) {
+                                if matches!(c, Code::JsrW) {
                                     if let Some(fb) =
                                         self.target_block((bci + len) as i64, code_len)
                                     {
@@ -953,8 +977,9 @@ impl<'a> BytecodeGraphBuilder<'a> {
                 }
             }
             Code::Iinc => {
-                let idx = bc.get_u2(2).unwrap_or(0) as usize;
-                let c = i32::from(bc.get_s2(4).unwrap_or(0));
+                // Project bytecode dialect: iinc is u1 index, i8 const.
+                let idx = bc.get_u1(1).unwrap_or(0) as usize;
+                let c = i32::from(bc.get_u1(2).unwrap_or(0) as i8);
                 if idx < frame.locals.len() {
                     let k = self.gvn.con_i(c);
                     let cur = frame.locals[idx];

@@ -438,7 +438,9 @@ impl<'a> X86Emitter<'a> {
         }
         // Two-phase parallel copy through operand temp slots: first read every
         // source, then write every destination.  This resolves register/slot
-        // cycles without a permutation solver.
+        // cycles without a permutation solver.  The staging slots are reserved
+        // in `temp_sp` so nested operand materialization (which allocates its
+        // own temps) cannot clobber values already staged.
         let mut moves: Vec<(NodeId, NodeId)> = Vec::new();
         for phi in phis {
             let inputs = self.gvn.node(phi).inputs.clone();
@@ -450,18 +452,21 @@ impl<'a> X86Emitter<'a> {
             }
             moves.push((src, phi));
         }
-        if moves.len() > TEMP_SLOTS {
+        let base = self.temp_sp;
+        if base + moves.len() > TEMP_SLOTS {
             return Err(BackendError::Unsupported(format!(
                 "{} phi copies exceed temp slots",
                 moves.len()
             )));
         }
+        self.temp_sp = base + moves.len();
         for (i, &(src, dst)) in moves.iter().enumerate() {
-            self.load_move_src(src, dst, i)?;
+            self.load_move_src(src, dst, base + i)?;
         }
         for (i, &(_, dst)) in moves.iter().enumerate() {
-            self.store_move_dst(dst, i)?;
+            self.store_move_dst(dst, base + i)?;
         }
+        self.temp_sp = base;
         Ok(())
     }
 

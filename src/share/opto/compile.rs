@@ -1149,4 +1149,50 @@ mod tests {
             other => panic!("unexpected result: {:?}", other),
         }
     }
+
+    #[test]
+    fn e2e_loop_sum() {
+        // static int sum(int n): sum = 0; i = 0;
+        // while (i < n) { sum += i; i++; } return sum;
+        // Exercises loop phis, the backward edge and the safepoint poll
+        // emitted at the loop header.
+        //
+        //  0: iconst_0
+        //  1: istore_1          sum = 0
+        //  2: iconst_0
+        //  3: istore_2          i = 0
+        //  4: iload_0           <- loop header
+        //  5: iload_2
+        //  6: if_icmple +13 -> 19   exit when n <= i
+        //  9: iload_1
+        // 10: iload_2
+        // 11: iadd
+        // 12: istore_1          sum += i
+        // 13: iinc 2, 1         i++
+        // 16: goto -12 -> 4
+        // 19: iload_1
+        // 20: ireturn
+        let code: &[u8] = &[
+            0x03, 0x3c, 0x03, 0x3d, 0x1a, 0x1c, 0xa4, 0x00, 0x0d, 0x1b, 0x1c, 0x60, 0x3c, 0x84,
+            0x02, 0x01, 0xa7, 0xff, 0xf4, 0x1b, 0xac,
+        ];
+        let mut m = method(code, 1);
+        m.max_locals = 3;
+        let options = BackendOptions {
+            params: vec![iparam(0)],
+            stubs: jit_stub_map(),
+            ..BackendOptions::default()
+        };
+        let mut c = Compile::compile(&m, &BuilderContext::empty());
+        let emitted = c
+            .backend(&m, &BuilderContext::empty(), &options)
+            .expect("c2 backend should emit loop");
+        let addr = publish_executable(&emitted.code, emitted.code.len())
+            .expect("publish executable");
+        let result = try_invoke(addr, b"(I)I", true, &[Value::Int(5)], 0).unwrap();
+        match result {
+            CompiledResult::Value(Some(Value::Int(v))) => assert_eq!(v, 10),
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
 }

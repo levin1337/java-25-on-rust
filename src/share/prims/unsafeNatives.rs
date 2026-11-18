@@ -330,9 +330,15 @@ pub(crate) fn invoke<'a>(
         (b"staticFieldBase0", b"(Ljava/lang/reflect/Field;)Ljava/lang/Object;") => {
             Some(static_field_base_from_field(loader, arguments, 1)?)
         }
-        (b"shouldBeInitialized0", b"(Ljava/lang/Class;)Z") => Some(Value::Int(i32::from(
-            class_initialized(loader, class_arg(loader, arguments, 1)?)?,
-        ))),
+        (b"shouldBeInitialized0", b"(Ljava/lang/Class;)Z") => {
+            // HotSpot `Klass::should_be_initialized` == `is_not_initialized`:
+            // true while the init state precedes being_initialized.
+            let klass = loader.load(class_arg(loader, arguments, 1)?)?;
+            Some(Value::Int(i32::from(matches!(
+                klass.state.get(),
+                InitState::Allocated | InitState::Loaded | InitState::Linked
+            ))))
+        }
         (b"ensureClassInitialized0", b"(Ljava/lang/Class;)V") => {
             ensure_class_initialized(loader, class_arg(loader, arguments, 1)?)?;
             None

@@ -294,6 +294,7 @@ pub struct ClassLoader<'a> {
     pub(crate) condy_values: Share<HashMap<(Vec<u8>, u32), Value<'a>>>,
     /// Cooperative Java thread registry (see runtime::threading).
     pub(crate) java_threads: Share<HashMap<usize, crate::share::runtime::threading::JavaThreadInfo>>,
+    pub(crate) scopedValueCaches: Share<HashMap<usize, usize>>,
     /// FIFO of thread object handles ready to run.
     pub(crate) thread_ready: Share<VecDeque<usize>>,
     /// Thread object handle currently executing (`None` = main thread).
@@ -627,6 +628,7 @@ impl<'a> ClassLoader<'a> {
             indy_targets: Share::new(HashMap::new()),
             condy_values: Share::new(HashMap::new()),
             java_threads: Share::new(HashMap::new()),
+            scopedValueCaches: Share::new(HashMap::new()),
             thread_ready: Share::new(VecDeque::new()),
             current_java_thread: Share::new(None),
             next_java_tid: Share::new(2),
@@ -723,6 +725,7 @@ impl<'a> ClassLoader<'a> {
             indy_targets: Share::new(HashMap::new()),
             condy_values: Share::new(HashMap::new()),
             java_threads: Share::new(HashMap::new()),
+            scopedValueCaches: Share::new(HashMap::new()),
             thread_ready: Share::new(VecDeque::new()),
             current_java_thread: Share::new(None),
             next_java_tid: Share::new(2),
@@ -1267,6 +1270,13 @@ impl<'a> ClassLoader<'a> {
         })?;
         if class.name != name {
             return Err(super::linkageError::LinkageError::no_class_def_found(name).io());
+        }
+        if std::env::var_os("JVM25_DUMP_PROXY").is_some() && name.starts_with(b"jdk/proxy") {
+            let file = format!(
+                "D:/jvm25-rust/proxy_{}.class",
+                String::from_utf8_lossy(name).replace('/', "_")
+            );
+            let _ = std::fs::write(&file, &*bytes);
         }
         self.defineParsed(class)
     }

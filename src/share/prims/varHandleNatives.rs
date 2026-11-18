@@ -180,7 +180,19 @@ pub(crate) fn invoke<'a>(
         object.klass.class.name
     };
     match polymorphic(loader, klass_name, name, descriptor, arguments)? {
-        Some(value) => Ok(Some(Some(value))),
+        Some(value) => {
+            // Void access modes (set*) are handled but push no value.
+            if descriptor
+                .iter()
+                .rposition(|&b| b == b')')
+                .and_then(|i| descriptor.get(i + 1))
+                == Some(&b'V')
+            {
+                Ok(Some(None))
+            } else {
+                Ok(Some(Some(value)))
+            }
+        }
         None => Ok(None),
     }
 }

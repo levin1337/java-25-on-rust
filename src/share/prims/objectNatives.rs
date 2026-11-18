@@ -5,11 +5,17 @@ use std::{
     io::{self, Error},
 };
 
-pub(crate) fn identity(value: Value<'_>) -> i32 {
+pub(crate) fn identity(loader: &ClassLoader<'_>, value: Value<'_>) -> i32 {
     let mut hash = DefaultHasher::new();
     match value {
         Value::Null => return 0,
-        Value::Object(handle) => return Jvm::identity_hash_code(handle.wrapping_add(1)),
+        Value::Object(handle) => {
+            let name = loader.class_object_names.borrow().get(&handle).copied();
+            match name {
+                Some(name) => name.hash(&mut hash),
+                None => return Jvm::identity_hash_code(handle.wrapping_add(1)),
+            }
+        }
         Value::ClassMirror(name) => name.hash(&mut hash),
         Value::PrimitiveArray(handle) | Value::ObjectArray(handle) => handle.hash(&mut hash),
         Value::String(bytes) => bytes.hash(&mut hash),
@@ -51,5 +57,5 @@ pub(crate) fn hashCode(loader: &ClassLoader<'_>, receiver: Value<'_>) -> io::Res
         | Value::Output => {}
         _ => return Ok(None),
     }
-    Ok(Some(identity(receiver)))
+    Ok(Some(identity(loader, receiver)))
 }

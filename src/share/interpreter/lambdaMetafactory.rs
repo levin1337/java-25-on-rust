@@ -332,11 +332,31 @@ fn emit_convert<'a>(
             emit_u16(code, midx);
         }
         (Type::Prim(a), Type::Prim(b)) => {
-            if a != b {
-                return Err(Error::other(format!(
-                    "Unsupported primitive conversion {} -> {}",
-                    *a as char, *b as char
-                )));
+            const INT_FAMILY: &[u8] = b"ZBCSI";
+            let opcode = match (*a, *b) {
+                // All sub-int types share the i32 slot representation.
+                (x, y) if INT_FAMILY.contains(&x) && INT_FAMILY.contains(&y) => None,
+                (b'I' | b'Z' | b'B' | b'C' | b'S', b'J') => Some(0x85), // i2l
+                (b'I' | b'Z' | b'B' | b'C' | b'S', b'F') => Some(0x86), // i2f
+                (b'I' | b'Z' | b'B' | b'C' | b'S', b'D') => Some(0x87), // i2d
+                (b'J', b'I' | b'Z' | b'B' | b'C' | b'S') => Some(0x88), // l2i
+                (b'J', b'F') => Some(0x89),                               // l2f
+                (b'J', b'D') => Some(0x8a),                               // l2d
+                (b'F', b'I' | b'Z' | b'B' | b'C' | b'S') => Some(0x8b),    // f2i
+                (b'F', b'J') => Some(0x8c),                               // f2l
+                (b'F', b'D') => Some(0x8d),                               // f2d
+                (b'D', b'I' | b'Z' | b'B' | b'C' | b'S') => Some(0x8e),    // d2i
+                (b'D', b'J') => Some(0x8f),                               // d2l
+                (b'D', b'F') => Some(0x90),                               // d2f
+                _ => {
+                    return Err(Error::other(format!(
+                        "Unsupported primitive conversion {} -> {}",
+                        *a as char, *b as char
+                    )));
+                }
+            };
+            if let Some(op) = opcode {
+                code.push(op);
             }
         }
     }

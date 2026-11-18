@@ -42,7 +42,6 @@ use crate::share::c1::asm::codeBuffer::CodeBuffer;
 use crate::share::c1::c1_LIR::{RuntimeStub, StubSite};
 use crate::share::classfile::classLoader::ClassLoader;
 use crate::share::classfile::systemDictionary::SystemDictionary;
-use crate::share::code::codeCache::CodeCache;
 use crate::share::interpreter::bytecodeInterpreter::{self, Value};
 use crate::share::interpreter::linkResolver::LinkResolver;
 use crate::share::memory::heap;
@@ -176,9 +175,14 @@ struct FrameRoots {
 }
 
 impl FrameRoots {
-    fn push(&mut self, value: Value<'static>) {
-        self.loader.gc_extra_roots.borrow_mut().push(value);
-        self.values.push(value);
+    fn register(loader: &Arc<ClassLoader<'static>>, values: Vec<Value<'static>>) -> Option<Self> {
+        if values.is_empty() {
+            return None;
+        }
+        let mut roots = loader.gc_extra_roots.borrow_mut();
+        let start = roots.len();
+        roots.extend_from_slice(&values);
+        Some(Self { loader: Arc::clone(loader), start, values })
     }
 }
 
@@ -212,11 +216,7 @@ fn frame_roots(loader: &Arc<ClassLoader<'static>>, frame: u64) -> Option<FrameRo
     let objects = loader.borrow_objects().len();
     let arrays = loader.arrays.borrow().len();
     let obj_arrays = loader.obj_arrays.borrow().len();
-    let mut roots = FrameRoots {
-        loader: Arc::clone(loader),
-        start: loader.gc_extra_roots.borrow().len(),
-        values: Vec::new(),
-    };
+    let mut roots = Vec::new();
     for i in 0..qwords {
         let addr = frame.wrapping_sub(8 + (i as u64) * 8);
         let raw = unsafe { (addr as *const u64).read_unaligned() };
@@ -239,10 +239,7 @@ fn frame_roots(loader: &Arc<ClassLoader<'static>>, frame: u64) -> Option<FrameRo
             roots.push(decode_ref(raw));
         }
     }
-    if roots.values.is_empty() {
-        return None;
-    }
-    Some(roots)
+    FrameRoots::register(loader, roots)
 }
 
 // ---------------------------------------------------------------------------
@@ -387,7 +384,16 @@ fn initialize_or_fail(
 /// Falls back to deoptimization when the throwable cannot be
 /// materialized (e.g. bootstrap without a loader) so the interpreter
 /// raises the failure itself.
+#[track_caller]
 fn throw_java(class_name: &'static [u8], message: Option<&str>) -> u64 {
+    static traceExceptions: OnceLock<bool> = OnceLock::new();
+    if *traceExceptions.get_or_init(|| std::env::var_os("JVM25_TRACE_EXC").is_some()) {
+        eprintln!(
+            "[jit-exception] {} at {}",
+            String::from_utf8_lossy(class_name),
+            std::panic::Location::caller()
+        );
+    }
     let Some(loader) = threading::jvm_loader() else {
         runtime::set_pending_deopt();
         return 0;
@@ -1126,25 +1132,11 @@ fn method_access_flags<'a>(
 }
 
 /// Converts an interpreter `Value` produced by a callee back into the
-/// raw word the JIT dst slot expects; float/double results additionally
-/// publish their bit pattern through the xmm channel.
+/// raw word the JIT destination slot expects.
 fn call_result_raw(loader: &ClassLoader<'static>, value: &Value<'static>) -> u64 {
-    match value {
-        Value::Float(f) => {
-            runtime::set_stub_xmm_result(*f as u64);
-            f.to_bits() as u64
-        }
-        Value::Double(d) => {
-            runtime::set_stub_xmm_result(d.to_bits());
-            d.to_bits()
-        }
-        _ => match heap_value_to_raw(loader, value) {
-            Some(raw) => raw,
-            None => {
-                runtime::set_pending_deopt();
-                0
-            }
-        },
+    match heap_value_to_raw(loader, value) {
+        Some(raw) => raw,
+        None => deopt(),
     }
 }
 
@@ -1156,9 +1148,7 @@ fn call_result_raw(loader: &ClassLoader<'static>, value: &Value<'static>) -> u64
 fn receiver_klass(
     loader: &Arc<ClassLoader<'static>>,
     receiver: Value<'static>,
-    frame: u64,
 ) -> Result<Arc<InstanceKlass<'static>>, u64> {
-    let _roots = frame_roots(loader, frame);
     match receiver {
         Value::Null => Err(throw_java(b"java/lang/NullPointerException", None)),
         Value::Object(handle) => {
@@ -1225,7 +1215,7 @@ unsafe extern "C" fn h_call_method(
     let Some(sig) = runtime::parse_signature(descriptor, is_static) else {
         return deopt();
     };
-    let expected = sig.params.len() + usize::from(sig.is_instance);
+    let expected = sig.params().len() + usize::from(sig.is_instance);
     if expected != n || (n > 0 && args_ptr == 0) {
         if std::env::var_os("JVM25_JIT_DEBUG").is_some() {
             eprintln!("[callmethod] arity mismatch n={n} expected={expected} args_ptr={args_ptr:#x}");
@@ -1240,11 +1230,7 @@ unsafe extern "C" fn h_call_method(
     // Flatten raw words into interpreter Values; reference arguments
     // are also pinned as GC roots for the duration of the call.
     let mut values: Vec<Value<'static>> = Vec::with_capacity(n);
-    let mut arg_roots = FrameRoots {
-        loader: Arc::clone(&loader),
-        start: loader.gc_extra_roots.borrow().len(),
-        values: Vec::new(),
-    };
+    let mut arg_roots = Vec::new();
     let mut index = 0usize;
     if sig.is_instance {
         let receiver = decode_ref(raw_args[0]);
@@ -1252,7 +1238,7 @@ unsafe extern "C" fn h_call_method(
         values.push(receiver);
         index = 1;
     }
-    for kind in &sig.params {
+    for kind in sig.params() {
         let raw = raw_args[index];
         index += 1;
         let value = match kind {
@@ -1268,9 +1254,10 @@ unsafe extern "C" fn h_call_method(
         }
         values.push(value);
     }
+    let _arg_roots = FrameRoots::register(&loader, arg_roots);
     let callerDepth = runtime::current_depth();
     let dispatched = (|| {
-        use crate::share::prims::{jdkIntrinsics, nativeLookup, stringNatives};
+        use crate::share::prims::{classNatives, jdkIntrinsics, nativeLookup, stringNatives};
 
         if is_static {
             if let Some(value) = jdkIntrinsics::invoke(&loader, owner, name, descriptor, &values)? {
@@ -1278,6 +1265,11 @@ unsafe extern "C" fn h_call_method(
             }
             nativeLookup::invokeStatic(&loader, owner, name, descriptor, &values, &mut io::sink(), callerDepth)
         } else {
+            if op == 0xb6 && owner == b"java/lang/Class"
+                && let Some(value) = classNatives::invoke(&loader, name, descriptor, &values)?
+            {
+                return Ok(Some(Some(value)));
+            }
             if matches!(op, 0xb6 | 0xb9)
                 && let Some(value) = stringNatives::invokeVirtual(&loader, owner, name, descriptor, &values)?
             {
@@ -1302,7 +1294,7 @@ unsafe extern "C" fn h_call_method(
     // resolve it up front so its NPE/ICCE outcomes propagate directly.
     let object_klass = if matches!(op, 0xb6 | 0xb9) {
         let receiver = values.first().copied().unwrap_or(Value::Null);
-        match receiver_klass(&loader, receiver, frame) {
+        match receiver_klass(&loader, receiver) {
             Ok(klass) => Some(klass),
             Err(raw) => return raw,
         }
@@ -1369,22 +1361,6 @@ unsafe extern "C" fn h_call_method(
         };
     }
     let flags = method_access_flags(&target, name, descriptor, is_static);
-    let addr = compiled_entry(&target.class.name, name, descriptor);
-    if addr != 0 && flags & (0x0100 | 0x0400 | 0x0020) == 0 {
-        match runtime::try_invoke(addr, descriptor, is_static, &values, depth) {
-            Some(runtime::CompiledResult::Value(value)) => {
-                return match value {
-                    Some(v) => call_result_raw(&loader, &v),
-                    None => 0,
-                };
-            }
-            Some(runtime::CompiledResult::Thrown(handle)) => {
-                runtime::set_pending_throw(handle);
-                return 0;
-            }
-            Some(runtime::CompiledResult::Deoptimize) | None => {}
-        }
-    }
     match bytecodeInterpreter::execute_labeled(
         &loader,
         &target,
@@ -1413,31 +1389,9 @@ unsafe extern "C" fn h_call_method(
     }
 }
 
-/// Entry point of the installed, in-use nmethod for
-/// `holder.name+descriptor`, or 0.
-fn compiled_entry(holder: &[u8], name: &[u8], descriptor: &[u8]) -> usize {
-    let holder = String::from_utf8_lossy(holder);
-    let name = String::from_utf8_lossy(name);
-    let descriptor = String::from_utf8_lossy(descriptor);
-    let cache = CodeCache::global();
-    let Some(nm) = cache.find_nmethod(holder.as_ref(), name.as_ref(), descriptor.as_ref()) else {
-        return 0;
-    };
-    if nm.is_in_use() && !nm.is_osr_method() && nm.entry_point() != 0 {
-        nm.entry_point()
-    } else {
-        0
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Stub escape / unwind.
 // ---------------------------------------------------------------------------
-
-/// Reads and clears the xmm result channel for the trampoline.
-extern "C" fn stub_xmm_result() -> u64 {
-    runtime::take_stub_xmm_result()
-}
 
 /// Unwind entry called by every trampoline when a pending outcome was
 /// recorded.  `frame` is the rbp of the JIT frame that called the
@@ -1523,10 +1477,7 @@ fn stub_entries() -> &'static [StubEntry] {
 ///   mov rax, <handler>
 ///   call rax                 ; -> extern "C" handler
 ///                            ;    (rcx..r9 = operands, stack arg = rbp)
-///   mov r11, rax             ; save stub result
-///   mov rax, <xmm_result>
-///   call rax                 ; -> xmm bits for float/double (0 else)
-///   movq xmm0, rax           ; JIT reads float results from xmm0
+///   mov [rsp+0x20], rax      ; save stub result
 ///   mov rax, <flow_check>
 ///   call rax                 ; -> pending outcome? 1 : 0
 ///   test eax, eax
@@ -1536,7 +1487,8 @@ fn stub_entries() -> &'static [StubEntry] {
 ///   mov rax, <jit_unwind>
 ///   jmp rax                  ; never returns
 /// ret_path:
-///   mov rax, r11
+///   mov rax, [rsp+0x20]
+///   movq xmm0, rax
 ///   add rsp, 0x28
 ///   ret
 /// ```
@@ -1549,7 +1501,6 @@ fn stub_entries() -> &'static [StubEntry] {
 /// into TLS by Rust.
 fn trampoline_bytes(handler_addr: usize) -> Vec<u8> {
     let check_addr = stub_flow_check as *const () as usize;
-    let xmm_addr = stub_xmm_result as *const () as usize;
     let unwind_addr = jit_unwind as *const () as usize;
     let mut b = Vec::with_capacity(112);
     b.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp,0x28
@@ -1559,11 +1510,7 @@ fn trampoline_bytes(handler_addr: usize) -> Vec<u8> {
     b.extend_from_slice(&[0x48, 0xB8]); // mov rax, imm64
     b.extend_from_slice(&(handler_addr as u64).to_le_bytes());
     b.extend_from_slice(&[0xFF, 0xD0]); // call rax
-    b.extend_from_slice(&[0x49, 0x89, 0xC3]); // mov r11,rax
-    b.extend_from_slice(&[0x48, 0xB8]); // mov rax, imm64
-    b.extend_from_slice(&(xmm_addr as u64).to_le_bytes());
-    b.extend_from_slice(&[0xFF, 0xD0]); // call rax
-    b.extend_from_slice(&[0x66, 0x48, 0x0F, 0x6E, 0xC0]); // movq xmm0,rax
+    b.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x20]);
     b.extend_from_slice(&[0x48, 0xB8]); // mov rax, imm64
     b.extend_from_slice(&(check_addr as u64).to_le_bytes());
     b.extend_from_slice(&[0xFF, 0xD0]); // call rax
@@ -1580,7 +1527,8 @@ fn trampoline_bytes(handler_addr: usize) -> Vec<u8> {
     let ret_pos = b.len();
     let rel = (ret_pos as i32) - ((jz_pos + 6) as i32);
     b[jz_pos + 2..jz_pos + 6].copy_from_slice(&rel.to_le_bytes());
-    b.extend_from_slice(&[0x4C, 0x89, 0xD8]); // mov rax,r11
+    b.extend_from_slice(&[0x48, 0x8B, 0x44, 0x24, 0x20]);
+    b.extend_from_slice(&[0x66, 0x48, 0x0F, 0x6E, 0xC0]);
     b.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]); // add rsp,0x28
     b.push(0xC3); // ret
     b

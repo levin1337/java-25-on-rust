@@ -41,11 +41,6 @@ thread_local! {
     /// Number of 8-byte slots below the JIT frame's `rbp` that may hold
     /// references; runtime stubs use it for conservative GC rooting.
     static FRAME_QWORDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    /// Floating-point result bits produced by a runtime stub (the stub
-    /// ABI returns integers in rax only); trampolines move this into
-    /// xmm0 on the success path so `float`/`double` stub results and
-    /// interpreted callee returns reach JIT code.
-    static XMM_RESULT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Result channel between JIT-called stubs and `try_invoke`.
@@ -90,17 +85,6 @@ pub(crate) fn set_frame_qwords(qwords: usize) {
 
 pub(crate) fn current_frame_qwords() -> usize {
     FRAME_QWORDS.with(|c| c.get())
-}
-
-pub(crate) fn set_stub_xmm_result(bits: u64) {
-    XMM_RESULT.with(|c| c.set(bits));
-}
-
-/// Reads and clears the floating-point stub result channel.  Called by
-/// every trampoline right after the handler returns, before the
-/// pending-outcome check.
-pub(crate) fn take_stub_xmm_result() -> u64 {
-    XMM_RESULT.with(|c| c.replace(0))
 }
 
 /// Outcome of a compiled-code invocation.
@@ -191,11 +175,18 @@ pub fn ref_is_null(raw: u64) -> bool {
 
 pub struct Signature {
     /// Parameter kinds in declaration order (`this` excluded).
-    pub params: Vec<SlotKind>,
+    params: [SlotKind; MAX_PARAMS],
+    paramCount: usize,
     /// Whether the method is an instance method (`this` occupies
     /// argument register 0 as an opaque handle).
     pub is_instance: bool,
     pub ret: SlotKind,
+}
+
+impl Signature {
+    pub fn params(&self) -> &[SlotKind] {
+        &self.params[..self.paramCount]
+    }
 }
 
 /// Parses `(params)return` and rejects anything outside the
@@ -204,7 +195,8 @@ pub fn parse_signature(descriptor: &[u8], is_static: bool) -> Option<Signature> 
     if descriptor.first() != Some(&b'(') {
         return None;
     }
-    let mut params = Vec::new();
+    let mut params = [SlotKind::Void; MAX_PARAMS];
+    let mut paramCount = 0;
     let mut i = 1usize;
     while i < descriptor.len() && descriptor[i] != b')' {
         let kind = match descriptor[i] {
@@ -249,11 +241,12 @@ pub fn parse_signature(descriptor: &[u8], is_static: bool) -> Option<Signature> 
             }
             _ => return None,
         };
-        params.push(kind);
-        i += 1;
-        if params.len() > MAX_PARAMS {
+        if paramCount == MAX_PARAMS {
             return None;
         }
+        params[paramCount] = kind;
+        paramCount += 1;
+        i += 1;
     }
     if i >= descriptor.len() || descriptor[i] != b')' {
         return None;
@@ -273,6 +266,7 @@ pub fn parse_signature(descriptor: &[u8], is_static: bool) -> Option<Signature> 
     };
     Some(Signature {
         params,
+        paramCount,
         is_instance: !is_static,
         ret,
     })
@@ -331,10 +325,10 @@ unsafe fn invoke_raw(args: &CallArgs) -> (u64, u64) {
     let mut xmm_result: u64;
     unsafe {
         core::arch::asm!(
+            "mov r10, {args}",
             "push r12",
             "mov r12, rsp",
             "and rsp, -16",
-            "mov r10, {args}",
             // frame = align16(32 + nstack*8): shadow space + stack args
             "mov rcx, [r10+72]",
             "lea rax, [rcx*8+47]",
@@ -454,7 +448,7 @@ fn try_invoke_inner<'a>(
         return None;
     }
     let sig = parse_signature(descriptor, is_static)?;
-    let expected = sig.params.len() + usize::from(sig.is_instance);
+    let expected = sig.params().len() + usize::from(sig.is_instance);
     if expected != arguments.len() {
         return None;
     }
@@ -476,7 +470,7 @@ fn try_invoke_inner<'a>(
         }
         arg_index += 1;
     }
-    for (kind, value) in sig.params.iter().zip(arg_iter) {
+    for (kind, value) in sig.params().iter().zip(arg_iter) {
         // Win64 unified slot: floats occupy xmm[i], integers gp[i];
         // slots >= 4 spill to the shared stack argument area.
         let is_float = matches!(kind, SlotKind::Float32 | SlotKind::Float64);
@@ -992,6 +986,18 @@ mod tests {
     }
 
     #[test]
+    fn dup2_keeps_materialized_array_and_index() {
+        let _loader = test_loader();
+        let addr = compile_and_publish(
+            &[0x04, 0xbc, 0x0b, 0x03, 0x5c, 0x2f, 0x50, 0xb1],
+            0,
+            Vec::new(),
+        );
+        let result = try_invoke(addr, b"()V", true, &[], 0).unwrap();
+        assert!(matches!(result, CompiledResult::Value(None)), "{result:?}");
+    }
+
+    #[test]
     fn object_array_store_load_instanceof() {
         let loader = test_loader();
         let klass = register_klass(&loader, b"TA", &[]);
@@ -1301,6 +1307,29 @@ mod tests {
         let args = [Value::Int(19), Value::Int(23)];
         let result = try_invoke(caller, b"(II)I", true, &args, 0).unwrap();
         assert_eq!(int_result(result), 42);
+    }
+
+    #[test]
+    fn jit_calls_interpreted_float_callee_via_stub() {
+        let loader = test_loader();
+        register_method_klass(
+            &loader,
+            b"FloatCallee",
+            b"value",
+            b"()F",
+            0x0009,
+            &[0x0d, 0xae],
+            0,
+        );
+        let mut metadata = MethodMetadata::default();
+        metadata.call_sites.insert(
+            1,
+            call_site(0xb8, vec![], ValueKind::Float32, true, None),
+        );
+        metadata.sites.insert(1, site("FloatCallee", "value", "()F"));
+        let caller = compile_meta(&[0xb8, 0x00, 0x01, 0xae], 0, Vec::new(), metadata);
+        let result = try_invoke(caller, b"()F", true, &[], 0).unwrap();
+        assert!(matches!(result, CompiledResult::Value(Some(Value::Float(2.0)))));
     }
 
     #[test]

@@ -108,20 +108,40 @@ pub fn frame_qwords_for(addr: usize) -> usize {
         .unwrap_or(0)
 }
 
-/// Parses the standard prologue (`push rbp; mov rbp,rsp; sub rsp,imm`)
-/// emitted by `X86Emitter::emit_prologue` to recover the frame size.
+/// Parses the standard prologue (`push rbp; mov rbp,rsp`, then any
+/// callee-saved `push`es, then `sub rsp,imm`) emitted by
+/// `X86Emitter::emit_prologue` to recover the total frame size in
+/// qwords.  The C2 emitter pushes saved registers between `mov rbp,rsp`
+/// and `sub rsp`, so the scan must skip push encodings (`[REX] 50+r`)
+/// instead of expecting `sub` immediately at offset 4.
 fn prologue_frame_qwords(code: &[u8]) -> usize {
-    if code.len() >= 4 && code[0] == 0x55 && code[1] == 0x48 && code[2] == 0x89 && code[3] == 0xe5 {
-        if code.len() >= 11 && code[4] == 0x48 && code[5] == 0x81 && code[6] == 0xec {
-            let size = i32::from_le_bytes(code[7..11].try_into().unwrap()) as usize;
-            return size / 8;
-        }
-        if code.len() >= 8 && code[4] == 0x48 && code[5] == 0x83 && code[6] == 0xec {
-            return (code[7] as usize) / 8;
-        }
+    if code.len() < 4 || code[0] != 0x55 || code[1] != 0x48 || code[2] != 0x89 || code[3] != 0xe5 {
         return 0;
     }
-    0
+    let mut i = 4;
+    let mut pushes = 0usize;
+    loop {
+        // Skip an optional REX prefix (0x40-0x4f) — emit_push only emits
+        // one for r8-r15, but accept any here.
+        let mut j = i;
+        if j < code.len() && (0x40..=0x4f).contains(&code[j]) {
+            j += 1;
+        }
+        if j < code.len() && (0x50..=0x57).contains(&code[j]) {
+            pushes += 1;
+            i = j + 1;
+            continue;
+        }
+        break;
+    }
+    if i + 7 <= code.len() && code[i] == 0x48 && code[i + 1] == 0x81 && code[i + 2] == 0xec {
+        let size = i32::from_le_bytes(code[i + 3..i + 7].try_into().unwrap()) as usize;
+        return pushes + size / 8;
+    }
+    if i + 4 <= code.len() && code[i] == 0x48 && code[i + 1] == 0x83 && code[i + 2] == 0xec {
+        return pushes + (code[i + 3] as usize) / 8;
+    }
+    pushes
 }
 
 /// Publishes `code` at offset 0 of a fresh RWX region reserved to at
@@ -1591,4 +1611,39 @@ pub fn stub_map() -> BTreeMap<RuntimeStub, u64> {
             map
         })
         .clone()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::prologue_frame_qwords;
+
+    #[test]
+    fn prologue_frame_qwords_c1_style() {
+        // push rbp; mov rbp,rsp; sub rsp,0x80  ->  16 qwords
+        let code = [0x55, 0x48, 0x89, 0xe5, 0x48, 0x81, 0xec, 0x80, 0, 0, 0];
+        assert_eq!(prologue_frame_qwords(&code), 16);
+    }
+
+    #[test]
+    fn prologue_frame_qwords_c2_saved_regs() {
+        // push rbp; mov rbp,rsp; push rbx; push r12; sub rsp,0x40
+        // -> 2 saved + 8 frame qwords = 10
+        let code = [
+            0x55, 0x48, 0x89, 0xe5, 0x53, 0x41, 0x54, 0x48, 0x81, 0xec, 0x40, 0, 0, 0,
+        ];
+        assert_eq!(prologue_frame_qwords(&code), 10);
+    }
+
+    #[test]
+    fn prologue_frame_qwords_imm8_and_no_frame() {
+        // push rbp; mov rbp,rsp; push rbp? no — push rax; sub rsp,0x18
+        // -> 1 saved + 3 frame qwords = 4
+        let code = [0x55, 0x48, 0x89, 0xe5, 0x50, 0x48, 0x83, 0xec, 0x18];
+        assert_eq!(prologue_frame_qwords(&code), 4);
+        // prologue only, no frame body -> just the pushes
+        let code = [0x55, 0x48, 0x89, 0xe5, 0x53, 0x5d, 0xc3];
+        assert_eq!(prologue_frame_qwords(&code), 1);
+        // not a prologue at all
+        assert_eq!(prologue_frame_qwords(&[0x90, 0x90]), 0);
+    }
 }

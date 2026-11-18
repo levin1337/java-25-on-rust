@@ -960,4 +960,193 @@ mod tests {
                 .is_err()
         );
     }
+
+    // ---- end-to-end: emit C2 code, publish it and execute --------------
+    //
+    // These tests run the real pipeline (graph -> optimize -> schedule ->
+    // regalloc -> x86-64 emission) and then execute the resulting bytes
+    // through the same `try_invoke` trampoline C1 nmethods use, with the
+    // real published runtime-stub table.
+
+    use crate::share::interpreter::bytecodeInterpreter::Value;
+    use crate::share::jitruntime::{CompiledResult, publish_executable, stub_map as jit_stub_map, try_invoke};
+    use crate::share::opto::codegen::ParamKind;
+    use crate::share::opto::codegen::ParamSlot;
+
+    fn iparam(slot: usize) -> ParamSlot {
+        ParamSlot {
+            local_slot: slot,
+            kind: ParamKind::I32,
+        }
+    }
+
+    fn lparam(slot: usize) -> ParamSlot {
+        ParamSlot {
+            local_slot: slot,
+            kind: ParamKind::I64,
+        }
+    }
+
+    fn run_c2(
+        code: &'static [u8],
+        param_slots: usize,
+        params: Vec<ParamSlot>,
+        descriptor: &'static [u8],
+        args: &[Value<'static>],
+    ) -> Option<CompiledResult<'static>> {
+        let options = BackendOptions {
+            params,
+            stubs: jit_stub_map(),
+            ..BackendOptions::default()
+        };
+        let mut c = Compile::compile(&method(code, param_slots), &BuilderContext::empty());
+        let emitted = c
+            .backend(&method(code, param_slots), &BuilderContext::empty(), &options)
+            .expect("c2 backend should emit");
+        let addr = publish_executable(&emitted.code, emitted.code.len())
+            .expect("publish executable");
+        try_invoke(addr, descriptor, true, args, 0)
+    }
+
+    #[test]
+    fn e2e_iconst_ireturn() {
+        // iconst_5 ; ireturn -> ()I
+        let result = run_c2(&[0x08, 0xac], 0, vec![], b"()I", &[]).unwrap();
+        match result {
+            CompiledResult::Value(Some(Value::Int(v))) => assert_eq!(v, 5),
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn e2e_iadd_params() {
+        // iload_0 ; iload_1 ; iadd ; ireturn -> (II)I
+        let result = run_c2(
+            &[0x1a, 0x1b, 0x60, 0xac],
+            2,
+            vec![iparam(0), iparam(1)],
+            b"(II)I",
+            &[Value::Int(20), Value::Int(22)],
+        )
+        .unwrap();
+        match result {
+            CompiledResult::Value(Some(Value::Int(v))) => assert_eq!(v, 42),
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn e2e_ladd_params() {
+        // lload_0 ; lload_2 ; ladd ; lreturn -> (JJ)J
+        let result = run_c2(
+            &[0x1e, 0x20, 0x61, 0xad],
+            4,
+            vec![lparam(0), lparam(2)],
+            b"(JJ)J",
+            &[Value::Long(1_000_000_007), Value::Long(2_000_000_003)],
+        )
+        .unwrap();
+        match result {
+            CompiledResult::Value(Some(Value::Long(v))) => {
+                assert_eq!(v, 3_000_000_010)
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn e2e_branch_selects() {
+        // iload_0 ; ifeq ->iconst_2 ; iconst_1 ; ireturn ; iconst_2 ; ireturn
+        // -> (I)I  returns 1 when arg != 0, 2 when arg == 0.
+        // Branch offsets are relative to the opcode bci: ifeq sits at
+        // bci 1 and iconst_2 at bci 6, so the offset is +5.
+        let code: &[u8] = &[
+            0x1a, // 0: iload_0
+            0x99, 0x00, 0x05, // 1: ifeq -> bci 6
+            0x04, // 4: iconst_1
+            0xac, // 5: ireturn
+            0x05, // 6: iconst_2
+            0xac, // 7: ireturn
+        ];
+        let r1 = run_c2(code, 1, vec![iparam(0)], b"(I)I", &[Value::Int(7)]).unwrap();
+        match r1 {
+            CompiledResult::Value(Some(Value::Int(v))) => assert_eq!(v, 1),
+            other => panic!("unexpected result: {:?}", other),
+        }
+        let r0 = run_c2(code, 1, vec![iparam(0)], b"(I)I", &[Value::Int(0)]).unwrap();
+        match r0 {
+            CompiledResult::Value(Some(Value::Int(v))) => assert_eq!(v, 2),
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn e2e_idiv_via_real_stub() {
+        // iload_0 ; iload_1 ; idiv ; ireturn -> (II)I  84/2 = 42
+        let result = run_c2(
+            &[0x1a, 0x1b, 0x6c, 0xac],
+            2,
+            vec![iparam(0), iparam(1)],
+            b"(II)I",
+            &[Value::Int(84), Value::Int(2)],
+        )
+        .unwrap();
+        match result {
+            CompiledResult::Value(Some(Value::Int(v))) => assert_eq!(v, 42),
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn e2e_float_return_channel() {
+        // dconst_1 ; dreturn -> ()D   exercises the xmm0 result path
+        let result = run_c2(&[0x0f, 0xaf], 0, vec![], b"()D", &[]).unwrap();
+        match result {
+            CompiledResult::Value(Some(Value::Double(v))) => assert_eq!(v, 1.0),
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn e2e_frem_via_real_stub() {
+        // fconst_1 ; fconst_2 ; frem ; freturn -> ()F  1.0 % 0.5 = 0.0? no:
+        // fconst_1=1.0, fconst_2=2.0 -> frem = 1.0
+        let result = run_c2(&[0x0c, 0x0d, 0x72, 0xae], 0, vec![], b"()F", &[]).unwrap();
+        match result {
+            CompiledResult::Value(Some(Value::Float(v))) => assert_eq!(v, 1.0),
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn e2e_drem_via_real_stub() {
+        // dconst_1 ; dconst_0 ; drem ; dreturn -> ()D  1.0 % 0.0 = NaN
+        // (x86 has no remainder instruction; the stub's fmod path must
+        // produce the Java NaN result, not an SSE artifact)
+        let result = run_c2(&[0x0f, 0x0e, 0x73, 0xad], 0, vec![], b"()D", &[]).unwrap();
+        match result {
+            CompiledResult::Value(Some(Value::Double(v))) => assert!(v.is_nan()),
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn e2e_f2i_via_real_stub() {
+        // fconst_1 ; f2i ; ireturn -> ()I  trunc(1.0) = 1
+        let result = run_c2(&[0x0c, 0x8b, 0xac], 0, vec![], b"()I", &[]).unwrap();
+        match result {
+            CompiledResult::Value(Some(Value::Int(v))) => assert_eq!(v, 1),
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn e2e_d2l_via_real_stub() {
+        // dconst_1 ; d2l ; lreturn -> ()J  1L
+        let result = run_c2(&[0x0f, 0x8f, 0xad], 0, vec![], b"()J", &[]).unwrap();
+        match result {
+            CompiledResult::Value(Some(Value::Long(v))) => assert_eq!(v, 1),
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
 }

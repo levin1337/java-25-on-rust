@@ -2004,4 +2004,92 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn e2e_try_catch_shared_handler_phi() {
+        // Two adjacent protected ranges feed ONE catch-all handler, so the
+        // handler entry is a Region merge of two IfException edges and the
+        // exception object on the stack becomes a Phi copied on each edge.
+        //
+        //   0: bipush 3 ; 2: newarray int ; 4: astore_2
+        //   5: aload_2 ; 6: iload_0 ; 7: iaload      <- try1 [5,8)
+        //   8: pop
+        //   9: aload_2 ; 10: iload_1 ; 11: iaload    <- try2 [9,12)
+        //  12: pop ; 13: bipush 3 ; 15: ireturn
+        //  16: astore_3                               <- handler_pc = 16
+        //  17: bipush 7 ; 19: ireturn
+        use super::super::builder::ExceptionHandler;
+        let _ = test_loader();
+        let loader = crate::share::runtime::threading::jvm_loader().unwrap();
+        register_klass(&loader, b"java/lang/ArrayIndexOutOfBoundsException", &[]);
+        let code: &[u8] = &[
+            0x10, 0x03, // 0: bipush 3
+            0xbc, 0x0a, // 2: newarray int
+            0x4d, // 4: astore_2
+            0x2c, // 5: aload_2
+            0x1a, // 6: iload_0
+            0x2e, // 7: iaload
+            0x57, // 8: pop
+            0x2c, // 9: aload_2
+            0x1b, // 10: iload_1
+            0x2e, // 11: iaload
+            0x57, // 12: pop
+            0x10, 0x03, // 13: bipush 3
+            0xac, // 15: ireturn
+            0x4e, // 16: astore_3 (handler)
+            0x10, 0x07, // 17: bipush 7
+            0xac, // 19: ireturn
+        ];
+        let handlers = [
+            ExceptionHandler {
+                start_pc: 5,
+                end_pc: 8,
+                handler_pc: 16,
+                catch_type: 0,
+            },
+            ExceptionHandler {
+                start_pc: 9,
+                end_pc: 12,
+                handler_pc: 16,
+                catch_type: 0,
+            },
+        ];
+        let m = MethodCode {
+            name: "test",
+            max_locals: 4,
+            max_stack: 8,
+            param_slots: 2,
+            code,
+            handlers: &handlers,
+        };
+        let options = BackendOptions {
+            params: vec![iparam(0), iparam(1)],
+            stubs: jit_stub_map(),
+            stubs_no_unwind: jit_stub_map_no_unwind(),
+            ..BackendOptions::default()
+        };
+        let mut c = Compile::compile(&m, &BuilderContext::empty());
+        c.optimize();
+        let emitted = c
+            .backend(&m, &BuilderContext::empty(), &options)
+            .expect("c2 backend should emit");
+        let addr = publish_executable(&emitted.code, emitted.code.len())
+            .expect("publish executable");
+        for (x, y, want) in [(1, 1, 3), (9, 1, 7), (1, 9, 7), (9, 9, 7)] {
+            let result = try_invoke(
+                addr,
+                b"(II)I",
+                true,
+                &[Value::Int(x), Value::Int(y)],
+                0,
+            )
+            .unwrap();
+            match result {
+                CompiledResult::Value(Some(Value::Int(v))) => {
+                    assert_eq!(v, want, "x={x} y={y}")
+                }
+                other => panic!("unexpected result for {x},{y}: {:?}", other),
+            }
+        }
+    }
+
 }

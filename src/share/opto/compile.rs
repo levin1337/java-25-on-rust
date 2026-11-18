@@ -1802,4 +1802,63 @@ mod tests {
             other => panic!("unexpected result: {:?}", other),
         }
     }
+
+    #[test]
+    fn e2e_tableswitch() {
+        // iload_0 ; tableswitch 1..3 -> iconst_N ; ireturn ; default iconst_0
+        // bci 1: opcode, bci 2-3 pad, default at bci 4 (aligned).
+        // Offsets are relative to the tableswitch opcode bci (1).
+        let code: &[u8] = &[
+            0x1a, // 0: iload_0
+            0xaa, 0x00, 0x00, // 1: tableswitch + 2 pad bytes
+            0x00, 0x00, 0x00, 0x1b, // 4: default -> bci 28
+            0x00, 0x00, 0x00, 0x01, // 8: low = 1
+            0x00, 0x00, 0x00, 0x03, // 12: high = 3
+            0x00, 0x00, 0x00, 0x1d, // 16: case 1 -> bci 30
+            0x00, 0x00, 0x00, 0x1f, // 20: case 2 -> bci 32
+            0x00, 0x00, 0x00, 0x21, // 24: case 3 -> bci 34
+            0x03, 0xac, // 28: iconst_0 ; ireturn (default)
+            0x04, 0xac, // 30: iconst_1 ; ireturn
+            0x05, 0xac, // 32: iconst_2 ; ireturn
+            0x06, 0xac, // 34: iconst_3 ; ireturn
+        ];
+        for (arg, want) in [(0, 0), (1, 1), (2, 2), (3, 3), (7, 0)] {
+            let result = run_c2(code, 1, vec![iparam(0)], b"(I)I", &[Value::Int(arg)])
+                .unwrap();
+            match result {
+                CompiledResult::Value(Some(Value::Int(v))) => {
+                    assert_eq!(v, want, "arg={arg}")
+                }
+                other => panic!("unexpected result for {arg}: {:?}", other),
+            }
+        }
+    }
+
+    #[test]
+    fn e2e_lookupswitch() {
+        // iload_0 ; lookupswitch {10->1, 20->2} default->0
+        let code: &[u8] = &[
+            0x1a, // 0: iload_0
+            0xab, 0x00, 0x00, // 1: lookupswitch + 2 pad bytes
+            0x00, 0x00, 0x00, 0x1b, // 4: default -> bci 28
+            0x00, 0x00, 0x00, 0x02, // 8: npairs = 2
+            0x00, 0x00, 0x00, 0x0a, // 12: match 10
+            0x00, 0x00, 0x00, 0x1d, // 16: -> bci 30
+            0x00, 0x00, 0x00, 0x14, // 20: match 20
+            0x00, 0x00, 0x00, 0x1f, // 24: -> bci 32
+            0x03, 0xac, // 28: iconst_0 ; ireturn (default)
+            0x04, 0xac, // 30: iconst_1 ; ireturn
+            0x05, 0xac, // 32: iconst_2 ; ireturn
+        ];
+        for (arg, want) in [(0, 0), (10, 1), (20, 2), (30, 0)] {
+            let result = run_c2(code, 1, vec![iparam(0)], b"(I)I", &[Value::Int(arg)])
+                .unwrap();
+            match result {
+                CompiledResult::Value(Some(Value::Int(v))) => {
+                    assert_eq!(v, want, "arg={arg}")
+                }
+                other => panic!("unexpected result for {arg}: {:?}", other),
+            }
+        }
+    }
 }

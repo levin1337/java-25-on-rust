@@ -242,12 +242,20 @@ impl<'a> X86Emitter<'a> {
 
     fn emit_param_moves(&mut self) -> Result<(), BackendError> {
         for (i, p) in self.options.params.iter().enumerate() {
-            if p.kind.is_xmm() {
-                return Err(BackendError::Unsupported(
-                    "floating-point parameters are outside the executable subset".into(),
-                ));
-            }
             let disp = self.slot_disp(p.local_slot);
+            if p.kind.is_xmm() {
+                // Win64 unified slots: float/double args arrive in xmm[i].
+                if i >= 4 {
+                    return Err(BackendError::Unsupported(
+                        "floating-point stack parameter is outside the executable subset".into(),
+                    ));
+                }
+                let xmm = XMMRegister::from_encoding(i as u8)
+                    .ok_or_else(|| BackendError::Unsupported("bad xmm param".into()))?;
+                self.asm
+                    .sse_store_mem(xmm, Register::FP, disp, p.kind == ParamKind::F64)?;
+                continue;
+            }
             if i < ARG_REGS.len() {
                 self.asm.mov_mem_reg(
                     Some(Register::FP),
@@ -949,6 +957,13 @@ impl<'a> X86Emitter<'a> {
             return false;
         }
         let n = self.gvn.node(node);
+        if let Opcode::Parm(slot) = n.op {
+            return self
+                .param_kinds
+                .get(&(slot as usize))
+                .map(|k| k.is_xmm())
+                .unwrap_or(false);
+        }
         matches!(n.ty, Type::Float | Type::Double)
             || matches!(
                 n.op,
@@ -1396,6 +1411,19 @@ impl<'a> X86Emitter<'a> {
     fn emit_pure_xmm(&mut self, node: NodeId) -> Result<(), BackendError> {
         let op = self.gvn.node(node).op.clone();
         let inputs = self.gvn.node(node).inputs.clone();
+        if let Opcode::Parm(slot) = op {
+            let disp = self.slot_disp(slot as usize);
+            // Parm nodes carry Type::Bottom, so the parameter kind table
+            // is the authoritative source for the load width.
+            let double = self
+                .param_kinds
+                .get(&(slot as usize))
+                .map(|k| *k == ParamKind::F64)
+                .unwrap_or_else(|| self.is_double_node(node));
+            self.asm
+                .sse_load_mem(XMMRegister::XMM0, Register::FP, disp, double)?;
+            return Ok(());
+        }
         match op {
             Opcode::AddF
             | Opcode::SubF
@@ -1413,14 +1441,17 @@ impl<'a> X86Emitter<'a> {
                     _ => AluOp::Div,
                 };
                 let t = self.alloc_temp()?;
-                self.emit_xmm_to(inputs[0], XMMRegister::XMM0)?;
+                // xmm0 must end up holding inputs[0] (the left operand):
+                // sse_arith computes xmm0 = xmm0 OP xmm1, and sub/div are
+                // not commutative.
+                self.emit_xmm_to(inputs[1], XMMRegister::XMM0)?;
                 self.asm.sse_store_mem(
                     XMMRegister::XMM0,
                     Register::FP,
                     self.temp_disp(t),
                     double,
                 )?;
-                self.emit_xmm_to(inputs[1], XMMRegister::XMM0)?;
+                self.emit_xmm_to(inputs[0], XMMRegister::XMM0)?;
                 self.asm.sse_load_mem(
                     XMMRegister::XMM1,
                     Register::FP,
@@ -1489,10 +1520,12 @@ impl<'a> X86Emitter<'a> {
         greater_nan: bool,
     ) -> Result<(), BackendError> {
         let t = self.alloc_temp()?;
-        self.emit_xmm_to(a, XMMRegister::XMM0)?;
+        // ucomiss xmm0,xmm1 compares xmm0 against xmm1, so xmm0 must hold
+        // the left operand `a`.
+        self.emit_xmm_to(b, XMMRegister::XMM0)?;
         self.asm
             .sse_store_mem(XMMRegister::XMM0, Register::FP, self.temp_disp(t), double)?;
-        self.emit_xmm_to(b, XMMRegister::XMM0)?;
+        self.emit_xmm_to(a, XMMRegister::XMM0)?;
         self.asm
             .sse_load_mem(XMMRegister::XMM1, Register::FP, self.temp_disp(t), double)?;
         self.free_temp();
@@ -1642,10 +1675,10 @@ impl<'a> X86Emitter<'a> {
 
     fn cmp_to_int(&mut self) -> Result<(), BackendError> {
         // result = (a > b) - (a < b) in {-1,0,1}
-        self.asm.emit_rex(false, false, false, false);
-        self.buf.write(&[0x45, 0x31, 0xc0])?; // xor r8d,r8d
-        self.asm.emit_rex(false, false, false, false);
-        self.buf.write(&[0x45, 0x31, 0xc9])?; // xor r9d,r9d
+        // Zero with mov, not xor: xor would clobber the flags the
+        // following setcc instructions read.
+        self.asm.mov_imm32(Register::R8, 0)?;
+        self.asm.mov_imm32(Register::R9, 0)?;
         self.asm.emit_setcc(XCond::L, Register::R8)?;
         self.asm.emit_setcc(XCond::G, Register::R9)?;
         self.asm.movzx_reg(Register::R8)?;
@@ -1657,8 +1690,9 @@ impl<'a> X86Emitter<'a> {
     }
 
     fn setcc_bool(&mut self, cond: CmpCondition) -> Result<(), BackendError> {
-        self.asm.emit_rex(false, false, false, false);
-        self.buf.write(&[0x31, 0xc0])?; // xor eax,eax
+        // mov eax,0 preserves the flags that setcc reads (xor would
+        // clear them and make every comparison look equal).
+        self.asm.mov_imm32(Register::RAX, 0)?;
         let cc = self.xcond_for(cond);
         self.asm.emit_setcc(cc, Register::RAX)?;
         self.asm.emit_rex(false, false, false, false);

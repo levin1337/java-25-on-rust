@@ -987,6 +987,20 @@ mod tests {
         }
     }
 
+    fn fparam(slot: usize) -> ParamSlot {
+        ParamSlot {
+            local_slot: slot,
+            kind: ParamKind::F32,
+        }
+    }
+
+    fn dparam(slot: usize) -> ParamSlot {
+        ParamSlot {
+            local_slot: slot,
+            kind: ParamKind::F64,
+        }
+    }
+
     fn run_c2(
         code: &'static [u8],
         param_slots: usize,
@@ -1355,6 +1369,116 @@ mod tests {
         let result = try_invoke(addr, b"(I)I", true, &[Value::Int(10)], 0).unwrap();
         match result {
             CompiledResult::Value(Some(Value::Int(v))) => assert_eq!(v, 22),
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn e2e_int_bitops() {
+        // (p << 2) | (p >>> 1) -> (I)I
+        // ishl, iushr and ior in one expression; iushr on a negative
+        // operand exercises the logical (zero-fill) shift path.
+        let result = run_c2(
+            &[0x1a, 0x05, 0x78, 0x1a, 0x04, 0x7c, 0x80, 0xac],
+            1,
+            vec![iparam(0)],
+            b"(I)I",
+            &[Value::Int(-8)],
+        )
+        .unwrap();
+        match result {
+            CompiledResult::Value(Some(Value::Int(v))) => assert_eq!(v, -4),
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn e2e_long_bitops() {
+        // (a * b) | (a ^ b) -> (JJ)J
+        let a: i64 = 0x1234_5678_9abc_def0;
+        let b: i64 = -0x0fed_cba9_8765_4321;
+        let result = run_c2(
+            &[0x1e, 0x20, 0x69, 0x1e, 0x20, 0x83, 0x81, 0xad],
+            4,
+            vec![lparam(0), lparam(2)],
+            b"(JJ)J",
+            &[Value::Long(a), Value::Long(b)],
+        )
+        .unwrap();
+        let expect = a.wrapping_mul(b) | (a ^ b);
+        match result {
+            CompiledResult::Value(Some(Value::Long(v))) => assert_eq!(v, expect),
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn e2e_lcmp() {
+        // a <=> b -> (JJ)I  lcmp pushes -1/0/1
+        let result = run_c2(
+            &[0x1e, 0x20, 0x94, 0xac],
+            4,
+            vec![lparam(0), lparam(2)],
+            b"(JJ)I",
+            &[Value::Long(5), Value::Long(9)],
+        )
+        .unwrap();
+        match result {
+            CompiledResult::Value(Some(Value::Int(v))) => assert_eq!(v, -1),
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn e2e_i2d_and_i2c() {
+        // iload_0 ; i2d ; dreturn -> (I)D
+        let result = run_c2(&[0x1a, 0x87, 0xaf], 1, vec![iparam(0)], b"(I)D", &[Value::Int(-3)])
+            .unwrap();
+        match result {
+            CompiledResult::Value(Some(Value::Double(v))) => assert_eq!(v, -3.0),
+            other => panic!("unexpected result: {:?}", other),
+        }
+        // iload_0 ; i2c ; ireturn -> (I)I  zero-extends through char
+        let result = run_c2(&[0x1a, 0x92, 0xac], 1, vec![iparam(0)], b"(I)I", &[Value::Int(-1)])
+            .unwrap();
+        match result {
+            CompiledResult::Value(Some(Value::Int(v))) => assert_eq!(v, 65535),
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn e2e_float_arith() {
+        // fload_0 ; fload_0 ; fconst_2 ; fmul ; fadd ; freturn -> (F)F
+        // p + p * 2.0 = 3p
+        let result = run_c2(
+            &[0x22, 0x22, 0x0d, 0x6a, 0x62, 0xae],
+            1,
+            vec![fparam(0)],
+            b"(F)F",
+            &[Value::Float(1.5)],
+        )
+        .unwrap();
+        match result {
+            CompiledResult::Value(Some(Value::Float(v))) => assert_eq!(v, 4.5),
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn e2e_double_arith() {
+        // dload_0 ; dload_0 ; dadd ; dload_0 ; ddiv ; dreturn -> (D)D
+        // (p + p) / p = 2.0
+        let result = run_c2(
+            &[0x26, 0x26, 0x63, 0x26, 0x6f, 0xaf],
+            2,
+            vec![dparam(0)],
+            b"(D)D",
+            &[Value::Double(3.5)],
+        )
+        .unwrap();
+        match result {
+            CompiledResult::Value(Some(Value::Double(v))) => assert_eq!(v, 2.0),
             other => panic!("unexpected result: {:?}", other),
         }
     }

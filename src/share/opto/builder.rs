@@ -1015,7 +1015,20 @@ impl<'a> BytecodeGraphBuilder<'a> {
     fn arith(&mut self, frame: &mut Frame, op: Opcode, cat2: bool) -> NodeId {
         let b = self.pop(frame);
         let a = self.pop(frame);
-        let n = self.gvn.transform(op, vec![a, b]);
+        // Integer div/rem can trap (ArithmeticException on a zero
+        // divisor), so they are control+memory dependent like loads:
+        // the extra inputs pin them to this program point, which both
+        // schedules them and keeps GVN from merging a trapping div
+        // inside a try region with an identical one outside it.
+        let n = if matches!(
+            op,
+            Opcode::DivI | Opcode::DivL | Opcode::RemI | Opcode::RemL
+        ) {
+            self.gvn
+                .transform(op, vec![frame.mem, frame.ctrl, a, b])
+        } else {
+            self.gvn.transform(op, vec![a, b])
+        };
         self.push(frame, n, cat2);
         n
     }
@@ -1891,12 +1904,17 @@ impl<'a> BytecodeGraphBuilder<'a> {
                 let ed = &self.exc_edges[eid];
                 (ed.handler_block, ed.slot)
             };
+            // Route the edge through a dedicated IfException token so every
+            // exception edge has a unique control point (the athrow node
+            // itself is the block terminator and may feed several handlers).
+            // Its value is never read: the handler sees `obj` directly.
+            let ie = self.gvn.alloc(Opcode::IfException, vec![athrow_node]);
             let stack = vec![StackVal {
                 node: obj,
                 cat2: false,
             }];
             let info = EdgeInfo {
-                ctrl: athrow_node,
+                ctrl: ie,
                 mem: frame.mem,
                 locals: frame.locals.clone(),
                 stack,

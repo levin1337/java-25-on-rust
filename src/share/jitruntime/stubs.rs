@@ -69,10 +69,16 @@ fn arena() -> &'static Mutex<Vec<CodeBuffer>> {
 }
 
 /// Metadata `try_invoke` needs to root a compiled frame: how many
-/// 8-byte slots below `rbp` may contain references.
+/// 8-byte slots below `rbp` may contain references, plus the offset
+/// of an epilogue sequence `jit_unwind` can jump to so callee-saved
+/// registers are restored before returning to `invoke_raw`.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ExecutableMeta {
     pub frame_qwords: usize,
+    /// Byte offset of a `lea rsp,[rbp-8k]; <saved-reg pops>; pop rbp;
+    /// ret` sequence, or 0 when the code has no recognizable epilogue
+    /// (C1 frames unwind with the legacy rsp=rbp+16 path).
+    pub epilogue_off: u32,
 }
 
 static EXEC_META: OnceLock<Mutex<BTreeMap<usize, ExecutableMeta>>> = OnceLock::new();
@@ -105,6 +111,57 @@ pub fn frame_qwords_for(addr: usize) -> usize {
         .get(&addr)
         .map(|m| m.frame_qwords)
         .unwrap_or(0)
+}
+
+/// Epilogue offset registered for the nmethod at `addr` (0 = none).
+pub fn epilogue_off_for(addr: usize) -> u32 {
+    exec_meta()
+        .lock()
+        .unwrap()
+        .get(&addr)
+        .map(|m| m.epilogue_off)
+        .unwrap_or(0)
+}
+
+/// Scans emitted code for the C2 epilogue shape
+/// `48 8d 65 <disp8>` (`lea rsp,[rbp+disp8]`, disp8 = -8*saved) followed
+/// by exactly `saved` register pops and `5d c3` (`pop rbp; ret`).
+/// Every Return emits an identical epilogue, so the first match is a
+/// valid unwind landing pad.  Returns the offset or 0.
+fn find_epilogue_off(code: &[u8]) -> u32 {
+    for i in 0..code.len().saturating_sub(4) {
+        if code[i] != 0x48 || code[i + 1] != 0x8d || code[i + 2] != 0x65 {
+            continue;
+        }
+        let disp = code[i + 3] as i8 as i32;
+        if disp > 0 || disp % 8 != 0 {
+            continue;
+        }
+        let saved = (-disp / 8) as usize;
+        let mut j = i + 4;
+        let mut pops = 0usize;
+        while pops < saved {
+            if j >= code.len() {
+                break;
+            }
+            if code[j] == 0x41 && j + 1 < code.len() && (0x58..=0x5f).contains(&code[j + 1]) {
+                j += 2;
+            } else if (0x58..=0x5f).contains(&code[j]) {
+                j += 1;
+            } else {
+                break;
+            }
+            pops += 1;
+        }
+        if pops == saved
+            && j + 1 < code.len()
+            && code[j] == 0x5d
+            && code[j + 1] == 0xc3
+        {
+            return i as u32;
+        }
+    }
+    0
 }
 
 /// Parses the standard prologue (`push rbp; mov rbp,rsp`, then any
@@ -152,6 +209,7 @@ fn prologue_frame_qwords(code: &[u8]) -> usize {
 pub fn publish_executable(code: &[u8], reserve: usize) -> Option<usize> {
     let meta = ExecutableMeta {
         frame_qwords: prologue_frame_qwords(code),
+        epilogue_off: find_epilogue_off(code),
     };
     publish_executable_meta(code, reserve, meta)
 }
@@ -896,6 +954,28 @@ unsafe extern "C" fn h_unresolved_call(a: u64, b: u64, c: u64, d: u64, f: u64) -
     unsafe { h_call_method(a, b, c, d, f) }
 }
 
+/// `ExcCheck`: called by C2 code right after a *non-unwinding* stub
+/// call that may have recorded a pending outcome.  Consumes the
+/// channel and reports:
+///   - 0: nothing pending — execution continues normally.
+///   - a value >= 2: a throwable was thrown; the low result is
+///     `tagged_ref + 1`, so JIT code subtracts one to recover the
+///     `encode_ref` word for `Value::Object(handle)` (tag 0,
+///     slot = handle + 1).
+/// A pending deopt is re-armed and reported as 0: the trampoline's
+/// flow check then unwinds the frame exactly like an unwinding
+/// stub call would have, so JIT code never observes it.
+unsafe extern "C" fn h_exc_check(_a: u64, _b: u64, _c: u64, _d: u64, _f: u64) -> u64 {
+    match runtime::take_pending() {
+        runtime::Pending::None => 0,
+        runtime::Pending::Deoptimize => {
+            runtime::set_pending_deopt();
+            0
+        }
+        runtime::Pending::Thrown(handle) => (handle as u64) + 2,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Array operations.
 // ---------------------------------------------------------------------------
@@ -1082,7 +1162,6 @@ unsafe extern "C" fn h_float_rem(a: u64, b: u64, kind: u64, _d: u64, _frame: u64
     } else {
         sharedRuntime::drem(f64::from_bits(a), f64::from_bits(b)).to_bits()
     };
-    runtime::set_stub_xmm_result(bits);
     bits
 }
 
@@ -1409,7 +1488,28 @@ unsafe extern "C" fn h_call_method(
 /// activation until it reaches the outermost `try_invoke`, covering
 /// JIT→JIT, JIT→stub→interpreter→JIT and interpreter-nested chains.
 /// Never returns.
+/// When the nmethod metadata carries an epilogue offset, the unwind
+/// jumps to `entry + epilogue_off` with `rbp` still pointing at the
+/// JIT frame: the epilogue's `lea rsp,[rbp-8k]; pops; pop rbp; ret`
+/// restores every callee-saved register the prologue pushed before
+/// returning to the `invoke_raw` landing pad.  The legacy
+/// `rsp = frame + 16` path skips those pops and would leave
+/// callee-saved registers corrupted for the Rust caller.
 pub unsafe extern "C" fn jit_unwind(frame: u64) -> ! {
+    let entry = runtime::current_nmethod();
+    let off = epilogue_off_for(entry);
+    if off != 0 {
+        let target = entry + off as usize;
+        unsafe {
+            core::arch::asm!(
+                "mov rbp, {frame}",
+                "jmp {target}",
+                frame = in(reg) frame,
+                target = in(reg) target,
+                options(noreturn),
+            );
+        }
+    }
     let saved_rbp = unsafe { *(frame as *const u64) };
     let rsp = frame + 16;
     let ret = unsafe { *((frame + 8) as *const u64) };
@@ -1465,6 +1565,7 @@ fn stub_entries() -> &'static [StubEntry] {
             StubEntry { stub: RuntimeStub::FloatConvert, handler: h_float_convert },
             StubEntry { stub: RuntimeStub::UnresolvedField, handler: h_unresolved_field },
             StubEntry { stub: RuntimeStub::UnresolvedCall, handler: h_unresolved_call },
+            StubEntry { stub: RuntimeStub::ExcCheck, handler: h_exc_check },
         ]
     })
 }
@@ -1534,30 +1635,66 @@ fn trampoline_bytes(handler_addr: usize) -> Vec<u8> {
     b
 }
 
+/// Variant of `trampoline_bytes` that never unwinds: the handler's
+/// result is returned to the JIT call site even when a pending
+/// outcome was recorded.  C2 emits these for calls that are followed
+/// by an inline `ExcCheck` + handler dispatch; every other call keeps
+/// the unwinding trampoline so pending outcomes propagate unchanged.
+fn trampoline_bytes_no_unwind(handler_addr: usize) -> Vec<u8> {
+    let mut b = Vec::with_capacity(64);
+    b.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp,0x28
+    b.extend_from_slice(&[0x48, 0x89, 0x6C, 0x24, 0x20]); // mov [rsp+0x20],rbp
+    b.extend_from_slice(&[0x48, 0xB8]); // mov rax, imm64
+    b.extend_from_slice(&(handler_addr as u64).to_le_bytes());
+    b.extend_from_slice(&[0xFF, 0xD0]); // call rax
+    b.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x20]);
+    b.extend_from_slice(&[0x48, 0x8B, 0x44, 0x24, 0x20]); // mov rax,[rsp+0x20]
+    b.extend_from_slice(&[0x66, 0x48, 0x0F, 0x6E, 0xC0]); // movq xmm0,rax
+    b.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]); // add rsp,0x28
+    b.push(0xC3); // ret
+    b
+}
+
 static STUB_MAP: OnceLock<BTreeMap<RuntimeStub, u64>> = OnceLock::new();
+static STUB_MAP_NO_UNWIND: OnceLock<BTreeMap<RuntimeStub, u64>> = OnceLock::new();
+
+fn emit_stub_map(unwind: bool) -> BTreeMap<RuntimeStub, u64> {
+    let entries = stub_entries();
+    let mut code = Vec::with_capacity(entries.len() * 80);
+    let mut offsets = Vec::with_capacity(entries.len());
+    for entry in entries {
+        offsets.push(code.len());
+        let bytes = if unwind {
+            trampoline_bytes(entry.handler as usize)
+        } else {
+            trampoline_bytes_no_unwind(entry.handler as usize)
+        };
+        code.extend_from_slice(&bytes);
+    }
+    let base = publish_executable(&code, code.len().max(4096)).unwrap_or(0);
+    let mut map = BTreeMap::new();
+    if base != 0 {
+        for (entry, off) in entries.iter().zip(offsets) {
+            map.insert(entry.stub, (base + off) as u64);
+        }
+    }
+    map
+}
 
 /// Builds the stub table once: emits every trampoline into a single
 /// RWX page and maps each `RuntimeStub` to its trampoline address.
 /// These are the addresses `BackendOptions.stubs` receives.
 pub fn stub_map() -> BTreeMap<RuntimeStub, u64> {
-    STUB_MAP
-        .get_or_init(|| {
-            let entries = stub_entries();
-            let mut code = Vec::with_capacity(entries.len() * 80);
-            let mut offsets = Vec::with_capacity(entries.len());
-            for entry in entries {
-                offsets.push(code.len());
-                code.extend_from_slice(&trampoline_bytes(entry.handler as usize));
-            }
-            let base = publish_executable(&code, code.len().max(4096)).unwrap_or(0);
-            let mut map = BTreeMap::new();
-            if base != 0 {
-                for (entry, off) in entries.iter().zip(offsets) {
-                    map.insert(entry.stub, (base + off) as u64);
-                }
-            }
-            map
-        })
+    STUB_MAP.get_or_init(|| emit_stub_map(true)).clone()
+}
+
+/// Same stub table as `stub_map` but with non-unwinding trampolines:
+/// handlers always return to the JIT call site so the caller can run
+/// its own pending-outcome dispatch (`ExcCheck`) for exception
+/// handlers.  Used by the C2 backend for calls inside `try` regions.
+pub fn stub_map_no_unwind() -> BTreeMap<RuntimeStub, u64> {
+    STUB_MAP_NO_UNWIND
+        .get_or_init(|| emit_stub_map(false))
         .clone()
 }
 

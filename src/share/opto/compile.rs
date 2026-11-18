@@ -969,7 +969,10 @@ mod tests {
     // real published runtime-stub table.
 
     use crate::share::interpreter::bytecodeInterpreter::Value;
-    use crate::share::jitruntime::{CompiledResult, publish_executable, stub_map as jit_stub_map, try_invoke};
+    use crate::share::jitruntime::{
+        CompiledResult, publish_executable, stub_map as jit_stub_map,
+        stub_map_no_unwind as jit_stub_map_no_unwind, try_invoke,
+    };
     use crate::share::opto::codegen::ParamKind;
     use crate::share::opto::codegen::ParamSlot;
 
@@ -1011,6 +1014,7 @@ mod tests {
         let options = BackendOptions {
             params,
             stubs: jit_stub_map(),
+            stubs_no_unwind: jit_stub_map_no_unwind(),
             ..BackendOptions::default()
         };
         let mut c = Compile::compile(&method(code, param_slots), &BuilderContext::empty());
@@ -1551,6 +1555,7 @@ mod tests {
         let options = BackendOptions {
             params,
             stubs: jit_stub_map(),
+            stubs_no_unwind: jit_stub_map_no_unwind(),
             ..BackendOptions::default()
         };
         let mut c = Compile::compile(&method(code, param_slots), ctx);
@@ -1858,6 +1863,144 @@ mod tests {
                     assert_eq!(v, want, "arg={arg}")
                 }
                 other => panic!("unexpected result for {arg}: {:?}", other),
+            }
+        }
+    }
+
+    #[test]
+    fn e2e_try_catch_array_oob() {
+        // try { a[i] } catch-all -> 7 ; in-bounds -> 9
+        //
+        //   0: bipush 3 ; 2: newarray int ; 4: astore_1
+        //   5: aload_1 ; 6: iload_0 ; 7: iaload
+        //   8: pop ; 9: bipush 9 ; 11: ireturn
+        //  12: pop            <- handler_pc (catch_type = 0)
+        //  13: bipush 7 ; 15: ireturn
+        //
+        // Exception table covers [5,8): the aload/iload cannot trap but
+        // iaload at bci 7 can (ArrayIndexOutOfBounds).
+        use super::super::builder::ExceptionHandler;
+        // JVM_LOADER is a global OnceLock: whichever test installed first
+        // wins, so register the throwable klass on the *active* loader.
+        let _ = test_loader();
+        let loader = crate::share::runtime::threading::jvm_loader().unwrap();
+        register_klass(&loader, b"java/lang/ArrayIndexOutOfBoundsException", &[]);
+        let code: &[u8] = &[
+            0x10, 0x03, // 0: bipush 3
+            0xbc, 0x0a, // 2: newarray int
+            0x4c, // 4: astore_1
+            0x2b, // 5: aload_1
+            0x1a, // 6: iload_0
+            0x2e, // 7: iaload
+            0x57, // 8: pop
+            0x10, 0x09, // 9: bipush 9
+            0xac, // 11: ireturn
+            0x57, // 12: pop (handler)
+            0x10, 0x07, // 13: bipush 7
+            0xac, // 15: ireturn
+        ];
+        let handlers = [ExceptionHandler {
+            start_pc: 5,
+            end_pc: 8,
+            handler_pc: 12,
+            catch_type: 0,
+        }];
+        let m = MethodCode {
+            name: "test",
+            max_locals: 2,
+            max_stack: 8,
+            param_slots: 2,
+            code,
+            handlers: &handlers,
+        };
+        let options = BackendOptions {
+            params: vec![iparam(0)],
+            stubs: jit_stub_map(),
+            stubs_no_unwind: jit_stub_map_no_unwind(),
+            ..BackendOptions::default()
+        };
+        let mut c = Compile::compile(&m, &BuilderContext::empty());
+        c.optimize();
+        let emitted = c
+            .backend(&m, &BuilderContext::empty(), &options)
+            .expect("c2 backend should emit");
+        let addr = publish_executable(&emitted.code, emitted.code.len())
+            .expect("publish executable");
+        for (arg, want) in [(1, 9), (9, 7)] {
+            let result = try_invoke(addr, b"(I)I", true, &[Value::Int(arg)], 0).unwrap();
+            match result {
+                CompiledResult::Value(Some(Value::Int(v))) => {
+                    assert_eq!(v, want, "arg={arg}")
+                }
+                other => panic!("unexpected result for {arg}: {:?}", other),
+            }
+        }
+    }
+
+    #[test]
+    fn e2e_try_catch_div_by_zero() {
+        // try { x / y } catch-all -> 7 ; nonzero divisor -> quotient
+        //
+        //   0: iload_0 ; 1: iload_1 ; 2: idiv ; 3: ireturn
+        //   4: pop          <- handler_pc (catch_type = 0)
+        //   5: bipush 7 ; 7: ireturn
+        //
+        // idiv at bci 2 raises ArithmeticException when y == 0; the
+        // exception edge must dispatch in-method instead of unwinding.
+        use super::super::builder::ExceptionHandler;
+        let _ = test_loader();
+        let loader = crate::share::runtime::threading::jvm_loader().unwrap();
+        register_klass(&loader, b"java/lang/ArithmeticException", &[]);
+        let code: &[u8] = &[
+            0x1a, // 0: iload_0
+            0x1b, // 1: iload_1
+            0x6c, // 2: idiv
+            0xac, // 3: ireturn
+            0x57, // 4: pop (handler)
+            0x10, 0x07, // 5: bipush 7
+            0xac, // 7: ireturn
+        ];
+        let handlers = [ExceptionHandler {
+            start_pc: 0,
+            end_pc: 3,
+            handler_pc: 4,
+            catch_type: 0,
+        }];
+        let m = MethodCode {
+            name: "test",
+            max_locals: 2,
+            max_stack: 8,
+            param_slots: 2,
+            code,
+            handlers: &handlers,
+        };
+        let options = BackendOptions {
+            params: vec![iparam(0), iparam(1)],
+            stubs: jit_stub_map(),
+            stubs_no_unwind: jit_stub_map_no_unwind(),
+            ..BackendOptions::default()
+        };
+        let mut c = Compile::compile(&m, &BuilderContext::empty());
+        c.optimize();
+        let emitted = c
+            .backend(&m, &BuilderContext::empty(), &options)
+            .expect("c2 backend should emit");
+        let addr = publish_executable(&emitted.code, emitted.code.len())
+            .expect("publish executable");
+        for (x, y, want) in [(20, 4, 5), (20, 0, 7), (i32::MIN, -1, i32::MIN)] {
+            let result = try_invoke(
+                addr,
+                b"(II)I",
+                true,
+                &[Value::Int(x), Value::Int(y)],
+                0,
+            )
+            .unwrap();
+            match result {
+                CompiledResult::Value(Some(Value::Int(v))) => {
+                    assert_eq!(v, want, "x={x} y={y}")
+                }
+                other => panic!("unexpected result for {x}/{y}: {:?}", other),
             }
         }
     }

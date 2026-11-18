@@ -135,6 +135,16 @@ impl AbstractCompiler for C2Compiler {
                 catch_type: e.catch_type as u32,
             })
             .collect();
+        // C2 dispatches every exception edge to the first covering
+        // handler unconditionally; typed catches (catch_type != 0) need
+        // runtime assignability checks that are not implemented yet, so
+        // methods containing them stay in the interpreter.
+        if handlers.iter().any(|h| h.catch_type != 0) {
+            return Err(CompileError::unsupported(
+                "typed exception handlers are not supported by C2 yet",
+                CompLevel::FullOptimization,
+            ));
+        }
         let method_code = MethodCode {
             name: task.method.method_name.as_str(),
             max_locals: method.max_locals() as usize,
@@ -170,6 +180,7 @@ impl AbstractCompiler for C2Compiler {
         let ctx = BuilderContext::with_sites(&sites);
         let options = BackendOptions {
             stubs: crate::share::jitruntime::stub_map(),
+            stubs_no_unwind: crate::share::jitruntime::stub_map_no_unwind(),
             params,
             emit_safepoints: true,
             obj_layout: ObjLayoutMode::Uncompressed,

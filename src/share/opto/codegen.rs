@@ -57,6 +57,11 @@ pub struct ParamSlot {
 #[derive(Clone, Debug)]
 pub struct BackendOptions {
     pub stubs: BTreeMap<RuntimeStub, u64>,
+    /// Non-unwinding trampoline addresses for the same stubs, used for
+    /// calls whose node has an exception-handler edge: the generated
+    /// code then runs `ExcCheck` itself and dispatches to the handler
+    /// instead of letting the trampoline unwind the frame.
+    pub stubs_no_unwind: BTreeMap<RuntimeStub, u64>,
     /// Incoming arguments in ABI order with their JVM local slot.
     pub params: Vec<ParamSlot>,
     pub emit_safepoints: bool,
@@ -67,6 +72,7 @@ impl Default for BackendOptions {
     fn default() -> Self {
         Self {
             stubs: BTreeMap::new(),
+            stubs_no_unwind: BTreeMap::new(),
             params: Vec::new(),
             emit_safepoints: true,
             obj_layout: ObjLayoutMode::Compressed,
@@ -132,6 +138,9 @@ pub struct X86Emitter<'a> {
     pc_descs: Vec<PcDesc>,
     temp_sp: usize,
     param_kinds: HashMap<usize, ParamKind>,
+    /// Trapping node -> (handler block, IfException token) for nodes
+    /// that have an exception-handler edge.
+    exc_by_trap: HashMap<NodeId, (usize, NodeId)>,
 }
 
 impl<'a> X86Emitter<'a> {
@@ -149,6 +158,20 @@ impl<'a> X86Emitter<'a> {
             .iter()
             .map(|p| (p.local_slot, p.kind))
             .collect();
+        let mut exc_by_trap: HashMap<NodeId, (usize, NodeId)> = HashMap::new();
+        for block in &schedule.blocks {
+            for e in &block.exc_succs {
+                let cn = gvn.node(e.ctrl);
+                let trap = if cn.op == Opcode::IfException {
+                    cn.inputs.first().copied().unwrap_or(NONE)
+                } else {
+                    e.ctrl
+                };
+                if trap != NONE {
+                    exc_by_trap.entry(trap).or_insert((e.block, e.ctrl));
+                }
+            }
+        }
         Self {
             buf,
             asm: X64Asm::new(buf),
@@ -162,6 +185,7 @@ impl<'a> X86Emitter<'a> {
             pc_descs: Vec::new(),
             temp_sp: 0,
             param_kinds,
+            exc_by_trap,
         }
     }
 
@@ -174,10 +198,15 @@ impl<'a> X86Emitter<'a> {
             }
             for &n in &self.schedule.blocks[b].instrs {
                 self.emit_effect(n)?;
+                self.emit_exc_dispatch(b, n)?;
             }
             self.emit_terminator(b)?;
         }
         self.patch_branches()?;
+        // Unreachable epilogue: guarantees every nmethod contains the
+        // frame-restore sequence `jit_unwind` scans for, including
+        // methods whose only exits are athrow/unwind.
+        self.emit_epilogue()?;
         self.buf.write(&[0x0f, 0x0b])?; // ud2 trap for unreachable tail
         Ok(EmitResult {
             code: self.buf.code_slice().to_vec(),
@@ -321,7 +350,9 @@ impl<'a> X86Emitter<'a> {
                     let inputs = self.gvn.node(t.node).inputs.clone();
                     let obj = inputs.get(2).copied().unwrap_or(NONE);
                     self.emit_gp_to(obj, Register::RCX)?;
-                    self.emit_runtime_call_addr(RuntimeStub::Throw)?;
+                    let addr = self.stub_addr_for(t.node, RuntimeStub::Throw)?;
+                    self.asm.emit_abs_call(addr)?;
+                    self.emit_exc_dispatch(b, t.node)?;
                     self.buf.write(&[0x0f, 0x0b])?;
                     Ok(())
                 }
@@ -532,8 +563,6 @@ impl<'a> X86Emitter<'a> {
             Opcode::AddI
                 | Opcode::SubI
                 | Opcode::MulI
-                | Opcode::DivI
-                | Opcode::RemI
                 | Opcode::AndI
                 | Opcode::OrI
                 | Opcode::XorI
@@ -544,8 +573,6 @@ impl<'a> X86Emitter<'a> {
                 | Opcode::AddL
                 | Opcode::SubL
                 | Opcode::MulL
-                | Opcode::DivL
-                | Opcode::RemL
                 | Opcode::AndL
                 | Opcode::OrL
                 | Opcode::XorL
@@ -621,7 +648,7 @@ impl<'a> X86Emitter<'a> {
             Opcode::NewArray(kind) => self.emit_new_array(node, kind as u32),
             Opcode::NewArrayRef(cp) => self.emit_anew_array(node, cp as u32),
             Opcode::MultianewArray => {
-                self.emit_runtime_call_addr(RuntimeStub::MultianewArray)?;
+                self.emit_stub_call(node, RuntimeStub::MultianewArray)?;
                 self.store_gp_loc(node, Register::RAX, true)
             }
             Opcode::Call(payload) => self.emit_call(node, payload),
@@ -631,6 +658,19 @@ impl<'a> X86Emitter<'a> {
             }
             Opcode::MonitorEnter => self.emit_monitor(node, RuntimeStub::MonitorEnter),
             Opcode::MonitorExit => self.emit_monitor(node, RuntimeStub::MonitorExit),
+            Opcode::DivI | Opcode::RemI | Opcode::DivL | Opcode::RemL => {
+                // [mem, ctrl, lhs, rhs]; result in rax like emit_pure_gp.
+                let inputs = self.gvn.node(node).inputs.clone();
+                let wide = self.is_wide_gp(node);
+                let t = self.alloc_temp()?;
+                self.emit_value(inputs[2])?;
+                self.store_gp_to_temp(t, Register::RAX, wide)?;
+                self.emit_gp_to(inputs[3], Register::RCX)?;
+                self.load_gp_from_temp(t, Register::RAX, wide)?;
+                self.free_temp();
+                self.emit_div_rem(node, wide)?;
+                self.store_gp_loc(node, Register::RAX, wide)
+            }
             _ => Err(BackendError::Unsupported(format!(
                 "scheduled effect {:?} is outside the executable subset",
                 op
@@ -651,11 +691,11 @@ impl<'a> X86Emitter<'a> {
             .ok_or_else(|| BackendError::InvalidGraph("field load missing site".into()))?;
         if inputs.len() == 3 {
             self.emit_gp_to(site, Register::RCX)?;
-            self.emit_runtime_call_addr(RuntimeStub::GetStatic)?;
+            self.emit_stub_call(node, RuntimeStub::GetStatic)?;
         } else {
             self.emit_gp_to(inputs[2], Register::RCX)?;
             self.emit_gp_to(site, Register::RDX)?;
-            self.emit_runtime_call_addr(RuntimeStub::GetField)?;
+            self.emit_stub_call(node, RuntimeStub::GetField)?;
         }
         match self.gvn.node(node).op {
             Opcode::LoadF | Opcode::LoadD => self.store_xmm_loc(node, XMMRegister::XMM0),
@@ -677,7 +717,11 @@ impl<'a> X86Emitter<'a> {
         Ok(t)
     }
 
-    fn emit_field_store(&mut self, inputs: &[NodeId]) -> Result<(), BackendError> {
+    fn emit_field_store(
+        &mut self,
+        node: NodeId,
+        inputs: &[NodeId],
+    ) -> Result<(), BackendError> {
         let is_static = inputs.len() == 4;
         let site = *inputs
             .last()
@@ -697,18 +741,21 @@ impl<'a> X86Emitter<'a> {
             self.load_gp_from_temp(tv, Register::R8, true)?;
         }
         self.free_temp();
-        self.emit_runtime_call_addr(if is_static {
-            RuntimeStub::PutStatic
-        } else {
-            RuntimeStub::PutField
-        })
+        self.emit_stub_call(
+            node,
+            if is_static {
+                RuntimeStub::PutStatic
+            } else {
+                RuntimeStub::PutField
+            },
+        )
     }
 
     fn emit_new_instance(&mut self, node: NodeId, _cp: u32) -> Result<(), BackendError> {
         let inputs = self.gvn.node(node).inputs.clone();
         let site = inputs.get(2).copied().unwrap_or(NONE);
         self.emit_gp_to(site, Register::RCX)?;
-        self.emit_runtime_call_addr(RuntimeStub::NewInstance)?;
+        self.emit_stub_call(node, RuntimeStub::NewInstance)?;
         self.store_gp_loc(node, Register::RAX, true)
     }
 
@@ -717,7 +764,7 @@ impl<'a> X86Emitter<'a> {
         let size = inputs.get(2).copied().unwrap_or(NONE);
         self.emit_gp_to(size, Register::RCX)?;
         self.asm.mov_imm32(Register::RDX, kind as i32)?;
-        self.emit_runtime_call_addr(RuntimeStub::NewArray)?;
+        self.emit_stub_call(node, RuntimeStub::NewArray)?;
         self.store_gp_loc(node, Register::RAX, true)
     }
 
@@ -727,7 +774,7 @@ impl<'a> X86Emitter<'a> {
         let size = inputs.get(2).copied().unwrap_or(NONE);
         self.emit_gp_to(site, Register::RCX)?;
         self.emit_gp_to(size, Register::RDX)?;
-        self.emit_runtime_call_addr(RuntimeStub::AnewArray)?;
+        self.emit_stub_call(node, RuntimeStub::AnewArray)?;
         self.store_gp_loc(node, Register::RAX, true)
     }
 
@@ -743,7 +790,7 @@ impl<'a> X86Emitter<'a> {
         let site = inputs.get(3).copied().unwrap_or(NONE);
         self.emit_gp_to(obj, Register::RCX)?;
         self.emit_gp_to(site, Register::RDX)?;
-        self.emit_runtime_call_addr(stub)?;
+        self.emit_stub_call(node, stub)?;
         if wide {
             self.store_gp_loc(node, Register::RAX, true)
         } else {
@@ -755,7 +802,7 @@ impl<'a> X86Emitter<'a> {
         let inputs = self.gvn.node(node).inputs.clone();
         let obj = inputs.get(2).copied().unwrap_or(NONE);
         self.emit_gp_to(obj, Register::RCX)?;
-        self.emit_runtime_call_addr(stub)
+        self.emit_stub_call(node, stub)
     }
 
     fn emit_call(&mut self, node: NodeId, payload: u64) -> Result<(), BackendError> {
@@ -795,7 +842,7 @@ impl<'a> X86Emitter<'a> {
         }
         self.asm.mov_imm32(Register::R8, n as i32)?;
         self.asm.mov_imm32(Register::R9, invoke_op as i32)?;
-        self.emit_runtime_call_addr(RuntimeStub::UnresolvedCall)?;
+        self.emit_stub_call(node, RuntimeStub::UnresolvedCall)?;
         self.temp_sp = base;
         match result {
             CallResult::Void => Ok(()),
@@ -813,6 +860,51 @@ impl<'a> X86Emitter<'a> {
             .copied()
             .ok_or(BackendError::MissingRuntimeStub(stub))?;
         self.asm.emit_abs_call(addr).map_err(BackendError::from)
+    }
+
+    /// Stub address for a call emitted for `node`: nodes with an
+    /// exception-handler edge use the non-unwinding trampoline so the
+    /// pending outcome can be dispatched inline; everything else keeps
+    /// the unwinding trampoline.
+    fn stub_addr_for(&self, node: NodeId, stub: RuntimeStub) -> Result<u64, BackendError> {
+        if self.exc_by_trap.contains_key(&node)
+            && let Some(&addr) = self.options.stubs_no_unwind.get(&stub)
+        {
+            return Ok(addr);
+        }
+        self.options
+            .stubs
+            .get(&stub)
+            .copied()
+            .ok_or(BackendError::MissingRuntimeStub(stub))
+    }
+
+    fn emit_stub_call(&mut self, node: NodeId, stub: RuntimeStub) -> Result<(), BackendError> {
+        let addr = self.stub_addr_for(node, stub)?;
+        self.asm.emit_abs_call(addr).map_err(BackendError::from)
+    }
+
+    /// Pending-outcome dispatch after a non-unwinding stub call.
+    /// `ExcCheck` returns 0 when nothing is pending and `tagged + 1`
+    /// for a thrown object (a pending deopt re-arms itself and the
+    /// trampoline unwinds before this point).  On a throw the tagged
+    /// reference is stored into the `IfException` token's location,
+    /// phi copies run, and control jumps to the handler block.
+    fn emit_exc_dispatch(&mut self, b: usize, node: NodeId) -> Result<(), BackendError> {
+        let Some(&(tb, ctrl)) = self.exc_by_trap.get(&node) else {
+            return Ok(());
+        };
+        self.emit_runtime_call_addr(RuntimeStub::ExcCheck)?;
+        self.asm.emit_rex(true, false, false, false);
+        self.buf.write(&[0x85, 0xc0])?; // test rax,rax
+        let jz = self.emit_jmp_local_cc(XCond::E)?;
+        self.buf.write(&[0x48, 0xff, 0xc8])?; // dec rax -> tagged ref
+        self.store_gp_loc(ctrl, Register::RAX, true)?;
+        self.emit_phi_moves(b, tb, ctrl)?;
+        self.emit_jmp_block(tb)?;
+        let cont = self.pos();
+        self.patch_local(jz, cont)?;
+        Ok(())
     }
 
     fn array_elem(&self, inputs: &[NodeId]) -> Result<ArrayElemKind, BackendError> {
@@ -857,12 +949,7 @@ impl<'a> X86Emitter<'a> {
     fn emit_array_load(&mut self, node: NodeId, inputs: &[NodeId]) -> Result<(), BackendError> {
         let (arr, idx) = (inputs[2], inputs[3]);
         let ek = self.array_elem(inputs)?;
-        let addr = self
-            .options
-            .stubs
-            .get(&RuntimeStub::ArrayLoad)
-            .copied()
-            .ok_or(BackendError::MissingRuntimeStub(RuntimeStub::ArrayLoad))?;
+        let addr = self.stub_addr_for(node, RuntimeStub::ArrayLoad)?;
         let ti = self.stage_gp_to_temp(idx, false)?;
         self.emit_gp_to(arr, Register::RCX)?;
         self.load_gp_from_temp(ti, Register::RDX, false)?;
@@ -887,15 +974,10 @@ impl<'a> X86Emitter<'a> {
         }
     }
 
-    fn emit_array_store(&mut self, _node: NodeId, inputs: &[NodeId]) -> Result<(), BackendError> {
+    fn emit_array_store(&mut self, node: NodeId, inputs: &[NodeId]) -> Result<(), BackendError> {
         let (arr, idx, value) = (inputs[2], inputs[3], inputs[4]);
         let ek = self.array_elem(inputs)?;
-        let addr = self
-            .options
-            .stubs
-            .get(&RuntimeStub::ArrayStore)
-            .copied()
-            .ok_or(BackendError::MissingRuntimeStub(RuntimeStub::ArrayStore))?;
+        let addr = self.stub_addr_for(node, RuntimeStub::ArrayStore)?;
         let ti = self.stage_gp_to_temp(idx, false)?;
         let tv = self.stage_value_to_temp(value, ek)?;
         self.emit_gp_to(arr, Register::RCX)?;
@@ -925,7 +1007,7 @@ impl<'a> X86Emitter<'a> {
     fn emit_store(&mut self, node: NodeId) -> Result<(), BackendError> {
         let inputs = self.gvn.node(node).inputs.clone();
         if self.last_input_is_site(&inputs) {
-            return self.emit_field_store(&inputs);
+            return self.emit_field_store(node, &inputs);
         }
         if inputs.len() >= 6 {
             return self.emit_array_store(node, &inputs);
@@ -939,12 +1021,7 @@ impl<'a> X86Emitter<'a> {
     fn emit_array_length(&mut self, node: NodeId) -> Result<(), BackendError> {
         let inputs = self.gvn.node(node).inputs.clone();
         let arr = inputs.get(2).copied().unwrap_or(NONE);
-        let addr = self
-            .options
-            .stubs
-            .get(&RuntimeStub::ArrayLength)
-            .copied()
-            .ok_or(BackendError::MissingRuntimeStub(RuntimeStub::ArrayLength))?;
+        let addr = self.stub_addr_for(node, RuntimeStub::ArrayLength)?;
         self.emit_gp_to(arr, Register::RCX)?;
         self.asm.emit_abs_call(addr)?;
         self.store_gp_loc(node, Register::RAX, false)
@@ -1002,7 +1079,10 @@ impl<'a> X86Emitter<'a> {
                 .map(|k| k.is_wide())
                 .unwrap_or(false);
         }
-        matches!(n.ty, Type::Long | Type::Ref) || matches!(n.op, Opcode::ConL(_) | Opcode::ConP(_))
+        // IfException carries the tagged exception reference across the
+        // handler edge; it is always a full 64-bit word.
+        matches!(n.ty, Type::Long | Type::Ref)
+            || matches!(n.op, Opcode::ConL(_) | Opcode::ConP(_) | Opcode::IfException)
     }
 
     fn emit_value(&mut self, node: NodeId) -> Result<(), BackendError> {
@@ -1224,10 +1304,6 @@ impl<'a> X86Emitter<'a> {
             | Opcode::LShiftL
             | Opcode::RShiftL
             | Opcode::URShiftL
-            | Opcode::DivI
-            | Opcode::RemI
-            | Opcode::DivL
-            | Opcode::RemL
             | Opcode::CmpI
             | Opcode::CmpL
             | Opcode::BoolCmp(_) => {
@@ -1367,26 +1443,23 @@ impl<'a> X86Emitter<'a> {
                 self.asm.cmp_rr(Register::RAX, Register::RCX, wide)?;
                 self.setcc_bool(*cond)
             }
-            DivI | RemI | DivL | RemL => self.emit_div_rem(op, wide),
             _ => Err(BackendError::Unsupported(format!("gp op {:?}", op))),
         }
     }
 
-    fn emit_div_rem(&mut self, op: &Opcode, wide: bool) -> Result<(), BackendError> {
-        let is_rem = matches!(op, Opcode::RemI | Opcode::RemL);
-        if !self
-            .options
-            .stubs
-            .contains_key(&RuntimeStub::ArithmeticException)
-        {
-            return Err(BackendError::MissingRuntimeStub(
-                RuntimeStub::ArithmeticException,
-            ));
-        }
+    fn emit_div_rem(&mut self, node: NodeId, wide: bool) -> Result<(), BackendError> {
+        let is_rem = matches!(
+            self.gvn.node(node).op,
+            Opcode::RemI | Opcode::RemL
+        );
+        let stub_addr = self.stub_addr_for(node, RuntimeStub::ArithmeticException)?;
         self.asm.test_rr(Register::RCX, Register::RCX, wide)?;
         let jnz = self.emit_jmp_local_cc(XCond::NE)?;
-        self.emit_runtime_call_addr(RuntimeStub::ArithmeticException)?;
-        self.buf.write(&[0x0f, 0x0b])?;
+        self.asm.emit_abs_call(stub_addr)?;
+        // With an exception edge the non-unwinding trampoline returns
+        // here with the pending outcome recorded; skip the division
+        // and let emit_exc_dispatch route to the handler block.
+        let jmp_end = self.emit_jmp_local()?;
         let after_zero = self.pos();
         self.patch_local(jnz, after_zero)?;
         self.asm.cmp_imm8(Register::RCX, -1, wide)?;
@@ -1405,6 +1478,7 @@ impl<'a> X86Emitter<'a> {
             self.asm.neg(Register::RAX, wide)?;
         }
         self.patch_local(done, self.pos())?;
+        self.patch_local(jmp_end, self.pos())?;
         Ok(())
     }
 
@@ -1760,7 +1834,7 @@ pub fn validate_supported(gvn: &PhaseGVN) -> Result<(), BackendError> {
             .map(|&i| matches!(gvn.node(i).op, Opcode::SitePtr(_)))
             .unwrap_or(false);
         let bad = match n.op {
-            Opcode::IfException | Opcode::Proj(_) => true,
+            Opcode::Proj(_) => true,
             Opcode::LoadI
             | Opcode::LoadL
             | Opcode::LoadF

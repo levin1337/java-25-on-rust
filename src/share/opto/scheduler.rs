@@ -54,6 +54,11 @@ pub struct Block {
     pub instrs: Vec<NodeId>,
     pub term: Option<Terminal>,
     pub succs: Vec<Edge>,
+    /// Exception-handler edges emitted by this block's trapping
+    /// instructions/terminator.  `Edge.ctrl` is the `IfException` token
+    /// stored in the handler Region inputs (or adopted as the handler
+    /// block entry for single-predecessor handlers).
+    pub exc_succs: Vec<Edge>,
     /// Control token at the end of the block for fallthrough edges.
     pub exit_ctrl: NodeId,
     pub rpo: usize,
@@ -70,6 +75,12 @@ pub struct Schedule {
     pub region_mem: HashMap<NodeId, NodeId>,
     /// Region node for each Phi node (last input).
     pub phi_region: HashMap<NodeId, NodeId>,
+    /// Definition site of each exception-edge value (`IfException`
+    /// token): (source block, instruction position).  The token's
+    /// machine location is written by the dispatch sequence at the end
+    /// of the trapping instruction, so liveness/regalloc treat it as
+    /// defined on that edge rather than inside any block's instr list.
+    pub exc_def: HashMap<NodeId, (usize, usize)>,
     pub unsupported: Vec<String>,
 }
 
@@ -87,7 +98,7 @@ pub fn mem_index(op: &Opcode) -> Option<usize> {
         LoadI | LoadL | LoadF | LoadD | LoadP | LoadB | LoadC | LoadS | StoreI | StoreL
         | StoreF | StoreD | StoreP | StoreB | StoreC | StoreS | New(_) | NewArray(_)
         | NewArrayRef(_) | MultianewArray | Call(_) | CheckCast(_) | InstanceOf(_)
-        | MonitorEnter | MonitorExit | Athrow => Some(0),
+        | MonitorEnter | MonitorExit | Athrow | DivI | DivL | RemI | RemL => Some(0),
         _ => None,
     }
 }
@@ -101,7 +112,7 @@ pub fn ctrl_index(op: &Opcode) -> Option<usize> {
         LoadI | LoadL | LoadF | LoadD | LoadP | LoadB | LoadC | LoadS | StoreI | StoreL
         | StoreF | StoreD | StoreP | StoreB | StoreC | StoreS | New(_) | NewArray(_)
         | NewArrayRef(_) | MultianewArray | Call(_) | CheckCast(_) | InstanceOf(_)
-        | MonitorEnter | MonitorExit | ArrayLength => Some(1),
+        | MonitorEnter | MonitorExit | ArrayLength | DivI | DivL | RemI | RemL => Some(1),
         _ => None,
     }
 }
@@ -150,6 +161,10 @@ pub fn produces_value(op: &Opcode) -> bool {
             | Opcode::InstanceOf(_)
             | Opcode::ArrayLength
             | Opcode::Call(_)
+            | Opcode::DivI
+            | Opcode::DivL
+            | Opcode::RemI
+            | Opcode::RemL
             | Opcode::IfException
     )
 }
@@ -182,6 +197,8 @@ fn value_operand_indices(op: &Opcode) -> &'static [usize] {
         Call(_) => &[2],
         // [mem, ctrl, obj]
         CheckCast(_) | InstanceOf(_) | MonitorEnter | MonitorExit | ArrayLength => &[2],
+        // [mem, ctrl, lhs, rhs]
+        DivI | DivL | RemI | RemL => &[2, 3],
         _ => &[],
     }
 }
@@ -211,6 +228,16 @@ pub struct Scheduler<'a> {
     ctrl_users: HashMap<NodeId, Vec<NodeId>>,
     region_of_phi: HashMap<NodeId, NodeId>,
     mem_of_region: HashMap<NodeId, NodeId>,
+    /// Trapping node -> [(handler entry control, IfException token)].
+    /// The entry control is the handler Region for merged handlers or
+    /// the `IfException` node itself for single-predecessor handlers.
+    exc_edges_of: HashMap<NodeId, Vec<(NodeId, NodeId)>>,
+    /// Memory state delivered to each exception-edge entry control.
+    exc_entry_mem: HashMap<NodeId, NodeId>,
+    /// IfException token -> (source block, position) definition site.
+    exc_def_out: HashMap<NodeId, (usize, usize)>,
+    /// Trapping nodes that produced at least one scheduled edge.
+    exc_matched: HashSet<NodeId>,
     unsupported: Vec<String>,
 }
 
@@ -244,11 +271,57 @@ impl<'a> Scheduler<'a> {
                 ctrl_users.entry(c).or_default().push(node.id);
             }
         }
+        // Index exception edges: every IfException token names its
+        // trapping node (inputs[0]) and is either a Region input
+        // (merged handler) or a standalone control entry
+        // (single-predecessor handler).
+        let mut exc_edges_of: HashMap<NodeId, Vec<(NodeId, NodeId)>> = HashMap::new();
+        let mut region_inputs: HashSet<NodeId> = HashSet::new();
+        for node in &gvn.nodes {
+            if node.op == Opcode::Region {
+                for &c in &node.inputs {
+                    if c != NONE {
+                        region_inputs.insert(c);
+                    }
+                }
+            }
+        }
+        for node in &gvn.nodes {
+            if node.op != Opcode::IfException {
+                continue;
+            }
+            let trap = node.inputs.first().copied().unwrap_or(NONE);
+            if trap == NONE {
+                continue;
+            }
+            if region_inputs.contains(&node.id) {
+                // Find every Region that consumes this token.
+                for r in &gvn.nodes {
+                    if r.op == Opcode::Region && r.inputs.contains(&node.id) {
+                        exc_edges_of
+                            .entry(trap)
+                            .or_default()
+                            .push((r.id, node.id));
+                    }
+                }
+            } else {
+                // Single-predecessor handler: the token itself is the
+                // block entry control.
+                exc_edges_of
+                    .entry(trap)
+                    .or_default()
+                    .push((node.id, node.id));
+            }
+        }
         Self {
             gvn,
             ctrl_users,
             region_of_phi,
             mem_of_region,
+            exc_edges_of,
+            exc_entry_mem: HashMap::new(),
+            exc_def_out: HashMap::new(),
+            exc_matched: HashSet::new(),
             unsupported: Vec::new(),
         }
     }
@@ -263,6 +336,7 @@ impl<'a> Scheduler<'a> {
                 entry_block,
                 region_mem: self.mem_of_region.clone(),
                 phi_region: self.region_of_phi.clone(),
+                exc_def: HashMap::new(),
                 unsupported: vec!["missing Start node".to_string()],
             };
         }
@@ -271,7 +345,7 @@ impl<'a> Scheduler<'a> {
         let mut seen = HashSet::from([start_id]);
         while let Some(bid) = queue.pop_front() {
             let succs = self.scan_block(bid, &mut blocks);
-            for e in succs {
+            for e in succs.iter().chain(blocks[bid].exc_succs.iter()) {
                 if seen.insert(e.block) {
                     queue.push_back(e.block);
                 }
@@ -284,11 +358,28 @@ impl<'a> Scheduler<'a> {
         }
         // Mark loop headers: targets of edges that do not go forward in RPO.
         for b in 0..blocks.len() {
-            let succs = blocks[b].succs.clone();
+            let succs = blocks[b]
+                .succs
+                .iter()
+                .chain(blocks[b].exc_succs.iter())
+                .cloned()
+                .collect::<Vec<_>>();
             for e in succs {
                 if blocks[e.block].rpo <= blocks[b].rpo {
                     blocks[e.block].loop_header = true;
                 }
+            }
+        }
+        // Exception edges whose trapping node never became a scheduled
+        // instruction or terminator (e.g. pure arith nodes rematerialized
+        // at use sites) cannot be dispatched; reject rather than emit
+        // code that would silently propagate the exception.
+        for trap in self.exc_edges_of.keys() {
+            if !self.exc_matched.contains(trap) {
+                self.unsupported.push(format!(
+                    "exception edge on unscheduled node {}",
+                    trap
+                ));
             }
         }
         entry_block.clear();
@@ -300,6 +391,7 @@ impl<'a> Scheduler<'a> {
             entry_block,
             region_mem: self.mem_of_region.clone(),
             phi_region: self.region_of_phi.clone(),
+            exc_def: self.exc_def_out.clone(),
             unsupported: self.unsupported.clone(),
         }
     }
@@ -318,6 +410,7 @@ impl<'a> Scheduler<'a> {
             instrs: Vec::new(),
             term: None,
             succs: Vec::new(),
+            exc_succs: Vec::new(),
             exit_ctrl: entry,
             rpo: usize::MAX,
             loop_header: false,
@@ -463,12 +556,82 @@ impl<'a> Scheduler<'a> {
             // control point, so there is nothing more to emit.
             break;
         }
-        blocks[bid].instrs = instrs;
-        blocks[bid].term = term;
+        blocks[bid].instrs = instrs.clone();
+        blocks[bid].term = term.clone();
         blocks[bid].succs = succs.clone();
         blocks[bid].exit_ctrl = exit_ctrl;
+        // Exception edges: each trapping instruction/terminator may
+        // deliver control to handler blocks through its IfException
+        // tokens.  The edge carries the memory state valid right after
+        // the trapping node so handler blocks see a consistent mem.
+        let mut exc_succs: Vec<Edge> = Vec::new();
+        let mut cm = blocks[bid].entry_mem;
+        for (ii, &n) in instrs.iter().enumerate() {
+            let mem_for_exc = if produces_mem(&self.gvn.node(n).op) {
+                n
+            } else {
+                cm
+            };
+            if produces_mem(&self.gvn.node(n).op) {
+                cm = n;
+            }
+            self.collect_exc_edges(
+                bid, n, ii + 1, mem_for_exc, blocks, &mut exc_succs,
+            );
+        }
+        if let Some(t) = &term {
+            let mem_idx = mem_index(&self.gvn.node(t.node).op);
+            let mem = mem_idx
+                .and_then(|mi| self.gvn.node(t.node).inputs.get(mi).copied())
+                .unwrap_or(cm);
+            self.collect_exc_edges(
+                bid,
+                t.node,
+                instrs.len() + 1,
+                mem,
+                blocks,
+                &mut exc_succs,
+            );
+        }
+        blocks[bid].exc_succs = exc_succs.clone();
         let _ = entry_op;
         succs
+    }
+
+    /// Records the exception edges of one trapping node as successor
+    /// edges of block `bid`.  Multiple edges for a single trapping node
+    /// are ambiguous when the node was CSE'd across bytecodes with
+    /// different handler sets; only unambiguous single-edge dispatch is
+    /// supported.
+    fn collect_exc_edges(
+        &mut self,
+        bid: usize,
+        trap: NodeId,
+        pos: usize,
+        mem: NodeId,
+        blocks: &mut Vec<Block>,
+        exc_succs: &mut Vec<Edge>,
+    ) {
+        let Some(list) = self.exc_edges_of.get(&trap).cloned() else {
+            return;
+        };
+        if list.len() > 1 {
+            self.unsupported.push(format!(
+                "ambiguous exception edges on node {}",
+                trap
+            ));
+            return;
+        }
+        for (entry, ctrl) in list {
+            if let Some(eb) =
+                self.block_for_control_or_add(entry, blocks, &mut Vec::new())
+            {
+                exc_succs.push(Edge { block: eb, ctrl });
+                self.exc_matched.insert(trap);
+                self.exc_def_out.insert(ctrl, (bid, pos));
+                self.exc_entry_mem.insert(entry, mem);
+            }
+        }
     }
 
     fn entry_mem(&self, entry: NodeId) -> NodeId {
@@ -478,6 +641,11 @@ impl<'a> Scheduler<'a> {
                 self.gvn.node(entry).inputs.get(1).copied().unwrap_or(entry)
             }
             Opcode::Region => self.mem_of_region.get(&entry).copied().unwrap_or(entry),
+            Opcode::IfException => self
+                .exc_entry_mem
+                .get(&entry)
+                .copied()
+                .unwrap_or(entry),
             _ => entry,
         }
     }
@@ -505,6 +673,7 @@ impl<'a> Scheduler<'a> {
             instrs: Vec::new(),
             term: None,
             succs: Vec::new(),
+            exc_succs: Vec::new(),
             exit_ctrl: ctrl,
             rpo: usize::MAX,
             loop_header: false,
@@ -522,8 +691,13 @@ impl<'a> Scheduler<'a> {
         visited[0] = true;
         while let Some((b, i)) = stack.last_mut() {
             let b = *b;
-            if *i < blocks[b].succs.len() {
-                let s = blocks[b].succs[*i].block;
+            let nsucc = blocks[b].succs.len() + blocks[b].exc_succs.len();
+            if *i < nsucc {
+                let s = if *i < blocks[b].succs.len() {
+                    blocks[b].succs[*i].block
+                } else {
+                    blocks[b].exc_succs[*i - blocks[b].succs.len()].block
+                };
                 *i += 1;
                 if !visited[s] {
                     visited[s] = true;
@@ -589,6 +763,10 @@ pub fn collect_materialized(
         | Opcode::InstanceOf(_)
         | Opcode::ArrayLength
         | Opcode::Call(_)
+        | Opcode::DivI
+        | Opcode::DivL
+        | Opcode::RemI
+        | Opcode::RemL
         | Opcode::IfException => {
             out.insert(node);
         }

@@ -41,6 +41,10 @@ thread_local! {
     /// Number of 8-byte slots below the JIT frame's `rbp` that may hold
     /// references; runtime stubs use it for conservative GC rooting.
     static FRAME_QWORDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Entry address of the innermost active nmethod; `jit_unwind`
+    /// uses it to locate the frame's epilogue for a register-restoring
+    /// unwind.
+    static CURRENT_NMETHOD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Result channel between JIT-called stubs and `try_invoke`.
@@ -85,6 +89,14 @@ pub(crate) fn set_frame_qwords(qwords: usize) {
 
 pub(crate) fn current_frame_qwords() -> usize {
     FRAME_QWORDS.with(|c| c.get())
+}
+
+pub(crate) fn set_current_nmethod(addr: usize) {
+    CURRENT_NMETHOD.with(|c| c.set(addr));
+}
+
+pub(crate) fn current_nmethod() -> usize {
+    CURRENT_NMETHOD.with(|c| c.get())
 }
 
 /// Outcome of a compiled-code invocation.
@@ -509,6 +521,8 @@ fn try_invoke_inner<'a>(
     set_depth(depth);
     let prev_frame_qwords = current_frame_qwords();
     set_frame_qwords(stubs::frame_qwords_for(addr));
+    let prev_nmethod = current_nmethod();
+    set_current_nmethod(addr);
     let call_args = CallArgs {
         regs,
         xmm,
@@ -517,6 +531,7 @@ fn try_invoke_inner<'a>(
         addr,
     };
     let (raw, xmm_raw) = unsafe { invoke_raw(&call_args) };
+    set_current_nmethod(prev_nmethod);
     set_frame_qwords(prev_frame_qwords);
     set_depth(previousDepth);
     static JIT_DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();

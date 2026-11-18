@@ -90,6 +90,11 @@ pub enum RuntimeStub {
     FloatConvert,
     UnresolvedField,
     UnresolvedCall,
+    /// Consumes the pending-outcome channel after a non-unwinding
+    /// stub call: returns 0 when nothing is pending, otherwise the
+    /// tagged reference word of the thrown object plus one (the JIT
+    /// subtracts one to recover the `encode_ref` encoding).
+    ExcCheck,
 }
 
 /// Resolved constant-pool site passed to JIT runtime stubs.  One

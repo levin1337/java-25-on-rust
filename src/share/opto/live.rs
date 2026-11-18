@@ -125,6 +125,13 @@ impl PhaseLive {
                 }
                 note_use(gvn, t.node, p, &mut use_pos);
             }
+            for e in &block.exc_succs {
+                if let Some(&(sb, sp)) = schedule.exc_def.get(&e.ctrl) {
+                    if sb == bi && e.ctrl < gvn.node_count() {
+                        def_pos.entry(e.ctrl).or_insert(pos(bi, sp as i64));
+                    }
+                }
+            }
         }
         for (phi, region) in &schedule.phi_region {
             if *phi >= gvn.node_count() || *region >= gvn.node_count() {
@@ -139,7 +146,11 @@ impl PhaseLive {
                 if value == NONE || ctrl == NONE || gvn.nodes[value].op.is_const() {
                     continue;
                 }
-                if let Some(&bi) = schedule.entry_block.get(&ctrl) {
+                if let Some(&bi) = schedule
+                    .entry_block
+                    .get(&ctrl)
+                    .or_else(|| schedule.exc_def.get(&ctrl).map(|d| &d.0))
+                {
                     let p = pos(bi, SPAN - 1);
                     let e = use_pos.entry(value).or_insert(i64::MIN);
                     if p > *e {
@@ -297,7 +308,11 @@ fn record_phi_edge_uses(
             if value == NONE || ctrl == NONE {
                 continue;
             }
-            if let Some(&bi) = schedule.entry_block.get(&ctrl) {
+            if let Some(&bi) = schedule
+                .entry_block
+                .get(&ctrl)
+                .or_else(|| schedule.exc_def.get(&ctrl).map(|d| &d.0))
+            {
                 use_sets[bi].insert(value);
             }
         }
@@ -316,7 +331,11 @@ fn backward_liveness(
         let mut changed = false;
         for bi in (0..nb).rev() {
             let mut out: HashSet<NodeId> = HashSet::new();
-            for e in &schedule.blocks[bi].succs {
+            for e in schedule.blocks[bi]
+                .succs
+                .iter()
+                .chain(schedule.blocks[bi].exc_succs.iter())
+            {
                 out.extend(live_in[e.block].iter().copied());
             }
             let mut inn: HashSet<NodeId> = use_sets[bi].clone();

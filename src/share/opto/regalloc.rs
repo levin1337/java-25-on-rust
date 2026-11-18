@@ -155,7 +155,7 @@ impl<'a> RegisterAllocator<'a> {
                 }
             }
             // Phi copies are uses in this predecessor block.
-            for e in &block.succs {
+            for e in block.succs.iter().chain(block.exc_succs.iter()) {
                 let succ_entry = self.schedule.blocks[e.block].entry;
                 if self.gvn.node(succ_entry).op != Opcode::Region {
                     continue;
@@ -167,6 +167,13 @@ impl<'a> RegisterAllocator<'a> {
                             self.collect_value(src, &mut use_set);
                         }
                     }
+                }
+            }
+            // Exception-edge tokens are defined by the dispatch sequence
+            // emitted after the trapping instruction.
+            for e in &block.exc_succs {
+                if matches!(self.gvn.node(e.ctrl).op, Opcode::IfException) {
+                    def.insert(e.ctrl);
                 }
             }
             out.insert(b, (use_set, def));
@@ -210,7 +217,11 @@ impl<'a> RegisterAllocator<'a> {
             let mut changed = false;
             for &b in self.order.iter().rev() {
                 let mut out = HashSet::new();
-                for e in &self.schedule.blocks[b].succs {
+                for e in self.schedule.blocks[b]
+                    .succs
+                    .iter()
+                    .chain(self.schedule.blocks[b].exc_succs.iter())
+                {
                     if let Some(s) = live_in.get(&e.block) {
                         out.extend(s.iter().copied());
                     }
@@ -260,6 +271,11 @@ impl<'a> RegisterAllocator<'a> {
     }
 
     fn def_key(&self, v: NodeId, use_def: &HashMap<usize, (HashSet<NodeId>, HashSet<NodeId>)>) -> (usize, usize) {
+        // Exception-edge tokens are defined on the edge out of their
+        // source block, not inside any instruction list.
+        if let Some(&(b, p)) = self.schedule.exc_def.get(&v) {
+            return (block_rpo(&self.schedule.blocks, b), p);
+        }
         for &b in &self.order {
             let block = &self.schedule.blocks[b];
             let (_, def) = &use_def[&b];

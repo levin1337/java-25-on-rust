@@ -155,6 +155,8 @@ impl AbstractCompiler for C2Compiler {
         };
         let mut sites: std::collections::HashMap<u16, super::builder::SiteInfo> =
             std::collections::HashMap::new();
+        let mut constants: std::collections::HashMap<u16, super::builder::ConstVal> =
+            std::collections::HashMap::new();
         if let Some(loader) = crate::share::runtime::threading::jvm_loader()
             && let Some(klass) = loader
                 .classes
@@ -163,6 +165,30 @@ impl AbstractCompiler for C2Compiler {
                 .cloned()
         {
             sites = super::builder::resolve_sites(&klass, bytecode);
+            for idx in crate::share::c1::c1_GraphBuilder::ldc_cp_indices(bytecode) {
+                if idx > u16::MAX as u32 {
+                    continue;
+                }
+                let Ok(c) = klass.constant(idx as u16) else {
+                    continue;
+                };
+                let v = match c {
+                    crate::share::classfile::classFileParser::Constant::Integer(v) => {
+                        super::builder::ConstVal::Int(*v)
+                    }
+                    crate::share::classfile::classFileParser::Constant::Long(v) => {
+                        super::builder::ConstVal::Long(*v)
+                    }
+                    crate::share::classfile::classFileParser::Constant::Float(v) => {
+                        super::builder::ConstVal::Float(*v)
+                    }
+                    crate::share::classfile::classFileParser::Constant::Double(v) => {
+                        super::builder::ConstVal::Double(*v)
+                    }
+                    _ => continue,
+                };
+                constants.insert(idx as u16, v);
+            }
         }
         if let Some(md) = &task.jit_metadata {
             for (idx, s) in &md.sites {
@@ -177,7 +203,16 @@ impl AbstractCompiler for C2Compiler {
                 }
             }
         }
-        let ctx = BuilderContext::with_sites(&sites);
+        let empty_fields: std::collections::HashMap<u16, super::builder::FieldAccess> =
+            std::collections::HashMap::new();
+        let empty_methods: std::collections::HashMap<u16, super::builder::MethodAccess> =
+            std::collections::HashMap::new();
+        let ctx = BuilderContext {
+            fields: &empty_fields,
+            methods: &empty_methods,
+            constants: &constants,
+            sites: &sites,
+        };
         let options = BackendOptions {
             stubs: crate::share::jitruntime::stub_map(),
             stubs_no_unwind: crate::share::jitruntime::stub_map_no_unwind(),
@@ -186,6 +221,18 @@ impl AbstractCompiler for C2Compiler {
             obj_layout: ObjLayoutMode::Uncompressed,
         };
         let mut compile = Compile::compile(&method_code, &ctx);
+        if let Some(build) = &compile.build
+            && !build.unsupported.is_empty()
+        {
+            return Err(CompileError::new(
+                FailureReason::Unsupported,
+                format!(
+                    "unsupported bytecodes: {}",
+                    build.unsupported.join("; ")
+                ),
+                CompLevel::FullOptimization,
+            ));
+        }
         let emitted = compile
             .backend(&method_code, &ctx, &options)
             .map_err(|e| match e {

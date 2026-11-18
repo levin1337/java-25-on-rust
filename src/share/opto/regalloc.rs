@@ -20,7 +20,7 @@
  */
 
 use super::gvn::PhaseGVN;
-use super::node::{NodeId, Opcode, Type};
+use super::node::{NodeId, Opcode, Type, NONE};
 use super::scheduler::{
     collect_materialized, effect_value_indices, phis_of_region, region_pred_index,
     terminal_value_indices, Schedule,
@@ -82,7 +82,23 @@ const XMM_POOL: [XMMRegister; 7] = [
 pub const TEMP_SLOTS: usize = 8;
 
 fn is_xmm_value(gvn: &PhaseGVN, node: NodeId) -> bool {
+    is_xmm_value_deep(gvn, node, 0)
+}
+
+fn is_xmm_value_deep(gvn: &PhaseGVN, node: NodeId, depth: u8) -> bool {
     let n = gvn.node(node);
+    if matches!(n.op, Opcode::Phi) {
+        // Phi carries no static type; its kind is that of its value
+        // inputs (all but the trailing Region control).  Depth cap
+        // keeps phi cycles terminating.
+        if depth >= 32 {
+            return false;
+        }
+        let values = &n.inputs[..n.inputs.len().saturating_sub(1)];
+        return values
+            .iter()
+            .any(|&i| i != NONE && is_xmm_value_deep(gvn, i, depth + 1));
+    }
     match n.op {
         Opcode::ConF(_) | Opcode::ConD(_) | Opcode::LoadF | Opcode::LoadD => true,
         _ => matches!(n.ty, Type::Float | Type::Double),

@@ -61,6 +61,15 @@ impl Compile {
         self.build = Some(res);
     }
 
+    fn dbg_dump(&self, tag: &str) {
+        if std::env::var("JVM25_DBG_PHASES").is_ok() {
+            eprintln!("=== {} ===", tag);
+            for n in &self.gvn.nodes {
+                eprintln!("N{} {:?} in={:?}", n.id, n.op, n.inputs);
+            }
+        }
+    }
+
     pub fn optimize(&mut self) {
         if self.optimized {
             return;
@@ -71,6 +80,7 @@ impl Compile {
             phase.complete();
             self.phases_run.push(phase);
         }
+        self.dbg_dump("itergvn1");
         {
             let mut phase = Phase::with_name(PhaseNumber::GVN, "typer");
             let typer = PhaseTyperRun::optimize(&self.gvn);
@@ -78,12 +88,14 @@ impl Compile {
             phase.complete();
             self.phases_run.push(phase);
         }
+        self.dbg_dump("typer");
         {
             let mut phase = Phase::with_name(PhaseNumber::Optimistic, "canonicalizer");
             PhaseCanonicalizerRun::optimize(&mut self.gvn);
             phase.complete();
             self.phases_run.push(phase);
         }
+        self.dbg_dump("canonicalizer");
         {
             let mut phase = Phase::with_name(PhaseNumber::MacroExpand, "macroExpand");
             let mut me = PhaseMacroExpandRun::new();
@@ -91,36 +103,42 @@ impl Compile {
             phase.complete();
             self.phases_run.push(phase);
         }
+        self.dbg_dump("macroexpand");
         {
             let mut phase = Phase::new(PhaseNumber::IdealLoop);
             self.loops = Some(PhaseIdealLoopRun::optimize(&self.gvn));
             phase.complete();
             self.phases_run.push(phase);
         }
+        self.dbg_dump("idealloop");
         {
             let mut phase = Phase::new(PhaseNumber::GVN);
             PhaseIterGVN::optimize(&mut self.gvn);
             phase.complete();
             self.phases_run.push(phase);
         }
+        self.dbg_dump("itergvn2");
         {
             let mut phase = Phase::new(PhaseNumber::RemoveUselessAndRenumberLive);
             PhaseRemoveUselessAndRenumber::optimize(&mut self.gvn);
             phase.complete();
             self.phases_run.push(phase);
         }
+        self.dbg_dump("dce1");
         {
             let mut phase = Phase::new(PhaseNumber::Optimistic);
             PhaseCCP::optimize(&mut self.gvn);
             phase.complete();
             self.phases_run.push(phase);
         }
+        self.dbg_dump("ccp");
         {
             let mut phase = Phase::new(PhaseNumber::RemoveUseless);
             PhaseRemoveUselessAndRenumber::optimize(&mut self.gvn);
             phase.complete();
             self.phases_run.push(phase);
         }
+        self.dbg_dump("dce2");
         self.optimized = true;
     }
 
@@ -2089,6 +2107,171 @@ mod tests {
                 }
                 other => panic!("unexpected result for {x},{y}: {:?}", other),
             }
+        }
+    }
+
+
+    #[test]
+    fn e2e_long_loop_phis() {
+        // Regression: production C2 run of this loop shape returned 0.
+        //   s=0L; i=0L; while (i < 2000000L) { s += (i*2654435761L)>>>13;
+        //   s ^= s<<7; if ((i&1023L)==0L) s+=i; i+=1L; } return s;
+        use super::super::builder::ConstVal;
+        use std::collections::HashMap;
+        let _ = test_loader();
+        let code: &[u8] = &[
+            0x09, // 0: lconst_0
+            0x3f, // 1: lstore_0
+            0x09, // 2: lconst_0
+            0x41, // 3: lstore_2
+            0x20, // 4: lload_2
+            0x14, 0x00, 0x0f, // 5: ldc2_w #15 (2000000)
+            0x94, // 8: lcmp
+            0x9c, 0x00, 0x2a, // 9: ifge 51
+            0x1e, // 12: lload_0
+            0x20, // 13: lload_2
+            0x14, 0x00, 0x11, // 14: ldc2_w #17 (2654435761)
+            0x69, // 17: lmul
+            0x10, 0x0d, // 18: bipush 13
+            0x7d, // 20: lushr
+            0x61, // 21: ladd
+            0x3f, // 22: lstore_0
+            0x1e, // 23: lload_0
+            0x1e, // 24: lload_0
+            0x10, 0x07, // 25: bipush 7
+            0x79, // 27: lshl
+            0x83, // 28: lxor
+            0x3f, // 29: lstore_0
+            0x20, // 30: lload_2
+            0x14, 0x00, 0x13, // 31: ldc2_w #19 (1023)
+            0x7f, // 34: land
+            0x09, // 35: lconst_0
+            0x94, // 36: lcmp
+            0x9a, 0x00, 0x07, // 37: ifne 44
+            0x1e, // 40: lload_0
+            0x20, // 41: lload_2
+            0x61, // 42: ladd
+            0x3f, // 43: lstore_0
+            0x20, // 44: lload_2
+            0x0a, // 45: lconst_1
+            0x61, // 46: ladd
+            0x41, // 47: lstore_2
+            0xa7, 0xff, 0xd4, // 48: goto 4
+            0x1e, // 51: lload_0
+            0xad, // 52: lreturn
+        ];
+        let mut constants: HashMap<u16, ConstVal> = HashMap::new();
+        constants.insert(15, ConstVal::Long(10));
+        constants.insert(17, ConstVal::Long(2_654_435_761));
+        constants.insert(19, ConstVal::Long(1023));
+        let fields = HashMap::new();
+        let methods = HashMap::new();
+        let sites = HashMap::new();
+        let ctx = super::super::builder::BuilderContext {
+            fields: &fields,
+            methods: &methods,
+            constants: &constants,
+            sites: &sites,
+        };
+        let m = MethodCode {
+            name: "burn",
+            max_locals: 4,
+            max_stack: 8,
+            param_slots: 0,
+            code,
+            handlers: &[],
+        };
+        let options = BackendOptions {
+            stubs: jit_stub_map(),
+            stubs_no_unwind: jit_stub_map_no_unwind(),
+            ..BackendOptions::default()
+        };
+        let mut c = Compile::compile(&m, &ctx);
+        c.optimize();
+        let emitted = c
+            .backend(&m, &ctx, &options)
+            .expect("c2 backend should emit");
+        let addr = publish_executable(&emitted.code, emitted.code.len())
+            .expect("publish executable");
+        let result = try_invoke(addr, b"()J", true, &[], 0).unwrap();
+        match result {
+            CompiledResult::Value(Some(Value::Long(v))) => {
+                assert_eq!(v, 9_039_158_812_727_735_167i64)
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn e2e_sumloop_shape() {
+        // C2Smoke.sumLoop(J)J shape: s/i live at locals 2/4 (param n at 0/1),
+        // generic lload/lstore index forms.  C2 returned n in production.
+        use super::super::builder::ConstVal;
+        use std::collections::HashMap;
+        let _ = test_loader();
+        let code: &[u8] = &[
+            0x09, // 0: lconst_0
+            0x41, // 1: lstore_2      (s)
+            0x09, // 2: lconst_0
+            0x37, 0x04, // 3: lstore 4  (i)
+            0x16, 0x04, // 5: lload 4
+            0x1e, // 7: lload_0       (n)
+            0x94, // 8: lcmp
+            0x9c, 0x00, 0x17, // 9: ifge 32
+            0x20, // 12: lload_2      (s)
+            0x16, 0x04, // 13: lload 4 (i)
+            0x14, 0x00, 0x0b, // 15: ldc2_w #11 (3)
+            0x69, // 18: lmul
+            0x0a, // 19: lconst_1
+            0x61, // 20: ladd
+            0x61, // 21: ladd
+            0x41, // 22: lstore_2
+            0x16, 0x04, // 23: lload 4
+            0x0a, // 25: lconst_1
+            0x61, // 26: ladd
+            0x37, 0x04, // 27: lstore 4
+            0xa7, 0xff, 0xe8, // 29: goto 5
+            0x20, // 32: lload_2
+            0xad, // 33: lreturn
+        ];
+        let mut constants: HashMap<u16, ConstVal> = HashMap::new();
+        constants.insert(11, ConstVal::Long(3));
+        let fields = HashMap::new();
+        let methods = HashMap::new();
+        let sites = HashMap::new();
+        let ctx = super::super::builder::BuilderContext {
+            fields: &fields,
+            methods: &methods,
+            constants: &constants,
+            sites: &sites,
+        };
+        let m = MethodCode {
+            name: "sumLoop",
+            max_locals: 6,
+            max_stack: 4,
+            param_slots: 2,
+            code,
+            handlers: &[],
+        };
+        let options = BackendOptions {
+            stubs: jit_stub_map(),
+            stubs_no_unwind: jit_stub_map_no_unwind(),
+            params: vec![lparam(0)],
+            ..BackendOptions::default()
+        };
+        let mut c = Compile::compile(&m, &ctx);
+        c.optimize();
+        let emitted = c
+            .backend(&m, &ctx, &options)
+            .expect("c2 backend should emit");
+        let addr = publish_executable(&emitted.code, emitted.code.len())
+            .expect("publish executable");
+        let result = try_invoke(addr, b"(J)J", true, &[Value::Long(100)], 0).unwrap();
+        match result {
+            CompiledResult::Value(Some(Value::Long(v))) => {
+                assert_eq!(v, 14_950i64)
+            }
+            other => panic!("unexpected result: {:?}", other),
         }
     }
 

@@ -391,14 +391,21 @@ pub fn compile_threshold() -> u32 {
 }
 
 /// Records one method entry. Returns `true` when the invocation threshold is
-/// crossed for the first time (caller should hand the method to the compile
-/// broker).
+/// crossed for the first time, and again every `threshold` invocations
+/// afterwards so the tiered policy keeps receiving events and can
+/// escalate C1 -> C2 (HotSpot polls continuously; we throttle to one
+/// event per threshold window).
 pub fn invocation_tick(code_key: usize) -> bool {
     let threshold = compile_threshold();
     let mut map = counters().lock().unwrap();
     let counters = map.entry(code_key).or_insert_with(MethodCounters::new);
     let count = counters.increment_invocation_counter(1);
-    if count >= threshold && hot().lock().unwrap().insert(code_key) {
+    let mut hot = hot().lock().unwrap();
+    if hot.contains(&code_key) {
+        return count % threshold == 0;
+    }
+    if count >= threshold {
+        hot.insert(code_key);
         return true;
     }
     false
@@ -411,7 +418,12 @@ pub fn backedge_tick(code_key: usize) -> bool {
     let mut map = counters().lock().unwrap();
     let counters = map.entry(code_key).or_insert_with(MethodCounters::new);
     let count = counters.increment_backedge_counter(1);
-    if count >= threshold && hot().lock().unwrap().insert(code_key) {
+    let mut hot = hot().lock().unwrap();
+    if hot.contains(&code_key) {
+        return count % threshold == 0;
+    }
+    if count >= threshold {
+        hot.insert(code_key);
         return true;
     }
     false

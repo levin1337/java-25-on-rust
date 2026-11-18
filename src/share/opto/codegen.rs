@@ -1030,10 +1030,27 @@ impl<'a> X86Emitter<'a> {
     // ---- value selection ---------------------------------------------------
 
     fn is_xmm(&self, node: NodeId) -> bool {
+        self.is_xmm_deep(node, 0)
+    }
+
+    fn is_xmm_deep(&self, node: NodeId, depth: u8) -> bool {
         if node == NONE {
             return false;
         }
         let n = self.gvn.node(node);
+        if matches!(n.op, Opcode::Phi) {
+            // Phi nodes carry no static type (`compute_type` yields
+            // `Type::None`); their kind is that of their value inputs —
+            // every input except the trailing Region control.  Follow
+            // input chains with a depth cap so phi cycles terminate.
+            if depth >= 32 {
+                return false;
+            }
+            let values = &n.inputs[..n.inputs.len().saturating_sub(1)];
+            return values
+                .iter()
+                .any(|&i| i != NONE && self.is_xmm_deep(i, depth + 1));
+        }
         if let Opcode::Parm(slot) = n.op {
             return self
                 .param_kinds
@@ -1068,10 +1085,23 @@ impl<'a> X86Emitter<'a> {
     }
 
     fn is_wide_gp(&self, node: NodeId) -> bool {
+        self.is_wide_gp_deep(node, 0)
+    }
+
+    fn is_wide_gp_deep(&self, node: NodeId, depth: u8) -> bool {
         if node == NONE {
             return false;
         }
         let n = self.gvn.node(node);
+        if matches!(n.op, Opcode::Phi) {
+            if depth >= 32 {
+                return false;
+            }
+            let values = &n.inputs[..n.inputs.len().saturating_sub(1)];
+            return values
+                .iter()
+                .any(|&i| i != NONE && self.is_wide_gp_deep(i, depth + 1));
+        }
         if let Opcode::Parm(slot) = n.op {
             return self
                 .param_kinds
@@ -1272,7 +1302,24 @@ impl<'a> X86Emitter<'a> {
     // ---- pure node selection ----------------------------------------------
 
     fn is_double_node(&self, node: NodeId) -> bool {
-        self.gvn.node(node).ty == Type::Double
+        self.is_double_node_deep(node, 0)
+    }
+
+    fn is_double_node_deep(&self, node: NodeId, depth: u8) -> bool {
+        if node == NONE {
+            return false;
+        }
+        let n = self.gvn.node(node);
+        if matches!(n.op, Opcode::Phi) {
+            if depth >= 32 {
+                return false;
+            }
+            let values = &n.inputs[..n.inputs.len().saturating_sub(1)];
+            return values
+                .iter()
+                .any(|&i| i != NONE && self.is_double_node_deep(i, depth + 1));
+        }
+        n.ty == Type::Double
     }
 
     fn emit_pure_gp(&mut self, node: NodeId) -> Result<(), BackendError> {

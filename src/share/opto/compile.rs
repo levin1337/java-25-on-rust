@@ -1312,4 +1312,50 @@ mod tests {
             other => panic!("unexpected result: {:?}", other),
         }
     }
+
+    #[test]
+    fn e2e_wide_locals() {
+        // static int f(int p) {
+        //   int x = 7;
+        //   p += 5;          // wide iinc on local 0
+        //   return x + p;    // wide iload on locals 0 and 1
+        // }
+        // Exercises the wide-prefixed encodings: u2 local index and an
+        // s2 iinc constant (the operands sit right after the sub-opcode,
+        // not after a phantom wide slot).
+        //
+        //  0: bipush 7
+        //  2: wide istore 1        x = 7
+        //  6: wide iinc 0, 5       p += 5
+        // 12: wide iload 1
+        // 16: wide iload 0
+        // 20: iadd
+        // 21: ireturn
+        let code: &[u8] = &[
+            0x10, 0x07, // bipush 7
+            0xc4, 0x36, 0x00, 0x01, // wide istore 1
+            0xc4, 0x84, 0x00, 0x00, 0x00, 0x05, // wide iinc 0, 5
+            0xc4, 0x15, 0x00, 0x01, // wide iload 1
+            0xc4, 0x15, 0x00, 0x00, // wide iload 0
+            0x60, 0xac, // iadd ; ireturn
+        ];
+        let mut m = method(code, 1);
+        m.max_locals = 2;
+        let options = BackendOptions {
+            params: vec![iparam(0)],
+            stubs: jit_stub_map(),
+            ..BackendOptions::default()
+        };
+        let mut c = Compile::compile(&m, &BuilderContext::empty());
+        let emitted = c
+            .backend(&m, &BuilderContext::empty(), &options)
+            .expect("c2 backend should emit wide locals");
+        let addr = publish_executable(&emitted.code, emitted.code.len())
+            .expect("publish executable");
+        let result = try_invoke(addr, b"(I)I", true, &[Value::Int(10)], 0).unwrap();
+        match result {
+            CompiledResult::Value(Some(Value::Int(v))) => assert_eq!(v, 22),
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
 }

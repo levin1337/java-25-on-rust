@@ -969,12 +969,12 @@ impl<'a> BytecodeGraphBuilder<'a> {
         let bc = Bytecode::new(self.code, bci).unwrap();
         match code {
             Code::Iload | Code::Lload | Code::Fload | Code::Dload | Code::Aload => {
-                let idx = bc.get_u2(2).unwrap_or(0) as usize;
+                let idx = bc.get_u2(1).unwrap_or(0) as usize;
                 let v = frame.locals.get(idx).copied().unwrap_or(self.zero);
                 self.push(frame, v, false);
             }
             Code::Istore | Code::Lstore | Code::Fstore | Code::Dstore | Code::Astore => {
-                let idx = bc.get_u2(2).unwrap_or(0) as usize;
+                let idx = bc.get_u2(1).unwrap_or(0) as usize;
                 let v = self.pop(frame);
                 if idx < frame.locals.len() {
                     frame.locals[idx] = v;
@@ -983,9 +983,9 @@ impl<'a> BytecodeGraphBuilder<'a> {
                 }
             }
             Code::Iinc => {
-                // Project bytecode dialect: iinc is u1 index, i8 const.
-                let idx = bc.get_u1(1).unwrap_or(0) as usize;
-                let c = i32::from(bc.get_u1(2).unwrap_or(0) as i8);
+                // wide iinc: u2 index, s2 const (JVMS layout).
+                let idx = bc.get_u2(1).unwrap_or(0) as usize;
+                let c = bc.get_s2(3).unwrap_or(0) as i32;
                 if idx < frame.locals.len() {
                     let k = self.gvn.con_i(c);
                     let cur = frame.locals[idx];

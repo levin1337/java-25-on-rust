@@ -1690,4 +1690,116 @@ mod tests {
             other => panic!("unexpected checkcast result: {:?}", other),
         }
     }
+
+    #[test]
+    fn e2e_getstatic_putstatic() {
+        // iconst_5 ; putstatic #1 ; getstatic #1 ; ireturn -> ()I
+        let loader = test_loader();
+        register_klass(&loader, b"S", &[(b"v", b"I", 0x0008)]);
+        let code: &[u8] = &[
+            0x08, // 0: iconst_5
+            0xb3, 0x00, 0x01, // 1: putstatic #1
+            0xb2, 0x00, 0x01, // 4: getstatic #1
+            0xac, // 7: ireturn
+        ];
+        let s = sites(&[(1, "S", "v", "I")]);
+        let ctx = BuilderContext::with_sites(&s);
+        let result = run_c2_ctx(code, 0, vec![], b"()I", &[], &ctx).unwrap();
+        match result {
+            CompiledResult::Value(Some(Value::Int(v))) => assert_eq!(v, 5),
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn e2e_athrow() {
+        // aload_0 ; athrow -> (LT;)V  propagates the throwable handle.
+        let loader = test_loader();
+        let klass = register_klass(&loader, b"java/lang/Throwable", &[]);
+        let object = InstanceOop::new(klass).unwrap();
+        let handle = loader.alloc_object(object);
+        let result = run_c2(
+            &[0x2a, 0xbf],
+            1,
+            ref_param(),
+            b"(Ljava/lang/Object;)V",
+            &[Value::Object(handle)],
+        )
+        .unwrap();
+        assert!(matches!(result, CompiledResult::Thrown(h) if h == handle));
+    }
+
+    /// Registers a klass whose `methods` carry a real `Code` attribute
+    /// so `h_call_method` can run the callee interpreted.
+    fn register_method_klass(
+        loader: &ClassLoader<'static>,
+        name: &'static [u8],
+        method_name: &'static [u8],
+        descriptor: &'static [u8],
+        access_flags: u16,
+        bytecode: &'static [u8],
+        max_locals: u16,
+    ) {
+        use crate::share::classfile::classFileParser::Attribute;
+        let mut code_attr = Vec::with_capacity(8 + bytecode.len() + 2);
+        code_attr.extend_from_slice(&[0, 4]); // max_stack = 4
+        code_attr.extend_from_slice(&max_locals.to_be_bytes());
+        code_attr.extend_from_slice(&(bytecode.len() as u32).to_be_bytes());
+        code_attr.extend_from_slice(bytecode);
+        code_attr.extend_from_slice(&[0, 0]); // exception_table_length = 0
+        let code_attr: &'static [u8] = Box::leak(code_attr.into_boxed_slice());
+        let class = ClassFile {
+            majorVersion: 65,
+            minorVersion: 0,
+            accessFlags: 0x0001,
+            name,
+            superName: Some(b"java/lang/Object"),
+            interfaces: Vec::new(),
+            constants: Vec::new(),
+            fields: Vec::new(),
+            methods: vec![Member {
+                accessFlags: access_flags,
+                name: method_name,
+                descriptor,
+                attributes: vec![Attribute {
+                    name: b"Code",
+                    bytes: code_attr,
+                }],
+            }],
+            attributes: Vec::new(),
+        };
+        let klass = Arc::new(InstanceKlass::new(class, None, Vec::new()).unwrap());
+        loader.classes.borrow_mut().insert(name, klass);
+    }
+
+    #[test]
+    fn e2e_invokestatic() {
+        // Caller: iload_0 ; iload_1 ; invokestatic #1 ; ireturn -> (II)I
+        // Callee C.add(II)I runs interpreted: iload_0; iload_1; iadd; ireturn
+        let loader = test_loader();
+        register_method_klass(
+            &loader,
+            b"C",
+            b"add",
+            b"(II)I",
+            0x0009,
+            Box::leak(vec![0x1a, 0x1b, 0x60, 0xac].into_boxed_slice()),
+            2,
+        );
+        let s = sites(&[(1, "C", "add", "(II)I")]);
+        let ctx = BuilderContext::with_sites(&s);
+        let result = run_c2_ctx(
+            &[0x1a, 0x1b, 0xb8, 0x00, 0x01, 0xac],
+            2,
+            vec![iparam(0), iparam(1)],
+            b"(II)I",
+            &[Value::Int(19), Value::Int(23)],
+            &ctx,
+        )
+        .unwrap();
+        match result {
+            CompiledResult::Value(Some(Value::Int(v))) => assert_eq!(v, 42),
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
 }

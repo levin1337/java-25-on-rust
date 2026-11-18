@@ -680,7 +680,13 @@ impl<'a> BytecodeGraphBuilder<'a> {
             stack_h = stack_h.max(info.stack.len());
         }
         let frame_len = nlocals + stack_h;
-        let region = self.gvn.alloc(Opcode::Region, vec![NONE; k]);
+        // Seed the Region inputs from already-delivered predecessors; edges
+        // that arrive later (backedges) are patched in by `deliver`.
+        let region_inputs: Vec<NodeId> = infos
+            .iter()
+            .map(|i| i.as_ref().map(|x| x.ctrl).unwrap_or(NONE))
+            .collect();
+        let region = self.gvn.alloc(Opcode::Region, region_inputs);
         let mut phis: Vec<(NodeId, usize)> = Vec::new();
         let mut merged: Vec<NodeId> = Vec::with_capacity(frame_len);
         for e in 0..frame_len {

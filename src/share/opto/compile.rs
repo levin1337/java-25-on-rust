@@ -1195,4 +1195,65 @@ mod tests {
             other => panic!("unexpected result: {:?}", other),
         }
     }
+
+    #[test]
+    fn e2e_loop_if_sum() {
+        // static int f(int n) {
+        //   int sum = 0;
+        //   for (int i = 0; i < n; i++)
+        //     sum += (i & 1) == 0 ? i : 1;
+        //   return sum;
+        // }
+        // The if/else inside the loop merges `sum` on both edges, so the
+        // join block needs phi copies arriving through IfTrue/IfFalse
+        // control edges, not just unconditional jumps.
+        //
+        //  0: iconst_0
+        //  1: istore_1          sum = 0
+        //  2: iconst_0
+        //  3: istore_2          i = 0
+        //  4: iload_0           <- loop header
+        //  5: iload_2
+        //  6: if_icmple +26 -> 32   exit when n <= i
+        //  9: iload_2
+        // 10: iconst_1
+        // 11: iand
+        // 12: ifeq +10 -> 22       even -> then
+        // 15: iload_1              else: sum += 1
+        // 16: iconst_1
+        // 17: iadd
+        // 18: istore_1
+        // 19: goto +7 -> 26        -> join
+        // 22: iload_1              then: sum += i
+        // 23: iload_2
+        // 24: iadd
+        // 25: istore_1
+        // 26: iinc 2, 1            <- join
+        // 29: goto -25 -> 4
+        // 32: iload_1
+        // 33: ireturn
+        let code: &[u8] = &[
+            0x03, 0x3c, 0x03, 0x3d, 0x1a, 0x1c, 0xa4, 0x00, 0x1a, 0x1c, 0x04, 0x7e, 0x99, 0x00,
+            0x0a, 0x1b, 0x04, 0x60, 0x3c, 0xa7, 0x00, 0x07, 0x1b, 0x1c, 0x60, 0x3c, 0x84, 0x02,
+            0x01, 0xa7, 0xff, 0xe7, 0x1b, 0xac,
+        ];
+        let mut m = method(code, 1);
+        m.max_locals = 3;
+        let options = BackendOptions {
+            params: vec![iparam(0)],
+            stubs: jit_stub_map(),
+            ..BackendOptions::default()
+        };
+        let mut c = Compile::compile(&m, &BuilderContext::empty());
+        let emitted = c
+            .backend(&m, &BuilderContext::empty(), &options)
+            .expect("c2 backend should emit loop");
+        let addr = publish_executable(&emitted.code, emitted.code.len())
+            .expect("publish executable");
+        let result = try_invoke(addr, b"(I)I", true, &[Value::Int(5)], 0).unwrap();
+        match result {
+            CompiledResult::Value(Some(Value::Int(v))) => assert_eq!(v, 8),
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
 }

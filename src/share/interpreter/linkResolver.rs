@@ -661,65 +661,90 @@ impl LinkResolver {
         let name_str = String::from_utf8_lossy(name);
         let sig_str = String::from_utf8_lossy(descriptor);
 
-        // 1. Check receiver's itable for the selected implementation.
-        if let Some(vtable_idx) = receiver_klass
-            .itable()
-            .resolve_interface_method(&iface_str, &name_str, &sig_str)
+        // 1. Locate the named interface inside the receiver's interface
+        //    closure. The closure includes interfaces implemented by
+        //    superclasses as well (JVMS §5.4.3.4 searches the receiver's
+        //    full interface closure).
+        let mut sym: Option<Arc<InstanceKlass<'a>>> = None;
         {
-            if let Some(entry) = receiver_klass.vtable().entry_at(vtable_idx) {
-                let holder = entry.holder_klass().as_bytes();
-                let mut curr = Some(receiver_klass);
-                while let Some(k) = curr {
-                    if k.class.name == holder {
-                        if let Some(method) = k.class.methods.iter().find(|m| {
-                            m.name == name && m.descriptor == descriptor && (m.accessFlags & 8 == 0)
-                        }) {
-                            return Ok((Arc::clone(k), Code::parse(method)?));
-                        }
+            let mut pending: Vec<Arc<InstanceKlass<'a>>> = Vec::new();
+            let mut curr = Some(receiver_klass);
+            while let Some(k) = curr {
+                pending.extend(k.interfaces.iter().cloned());
+                curr = k.super_klass.as_ref();
+            }
+            let mut seen: HashSet<usize> = HashSet::new();
+            while let Some(i) = pending.pop() {
+                if !seen.insert(Arc::as_ptr(&i) as usize) {
+                    continue;
+                }
+                if i.class.name == interface_name {
+                    sym = Some(i);
+                    break;
+                }
+                pending.extend(i.interfaces.iter().cloned());
+            }
+        }
+
+        // 2. JVMS §5.4.3.3 resolution inside the named interface: a private
+        //    method declared on the interface itself is selected directly
+        //    (private interface methods are never inherited nor overridden).
+        //    Otherwise collect non-private candidates from the interface and
+        //    its superinterfaces for maximally-specific selection.
+        let mut iface_candidates: Vec<Resolved<'a>> = Vec::new();
+        if let Some(sym_k) = &sym {
+            if let Some(index) = find_declared(sym_k, name, descriptor) {
+                let member = &sym_k.class.methods[index];
+                if member.accessFlags & ACC_STATIC == 0
+                    && member.accessFlags & ACC_PRIVATE != 0
+                {
+                    return Ok((Arc::clone(sym_k), Code::parse(member)?));
+                }
+            }
+            let mut seen: HashSet<usize> = HashSet::new();
+            let mut pending = vec![Arc::clone(sym_k)];
+            while let Some(i) = pending.pop() {
+                if !seen.insert(Arc::as_ptr(&i) as usize) {
+                    continue;
+                }
+                pending.extend(i.interfaces.iter().cloned());
+                if let Some(index) = find_declared(&i, name, descriptor) {
+                    let member = &i.class.methods[index];
+                    if member.accessFlags & (ACC_STATIC | ACC_PRIVATE) == 0 {
+                        iface_candidates.push(Resolved {
+                            holder: i.clone(),
+                            index,
+                        });
                     }
-                    curr = k.super_klass.as_ref();
                 }
             }
         }
 
-        // 2. Resolve within the receiver's interface closure: the interface
-        // matching `interface_name` (or declaring the method) provides the
-        // resolved method; private/default methods on it are directly
-        // selectable.
-        {
-            let mut pending: Vec<Arc<InstanceKlass<'a>>> = receiver_klass.interfaces.clone();
-            let mut visited = HashSet::new();
-            while let Some(iface) = pending.pop() {
-                if !visited.insert(Arc::as_ptr(&iface) as usize) {
-                    continue;
-                }
-                pending.extend(iface.interfaces.iter().cloned());
-                let declares = iface.class.name == interface_name
-                    || iface
-                        .class
-                        .methods
-                        .iter()
-                        .any(|m| m.name == name && m.descriptor == descriptor);
-                if !declares {
-                    continue;
-                }
-                if let Some(method) = iface.class.methods.iter().find(|m| {
-                    m.name == name
-                        && m.descriptor == descriptor
-                        && m.accessFlags & 8 == 0
-                        && m.code_attribute().is_some()
-                }) {
-                    return Ok((Arc::clone(&iface), Code::parse(method)?));
-                }
-            }
-        }
-
-        // 3. If receiver overrides it directly, resolve virtual call.
-        if let Ok(res) = Self::resolve_virtual_call(receiver_klass, name, descriptor) {
+        // 3. Selection (HotSpot runtime_resolve_interface_method): unless the
+        //    resolved method is private, look the method up in the receiver's
+        //    class hierarchy — class methods and itable/vtable-registered
+        //    interface defaults both win over the resolved interface method.
+        let virtual_res = Self::resolve_virtual_call(receiver_klass, name, descriptor);
+        if let Ok(res) = virtual_res {
             return Ok(res);
         }
 
-        // 4. Public non-static methods of java.lang.Object (JVMS §5.4.3.3:
+        // 4. The receiver provides no implementation: use the resolved
+        //    interface method itself (a default method), or report
+        //    AbstractMethodError when it is abstract.
+        if let Some(r) = select_maximally_specific(iface_candidates)? {
+            if r.member().code_attribute().is_some() {
+                return Ok((Arc::clone(&r.holder), r.code()?));
+            }
+            if r.is_abstract() {
+                return Err(Error::other(format!(
+                    "AbstractMethodError: {}.{}{}",
+                    iface_str, name_str, sig_str
+                )));
+            }
+        }
+
+        // 5. Public non-static methods of java.lang.Object (JVMS §5.4.3.3:
         // interface method resolution falls back to Object's public methods).
         let mut curr = Some(Arc::clone(receiver_klass));
         while let Some(k) = curr {
@@ -735,10 +760,21 @@ impl LinkResolver {
             curr = k.super_klass();
         }
 
-        Err(Error::other(format!(
-            "NoSuchMethodError: interface method {}.{}{}",
-            iface_str, name_str, sig_str
-        )))
+        if std::env::var_os("JVM25_TRACE").is_some() {
+            eprintln!(
+                "[iface-resolve-fail] receiver={} iface={} {}{}",
+                String::from_utf8_lossy(&receiver_klass.class.name),
+                iface_str,
+                name_str,
+                sig_str,
+            );
+        }
+        Err(virtual_res.err().unwrap_or_else(|| {
+            Error::other(format!(
+                "NoSuchMethodError: interface method {}.{}{}",
+                iface_str, name_str, sig_str
+            ))
+        }))
     }
 
     /// Resolves invokespecial call (constructors, private methods, super calls).

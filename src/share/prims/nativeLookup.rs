@@ -752,13 +752,13 @@ fn invokeInstanceInner<'a>(
         }
         (b"jdk/internal/perf/Perf", b"detach", b"(Ljava/nio/ByteBuffer;)V") => None,
         (b"jdk/internal/misc/ScopedMemoryAccess", b"closeScope0", b"(Ljdk/internal/foreign/MemorySessionImpl;Ljdk/internal/misc/ScopedMemoryAccess$ScopedAccessError;)V") => {
-            // Scoped-memory cleanup: rethrow the supplied ScopedAccessError
-            // when present; closing the scope itself is a no-op for us.
-            if let Some(Value::Object(handle)) = arguments.get(2) {
-                return Err(io::Error::other(
-                    crate::share::interpreter::bytecodeInterpreter::JavaThrowable(*handle),
-                ));
-            }
+            // HotSpot performs a thread handshake and returns normally; the
+            // supplied ScopedAccessError is only *delivered* to threads found
+            // inside @Scoped methods — it is never thrown unconditionally.
+            // There is no real handshake here, so closing the scope is a no-op.
+            // (Previously this rethrew arg2 whenever non-null, which made every
+            // shared-session close — e.g. Arena.ofShared().close() — throw
+            // `java.lang.Error: Invalid memory access`.)
             None
         }
         (b"java/lang/Object", b"wait0", b"(J)V") => {
@@ -1050,7 +1050,7 @@ fn invokeInstanceInner<'a>(
                 Some(value) => Some(value),
                 None => {
                     return match super::jniInvocation::invoke_dll_native(
-                        loader, owner, name, descriptor, false, arguments,
+                        loader, owner, name, descriptor, false, arguments, output, depth,
                     )? {
                         Some(result) => Ok(Some(result)),
                         None => Ok(None),
@@ -1064,7 +1064,7 @@ fn invokeInstanceInner<'a>(
                 Some(value) => Some(value),
                 None => {
                     return match super::jniInvocation::invoke_dll_native(
-                        loader, owner, name, descriptor, false, arguments,
+                        loader, owner, name, descriptor, false, arguments, output, depth,
                     )? {
                         Some(result) => Ok(Some(result)),
                         None => Ok(None),
@@ -1077,7 +1077,7 @@ fn invokeInstanceInner<'a>(
                 Some(value) => Some(value),
                 None => {
                     return match super::jniInvocation::invoke_dll_native(
-                        loader, owner, name, descriptor, false, arguments,
+                        loader, owner, name, descriptor, false, arguments, output, depth,
                     )? {
                         Some(result) => Ok(Some(result)),
                         None => Ok(None),
@@ -1112,7 +1112,7 @@ fn invokeInstanceInner<'a>(
                 );
             }
             return match super::jniInvocation::invoke_dll_native(
-                loader, owner, name, descriptor, false, arguments,
+                loader, owner, name, descriptor, false, arguments, output, depth,
             )? {
                 Some(result) => Ok(Some(result)),
                 None => Ok(None),
@@ -1696,7 +1696,7 @@ fn invokeStaticInner<'a>(
         (b"java/lang/StringUTF16", b"isBigEndian", b"()Z") => {
             Some(Some(Value::Int(i32::from(cfg!(target_endian = "big")))))
         }
-        (_, b"registerNatives", b"()V") | (_, b"initIDs", b"()V") => Some(None),
+        (_, b"registerNatives" | b"initIDs", b"()V") if loader.is_boot_class(owner)? => Some(None),
         (
             b"java/lang/StackTraceElement",
             b"initStackTraceElement",
@@ -1889,18 +1889,44 @@ fn invokeStaticInner<'a>(
         (b"java/lang/Thread", b"getNextThreadIdOffset", b"()J") => Some(Some(Value::Long(
             crate::share::prims::unsafeNatives::THREAD_TID_SENTINEL_OFFSET,
         ))),
-        (b"java/lang/Thread", b"findScopedValueBindings", b"()Ljava/lang/Object;")
-        | (b"java/security/AccessController", b"ensureMaterializedForStackWalk", b"(Ljava/lang/Object;)V")
-        | (b"java/lang/Thread", b"ensureMaterializedForStackWalk", b"(Ljava/lang/Object;)V") => {
-            Some(if name == b"findScopedValueBindings" { Some(Value::Null) } else { None })
+        (b"java/lang/Thread", b"findScopedValueBindings", b"()Ljava/lang/Object;") => {
+            Some(Some(crate::share::interpreter::bytecodeInterpreter::findScopedValueBindings()))
         }
+        (b"java/security/AccessController" | b"java/lang/Thread", b"ensureMaterializedForStackWalk", b"(Ljava/lang/Object;)V") => Some(None),
         (b"java/lang/Thread", b"scopedValueCache", b"()[Ljava/lang/Object;") => {
-            let component = loader.storage.alloc_slice_copy(b"java/lang/Object");
-            let array =
-                crate::share::oops::objArrayOop::ObjArrayOop::withComponent(0, component)?;
-            Some(Some(Value::ObjectArray(loader.alloc_obj_array(array))))
+            use crate::share::runtime::threading::{MAIN_THREAD_KEY, current_thread_handle};
+            let thread = current_thread_handle(loader).unwrap_or(MAIN_THREAD_KEY);
+            let cache = loader.scopedValueCaches.borrow().get(&thread).copied();
+            if std::env::var_os("JVM25_TRACE_SV").is_some() {
+                let len = cache.and_then(|h| {
+                    loader
+                        .obj_arrays
+                        .borrow()
+                        .get(h)
+                        .map(|a| a.len())
+                });
+                eprintln!("[sv-cache-get] thread={thread:#x} handle={cache:?} len={len:?}");
+            }
+            Some(Some(cache.map_or(Value::Null, Value::ObjectArray)))
         }
-        (b"java/lang/Thread", b"setScopedValueCache", b"([Ljava/lang/Object;)V") => Some(None),
+        (b"java/lang/Thread", b"setScopedValueCache", b"([Ljava/lang/Object;)V") => {
+            use crate::share::runtime::threading::{MAIN_THREAD_KEY, current_thread_handle};
+            let thread = current_thread_handle(loader).unwrap_or(MAIN_THREAD_KEY);
+            if std::env::var_os("JVM25_TRACE_SV").is_some() {
+                let len = match arguments {
+                    [Value::ObjectArray(h)] => loader.obj_arrays.borrow().get(*h).map(|a| a.len()),
+                    _ => None,
+                };
+                eprintln!("[sv-cache-set] thread={thread:#x} len={len:?}");
+            }
+            let mut caches = loader.scopedValueCaches.borrow_mut();
+            match arguments {
+                [Value::ObjectArray(cache)] => { caches.insert(thread, *cache); }
+                [Value::Null] => { caches.remove(&thread); }
+                _ => return Err(io::Error::other("Invalid scoped value cache")),
+            }
+            Some(None)
+        }
         (b"jdk/internal/misc/Unsafe", b"getUnsafe", b"()Ljdk/internal/misc/Unsafe;") => {
             match loader.load(b"jdk/internal/misc/Unsafe") {
                 Ok(klass) => match crate::share::oops::instanceOop::InstanceOop::new(klass) {
@@ -2472,7 +2498,7 @@ fn invokeStaticInner<'a>(
         }
         (b"java/lang/System", b"identityHashCode", b"(Ljava/lang/Object;)I") => arguments
             .first()
-            .map(|&value| Some(Value::Int(super::objectNatives::identity(value)))),
+            .map(|&value| Some(Value::Int(super::objectNatives::identity(loader, value)))),
         (b"java/lang/Float", b"floatToRawIntBits", b"(F)I") => {
             if let Some(Value::Float(f)) = arguments.first() {
                 Some(Some(Value::Int(JvmNatives::float_to_raw_int_bits(*f))))
@@ -2580,9 +2606,11 @@ fn invokeStaticInner<'a>(
             b"getClassAccessFlags",
             b"(Ljava/lang/Class;)I",
         ) => {
-            let flags = match arguments.first() {
-                Some(Value::ClassMirror(name)) => {
-                    let mut name = *name;
+            let flags = match super::classNatives::class_value_name(
+                loader,
+                arguments.first().copied().unwrap_or(Value::Null),
+            )? {
+                Some(mut name) => {
                     if name.starts_with(b":") {
                         Some(0x0411i32)
                     } else {
@@ -2812,7 +2840,7 @@ fn invokeStaticInner<'a>(
                 Some(value) => Some(Some(value)),
                 None => {
                     return super::jniInvocation::invoke_dll_native(
-                        loader, owner, name, descriptor, true, arguments,
+                        loader, owner, name, descriptor, true, arguments, output, depth,
                     );
                 }
             }

@@ -113,7 +113,7 @@ struct JvmState {
     /// declared `native`. Keys are (ptr, len) of the class-file slices —
     /// bump-allocated and stable for the VM lifetime, so lookups need no
     /// allocation on the hot path.
-    method_native: HashMap<(usize, usize, usize, usize, usize, usize, bool), Option<bool>>,
+    method_native: HashMap<(usize, usize, usize, usize, usize, usize, bool), Option<&'static [u8]>>,
     /// Methods with no DLL export; avoids repeated symbol lookups.
     native_misses: HashSet<(Vec<u8>, Vec<u8>, Vec<u8>)>,
     trampoline_cache: HashMap<(usize, Vec<u8>), NativeCode>,
@@ -4270,34 +4270,26 @@ pub fn has_native_implementation(vm: &JavaVm, class_name: &[u8], name: &[u8], si
         .contains_key(&(class_name.to_vec(), name.to_vec(), sig.to_vec()))
 }
 
-/// Whether `owner.name(descriptor)` is declared with `ACC_NATIVE`, walking
-/// the superclass chain for instance methods. Used to skip JNI symbol
-/// resolution for ordinary bytecode methods.
-/// `Some(true)`/`Some(false)` when the owner class loads and the method
-/// is/isn't declared `native`; `None` when the class cannot be loaded
-/// (synthetic dispatch, tests) — callers must fall back to symbol
-/// resolution in that case.
-fn method_is_native(
-    loader: &ClassLoader<'_>,
+fn nativeMethodOwner(
+    loader: &ClassLoader<'static>,
     owner: &[u8],
     name: &[u8],
     descriptor: &[u8],
     is_static: bool,
-) -> Option<bool> {
+) -> Option<Option<&'static [u8]>> {
     let mut klass = loader.load(owner).ok()?;
     loop {
-        let found = klass.class.methods.iter().any(|method| {
+        if let Some(method) = klass.class.methods.iter().find(|method| {
             method.name == name
                 && method.descriptor == descriptor
-                && (method.accessFlags & 0x0008 != 0) == is_static
-                && method.accessFlags & 0x0100 != 0
-        });
-        if found {
-            return Some(true);
+        }) {
+            let native = method.accessFlags & 0x0100 != 0;
+            let staticMethod = method.accessFlags & 0x0008 != 0;
+            return Some((native && staticMethod == is_static).then_some(klass.class.name));
         }
         match klass.super_klass.clone() {
             Some(parent) => klass = parent,
-            None => return Some(false),
+            None => return Some(None),
         }
     }
 }
@@ -4318,6 +4310,8 @@ pub fn invoke_dll_native(
     descriptor: &[u8],
     is_static: bool,
     arguments: &[Value<'_>],
+    output: &mut dyn io::Write,
+    depth: usize,
 ) -> io::Result<Option<Option<Value<'static>>>> {
     let vm = unsafe { &*JavaVm::global() };
     vm.bind_loader(loader);
@@ -4342,20 +4336,24 @@ pub fn invoke_dll_native(
         is_static,
     );
     let cached_native = vm.state().method_native.get(&method_key).copied();
-    let is_native = match cached_native {
+    let declaringOwner = match cached_native {
         Some(value) => value,
         None => {
             // NOTE: no JvmState lock may be held here — class loading can
             // re-enter the interpreter and this function.
-            let value = method_is_native(loader, owner, name, descriptor, is_static);
-            vm.state().method_native.insert(method_key, value);
-            value
+            if let Some(value) = nativeMethodOwner(loader, owner, name, descriptor, is_static) {
+                vm.state().method_native.insert(method_key, value);
+                value
+            } else {
+                Some(owner)
+            }
         }
     };
-    // Only a provably non-native method skips DLL resolution; `None`
-    // (unloadable owner) falls through to symbol lookup.
-    if is_native == Some(false) {
+    let Some(owner) = declaringOwner else {
         return Ok(None);
+    };
+    if is_static && let Ok(klass) = loader.load(owner) {
+        crate::share::interpreter::bytecodeInterpreter::initialize(loader, &klass, output, depth + 1)?;
     }
 
     let key = (owner.to_vec(), name.to_vec(), descriptor.to_vec());
@@ -4459,7 +4457,13 @@ pub fn invoke_dll_native(
         Some(2) => Value::Float(f32::from_bits(raw as u32)),
         Some(3) => Value::Double(f64::from_bits(raw)),
         Some(4) => token_to_value(env, loader, result_token).unwrap_or(Value::Null),
-        _ => Value::Int(raw as u32 as i32),
+        _ => Value::Int(match descriptor.last() {
+            Some(b'Z') => i32::from(raw as u8 != 0),
+            Some(b'B') => i32::from(raw as i8),
+            Some(b'C') => i32::from(raw as u16),
+            Some(b'S') => i32::from(raw as i16),
+            _ => raw as i32,
+        }),
     };
     Ok(Some(Some(value)))
 }

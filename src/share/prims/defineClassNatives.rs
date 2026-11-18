@@ -46,6 +46,13 @@ fn define_from_window<'a>(
     let owned = loader.storage.alloc_slice_copy(&window);
     let class = ClassFile::parse(owned, false).map_err(linkage_error)?;
     let name = class.name;
+    if std::env::var_os("JVM25_DUMP_PROXY").is_some() && name.starts_with(b"jdk/proxy") {
+        let file = format!(
+            "D:/jvm25-rust/proxy_{}.class",
+            String::from_utf8_lossy(name).replace('/', "_")
+        );
+        let _ = std::fs::write(&file, &window);
+    }
     loader.define_class(class)?;
     if let Value::Object(handle) = protection_domain {
         if std::env::var_os("JVM25_TRACE_PD").is_some() {
@@ -149,6 +156,13 @@ pub(crate) fn define_class2<'a>(
     let owned = loader.storage.alloc_slice_copy(&window);
     let class = ClassFile::parse(owned, false).map_err(linkage_error)?;
     let name = class.name;
+    if std::env::var_os("JVM25_DUMP_PROXY").is_some() && name.starts_with(b"jdk/proxy") {
+        let file = format!(
+            "D:/jvm25-rust/proxy_{}.class",
+            String::from_utf8_lossy(name).replace('/', "_")
+        );
+        let _ = std::fs::write(&file, &window);
+    }
     loader.define_class(class)?;
     let protection_domain = arguments.get(5).copied().unwrap_or(Value::Null);
     if let Value::Object(handle) = protection_domain {

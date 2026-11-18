@@ -736,8 +736,7 @@ impl<'a> X86Emitter<'a> {
     /// The handler resolves the target through `LinkResolver`, runs an
     /// installed nmethod via `try_invoke` when present and otherwise
     /// executes the method in `bytecodeInterpreter`.  Integer results
-    /// return in rax; float/double results reach xmm0 through the
-    /// stub's TLS channel, so the destination store is kind-driven.
+    /// return in rax; float/double results return in xmm0.
     fn emit_call_stub(&mut self, dst: Option<&LirOperand>, operands: &[LirOperand], info: &crate::share::c1::c1_Instruction::CallInfo) -> Result<(), BackendError> {
         let addr = self
             .options

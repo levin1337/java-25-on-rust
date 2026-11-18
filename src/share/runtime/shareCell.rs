@@ -70,7 +70,11 @@ impl<T> Share<T> {
             }
         };
         if guard.borrows.get() != 0 {
-            panic!("already borrowed");
+            panic!(
+                "already borrowed: Share<{}> borrows={}",
+                std::any::type_name::<T>(),
+                guard.borrows.get()
+            );
         }
         guard.borrows.set(-1);
         // SAFETY: same as `borrow`, plus the borrow counter marks exclusive

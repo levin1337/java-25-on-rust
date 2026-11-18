@@ -35,3 +35,9 @@ Goal: full Minecraft 26.3 + Fabric on Rust JVM, JIT enabled, no crashes.
 - If real areturn: returnType.isPrimitive() was false at gen time in MC context -> find why (Mixin-transformed interface? different Method resolution? classloader?).
 - If ireturn but interpreter reads 0xb0: pc/stack corruption bug.
 - Pending other bugs: coerce_value->Empty, Log4j newInstance, JNA field-order, OSHI, javac arg0 field.
+
+## C2 PRODUCTION MILESTONE (commit e2ca60a)
+- C2 now reachable in tiered pipeline: flag on, C2Compiler registered, policy falls back to raw counters w/o MDO, hotness ticks re-fire every threshold.
+- Fixed: phi width classification (i64/f64 phis were 32-bit -> loop corruption); ldc/ldc2_w constants now resolved from CP (were ConI(0) -> i*3=0 miscompile); builder-unsupported bytecodes now reject to interpreter; permanent per-method compile failures recorded (no retry storms).
+- Verified on real JVM: C2Smoke burn(J)J + sumLoop(J)J C2-compiled, correct output.
+- C2 limits: no OSR, no typed catches, array/ref signatures unsupported, fields/methods ctx maps still empty in production (field/invoke methods -> interpreter fallback).

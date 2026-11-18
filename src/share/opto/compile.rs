@@ -1482,4 +1482,212 @@ mod tests {
             other => panic!("unexpected result: {:?}", other),
         }
     }
+
+    // -----------------------------------------------------------------
+    // Heap-operation e2e tests: real ClassLoader + registered klasses,
+    // so field/array/cast stubs resolve against live objects exactly
+    // like the C1 nmethod tests in jitruntime::runtime.
+    // -----------------------------------------------------------------
+
+    use crate::share::classfile::classFileParser::{ClassFile, Member};
+    use crate::share::classfile::classLoader::ClassLoader;
+    use crate::share::oops::instanceKlass::InstanceKlass;
+    use crate::share::oops::instanceOop::InstanceOop;
+    use crate::share::runtime::syncBump::SyncBump;
+    use crate::share::runtime::threading;
+    use std::sync::{Arc, OnceLock};
+
+    fn test_loader() -> Arc<ClassLoader<'static>> {
+        static LOADER: OnceLock<Arc<ClassLoader<'static>>> = OnceLock::new();
+        LOADER
+            .get_or_init(|| {
+                let arena: &'static SyncBump = Box::leak(Box::new(SyncBump::new()));
+                let loader =
+                    Arc::new(ClassLoader::open(std::path::Path::new("."), arena).unwrap());
+                threading::install_loader(loader.clone());
+                loader
+            })
+            .clone()
+    }
+
+    fn register_klass(
+        loader: &ClassLoader<'static>,
+        name: &'static [u8],
+        fields: &[(&'static [u8], &'static [u8], u16)],
+    ) -> Arc<InstanceKlass<'static>> {
+        let class = ClassFile {
+            majorVersion: 65,
+            minorVersion: 0,
+            accessFlags: 0x0001,
+            name,
+            superName: Some(b"java/lang/Object"),
+            interfaces: Vec::new(),
+            constants: Vec::new(),
+            fields: fields
+                .iter()
+                .map(|&(n, d, f)| Member {
+                    accessFlags: f,
+                    name: n,
+                    descriptor: d,
+                    attributes: Vec::new(),
+                })
+                .collect(),
+            methods: Vec::new(),
+            attributes: Vec::new(),
+        };
+        let klass = Arc::new(InstanceKlass::new(class, None, Vec::new()).unwrap());
+        loader.classes.borrow_mut().insert(name, klass.clone());
+        klass
+    }
+
+    fn run_c2_ctx(
+        code: &'static [u8],
+        param_slots: usize,
+        params: Vec<ParamSlot>,
+        descriptor: &'static [u8],
+        args: &[Value<'static>],
+        ctx: &BuilderContext,
+    ) -> Option<CompiledResult<'static>> {
+        let options = BackendOptions {
+            params,
+            stubs: jit_stub_map(),
+            ..BackendOptions::default()
+        };
+        let mut c = Compile::compile(&method(code, param_slots), ctx);
+        let emitted = c
+            .backend(&method(code, param_slots), ctx, &options)
+            .expect("c2 backend should emit");
+        let addr = publish_executable(&emitted.code, emitted.code.len())
+            .expect("publish executable");
+        try_invoke(addr, descriptor, true, args, 0)
+    }
+
+    #[test]
+    fn e2e_getfield_putfield() {
+        // aload_0 ; bipush 42 ; putfield #1 ; aload_0 ; getfield #1 ; ireturn
+        // -> (LT;)I  stores then reloads field x through real stubs.
+        let loader = test_loader();
+        let klass = register_klass(&loader, b"T", &[(b"x", b"I", 0)]);
+        let object = InstanceOop::new(klass).unwrap();
+        let handle = loader.alloc_object(object);
+
+        let code: &[u8] = &[
+            0x2a, // 0: aload_0
+            0x10, 0x2a, // 1: bipush 42
+            0xb5, 0x00, 0x01, // 3: putfield #1
+            0x2a, // 6: aload_0
+            0xb4, 0x00, 0x01, // 7: getfield #1
+            0xac, // 10: ireturn
+        ];
+        let s = sites(&[(1, "T", "x", "I")]);
+        let ctx = BuilderContext::with_sites(&s);
+        let result = run_c2_ctx(
+            code,
+            1,
+            ref_param(),
+            b"(LT;)I",
+            &[Value::Object(handle)],
+            &ctx,
+        )
+        .unwrap();
+        match result {
+            CompiledResult::Value(Some(Value::Int(v))) => assert_eq!(v, 42),
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn e2e_newarray_iastore_iaload() {
+        // The array stubs resolve through the JVM loader; make sure it
+        // is installed before the compiled code runs (tests are
+        // parallel, so do not rely on another test having done it).
+        let _loader = test_loader();
+        // bipush 3 ; newarray int ; astore_0 ;
+        // aload_0 ; iconst_0 ; bipush 42 ; iastore ;
+        // aload_0 ; iconst_0 ; iaload ; ireturn  -> ()I
+        let code: &[u8] = &[
+            0x10, 0x03, // 0: bipush 3
+            0xbc, 0x0a, // 2: newarray int
+            0x4b, // 4: astore_0
+            0x2a, // 5: aload_0
+            0x03, // 6: iconst_0
+            0x10, 0x2a, // 7: bipush 42
+            0x4f, // 9: iastore
+            0x2a, // 10: aload_0
+            0x03, // 11: iconst_0
+            0x2e, // 12: iaload
+            0xac, // 13: ireturn
+        ];
+        let result = run_c2(
+            code,
+            0,
+            vec![],
+            b"()I",
+            &[],
+        )
+        .unwrap();
+        match result {
+            CompiledResult::Value(Some(Value::Int(v))) => assert_eq!(v, 42),
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn e2e_arraylength() {
+        let _loader = test_loader();
+        // bipush 5 ; newarray int ; astore_0 ; aload_0 ; arraylength ; ireturn
+        let code: &[u8] = &[
+            0x10, 0x05, // 0: bipush 5
+            0xbc, 0x0a, // 2: newarray int
+            0x4b, // 4: astore_0
+            0x2a, // 5: aload_0
+            0xbe, // 6: arraylength
+            0xac, // 7: ireturn
+        ];
+        let result = run_c2(code, 0, vec![], b"()I", &[]).unwrap();
+        match result {
+            CompiledResult::Value(Some(Value::Int(v))) => assert_eq!(v, 5),
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn e2e_instanceof_checkcast() {
+        // aload_0 ; instanceof #1 ; ireturn -> (LT;)I  (expects 1)
+        // aload_0 ; checkcast #1 ; pop ; iconst_1 ; ireturn -> (LT;)I
+        let loader = test_loader();
+        let klass = register_klass(&loader, b"T", &[]);
+        let object = InstanceOop::new(klass).unwrap();
+        let handle = loader.alloc_object(object);
+
+        let s = sites(&[(1, "T", "", "")]);
+        let ctx = BuilderContext::with_sites(&s);
+        let result = run_c2_ctx(
+            &[0x2a, 0xc1, 0x00, 0x01, 0xac],
+            1,
+            ref_param(),
+            b"(LT;)I",
+            &[Value::Object(handle)],
+            &ctx,
+        )
+        .unwrap();
+        match result {
+            CompiledResult::Value(Some(Value::Int(v))) => assert_eq!(v, 1),
+            other => panic!("unexpected instanceof result: {:?}", other),
+        }
+
+        let result = run_c2_ctx(
+            &[0x2a, 0xc0, 0x00, 0x01, 0x57, 0x04, 0xac],
+            1,
+            ref_param(),
+            b"(LT;)I",
+            &[Value::Object(handle)],
+            &ctx,
+        )
+        .unwrap();
+        match result {
+            CompiledResult::Value(Some(Value::Int(v))) => assert_eq!(v, 1),
+            other => panic!("unexpected checkcast result: {:?}", other),
+        }
+    }
 }

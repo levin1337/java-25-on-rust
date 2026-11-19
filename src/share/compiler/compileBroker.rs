@@ -509,7 +509,9 @@ impl CompileBroker {
     pub fn ensure_compiler_threads_started() {
         Self::ensure_compiler_thread_for_level(CompLevel::Simple);
         static C2_REGISTERED: AtomicBool = AtomicBool::new(false);
-        if !C2_REGISTERED.swap(true, Ordering::AcqRel) {
+        if std::env::var_os("JVM25_NO_C2").is_none()
+            && !C2_REGISTERED.swap(true, Ordering::AcqRel)
+        {
             let c2: Arc<Mutex<dyn AbstractCompiler>> = Arc::new(Mutex::new(
                 crate::share::opto::compiler::C2Compiler::new(),
             ));
@@ -1362,12 +1364,13 @@ impl CompileBroker {
 
                     // Publish the entry point to the interpreter's
                     // per-method dispatch: the next invocation of this
-                    // method calls the compiled code directly. OSR
-                    // tasks also produce full-method code (the C1
-                    // backend has no separate OSR entry sequence), so
-                    // they publish the same way; repeated OSR installs
-                    // simply overwrite with an equivalent blob.
-                    if let Some(key) = task.profile_key {
+                    // method calls the compiled code directly.  OSR
+                    // nmethods must NOT publish here: their entry
+                    // expects the marshal-buffer pointer in rcx, not
+                    // Java arguments — the interpreter reaches them
+                    // only through find_osr_nmethod_by_key +
+                    // invoke_osr at backedge targets.
+                    if !is_osr && let Some(key) = task.profile_key {
                         methodCounters::mark_compiled(key, addr);
                     }
 

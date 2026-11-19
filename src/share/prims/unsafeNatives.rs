@@ -27,6 +27,12 @@ pub(crate) const THREAD_TID_SENTINEL_OFFSET: i64 = i64::MAX;
 
 static THREAD_TID_COUNTER: AtomicI64 = AtomicI64::new(0);
 
+thread_local! {
+    static CURRENT_NATIVE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    static NULL_READS: std::cell::RefCell<std::collections::HashMap<i64, u32>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
 type NativeResult<'a> = Option<Option<Value<'a>>>;
 
 pub(crate) fn invoke<'a>(
@@ -40,6 +46,7 @@ pub(crate) fn invoke<'a>(
     if name == b"registerNatives" {
         return Ok(Some(None));
     }
+    CURRENT_NATIVE.with(|c| *c.borrow_mut() = name.to_vec());
 
     let result = match (name, descriptor) {
         (b"getBoolean", b"(Ljava/lang/Object;J)Z")
@@ -754,7 +761,25 @@ fn read_raw<'a>(
     let object = object_arg(loader, arguments, object_index)?;
     let offset = offset_arg(arguments, object_index + 1)?;
     if std::env::var_os("JVM25_TRACE").is_some() && matches!(object, Value::Null) {
-        eprintln!("[unsafe-null] offset={offset} args={arguments:?}");
+        let what = CURRENT_NATIVE.with(|c| String::from_utf8_lossy(&c.borrow()).into_owned());
+        eprintln!("[unsafe-null] {what} offset={offset} args={arguments:?}");
+    }
+    if std::env::var_os("JVM25_TRACE").is_some() && matches!(object, Value::Null) {
+        NULL_READS.with(|c| {
+            let mut map = c.borrow_mut();
+            let n = {
+                let e = map.entry(offset).or_insert(0);
+                *e += 1;
+                *e
+            };
+            if n == 30 {
+                let mut frames = Vec::new();
+                crate::share::interpreter::bytecodeInterpreter::for_each_active_frame(
+                    &mut |f| frames.push(f.site()),
+                );
+                eprintln!("[unsafe-spin] offset={offset} n={n} stack={frames:?}");
+            }
+        });
     }
     if matches!(object, Value::Null) && offset == THREAD_TID_SENTINEL_OFFSET {
         return Ok(Raw {

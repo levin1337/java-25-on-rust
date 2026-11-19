@@ -344,6 +344,22 @@ impl AbstractCompiler for C2Compiler {
                 ),
             })?;
         self.compiled_methods += 1;
+        if let Ok(filter) = std::env::var("JVM25_DUMP_C2")
+            && method_code.name == filter
+        {
+            eprintln!(
+                "[c2-code] {} frame={}",
+                method_code.name,
+                emitted.frame_size
+            );
+            for (i, chunk) in emitted.code.chunks(16).enumerate() {
+                eprint!("  {:04x} ", i * 16);
+                for b in chunk {
+                    eprint!("{b:02x} ");
+                }
+                eprintln!();
+            }
+        }
         Ok(CompileOutcome {
             code_bytes: emitted.code,
             frame_size: emitted.frame_size,

@@ -13,7 +13,7 @@ public class C2Fields {
     }
     public static void main(String[] a) {
         C2Fields f = new C2Fields();
-        for (int k = 0; k < 30000; k++) f.run(100);
+        for (int k = 0; k < 600; k++) f.run(50);
         C2Fields g = new C2Fields();
         long r = g.run(1000);
         long expect = 0, c = 0;

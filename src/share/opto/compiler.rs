@@ -60,7 +60,56 @@ fn parse_params(descriptor: &str, is_static: bool) -> Option<(Vec<ParamSlot>, us
         let (kind, width) = match bytes[i] {
             b'B' | b'C' | b'I' | b'S' | b'Z' => (ParamKind::I32, 1usize),
             b'J' => (ParamKind::I64, 2usize),
-            // Floats/references are outside the executable bridge subset.
+            b'F' => (ParamKind::F32, 1usize),
+            b'D' => (ParamKind::F64, 2usize),
+            b'L' => {
+                // Reference type: skip to the terminating ';'.
+                let mut j = i + 1;
+                while j < bytes.len() && bytes[j] != b';' {
+                    j += 1;
+                }
+                if j >= bytes.len() {
+                    return None;
+                }
+                params.push(ParamSlot {
+                    local_slot: slot,
+                    kind: ParamKind::Ref,
+                });
+                slot += 1;
+                i = j + 1;
+                continue;
+            }
+            b'[' => {
+                // Array type: skip the bracket run then the element
+                // (primitive letter or L...;).
+                let mut j = i;
+                while j < bytes.len() && bytes[j] == b'[' {
+                    j += 1;
+                }
+                if j >= bytes.len() {
+                    return None;
+                }
+                if bytes[j] == b'L' {
+                    while j < bytes.len() && bytes[j] != b';' {
+                        j += 1;
+                    }
+                    if j >= bytes.len() {
+                        return None;
+                    }
+                } else if !matches!(
+                    bytes[j],
+                    b'B' | b'C' | b'D' | b'F' | b'I' | b'J' | b'S' | b'Z'
+                ) {
+                    return None;
+                }
+                params.push(ParamSlot {
+                    local_slot: slot,
+                    kind: ParamKind::Ref,
+                });
+                slot += 1;
+                i = j + 1;
+                continue;
+            }
             _ => return None,
         };
         params.push(ParamSlot {

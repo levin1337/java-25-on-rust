@@ -1107,7 +1107,12 @@ impl<'a> BytecodeGraphBuilder<'a> {
                 self.push_const_i(frame, v);
             }
             Ldc | LdcW | Ldc2W => {
-                let idx = bc.get_u2(1).unwrap_or(0);
+                // `ldc` carries a u1 index; `ldc_w`/`ldc2_w` carry u2.
+                let idx = if code == Ldc {
+                    bc.get_u1(1).unwrap_or(0) as u16
+                } else {
+                    bc.get_u2(1).unwrap_or(0)
+                };
                 match self.ctx.constants.get(&idx) {
                     Some(ConstVal::Int(v)) => self.push_const_i(frame, *v),
                     Some(ConstVal::Long(v)) => {

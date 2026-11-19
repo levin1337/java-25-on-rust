@@ -14,7 +14,10 @@ Goal: full Minecraft 26.3 + Fabric on Rust JVM, JIT enabled, no crashes.
   (catch site + table priority); codegen emits an ordered
   ExcCheck->InstanceOf dispatch chain with rethrow-on-miss.
   Verified by e2e_typed_catch (match / non-match propagate /
-  typed-fail -> catch-all).
+  typed-fail -> catch-all) and C2Catch.java in production.
+- OSR supports exception handlers: restrict_to_osr keeps handler
+  blocks reachable via exception edges and remaps exc preds.
+  Verified by e2e_osr_try_catch + C2Catch OSR nmethods in production.
 - Known C2 gaps -> interpreter fallback: invokedynamic, precise deopt,
   GC barriers in JIT code (conservative frame scan only).
 

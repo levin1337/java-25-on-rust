@@ -27,6 +27,13 @@ Goal: full Minecraft 26.3 + Fabric on Rust JVM, JIT enabled, no crashes.
   with correct results.
 - Known C2 gaps -> interpreter fallback: precise deopt,
   GC barriers in JIT code (conservative frame scan only).
+- FIXED (f85c2e6): OSR installs no longer publish their entry to
+  methodCounters::mark_compiled — regular invocations were entering
+  OSR code with the wrong ABI (rcx=marshal buf vs Java args) and
+  segfaulting on the first OsrArg load. Repro: hot
+  String.toLowerCase -> C2 OSR of StringLatin1.toLowerCase crashed
+  at [encoded-ref+8]; NettyProbe (PlatformDependent clinit) crashed
+  the same way. VEH crash handler now prints fault RIP -> nmethod.
 
 ## Build/run
 - `cargo build --release` -> `target/release/jvm25-rust.exe`; MUST `cp` to `release/jvm25-rust.exe` (ps1 uses release/).

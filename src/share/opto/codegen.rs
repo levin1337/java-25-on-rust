@@ -64,6 +64,9 @@ pub struct BackendOptions {
     pub stubs_no_unwind: BTreeMap<RuntimeStub, u64>,
     /// Incoming arguments in ABI order with their JVM local slot.
     pub params: Vec<ParamSlot>,
+    /// OSR entry: no ABI parameters; rcx carries the marshal-buffer
+    /// pointer which the prologue stores in frame slot 0.
+    pub osr: bool,
     pub emit_safepoints: bool,
     pub obj_layout: ObjLayoutMode,
 }
@@ -74,6 +77,7 @@ impl Default for BackendOptions {
             stubs: BTreeMap::new(),
             stubs_no_unwind: BTreeMap::new(),
             params: Vec::new(),
+            osr: false,
             emit_safepoints: true,
             obj_layout: ObjLayoutMode::Compressed,
         }
@@ -266,6 +270,17 @@ impl<'a> X86Emitter<'a> {
             self.buf.write_i32(self.alloc.frame_size as i32)?; // sub rsp,imm32
         }
         self.emit_param_moves()?;
+        if self.options.osr {
+            // rcx holds the marshal-buffer pointer on OSR entry.
+            self.asm.mov_mem_reg(
+                Some(Register::FP),
+                None,
+                Scale::S1,
+                self.slot_disp(0),
+                Register::RCX,
+                true,
+            )?;
+        }
         Ok(())
     }
 
@@ -1148,6 +1163,10 @@ impl<'a> X86Emitter<'a> {
                     .map_err(BackendError::from);
             }
             Opcode::Parm(slot) => return self.emit_parm_gp(slot as usize, dst),
+            Opcode::OsrI(idx) => return self.emit_osr_gp(idx, dst, false),
+            Opcode::OsrL(idx) | Opcode::OsrP(idx) => {
+                return self.emit_osr_gp(idx, dst, true);
+            }
             _ => {}
         }
         if self.is_pure(node) {
@@ -1200,6 +1219,8 @@ impl<'a> X86Emitter<'a> {
                 self.asm.movq_xmm_from_gp(dst, Register::RAX)?;
                 return Ok(());
             }
+            Opcode::OsrF(idx) => return self.emit_osr_xmm(idx, dst, false),
+            Opcode::OsrD(idx) => return self.emit_osr_xmm(idx, dst, true),
             _ => {}
         }
         if self.is_pure(node) {
@@ -1228,6 +1249,57 @@ impl<'a> X86Emitter<'a> {
             Loc::Gp(_) => return Err(BackendError::InvalidGraph("xmm/gp mismatch".into())),
         }
         Ok(())
+    }
+
+    /// Loads one marshal-buffer slot: `[rbp + slot_disp(0)]` holds the
+    /// buffer pointer written by the OSR prologue.
+    fn emit_osr_gp(
+        &mut self,
+        idx: u32,
+        dst: Register,
+        wide: bool,
+    ) -> Result<(), BackendError> {
+        self.asm
+            .mov_reg_mem(
+                Register::RAX,
+                Some(Register::FP),
+                None,
+                Scale::S1,
+                self.slot_disp(0),
+                true,
+            )
+            .map_err(BackendError::from)?;
+        self.asm
+            .mov_reg_mem(
+                dst,
+                Some(Register::RAX),
+                None,
+                Scale::S1,
+                (idx as i32) * 8,
+                wide,
+            )
+            .map_err(BackendError::from)
+    }
+
+    fn emit_osr_xmm(
+        &mut self,
+        idx: u32,
+        dst: XMMRegister,
+        double: bool,
+    ) -> Result<(), BackendError> {
+        self.asm
+            .mov_reg_mem(
+                Register::RAX,
+                Some(Register::FP),
+                None,
+                Scale::S1,
+                self.slot_disp(0),
+                true,
+            )
+            .map_err(BackendError::from)?;
+        self.asm
+            .sse_load_mem(dst, Register::RAX, (idx as i32) * 8, double)
+            .map_err(BackendError::from)
     }
 
     fn emit_parm_gp(&mut self, slot: usize, dst: Register) -> Result<(), BackendError> {

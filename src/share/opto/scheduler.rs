@@ -745,7 +745,12 @@ pub fn collect_materialized(
         | Opcode::ConD(_)
         | Opcode::ConP(_)
         | Opcode::Bool(_)
-        | Opcode::Parm(_) => {}
+        | Opcode::Parm(_)
+        | Opcode::OsrI(_)
+        | Opcode::OsrL(_)
+        | Opcode::OsrF(_)
+        | Opcode::OsrD(_)
+        | Opcode::OsrP(_) => {}
         Opcode::Phi
         | Opcode::LoadI
         | Opcode::LoadL

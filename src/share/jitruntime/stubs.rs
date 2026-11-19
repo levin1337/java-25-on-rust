@@ -226,7 +226,16 @@ pub fn publish_executable(code: &[u8], reserve: usize) -> Option<usize> {
 /// valid tagged reference inside the current arena bounds is treated
 /// as a root.  False positives only retain objects longer; they can
 /// never free a live one.
-struct FrameRoots {
+/// Public wrapper so `runtime::invoke_osr` can pin marshal-buffer
+/// references for the duration of an OSR-compiled call.
+pub fn register_frame_roots(
+    loader: &Arc<ClassLoader<'static>>,
+    values: Vec<Value<'static>>,
+) -> Option<FrameRoots> {
+    FrameRoots::register(loader, values)
+}
+
+pub struct FrameRoots {
     loader: Arc<ClassLoader<'static>>,
     start: usize,
     values: Vec<Value<'static>>,

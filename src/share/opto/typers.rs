@@ -74,6 +74,11 @@ pub fn node_value_type(gvn: &PhaseGVN, id: NodeId, types: &[Type]) -> Type {
         }
         Opcode::Bool(b) => Type::int_const(*b as i32),
         Opcode::Parm(_) => Type::Bottom,
+        Opcode::OsrI(_) => Type::int(),
+        Opcode::OsrL(_) => Type::long(),
+        Opcode::OsrF(_) => Type::float(),
+        Opcode::OsrD(_) => Type::double(),
+        Opcode::OsrP(_) => Type::inst_ptr(None),
         Opcode::I2L => Type::long(),
         Opcode::I2F => Type::float(),
         Opcode::I2D => Type::double(),

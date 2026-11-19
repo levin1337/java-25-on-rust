@@ -210,6 +210,29 @@ struct Frame {
     ctrl: NodeId,
 }
 
+/// Kind of one OSR marshal-buffer slot, captured from the interpreter
+/// frame at the backedge that triggered compilation.  Types at a given
+/// bytecode index are static, so request-time kinds stay valid at the
+/// later OSR entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OsrKind {
+    I32,
+    I64,
+    F32,
+    F64,
+    Ref,
+}
+
+/// OSR compilation request: enter at `entry_bci` (a backward-branch
+/// target) with `local_kinds` describing every local slot
+/// (`max_locals` entries, padded with `I32` when short) and
+/// `stack_kinds` the operand-stack values live at that point.
+pub struct OsrSpec {
+    pub entry_bci: u32,
+    pub local_kinds: Vec<OsrKind>,
+    pub stack_kinds: Vec<OsrKind>,
+}
+
 pub struct BytecodeGraphBuilder<'a> {
     gvn: &'a mut PhaseGVN,
     code: &'a [u8],
@@ -235,6 +258,32 @@ impl<'a> BytecodeGraphBuilder<'a> {
         start: NodeId,
         root: NodeId,
     ) -> BuildResult {
+        Self::build_inner(gvn, method, ctx, start, root, None)
+    }
+
+    /// OSR variant: the graph entry is the block containing
+    /// `osr.entry_bci`; its frame is seeded from `OsrArg` nodes that
+    /// read the interpreter-marshalled buffer at run time.  Blocks not
+    /// reachable from the entry are dropped from the CFG.
+    pub fn build_osr(
+        gvn: &'a mut PhaseGVN,
+        method: &'a MethodCode<'a>,
+        ctx: &'a BuilderContext<'a>,
+        start: NodeId,
+        root: NodeId,
+        osr: &OsrSpec,
+    ) -> BuildResult {
+        Self::build_inner(gvn, method, ctx, start, root, Some(osr))
+    }
+
+    fn build_inner(
+        gvn: &'a mut PhaseGVN,
+        method: &'a MethodCode<'a>,
+        ctx: &'a BuilderContext<'a>,
+        start: NodeId,
+        root: NodeId,
+        osr_spec: Option<&OsrSpec>,
+    ) -> BuildResult {
         let mut b = Self {
             gvn,
             code: method.code,
@@ -255,6 +304,9 @@ impl<'a> BytecodeGraphBuilder<'a> {
         b.halt = b.gvn.alloc(Opcode::Halt, vec![]);
         b.build_cfg(method);
         b.build_exception_edges(method);
+        if let Some(osr) = osr_spec {
+            b.restrict_to_osr(method, osr, start);
+        }
         for i in 0..b.blocks.len() {
             b.process_block(i, method, start);
         }
@@ -575,6 +627,110 @@ impl<'a> BytecodeGraphBuilder<'a> {
                 self.blocks[i].succs.push(Succ { target: tb, slot });
             }
         }
+    }
+
+    /// Restricts the CFG to blocks reachable from the OSR entry and
+    /// seeds the entry block's frame from marshal-buffer inputs.  The
+    /// seed is injected as an extra already-delivered predecessor so
+    /// the normal merge/phi machinery treats it like any other edge.
+    fn restrict_to_osr(&mut self, method: &MethodCode, osr: &OsrSpec, start: NodeId) {
+        if !method.handlers.is_empty() {
+            self.result
+                .unsupported
+                .push("osr: exception handlers are not supported".to_string());
+            return;
+        }
+        let entry_bci = osr.entry_bci as usize;
+        let Some(entry) = self.blocks.iter().position(|b| b.start == entry_bci) else {
+            self.result
+                .unsupported
+                .push(format!("osr: bci {} is not a block start", osr.entry_bci));
+            return;
+        };
+        let n = self.blocks.len();
+        let mut reach = vec![false; n];
+        let mut work = vec![entry];
+        reach[entry] = true;
+        while let Some(b) = work.pop() {
+            for s in &self.blocks[b].succs {
+                if !reach[s.target] {
+                    reach[s.target] = true;
+                    work.push(s.target);
+                }
+            }
+        }
+        // Remap old block indices to the filtered list.
+        let mut map = vec![usize::MAX; n];
+        let mut new_blocks: Vec<Block> = Vec::new();
+        for (i, blk) in self.blocks.iter().enumerate() {
+            if reach[i] {
+                map[i] = new_blocks.len();
+                new_blocks.push(blk.clone());
+            }
+        }
+        for blk in new_blocks.iter_mut() {
+            blk.preds.clear();
+            blk.succs.clear();
+        }
+        for i in 0..n {
+            if !reach[i] {
+                continue;
+            }
+            let ni = map[i];
+            let succs = self.blocks[i].succs.clone();
+            for s in succs {
+                if !reach[s.target] {
+                    continue;
+                }
+                let nt = map[s.target];
+                let slot = new_blocks[nt].preds.len();
+                new_blocks[nt].preds.push(PredRef::Normal);
+                new_blocks[ni].succs.push(Succ {
+                    target: nt,
+                    slot,
+                });
+            }
+        }
+        self.blocks = new_blocks;
+        let entry = map[entry];
+
+        // Seed frame: locals come from buffer slots [0, max_locals),
+        // stack values from [max_locals, max_locals + depth).
+        let mut locals = Vec::with_capacity(method.max_locals);
+        for i in 0..method.max_locals {
+            let kind = osr.local_kinds.get(i).copied().unwrap_or(OsrKind::I32);
+            locals.push(self.osr_node(kind, i as u32));
+        }
+        let mut stack = Vec::with_capacity(osr.stack_kinds.len());
+        for (j, &kind) in osr.stack_kinds.iter().enumerate() {
+            let cat2 = matches!(kind, OsrKind::I64 | OsrKind::F64);
+            stack.push(StackVal {
+                node: self.osr_node(kind, method.max_locals as u32 + j as u32),
+                cat2,
+            });
+        }
+        let seed_slot = self.blocks[entry].preds.len();
+        self.blocks[entry].preds.push(PredRef::Normal);
+        self.delivered.insert(
+            (entry, seed_slot),
+            EdgeInfo {
+                ctrl: start,
+                mem: start,
+                locals,
+                stack,
+            },
+        );
+    }
+
+    fn osr_node(&mut self, kind: OsrKind, idx: u32) -> NodeId {
+        let op = match kind {
+            OsrKind::I32 => Opcode::OsrI(idx),
+            OsrKind::I64 => Opcode::OsrL(idx),
+            OsrKind::F32 => Opcode::OsrF(idx),
+            OsrKind::F64 => Opcode::OsrD(idx),
+            OsrKind::Ref => Opcode::OsrP(idx),
+        };
+        self.gvn.alloc(op, vec![])
     }
 
     fn build_exception_edges(&mut self, method: &MethodCode) {

@@ -53,6 +53,42 @@ impl Compile {
         c
     }
 
+    /// OSR compilation: graph entry is `osr.entry_bci` seeded from
+    /// marshal-buffer inputs instead of method parameters.
+    pub fn compile_osr(
+        method: &MethodCode,
+        ctx: &BuilderContext,
+        osr: &super::builder::OsrSpec,
+    ) -> Self {
+        let mut gvn = PhaseGVN::new();
+        let start = gvn.transform(Opcode::Start, vec![]);
+        let root = gvn.transform(Opcode::Root, vec![start]);
+        let mut c = Self {
+            method_name: method.name.to_string(),
+            gvn,
+            root,
+            start,
+            phases_run: Vec::new(),
+            build: None,
+            optimized: false,
+            node_types: Vec::new(),
+            loops: None,
+        };
+        let mut phase = Phase::new(PhaseNumber::Parser);
+        let res = BytecodeGraphBuilder::build_osr(
+            &mut c.gvn,
+            method,
+            ctx,
+            c.start,
+            c.root,
+            osr,
+        );
+        phase.complete();
+        c.phases_run.push(phase);
+        c.build = Some(res);
+        c
+    }
+
     pub fn build_graph(&mut self, method: &MethodCode, ctx: &BuilderContext) {
         let mut phase = Phase::new(PhaseNumber::Parser);
         let res = BytecodeGraphBuilder::build(&mut self.gvn, method, ctx, self.start, self.root);
@@ -2194,6 +2230,118 @@ mod tests {
         let addr = publish_executable(&emitted.code, emitted.code.len())
             .expect("publish executable");
         let result = try_invoke(addr, b"()J", true, &[], 0).unwrap();
+        match result {
+            CompiledResult::Value(Some(Value::Long(v))) => {
+                assert_eq!(v, 9_039_158_812_727_735_167i64)
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn e2e_osr_long_loop() {
+        // OSR entry into the same burn-loop shape at the loop header
+        // (bci 4): locals s/i arrive via the marshal buffer instead of
+        // parameters.  Entering with s=0, i=0 must reproduce the
+        // whole-method result.
+        use super::super::builder::{ConstVal, OsrKind, OsrSpec};
+        use std::collections::HashMap;
+        let _ = test_loader();
+        let code: &[u8] = &[
+            0x09, // 0: lconst_0
+            0x3f, // 1: lstore_0
+            0x09, // 2: lconst_0
+            0x41, // 3: lstore_2
+            0x20, // 4: lload_2
+            0x14, 0x00, 0x0f, // 5: ldc2_w #15 (2000000)
+            0x94, // 8: lcmp
+            0x9c, 0x00, 0x2a, // 9: ifge 51
+            0x1e, // 12: lload_0
+            0x20, // 13: lload_2
+            0x14, 0x00, 0x11, // 14: ldc2_w #17 (2654435761)
+            0x69, // 17: lmul
+            0x10, 0x0d, // 18: bipush 13
+            0x7d, // 20: lushr
+            0x61, // 21: ladd
+            0x3f, // 22: lstore_0
+            0x1e, // 23: lload_0
+            0x1e, // 24: lload_0
+            0x10, 0x07, // 25: bipush 7
+            0x79, // 27: lshl
+            0x83, // 28: lxor
+            0x3f, // 29: lstore_0
+            0x20, // 30: lload_2
+            0x14, 0x00, 0x13, // 31: ldc2_w #19 (1023)
+            0x7f, // 34: land
+            0x09, // 35: lconst_0
+            0x94, // 36: lcmp
+            0x9a, 0x00, 0x07, // 37: ifne 44
+            0x1e, // 40: lload_0
+            0x20, // 41: lload_2
+            0x61, // 42: ladd
+            0x3f, // 43: lstore_0
+            0x20, // 44: lload_2
+            0x0a, // 45: lconst_1
+            0x61, // 46: ladd
+            0x41, // 47: lstore_2
+            0xa7, 0xff, 0xd4, // 48: goto 4
+            0x1e, // 51: lload_0
+            0xad, // 52: lreturn
+        ];
+        let mut constants: HashMap<u16, ConstVal> = HashMap::new();
+        constants.insert(15, ConstVal::Long(10));
+        constants.insert(17, ConstVal::Long(2_654_435_761));
+        constants.insert(19, ConstVal::Long(1023));
+        let fields = HashMap::new();
+        let methods = HashMap::new();
+        let sites = HashMap::new();
+        let ctx = super::super::builder::BuilderContext {
+            fields: &fields,
+            methods: &methods,
+            constants: &constants,
+            sites: &sites,
+        };
+        let m = MethodCode {
+            name: "burn",
+            max_locals: 4,
+            max_stack: 8,
+            param_slots: 1, // slot 0 reserves the OSR buffer pointer
+            code,
+            handlers: &[],
+        };
+        let osr = OsrSpec {
+            entry_bci: 4,
+            local_kinds: vec![OsrKind::I64; 4],
+            stack_kinds: vec![],
+        };
+        let options = BackendOptions {
+            stubs: jit_stub_map(),
+            stubs_no_unwind: jit_stub_map_no_unwind(),
+            osr: true,
+            ..BackendOptions::default()
+        };
+        let mut c = Compile::compile_osr(&m, &ctx, &osr);
+        c.optimize();
+        let emitted = c
+            .backend(&m, &ctx, &options)
+            .expect("c2 osr backend should emit");
+        let addr = publish_executable(&emitted.code, emitted.code.len())
+            .expect("publish executable");
+        // Interpreter state at the loop header: s=0, i=0.
+        let locals = vec![
+            Value::Long(0),
+            Value::Empty,
+            Value::Long(0),
+            Value::Empty,
+        ];
+        let result = crate::share::jitruntime::runtime::invoke_osr(
+            addr,
+            b"()J",
+            true,
+            &locals,
+            &[],
+        )
+        .expect("invoke_osr should marshal");
         match result {
             CompiledResult::Value(Some(Value::Long(v))) => {
                 assert_eq!(v, 9_039_158_812_727_735_167i64)

@@ -308,6 +308,21 @@ impl Drop for FrameRegistration {
     }
 }
 
+/// Maps an interpreter `Value` to the `OsrKind` used for OSR graph
+/// inputs.  `Empty` slots (cat2 second halves, dead locals) map to I32 —
+/// they are never read as values.  Non-primitive values map to Ref;
+/// `invoke_osr` refuses to marshal shapes `encode_ref` rejects.
+fn osr_kind_of(v: &Value<'_>) -> crate::share::opto::builder::OsrKind {
+    use crate::share::opto::builder::OsrKind::*;
+    match v {
+        Value::Int(_) => I32,
+        Value::Long(_) => I64,
+        Value::Float(_) => F32,
+        Value::Double(_) => F64,
+        _ => Ref,
+    }
+}
+
 pub(crate) struct Frame<'a> {
     code: Code<'a>,
     pc: usize,
@@ -318,6 +333,9 @@ pub(crate) struct Frame<'a> {
     stackSlots: usize,
     owner: &'a [u8],
     monitors: Vec<u64>,
+    /// Set when an OSR-compiled nmethod ran the method to completion;
+    /// the execute loop returns this value as the method result.
+    osr_result: Option<Value<'a>>,
     /// Raw pointer/length to the declaring class's constant pool, used by
     /// `stackWalkInfo` to resolve LineNumberTable entries. The `InstanceKlass`
     /// `Arc` owning the `ClassFile` (and thus this `Vec`'s buffer) is kept
@@ -463,6 +481,14 @@ impl<'a> Frame<'a> {
                     is_static_initializer: self.code.name == b"<clinit>",
                     ..Default::default()
                 };
+                // Snapshot the frame for the OSR graph: local-slot kinds
+                // (max_locals entries) and operand-stack kinds at the
+                // branch target — the verifier guarantees these are the
+                // static types at that bci.
+                let osr_frame = crate::share::compiler::compileTask::OsrFrame {
+                    local_kinds: self.locals.iter().map(osr_kind_of).collect(),
+                    stack_kinds: self.stack.iter().map(osr_kind_of).collect(),
+                };
                 crate::share::compiler::compileBroker::CompileBroker::global()
                     .backedge_event(
                         crate::share::oops::symbol::Symbol::new(self.owner),
@@ -474,7 +500,39 @@ impl<'a> Frame<'a> {
                         false,
                         None,
                         crate::share::compiler::compilerDefinitions::CompLevel::Simple,
+                        Some(osr_frame),
                     );
+                // OSR entry: if an OSR nmethod was already installed for
+                // this backedge target, marshal the frame and run the
+                // compiled rest-of-method.  Checked on the same tick
+                // cadence as compile requests.
+                let owner_s = String::from_utf8_lossy(self.owner).into_owned();
+                let name_s = String::from_utf8_lossy(self.code.name).into_owned();
+                let desc_s = String::from_utf8_lossy(self.code.descriptor).into_owned();
+                let method_key = crate::share::code::codeCache::CodeCache::method_key(
+                    &owner_s, &name_s, &desc_s,
+                );
+                if let Some(nm) = crate::share::code::codeCache::CodeCache::global()
+                    .find_osr_nmethod_by_key(&method_key, target as i32)
+                    && nm.is_in_use()
+                    && nm.osr_entry_point() != 0
+                {
+                    match crate::share::jitruntime::runtime::invoke_osr(
+                        nm.osr_entry_point(),
+                        self.code.descriptor,
+                        false,
+                        &self.locals,
+                        &self.stack,
+                    ) {
+                        Some(crate::share::jitruntime::CompiledResult::Value(v)) => {
+                            self.osr_result = Some(v.unwrap_or(Value::Null));
+                        }
+                        Some(crate::share::jitruntime::CompiledResult::Thrown(h)) => {
+                            return Err(Error::other(JavaThrowable(h)));
+                        }
+                        _ => {}
+                    }
+                }
             }
         }
         self.pc = target;
@@ -1190,6 +1248,7 @@ fn executeFrame<'a>(
         locals,
         owner,
         monitors: Vec::new(),
+        osr_result: None,
         constants_ptr: klass.class.constants.as_ptr(),
         constants_len: klass.class.constants.len(),
     };
@@ -1232,7 +1291,11 @@ fn executeFrame<'a>(
                     return Err(error);
                 }
             }
-            Ok(Step::Continue) => {}
+            Ok(Step::Continue) => {
+                if let Some(v) = frame.osr_result.take() {
+                    return Ok(Some(v));
+                }
+            }
             Ok(Step::Return(value)) => {
                 return Ok(value);
             }

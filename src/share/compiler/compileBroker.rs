@@ -10,7 +10,7 @@
  */
 
 use super::abstractCompiler::{AbstractCompiler, CompileError};
-use super::compileTask::{CompileOutcome, CompileReason, CompileTask, FailureReason, MethodIdentity};
+use super::compileTask::{CompileOutcome, CompileReason, CompileTask, FailureReason, MethodIdentity, OsrFrame};
 use super::compilationPolicy::{CompilationPolicy, MethodProfile, PolicyActions};
 use super::compilerDefinitions::CompLevel;
 use super::compilerOracle::CompilerOracle;
@@ -868,6 +868,7 @@ impl CompileBroker {
         blocking: bool,
         profile_key: Option<usize>,
         submit_epoch: u64,
+        osr_frame: Option<OsrFrame>,
     ) -> CompileTask {
         let mut task = if osr_bci == CompileTask::INVOCATION_ENTRY_BCI {
             CompileTask::new(
@@ -894,6 +895,7 @@ impl CompileBroker {
             )
         };
         task.submit_epoch = submit_epoch;
+        task.osr_frame = osr_frame;
         if let Some(pk) = profile_key {
             task.profile_key = Some(pk);
         }
@@ -916,6 +918,7 @@ impl CompileBroker {
         blocking: bool,
         flags: MethodCompileFlags,
         profile_key: Option<usize>,
+        osr_frame: Option<OsrFrame>,
     ) -> Option<CompileTask> {
         if !self.is_initialized() || comp_level == CompLevel::None {
             return None;
@@ -994,6 +997,7 @@ impl CompileBroker {
             blocking,
             profile_key,
             submit_epoch,
+            osr_frame,
         );
         self.policy.note_queued(&method_key);
 
@@ -1026,6 +1030,7 @@ impl CompileBroker {
             blocking,
             MethodCompileFlags::default(),
             None,
+            None,
         )
     }
 
@@ -1053,6 +1058,7 @@ impl CompileBroker {
             blocking,
             MethodCompileFlags::default(),
             None,
+            None,
         )
     }
 
@@ -1070,6 +1076,7 @@ impl CompileBroker {
         blocking: bool,
         flags: MethodCompileFlags,
         profile_key: Option<usize>,
+        osr_frame: Option<OsrFrame>,
     ) -> Option<CompileTask> {
         self.compile_method_base(
             class_name,
@@ -1082,6 +1089,7 @@ impl CompileBroker {
             blocking,
             flags,
             profile_key,
+            osr_frame,
         )
     }
 
@@ -1519,7 +1527,7 @@ impl CompileBroker {
                 flags.is_trivial,
             )
         };
-        self.execute_actions(&method_key, &class_name, &method_name, &descriptor, profile_key, flags, blocking, actions, None)
+        self.execute_actions(&method_key, &class_name, &method_name, &descriptor, profile_key, flags, blocking, actions, None, None)
     }
 
     /// Feed a back-edge event; may trigger an OSR compile and/or a
@@ -1536,6 +1544,7 @@ impl CompileBroker {
         blocking: bool,
         enclosing: Option<(String, CompLevel, bool)>, // (key, level, is_osr)
         max_osr_level: CompLevel,
+        osr_frame: Option<OsrFrame>,
     ) -> Option<CompileTask> {
         Self::ensure_compiler_threads_started();
         let method_key = CodeCache::method_key(
@@ -1574,7 +1583,7 @@ impl CompileBroker {
                 oracle_scale,
             )
         };
-        self.execute_actions(&method_key, &class_name, &method_name, &descriptor, profile_key, flags, blocking, actions, Some(bci))
+        self.execute_actions(&method_key, &class_name, &method_name, &descriptor, profile_key, flags, blocking, actions, Some(bci), osr_frame)
     }
 
     /// Execute PolicyActions: enqueue OSR/regular compiles and mark
@@ -1591,6 +1600,7 @@ impl CompileBroker {
         blocking: bool,
         actions: PolicyActions,
         osr_bci_hint: Option<i32>,
+        osr_frame: Option<OsrFrame>,
     ) -> Option<CompileTask> {
         if std::env::var_os("JVM25_TRACE_COMPILE").is_some() {
             eprintln!(
@@ -1628,6 +1638,7 @@ impl CompileBroker {
                 blocking,
                 flags,
                 profile_key,
+                osr_frame.clone(),
             ) {
                 if first_task.is_none() {
                     first_task = Some(t);
@@ -1647,6 +1658,7 @@ impl CompileBroker {
                 blocking,
                 flags,
                 profile_key,
+                None,
             ) {
                 if first_task.is_none() {
                     first_task = Some(t);

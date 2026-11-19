@@ -555,6 +555,94 @@ fn try_invoke_inner<'a>(
     }
 }
 
+/// OSR entry: marshals the interpreter's locals + operand stack into a
+/// contiguous `u64` buffer and calls the OSR nmethod with the buffer
+/// pointer in `rcx` (the compiled prologue spills it to frame slot 0;
+/// `OsrArg` nodes index `[buf + slot*8]`).  Returns `None` when the
+/// value shapes cannot be marshalled — the interpreter then continues.
+pub fn invoke_osr<'a>(
+    addr: usize,
+    descriptor: &[u8],
+    is_static: bool,
+    locals: &[Value<'a>],
+    stack: &[Value<'a>],
+) -> Option<CompiledResult<'a>> {
+    if addr == 0 {
+        return None;
+    }
+    let sig = parse_signature(descriptor, is_static)?;
+    let mut buf: Vec<u64> = Vec::with_capacity(locals.len() + stack.len());
+    for v in locals {
+        buf.push(match v {
+            Value::Empty => 0,
+            _ => arg_bits(v)?,
+        });
+    }
+    for v in stack {
+        buf.push(arg_bits(v)?);
+    }
+    take_pending();
+    let previous_depth = current_depth();
+    set_depth(0);
+    let prev_frame_qwords = current_frame_qwords();
+    set_frame_qwords(stubs::frame_qwords_for(addr));
+    let prev_nmethod = current_nmethod();
+    set_current_nmethod(addr);
+    let call_args = CallArgs {
+        regs: [buf.as_ptr() as u64, 0, 0, 0],
+        xmm: [0; 4],
+        stack: buf.as_ptr(),
+        nstack: 0,
+        addr,
+    };
+    // The marshal buffer holds live tagged references; scan it with the
+    // same conservative tagged-word check `frame_roots` uses and pin
+    // the decoded values for the duration of the call.
+    let _roots = crate::share::runtime::threading::jvm_loader().and_then(|loader| {
+        let mut roots = Vec::new();
+        for &raw in &buf {
+            if raw == 0 {
+                continue;
+            }
+            let tag = raw >> 48;
+            let slot = raw & REF_HANDLE_MASK;
+            if slot == 0 {
+                continue;
+            }
+            let handle = (slot - 1) as usize;
+            let in_bounds = match tag {
+                0 => handle < loader.borrow_objects().len(),
+                REF_TAG_OBJECT_ARRAY => handle < loader.obj_arrays.borrow().len(),
+                REF_TAG_PRIMITIVE_ARRAY => handle < loader.arrays.borrow().len(),
+                _ => false,
+            };
+            if in_bounds {
+                roots.push(decode_ref(raw));
+            }
+        }
+        stubs::register_frame_roots(&loader, roots)
+    });
+    let (raw, xmm_raw) = unsafe { invoke_raw(&call_args) };
+    set_current_nmethod(prev_nmethod);
+    set_frame_qwords(prev_frame_qwords);
+    set_depth(previous_depth);
+    match take_pending() {
+        Pending::Thrown(handle) => Some(CompiledResult::Thrown(handle)),
+        Pending::Deoptimize => Some(CompiledResult::Deoptimize),
+        Pending::None => {
+            let value = match sig.ret {
+                SlotKind::Void => None,
+                SlotKind::Int32 => Some(Value::Int(raw as u32 as i32)),
+                SlotKind::Int64 => Some(Value::Long(raw as i64)),
+                SlotKind::Float32 => Some(Value::Float(f32::from_bits(xmm_raw as u32))),
+                SlotKind::Float64 => Some(Value::Double(f64::from_bits(xmm_raw))),
+                SlotKind::Ref => Some(decode_ref(raw)),
+            };
+            Some(CompiledResult::Value(value))
+        }
+    }
+}
+
 /// Re-export so the compiler backend can pull the stub table without
 /// depending on the stubs module directly.
 pub use stubs::stub_map;

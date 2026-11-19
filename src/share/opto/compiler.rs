@@ -165,14 +165,20 @@ impl AbstractCompiler for C2Compiler {
                 CompLevel::FullOptimization,
             ));
         }
-        let (params, param_slots) =
+        let is_osr = task.is_osr();
+        let (params, param_slots) = if is_osr {
+            // OSR entry reads locals/stack from the marshal buffer in
+            // rcx; local slot 0 of the frame reserves the buffer ptr.
+            (Vec::new(), 1usize)
+        } else {
             parse_params(descriptor, method.is_static()).ok_or_else(|| {
                 CompileError::new(
                     FailureReason::Unsupported,
                     format!("unsupported signature {}", descriptor),
                     CompLevel::FullOptimization,
                 )
-            })?;
+            })?
+        };
         let handlers: Vec<ExceptionHandler> = method
             .const_method()
             .exception_table()
@@ -268,8 +274,28 @@ impl AbstractCompiler for C2Compiler {
             params,
             emit_safepoints: true,
             obj_layout: ObjLayoutMode::Uncompressed,
+            osr: is_osr,
         };
-        let mut compile = Compile::compile(&method_code, &ctx);
+        let mut compile = if is_osr {
+            let spec = task.osr_frame.as_ref().map(|f| {
+                super::builder::OsrSpec {
+                    entry_bci: task.osr_bci.max(0) as u32,
+                    local_kinds: f.local_kinds.clone(),
+                    stack_kinds: f.stack_kinds.clone(),
+                }
+            });
+            match spec {
+                Some(s) => Compile::compile_osr(&method_code, &ctx, &s),
+                None => {
+                    return Err(CompileError::unsupported(
+                        "OSR compile without frame snapshot",
+                        CompLevel::FullOptimization,
+                    ));
+                }
+            }
+        } else {
+            Compile::compile(&method_code, &ctx)
+        };
         if let Some(build) = &compile.build
             && !build.unsupported.is_empty()
         {

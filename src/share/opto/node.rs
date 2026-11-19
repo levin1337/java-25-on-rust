@@ -58,6 +58,16 @@ pub enum Opcode {
     Bool(bool),
     Parm(u16),
 
+    /// OSR entry inputs: index into the marshal buffer written by the
+    /// interpreter (locals `[0, max_locals)`, then stack values).
+    /// Kind is fixed by the opcode so width/regalloc classification
+    /// works without typer feedback.
+    OsrI(u32),
+    OsrL(u32),
+    OsrF(u32),
+    OsrD(u32),
+    OsrP(u32),
+
     I2L,
     I2F,
     I2D,
@@ -561,11 +571,12 @@ fn compute_type(op: &Opcode) -> Type {
     use Opcode::*;
     match op {
         ConI(_) | CmpI | CmpL | CmpF(_) | CmpD(_) | InstanceOf(_) | ArrayLength | LoadI | LoadB
-        | LoadC | LoadS | I2B | I2C | I2S => Type::Int,
-        ConL(_) | LoadL => Type::Long,
-        ConF(_) | LoadF => Type::Float,
-        ConD(_) | LoadD => Type::Double,
-        ConP(_) | LoadP | CheckCast(_) | New(_) | NewArray(_) | NewArrayRef(_) | MultianewArray => {
+        | LoadC | LoadS | I2B | I2C | I2S | OsrI(_) => Type::Int,
+        ConL(_) | LoadL | OsrL(_) => Type::Long,
+        ConF(_) | LoadF | OsrF(_) => Type::Float,
+        ConD(_) | LoadD | OsrD(_) => Type::Double,
+        ConP(_) | LoadP | CheckCast(_) | New(_) | NewArray(_) | NewArrayRef(_) | MultianewArray
+        | OsrP(_) => {
             Type::Ref
         }
         Bool(_) | BoolCmp(_) => Type::Bool,

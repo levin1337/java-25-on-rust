@@ -1,6 +1,18 @@
 # JVM25-Rust Minecraft bootstrap state
 Goal: full Minecraft 26.3 + Fabric on Rust JVM, JIT enabled, no crashes.
 
+## JIT progress (opto/C2)
+- C2 enabled in production tiered pipeline; invocation-entry compiles work
+  for all supported signatures (int/long/float/double/ref/array params).
+- OSR works end to end: backedge tick -> OsrFrame capture -> C2
+  compile_osr -> OSR nmethod installed at osr_bci -> interpreter enters it
+  via jitruntime::invoke_osr (marshal buffer in rcx). Verified by
+  OsrSmoke.java (50M-iter single-call loop, correct result).
+- C1 rejects is_osr tasks (no OSR entry support); interpreter requests
+  max_osr_level=FullOptimization.
+- Known C2 gaps -> interpreter fallback: typed catches, invokedynamic,
+  precise deopt, GC barriers in JIT code (conservative frame scan only).
+
 ## Build/run
 - `cargo build --release` -> `target/release/jvm25-rust.exe`; MUST `cp` to `release/jvm25-rust.exe` (ps1 uses release/).
 - Run: `powershell -File tests/run-mc263.ps1` (writes tests/mc-run.out). Env flags prefix it.

@@ -2441,6 +2441,135 @@ mod tests {
     }
 
     #[test]
+    fn e2e_osr_try_catch() {
+        // OSR entry into a loop whose body contains a typed catch: the
+        // handler block is reachable only through exception edges, so
+        // restrict_to_osr must keep it and remap exc preds/edges.
+        //
+        //   0: iconst_0 ; 1: istore_1      ; s = 0
+        //   2: iconst_0 ; 3: istore_2      ; i = 0
+        //   4: iload_2 ; 5: iload_0 ; 6: if_icmpge 35   ; loop header
+        //   9: iload_1 ; 10: bipush 100 ; 12: iload_2 ; 13: iconst_1
+        //  14: iadd ; 15: iload_0 ; 16: isub ; 17: idiv ; 18: iadd
+        //  19: istore_1                    ; try body [9,20), trap@17
+        //  20: goto 29
+        //  23: pop ; 24: iload_1 ; 25: bipush 5 ; 27: iadd ; 28: istore_1
+        //                                        ; handler (catch AE)
+        //  29: iinc 2,1 ; 32: goto 4
+        //  35: iload_1 ; 36: ireturn
+        use super::super::builder::{ExceptionHandler, OsrKind, OsrSpec, SiteInfo};
+        use std::collections::HashMap;
+        let _ = test_loader();
+        let loader = crate::share::runtime::threading::jvm_loader().unwrap();
+        register_klass(&loader, b"java/lang/ArithmeticException", &[]);
+        let code: &[u8] = &[
+            0x03, // 0: iconst_0
+            0x3c, // 1: istore_1
+            0x03, // 2: iconst_0
+            0x3d, // 3: istore_2
+            0x1c, // 4: iload_2
+            0x1a, // 5: iload_0
+            0xa2, 0x00, 0x1d, // 6: if_icmpge 35
+            0x1b, // 9: iload_1
+            0x10, 0x64, // 10: bipush 100
+            0x1c, // 12: iload_2
+            0x04, // 13: iconst_1
+            0x60, // 14: iadd
+            0x1a, // 15: iload_0
+            0x64, // 16: isub
+            0x6c, // 17: idiv
+            0x60, // 18: iadd
+            0x3c, // 19: istore_1
+            0xa7, 0x00, 0x09, // 20: goto 29
+            0x57, // 23: pop (handler)
+            0x1b, // 24: iload_1
+            0x10, 0x05, // 25: bipush 5
+            0x60, // 27: iadd
+            0x3c, // 28: istore_1
+            0x84, 0x02, 0x01, // 29: iinc 2, 1
+            0xa7, 0xff, 0xe4, // 32: goto 4
+            0x1b, // 35: iload_1
+            0xac, // 36: ireturn
+        ];
+        let handlers = [ExceptionHandler {
+            start_pc: 9,
+            end_pc: 20,
+            handler_pc: 23,
+            catch_type: 100,
+        }];
+        let site = SiteInfo {
+            class: "java/lang/ArithmeticException".to_string(),
+            name: String::new(),
+            desc: String::new(),
+        };
+        let mut sites: HashMap<u16, SiteInfo> = HashMap::new();
+        sites.insert(100, site);
+        let fields = HashMap::new();
+        let methods = HashMap::new();
+        let constants = HashMap::new();
+        let ctx = super::super::builder::BuilderContext {
+            fields: &fields,
+            methods: &methods,
+            constants: &constants,
+            sites: &sites,
+        };
+        let m = MethodCode {
+            name: "test",
+            max_locals: 3,
+            max_stack: 8,
+            param_slots: 1, // slot 0 reserves the OSR buffer pointer
+            code,
+            handlers: &handlers,
+        };
+        let osr = OsrSpec {
+            entry_bci: 4,
+            local_kinds: vec![OsrKind::I32; 3],
+            stack_kinds: vec![],
+        };
+        let options = BackendOptions {
+            stubs: jit_stub_map(),
+            stubs_no_unwind: jit_stub_map_no_unwind(),
+            osr: true,
+            ..BackendOptions::default()
+        };
+        let mut c = Compile::compile_osr(&m, &ctx, &osr);
+        c.optimize();
+        let emitted = c
+            .backend(&m, &ctx, &options)
+            .expect("c2 osr backend should emit");
+        let addr = publish_executable(&emitted.code, emitted.code.len())
+            .expect("publish executable");
+        // Enter at the header with n=10, s=1000, i=3 — mid-loop state.
+        let locals = vec![
+            Value::Int(10),
+            Value::Int(1000),
+            Value::Int(3),
+        ];
+        let result = crate::share::jitruntime::runtime::invoke_osr(
+            addr,
+            b"()I",
+            true,
+            &locals,
+            &[],
+        )
+        .expect("invoke_osr should marshal");
+        // Reference: same loop from i=3, s=1000.
+        let mut want = 1000i32;
+        for i in 3..10i32 {
+            let d = i + 1 - 10;
+            if d == 0 {
+                want += 5; // ArithmeticException -> catch
+            } else {
+                want += 100 / d; // Rust / truncates toward zero like idiv
+            }
+        }
+        match result {
+            CompiledResult::Value(Some(Value::Int(v))) => assert_eq!(v, want),
+            other => panic!("unexpected result: {:?} want={}", other, want),
+        }
+    }
+
+    #[test]
     fn e2e_sumloop_shape() {
         // C2Smoke.sumLoop(J)J shape: s/i live at locals 2/4 (param n at 0/1),
         // generic lload/lstore index forms.  C2 returned n in production.

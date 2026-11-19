@@ -638,12 +638,6 @@ impl<'a> BytecodeGraphBuilder<'a> {
     /// seed is injected as an extra already-delivered predecessor so
     /// the normal merge/phi machinery treats it like any other edge.
     fn restrict_to_osr(&mut self, method: &MethodCode, osr: &OsrSpec, start: NodeId) {
-        if !method.handlers.is_empty() {
-            self.result
-                .unsupported
-                .push("osr: exception handlers are not supported".to_string());
-            return;
-        }
         let entry_bci = osr.entry_bci as usize;
         let Some(entry) = self.blocks.iter().position(|b| b.start == entry_bci) else {
             self.result
@@ -652,6 +646,27 @@ impl<'a> BytecodeGraphBuilder<'a> {
             return;
         };
         let n = self.blocks.len();
+
+        // Exception-edge bookkeeping before any remapping: each edge's
+        // source bci (inverted from exc_at) and containing block, plus
+        // per-block lists of trapping bcis for reachability.
+        let mut edge_bci = vec![usize::MAX; self.exc_edges.len()];
+        let mut bci_block: HashMap<usize, usize> = HashMap::new();
+        let mut exc_bcis_by_block: HashMap<usize, Vec<usize>> = HashMap::new();
+        for (&bci, eids) in &self.exc_at {
+            for &eid in eids {
+                edge_bci[eid] = bci;
+            }
+            if let Some(b) = self.block_index_of(bci) {
+                bci_block.insert(bci, b);
+                exc_bcis_by_block.entry(b).or_default().push(bci);
+            }
+        }
+
+        // Reachability over normal successors AND exception edges: a
+        // handler block is reachable when a trapping bci inside a
+        // reachable block is covered by it.  Fixpoint — handler bodies
+        // can themselves trap into outer handlers.
         let mut reach = vec![false; n];
         let mut work = vec![entry];
         reach[entry] = true;
@@ -660,6 +675,19 @@ impl<'a> BytecodeGraphBuilder<'a> {
                 if !reach[s.target] {
                     reach[s.target] = true;
                     work.push(s.target);
+                }
+            }
+            if let Some(bcis) = exc_bcis_by_block.get(&b) {
+                for &bci in bcis {
+                    if let Some(eids) = self.exc_at.get(&bci) {
+                        for &eid in eids {
+                            let hb = self.exc_edges[eid].handler_block;
+                            if hb < n && !reach[hb] {
+                                reach[hb] = true;
+                                work.push(hb);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -694,6 +722,33 @@ impl<'a> BytecodeGraphBuilder<'a> {
                     slot,
                 });
             }
+        }
+
+        // Exception preds: keep exactly the edges whose handler AND
+        // source block are reachable, appended after the Normal preds
+        // (matching the original [Normals..., Excs...] ordering).
+        // exc_edges order preserves each handler's pred order.
+        for eid in 0..self.exc_edges.len() {
+            let ed = self.exc_edges[eid];
+            let bci = edge_bci[eid];
+            if bci == usize::MAX || !reach[ed.handler_block] {
+                continue;
+            }
+            let Some(&src) = bci_block.get(&bci) else {
+                continue;
+            };
+            if !reach[src] {
+                continue;
+            }
+            let nt = map[ed.handler_block];
+            let slot = new_blocks[nt].preds.len();
+            new_blocks[nt].preds.push(PredRef::Exc);
+            self.exc_edges[eid] = ExcEdge {
+                handler_block: nt,
+                slot,
+                catch_type: ed.catch_type,
+                prio: ed.prio,
+            };
         }
         self.blocks = new_blocks;
         let entry = map[entry];

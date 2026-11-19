@@ -634,6 +634,15 @@ impl<'a> Scheduler<'a> {
             bcis.insert(bci);
         }
         if bcis.len() > 1 {
+            if std::env::var("JVM25_DBG_EXC").is_ok() {
+                eprintln!(
+                    "[exc-ambig] trap={} edges={:?}",
+                    trap,
+                    list.iter()
+                        .map(|(e, c, b)| (*e, *c, *b))
+                        .collect::<Vec<_>>()
+                );
+            }
             self.unsupported.push(format!(
                 "ambiguous exception edges on node {}",
                 trap

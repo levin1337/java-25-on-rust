@@ -18,7 +18,14 @@ Goal: full Minecraft 26.3 + Fabric on Rust JVM, JIT enabled, no crashes.
 - OSR supports exception handlers: restrict_to_osr keeps handler
   blocks reachable via exception edges and remaps exc preds.
   Verified by e2e_osr_try_catch + C2Catch OSR nmethods in production.
-- Known C2 gaps -> interpreter fallback: invokedynamic, precise deopt,
+- invokedynamic works: interpreter dispatch extracted to
+  interpreter/invokeDynamic.rs (shared); C2 resolves InvokeDynamic
+  CP entries to callsite sites and routes Call nodes to
+  RuntimeStub::InvokeDynamic (CP index via stub opcode slot).
+  Verified by C2Indy.java in production — concat (string concat
+  indy), apply (lambda metafactory indy), main all C2-installed
+  with correct results.
+- Known C2 gaps -> interpreter fallback: precise deopt,
   GC barriers in JIT code (conservative frame scan only).
 
 ## Build/run

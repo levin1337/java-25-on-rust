@@ -1,3 +1,5 @@
+use super::decoder_amd64;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DecoderStatus {
     Ok,

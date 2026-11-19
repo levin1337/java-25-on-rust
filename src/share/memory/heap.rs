@@ -417,6 +417,78 @@ fn entry_mut<'a>(state: &'a mut GcShared, id: ThreadId) -> &'a mut ThreadEntry {
     }
 }
 
+/// JIT-compiled frames keep their reference slots as tagged words on the
+/// native stack but have no interpreter `Frame` for `snapshot_handles` to
+/// walk — stub-time `frame_roots` only covers the innermost frame, so
+/// references held by outer compiled frames would be swept.  As a
+/// conservative fallback we scan the whole committed stack for words that
+/// decode as in-bounds tagged references; false positives only retain
+/// objects longer, they can never free a live one.
+#[cfg(windows)]
+fn stack_tagged_roots(loader: &ClassLoader<'_>, out: &mut Vec<Handle>) {
+    use crate::share::jitruntime::runtime::{REF_HANDLE_MASK, REF_TAG_OBJECT, REF_TAG_OBJECT_ARRAY, REF_TAG_PRIMITIVE_ARRAY};
+    let (objects, obj_arrays, arrays) = {
+        let (Some(objects), Some(obj_arrays), Some(arrays)) = (
+            loader.objects.try_borrow(),
+            loader.obj_arrays.try_borrow(),
+            loader.arrays.try_borrow(),
+        ) else {
+            return;
+        };
+        (objects.len(), obj_arrays.len(), arrays.len())
+    };
+    let stack_base = unsafe {
+        unsafe extern "system" {
+            fn NtCurrentTeb() -> *mut u8;
+        }
+        // NT_TIB64: StackBase at +0x08 (high address of the stack).
+        (NtCurrentTeb().add(8) as *const usize).read_unaligned()
+    };
+    let mut rsp: usize;
+    unsafe {
+        core::arch::asm!("mov {}, rsp", out(reg) rsp);
+    }
+    let start = rsp & !7;
+    if stack_base <= start || stack_base - start > (64 << 20) {
+        return;
+    }
+    let mut addr = start;
+    let mut found = 0usize;
+    while addr + 8 <= stack_base {
+        let raw = unsafe { (addr as *const u64).read_unaligned() };
+        addr += 8;
+        if raw == 0 {
+            continue;
+        }
+        let tag = raw >> 48;
+        let slot = raw & REF_HANDLE_MASK;
+        if slot == 0 {
+            continue;
+        }
+        let handle = (slot - 1) as usize;
+        let in_bounds = match tag {
+            REF_TAG_OBJECT => handle < objects,
+            REF_TAG_OBJECT_ARRAY => handle < obj_arrays,
+            REF_TAG_PRIMITIVE_ARRAY => handle < arrays,
+            _ => false,
+        };
+        if in_bounds {
+            found += 1;
+            out.push(match tag {
+                REF_TAG_OBJECT => Handle::Object(handle),
+                REF_TAG_OBJECT_ARRAY => Handle::ObjArray(handle),
+                _ => Handle::TypeArray(handle),
+            });
+        }
+    }
+    if std::env::var_os("JVM25_BLOCKTRACE").is_some() {
+        eprintln!("[stackroots] rsp={start:#x} base={stack_base:#x} qwords={} found={found}", (stack_base - start) / 8);
+    }
+}
+
+#[cfg(not(windows))]
+fn stack_tagged_roots(_loader: &ClassLoader<'_>, _out: &mut Vec<Handle>) {}
+
 /// Captures the handles reachable from this thread's interpreter frames.
 fn snapshot_handles() -> Vec<Handle> {
     let mut out = Vec::new();
@@ -427,6 +499,9 @@ fn snapshot_handles() -> Vec<Handle> {
             }
         }
     });
+    if let Some(loader) = crate::share::runtime::threading::jvm_loader() {
+        stack_tagged_roots(&loader, &mut out);
+    }
     out
 }
 

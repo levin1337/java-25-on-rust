@@ -993,6 +993,9 @@ unsafe extern "C" fn h_exc_check(_a: u64, _b: u64, _c: u64, _d: u64, _f: u64) ->
 unsafe extern "C" fn h_array_length(array: u64, _b: u64, _c: u64, _d: u64, frame: u64) -> u64 {
     let Some(loader) = loader_or_deopt() else { return 0 };
     let _roots = frame_roots(&loader, frame);
+    if std::env::var_os("JVM25_JIT_STUB").is_some() {
+        eprintln!("[stub] array_length raw={:016x} frame={:016x}", array, frame);
+    }
     if array == 0 {
         return throw_java(b"java/lang/NullPointerException", None);
     }

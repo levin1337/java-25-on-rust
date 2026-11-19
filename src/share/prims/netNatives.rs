@@ -1942,6 +1942,9 @@ fn wsabuf_read(mut stream: &TcpStream, address: i64, count: i32) -> io::Result<i
     let bufs = read_wsabufs(address, count)?;
     let mut total = 0i64;
     stream.set_nonblocking(false)?;
+    // Blocking socket read: quiesce so a pending GC is not starved by a
+    // thread parked here indefinitely.
+    crate::share::memory::heap::quiesce();
     let result = (|| {
         for (base, len) in &bufs {
             if *len == 0 {
@@ -1960,6 +1963,7 @@ fn wsabuf_read(mut stream: &TcpStream, address: i64, count: i32) -> io::Result<i
         }
         Ok(total)
     })();
+    crate::share::memory::heap::unquiesce();
     stream.set_nonblocking(true).ok();
     result
 }

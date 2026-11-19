@@ -81,19 +81,32 @@ impl ObjectMonitor {
             eprintln!("[block] enter_blocking tid={thread_id}");
         }
         let mut state = self.state.lock();
+        let mut blocked = false;
         loop {
             match state.owner {
                 None => {
                     state.owner = Some(thread_id);
                     state.recursions = 0;
+                    if blocked {
+                        crate::share::memory::heap::unquiesce();
+                    }
                     return;
                 }
                 Some(owner) if owner == thread_id => {
                     state.recursions = state.recursions.saturating_add(1);
+                    if blocked {
+                        crate::share::memory::heap::unquiesce();
+                    }
                     return;
                 }
                 Some(_) => {
                     state.entry_waiters += 1;
+                    if !blocked {
+                        // Contended monitor entry is a GC-quiesced block:
+                        // the thread's frames are frozen while it waits.
+                        crate::share::memory::heap::quiesce();
+                        blocked = true;
+                    }
                     self.cond.wait(&mut state);
                     state.entry_waiters = state.entry_waiters.saturating_sub(1);
                 }

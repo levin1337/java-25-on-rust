@@ -31,6 +31,61 @@ use std::sync::Arc;
 static BYTECODE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static FRAME_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+thread_local! {
+    static CURRENT_FRAME: std::cell::RefCell<String> =
+        const { std::cell::RefCell::new(String::new()) };
+}
+
+fn blocktrace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("JVM25_BLOCKTRACE").is_some())
+}
+
+/// Innermost Java frame of the calling OS thread; used by `JVM25_BLOCKTRACE`
+/// diagnostics in `shareCell` to identify who is running when a `Share`
+/// stays contended.
+pub(crate) fn current_frame() -> String {
+    CURRENT_FRAME.with(|f| f.borrow().clone())
+}
+
+struct FrameGuard {
+    prev: String,
+    active: bool,
+}
+
+impl FrameGuard {
+    fn enter(owner: &[u8], method: Option<(&[u8], &[u8])>) -> Self {
+        if !blocktrace_enabled() {
+            return Self {
+                prev: String::new(),
+                active: false,
+            };
+        }
+        let frame = match method {
+            Some((name, desc)) => format!(
+                "{}.{}{}",
+                dotted(owner),
+                String::from_utf8_lossy(name),
+                String::from_utf8_lossy(desc)
+            ),
+            None => dotted(owner),
+        };
+        let prev = CURRENT_FRAME.with(|f| std::mem::replace(&mut *f.borrow_mut(), frame));
+        Self {
+            prev,
+            active: true,
+        }
+    }
+}
+
+impl Drop for FrameGuard {
+    fn drop(&mut self) {
+        if self.active {
+            CURRENT_FRAME.with(|f| *f.borrow_mut() = std::mem::take(&mut self.prev));
+        }
+    }
+}
+
 pub fn bytecode_count() -> u64 {
     BYTECODE_COUNT.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -873,7 +928,12 @@ pub(crate) fn initialize<'a>(
             if env_flag("JVM25_BLOCKTRACE") {
                 eprintln!("[block] init-wait tid={tid} class={}", dotted(klass.class.name));
             }
+            // A thread parked on a class-init gate is GC-quiesced: its
+            // frames cannot change while it waits, and leaving it
+            // `Running` would deadlock any pending collection.
+            crate::share::memory::heap::quiesce();
             owner = init_cond.wait(owner).unwrap();
+            crate::share::memory::heap::unquiesce();
         }
     }
     klass.state.set(InitState::BeingInitialized);
@@ -959,6 +1019,7 @@ pub fn execute_labeled<'a>(
     // descriptor are already available through `code`, and `stackWalkInfo`
     // relies on `owner` being a real class name.
     let owner = klass.class.name;
+    let _frame_guard = FrameGuard::enter(owner, method);
     let _ = method;
     // JDK intrinsics must be honored on every entry path, not only when
     // the caller is interpreted: JIT-compiled callers reach this function
@@ -2483,7 +2544,24 @@ fn step<'a>(
                     return Err(Error::other("Unsupported field receiver class"));
                 }
                 let ownerKlass = loader.load(owner)?;
-                let index = ownerKlass.instanceField(name, descriptor)?;
+                let index = match ownerKlass.instanceField(name, descriptor) {
+                    Ok(index) => index,
+                    Err(error) => {
+                        if env_flag("JVM25_TRACE_FIELD") {
+                            eprintln!(
+                                "[field-miss] owner={} name={} desc={} obj_klass={} in {}.{} pc={}",
+                                String::from_utf8_lossy(owner),
+                                String::from_utf8_lossy(name),
+                                String::from_utf8_lossy(descriptor),
+                                String::from_utf8_lossy(object.klass.class.name),
+                                String::from_utf8_lossy(frame.owner),
+                                String::from_utf8_lossy(frame.code.name),
+                                pc,
+                            );
+                        }
+                        return Err(error);
+                    }
+                };
                 if index >= object.fields.len() {
                     return Err(Error::other("Invalid instance field slot"));
                 }
@@ -2946,7 +3024,9 @@ fn step<'a>(
                 )? {
                     frame.stack.truncate(start);
                     frame.stackSlots -= slots;
-                    frame.push(intrinsic)?;
+                    if !descriptor.ends_with(b")V") {
+                        frame.push(intrinsic)?;
+                    }
                     return Ok(Step::Continue);
                 }
                 let __t = std::time::Instant::now();

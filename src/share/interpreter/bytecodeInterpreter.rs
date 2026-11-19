@@ -554,7 +554,7 @@ impl<'a> Frame<'a> {
                         flags,
                         false,
                         None,
-                        crate::share::compiler::compilerDefinitions::CompLevel::Simple,
+                        crate::share::compiler::compilerDefinitions::CompLevel::FullOptimization,
                         Some(osr_frame),
                     );
                 // OSR entry: if an OSR nmethod was already installed for

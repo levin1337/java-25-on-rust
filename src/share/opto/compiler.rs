@@ -142,12 +142,6 @@ impl AbstractCompiler for C2Compiler {
                 CompLevel::FullOptimization,
             )
         })?;
-        if task.is_osr() {
-            return Err(CompileError::unsupported(
-                "C2 OSR compilation is not ported",
-                CompLevel::FullOptimization,
-            ));
-        }
         let bytecode = method.bytecodes();
         if bytecode.is_empty() {
             return Err(CompileError::new(

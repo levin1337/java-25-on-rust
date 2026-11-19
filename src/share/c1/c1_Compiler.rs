@@ -173,6 +173,16 @@ impl AbstractCompiler for C1Compiler {
     fn compiler_type(&self) -> CompilerType { CompilerType::C1 }
 
     fn compile_method(&mut self, task: &CompileTask) -> Result<CompileOutcome, CompileError> {
+        // C1 has no OSR entry support: it would compile the whole method
+        // yet the broker installs the result under the OSR bci, where the
+        // interpreter would invoke it with the marshal-buffer ABI.
+        if task.is_osr() {
+            return Err(CompileError::new(
+                FailureReason::Unsupported,
+                "C1 does not support OSR compilation",
+                task.comp_level(),
+            ));
+        }
         self.compiled_methods += 1;
         let method = task.method_obj.as_ref().ok_or_else(|| CompileError::new(FailureReason::Unresolved, "missing Method handle", CompLevel::Simple))?;
         let bytecode = method.bytecodes();

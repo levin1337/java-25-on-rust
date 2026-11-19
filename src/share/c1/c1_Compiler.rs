@@ -189,7 +189,7 @@ impl AbstractCompiler for C1Compiler {
             ));
         };
         let mut params =
-            Vec::with_capacity(signature.params.len() + usize::from(signature.is_instance));
+            Vec::with_capacity(signature.params().len() + usize::from(signature.is_instance));
         let mut slot = 0;
         if signature.is_instance {
             params.push(ParamInfo {
@@ -198,7 +198,7 @@ impl AbstractCompiler for C1Compiler {
             });
             slot += 1;
         }
-        for kind in signature.params {
+        for &kind in signature.params() {
             let (kind, width) = match kind {
                 SlotKind::Int32 => (ValueKind::Int32, 1),
                 SlotKind::Int64 => (ValueKind::Int64, 2),

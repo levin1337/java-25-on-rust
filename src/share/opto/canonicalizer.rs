@@ -65,14 +65,10 @@ impl PhaseCanonicalizer {
                         }
                     }
                 }
-                Opcode::MergeMem => {
-                    let mems = &node.inputs[..node.inputs.len().saturating_sub(1)];
-                    if let Some(m) = single_distinct(mems) {
-                        if m != id {
-                            reps.insert(id, m);
-                        }
-                    }
-                }
+                // MergeMem is deliberately NOT collapsed: the scheduler
+                // recovers a Region's memory state through the MergeMem that
+                // names it as its last input, so the node must survive even
+                // when all predecessor memory states happen to agree.
                 Opcode::If => {
                     if let Some((ctrl, taken)) = const_branch(gvn, node) {
                         if let Some(h) = halt {

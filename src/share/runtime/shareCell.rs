@@ -139,7 +139,11 @@ impl<T> Share<T> {
             }
         };
         if guard.borrows.get() != 0 {
-            panic!("already borrowed");
+            panic!(
+                "already borrowed: Share<{}> borrows={}",
+                std::any::type_name::<T>(),
+                guard.borrows.get()
+            );
         }
         self.mark_holder();
         guard.borrows.set(-1);

@@ -516,19 +516,19 @@ impl CompilationPolicy {
         // HotSpot `transition_from_full_profile`: `mdo == nullptr`
         // keeps the method at full_profile — without profiling data
         // there is no evidence it is C2-worthy, so it must NOT jump
-        // straight to full optimization.
+        // straight to full optimization.  This port's C1 emits no MDO
+        // yet, so `has_mdo` is always false; treat that case like
+        // "profile might help" and gate the jump on the raw tier-4
+        // counters instead of never escalating.
         let has_mdo = profile.mdo_invocation_delta.is_some()
             || profile.mdo_backedge_delta.is_some()
             || profile.mdo_would_profile;
-        if !has_mdo {
-            return CompLevel::FullProfile;
-        }
         // MDO deltas when present; otherwise raw counters.
         let (mi, mb) = match (profile.mdo_invocation_delta, profile.mdo_backedge_delta) {
             (Some(di), Some(db)) => (di, db),
             _ => (i, b),
         };
-        if profile.mdo_would_profile || self.mode.disable_intermediate() {
+        if profile.mdo_would_profile || self.mode.disable_intermediate() || !has_mdo {
             let k = self.threshold_scale(
                 CompLevel::FullOptimization,
                 self.thresholds.tier4_load_feedback,
@@ -1260,8 +1260,8 @@ mod tests {
             ..Default::default()
         };
         let actions = p.method_invocation_event("k.m()V", &hot, CompLevel::None, 0, 0, None, false);
-        // C2 is disabled in this port, so the top reachable level is C1
-        // full profile (level 3).
+        // The first tier for a hot method is C1 full profile (level 3);
+        // C2 escalation happens on later events.
         assert_eq!(actions.call_compile_level, Some(CompLevel::FullProfile));
 
         let cold = MethodProfile {
@@ -1315,11 +1315,12 @@ mod tests {
         p.note_level("k.x()V", CompLevel::Simple, true);
         assert_eq!(p.level_of("k.x()V"), CompLevel::FullProfile);
         assert_eq!(p.osr_level_of("k.x()V"), CompLevel::Simple);
-        // C2 disabled -> highest available is C1 full profile.
-        assert_eq!(p.highest_compile_level(), CompLevel::FullProfile);
-        assert_eq!(p.limit_level(CompLevel::FullOptimization), CompLevel::FullProfile);
+        // C2 enabled -> highest available is full optimization.
+        assert_eq!(p.highest_compile_level(), CompLevel::FullOptimization);
+        assert_eq!(p.limit_level(CompLevel::FullOptimization), CompLevel::FullOptimization);
         assert_eq!(p.limit_level(CompLevel::Simple), CompLevel::Simple);
         assert!(p.verify_level(CompLevel::FullProfile));
+        assert!(p.verify_level(CompLevel::FullOptimization));
         assert!(!p.verify_level(CompLevel::Any));
     }
 

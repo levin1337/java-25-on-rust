@@ -102,15 +102,14 @@ fn new_throwable<'a>(
         }
         Ok(())
     })();
-    let root_position = {
-        let roots = loader.gc_extra_roots.borrow();
-        roots
-            .iter()
-            .rposition(|value| matches!(value, Value::Object(root) if *root == handle))
-    };
-    if let Some(position) = root_position {
-        loader.gc_extra_roots.borrow_mut().remove(position);
+    let mut roots = loader.gc_extra_roots.borrow_mut();
+    if let Some(position) = roots
+        .iter()
+        .rposition(|value| matches!(value, Value::Object(root) if *root == handle))
+    {
+        roots.remove(position);
     }
+    drop(roots);
     result?;
     Ok(handle)
 }

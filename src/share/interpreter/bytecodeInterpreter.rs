@@ -97,6 +97,9 @@ pub fn frame_count() -> u64 {
 }
 
 fn jit_skip(owner: &[u8], code: &crate::share::oops::method::Code<'_>) -> bool {
+    if holdsScopedValueBindings(owner, code.name) {
+        return true;
+    }
     static SKIP: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
     let skip = SKIP.get_or_init(|| {
         std::env::var("JVM25_JIT_SKIP")
@@ -302,6 +305,27 @@ pub(crate) fn for_each_active_frame(f: &mut impl FnMut(&Frame<'static>)) {
             f(unsafe { &*frame });
         }
     });
+}
+
+fn holdsScopedValueBindings(owner: &[u8], method: &[u8]) -> bool {
+    method == b"runWith" && matches!(owner, b"java/lang/Thread" | b"java/lang/ScopedValue$Carrier")
+}
+
+pub(crate) fn findScopedValueBindings() -> Value<'static> {
+    ACTIVE_FRAMES.with(|frames| {
+        frames
+            .borrow()
+            .iter()
+            .rev()
+            .find_map(|&ptr| {
+                let frame = unsafe { &*ptr };
+                if !holdsScopedValueBindings(frame.owner, frame.code.name) {
+                    return None;
+                }
+                frame.locals.get(1).copied().filter(|value| *value != Value::Null)
+            })
+            .unwrap_or(Value::Null)
+    })
 }
 
 pub fn current_frame_site() -> String {
@@ -624,6 +648,18 @@ impl<'a> Frame<'a> {
                 };
 
                 if is_match {
+                    if env_flag("JVM25_TRACE_EXC")
+                        && let Value::Object(handle) = exc
+                    {
+                        eprintln!(
+                            "[exc-caught] {}.{}{} pc={pc} handler={} exception={}",
+                            String::from_utf8_lossy(klass.class.name),
+                            String::from_utf8_lossy(self.code.name),
+                            String::from_utf8_lossy(self.code.descriptor),
+                            entry.handler_pc,
+                            throwableDescription(loader, handle),
+                        );
+                    }
                     self.stack.clear();
                     self.stackSlots = exc.slots();
                     self.stack.push(exc);
@@ -871,9 +907,13 @@ pub(crate) fn initialize<'a>(
     if let Err(error) = &result
         && env_flag("JVM25_TRACE")
     {
+        let detail = throwable_of(error)
+            .map(|handle| throwableDescription(loader, handle))
+            .unwrap_or_else(|| format!("{error}"));
         eprintln!(
-            "[clinit-fail] {}: {error}",
-            String::from_utf8_lossy(klass.class.name)
+            "[clinit-fail] {}: {}",
+            String::from_utf8_lossy(klass.class.name),
+            detail
         );
     }
     klass.state.set(if result.is_ok() {
@@ -923,15 +963,6 @@ pub fn execute_labeled<'a>(
     let owner = klass.class.name;
     let _frame_guard = FrameGuard::enter(owner, method);
     let _ = method;
-    if std::env::var_os("JVM25_TRACE_LABELED").is_some() && code.name == b"forAllBoxes" {
-        eprintln!(
-            "[labeled-in] {}.{}{} af={:#06x}",
-            String::from_utf8_lossy(owner),
-            String::from_utf8_lossy(code.name),
-            String::from_utf8_lossy(code.descriptor),
-            access_flags
-        );
-    }
     // JDK intrinsics must be honored on every entry path, not only when
     // the caller is interpreted: JIT-compiled callers reach this function
     // through their call stubs and would otherwise run intrinsified
@@ -986,7 +1017,7 @@ pub fn execute_labeled<'a>(
     } else {
         crate::share::oops::methodCounters::compiled_addr(code_key)
     };
-    if compiled_addr == 0 && crate::share::oops::methodCounters::is_hot(code_key) {
+    if !no_jit && compiled_addr == 0 && crate::share::oops::methodCounters::is_hot(code_key) {
         // Hot method without a published dispatch entry: consult the
         // CodeCache nmethod index by method key (HotSpot's
         // `nmethod::entry_point` lookup on the Method).
@@ -1006,8 +1037,7 @@ pub fn execute_labeled<'a>(
         // The published dispatch entry can outlive its nmethod
         // (deoptimization, sweeping): validate before calling into it.
         let live = crate::share::code::codeCache::CodeCache::global()
-            .find_nmethod_at_address(compiled_addr)
-            .is_some_and(|nm| nm.is_in_use());
+            .isLiveEntry(compiled_addr);
         if !live {
             crate::share::oops::methodCounters::clear_compiled(code_key);
             compiled_addr = 0;
@@ -1027,6 +1057,14 @@ pub fn execute_labeled<'a>(
                 return Ok(value);
             }
             Some(crate::share::jitruntime::CompiledResult::Thrown(handle)) => {
+                if env_flag("JVM25_TRACE_EXC") {
+                    eprintln!(
+                        "[jit-throw] {}.{}{} handle={handle}",
+                        String::from_utf8_lossy(owner),
+                        String::from_utf8_lossy(code.name),
+                        String::from_utf8_lossy(code.descriptor)
+                    );
+                }
                 if code.exception_table.is_empty() {
                     return Err(Error::other(JavaThrowable(handle)));
                 }
@@ -1203,13 +1241,6 @@ fn executeFrame<'a>(
         locals[index] = value;
         index += value.slots();
     }
-    let labeled_trace = std::env::var_os("JVM25_TRACE_LABELED").is_some()
-        && (owner
-            .windows(b"VoxelShape".len())
-            .any(|w| w == b"VoxelShape")
-            || code.name == b"forAllBoxes");
-    let labeled_name = code.name;
-    let labeled_desc = code.descriptor;
     let mut frame = Frame {
         stack: Vec::with_capacity(code.maxStack),
         stackSlots: 0,
@@ -1224,18 +1255,6 @@ fn executeFrame<'a>(
         constants_len: klass.class.constants.len(),
     };
     let _registration = FrameRegistration::new(&frame);
-    if labeled_trace {
-        eprintln!(
-            "[labeled] {}.{}{} args={:?}",
-            String::from_utf8_lossy(owner),
-            String::from_utf8_lossy(labeled_name),
-            String::from_utf8_lossy(labeled_desc),
-            arguments
-                .iter()
-                .map(|v| format!("{v:?}").chars().take(60).collect::<String>())
-                .collect::<Vec<_>>()
-        );
-    }
     let mut safepoint_tick = 0u32;
     let dumpEnabled = env_flag("JVM25_DUMP");
     loop {
@@ -1386,15 +1405,14 @@ pub(crate) fn throwableObject<'a>(
         }
         Ok(())
     })();
-    let root_position = {
-        let roots = loader.gc_extra_roots.borrow();
-        roots
-            .iter()
-            .rposition(|value| matches!(value, Value::Object(root) if *root == handle))
-    };
-    if let Some(position) = root_position {
-        loader.gc_extra_roots.borrow_mut().remove(position);
+    let mut roots = loader.gc_extra_roots.borrow_mut();
+    if let Some(position) = roots
+        .iter()
+        .rposition(|value| matches!(value, Value::Object(root) if *root == handle))
+    {
+        roots.remove(position);
     }
+    drop(roots);
     let _ = init_result;
 
     if let (Some(bytes), Ok(index)) = (
@@ -1874,13 +1892,21 @@ fn step<'a>(
                             .ok_or_else(|| Error::other("Invalid object array reference"))
                             .and_then(|array| array.get(index))
                     };
+                    let array_len = {
+                        let arrays = loader.obj_arrays.borrow();
+                        arrays.get(handle).map(|array| array.len())
+                    };
                     load_result.map_err(|error| {
                         jex(
                             loader,
                             output,
                             depth,
                             b"java/lang/ArrayIndexOutOfBoundsException",
-                            Some(&error.to_string()),
+                            Some(&format!(
+                                "Index {index} out of bounds for length {array_len:?} in {}.{}",
+                                String::from_utf8_lossy(klass.class.name),
+                                String::from_utf8_lossy(frame.code.name)
+                            )),
                         )
                     })?
                 }
@@ -2313,6 +2339,42 @@ fn step<'a>(
         0xac..=0xb0 => {
             let value = frame.pop()?;
             if !value.matchesLocal(opcode - 0xac) {
+                let variant = match value {
+                    Value::Int(_) => "Int",
+                    Value::Long(_) => "Long",
+                    Value::Float(_) => "Float",
+                    Value::Double(_) => "Double",
+                    Value::String(_) => "String",
+                    Value::ClassMirror(_) => "ClassMirror",
+                    Value::HostString(_) => "HostString",
+                    Value::Arguments(_) => "Arguments",
+                    Value::Output => "Output",
+                    Value::PrimitiveArray(_) => "PrimitiveArray",
+                    Value::Object(_) => "Object",
+                    Value::ObjectArray(_) => "ObjectArray",
+                    Value::ReturnAddress(_) => "ReturnAddress",
+                    Value::Null => "Null",
+                    Value::Empty => "Empty",
+                };
+                let tail: String = frame
+                    .code
+                    .bytes
+                    .iter()
+                    .rev()
+                    .take(24)
+                    .rev()
+                    .map(|b| format!("{b:02x}"))
+                    .collect();
+                eprintln!(
+                    "[ret-operand] owner={} method={} desc={} opcode={:#x} pc={} value={} tail={}",
+                    String::from_utf8_lossy(frame.owner),
+                    String::from_utf8_lossy(frame.code.name),
+                    String::from_utf8_lossy(frame.code.descriptor),
+                    opcode,
+                    frame.pc,
+                    variant,
+                    tail
+                );
                 return Err(Error::other("Invalid return operand"));
             }
             return Ok(Step::Return(Some(value)));
@@ -2655,7 +2717,7 @@ fn step<'a>(
                 }
                 // invokespecial must bypass overrides: identity hash always.
                 let hash = if opcode == 0xb7 {
-                    Some(crate::share::prims::objectNatives::identity(receiver))
+                    Some(crate::share::prims::objectNatives::identity(loader, receiver))
                 } else {
                     crate::share::prims::objectNatives::hashCode(loader, receiver)?
                 };
@@ -2995,10 +3057,10 @@ fn step<'a>(
                 if let Value::ClassMirror(class_name) = frame.stack[start] {
                     match (name, descriptor) {
                         (b"equals", b"(Ljava/lang/Object;)Z") => {
-                            let equal = matches!(
-                                frame.stack.get(start + 1),
-                                Some(Value::ClassMirror(other)) if *other == class_name
-                            );
+                            let equal = crate::share::prims::classNatives::class_value_name(
+                                loader,
+                                frame.stack[start + 1],
+                            )? == Some(class_name);
                             frame.stack.truncate(start);
                             frame.stackSlots -= slots;
                             frame.push(Value::Int(i32::from(equal)))?;
@@ -3008,7 +3070,7 @@ fn step<'a>(
                             frame.stack.truncate(start);
                             frame.stackSlots -= slots;
                             frame.push(Value::Int(
-                                crate::share::prims::objectNatives::identity(Value::ClassMirror(
+                                crate::share::prims::objectNatives::identity(loader, Value::ClassMirror(
                                     class_name,
                                 )),
                             ))?;
@@ -3183,7 +3245,16 @@ fn step<'a>(
                 {
                     frame.stack.truncate(start);
                     frame.stackSlots -= slots;
-                    frame.push(value)?;
+                    // Signature-polymorphic void access modes (VarHandle set*)
+                    // yield no operand-stack value.
+                    if descriptor
+                        .iter()
+                        .rposition(|&b| b == b')')
+                        .and_then(|i| descriptor.get(i + 1))
+                        != Some(&b'V')
+                    {
+                        frame.push(value)?;
+                    }
                     return Ok(Step::Continue);
                 }
                 if opcode == 0xb9 && !SystemDictionary::implements_interface(&object_klass, owner) {

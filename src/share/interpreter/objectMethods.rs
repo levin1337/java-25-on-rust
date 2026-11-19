@@ -85,7 +85,7 @@ fn field_hash<'a>(loader: &ClassLoader<'a>, value: Value<'a>) -> i32 {
         Value::Null => 0,
         _ => match string_text(loader, value) {
             Some(text) => string_hash(&text),
-            None => crate::share::prims::objectNatives::identity(value),
+            None => crate::share::prims::objectNatives::identity(loader, value),
         },
     }
 }

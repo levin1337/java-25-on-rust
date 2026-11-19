@@ -324,7 +324,16 @@ impl<'a> BytecodeGraphBuilder<'a> {
                             }
                             leaders.insert(next);
                         }
-                        Code::Goto | Code::GotoW | Code::Jsr | Code::JsrW => {
+                        Code::Goto | Code::Jsr => {
+                            if let Some(t) = bc.get_s2(1) {
+                                let tgt = (bci as i64 + t as i64) as usize;
+                                if tgt < code.len() {
+                                    leaders.insert(tgt);
+                                }
+                            }
+                            leaders.insert(next);
+                        }
+                        Code::GotoW | Code::JsrW => {
                             if let Some(t) = bc.get_s4(1) {
                                 let tgt = (bci as i64 + t as i64) as usize;
                                 if tgt < code.len() {
@@ -466,14 +475,29 @@ impl<'a> BytecodeGraphBuilder<'a> {
                                     succs[i].push((fb, SuccKind::False));
                                 }
                             }
-                            Code::Goto | Code::GotoW | Code::Jsr | Code::JsrW => {
+                            Code::Goto | Code::Jsr => {
+                                if let Some(t) = bc.get_s2(1) {
+                                    let tgt = bci as i64 + t as i64;
+                                    if let Some(tb) = self.target_block(tgt, code_len) {
+                                        succs[i].push((tb, SuccKind::Fall));
+                                    }
+                                }
+                                if matches!(c, Code::Jsr) {
+                                    if let Some(fb) =
+                                        self.target_block((bci + len) as i64, code_len)
+                                    {
+                                        succs[i].push((fb, SuccKind::Fall));
+                                    }
+                                }
+                            }
+                            Code::GotoW | Code::JsrW => {
                                 if let Some(t) = bc.get_s4(1) {
                                     let tgt = bci as i64 + t as i64;
                                     if let Some(tb) = self.target_block(tgt, code_len) {
                                         succs[i].push((tb, SuccKind::Fall));
                                     }
                                 }
-                                if matches!(c, Code::Jsr | Code::JsrW) {
+                                if matches!(c, Code::JsrW) {
                                     if let Some(fb) =
                                         self.target_block((bci + len) as i64, code_len)
                                     {
@@ -656,7 +680,13 @@ impl<'a> BytecodeGraphBuilder<'a> {
             stack_h = stack_h.max(info.stack.len());
         }
         let frame_len = nlocals + stack_h;
-        let region = self.gvn.alloc(Opcode::Region, vec![NONE; k]);
+        // Seed the Region inputs from already-delivered predecessors; edges
+        // that arrive later (backedges) are patched in by `deliver`.
+        let region_inputs: Vec<NodeId> = infos
+            .iter()
+            .map(|i| i.as_ref().map(|x| x.ctrl).unwrap_or(NONE))
+            .collect();
+        let region = self.gvn.alloc(Opcode::Region, region_inputs);
         let mut phis: Vec<(NodeId, usize)> = Vec::new();
         let mut merged: Vec<NodeId> = Vec::with_capacity(frame_len);
         for e in 0..frame_len {
@@ -939,12 +969,12 @@ impl<'a> BytecodeGraphBuilder<'a> {
         let bc = Bytecode::new(self.code, bci).unwrap();
         match code {
             Code::Iload | Code::Lload | Code::Fload | Code::Dload | Code::Aload => {
-                let idx = bc.get_u2(2).unwrap_or(0) as usize;
+                let idx = bc.get_u2(1).unwrap_or(0) as usize;
                 let v = frame.locals.get(idx).copied().unwrap_or(self.zero);
                 self.push(frame, v, false);
             }
             Code::Istore | Code::Lstore | Code::Fstore | Code::Dstore | Code::Astore => {
-                let idx = bc.get_u2(2).unwrap_or(0) as usize;
+                let idx = bc.get_u2(1).unwrap_or(0) as usize;
                 let v = self.pop(frame);
                 if idx < frame.locals.len() {
                     frame.locals[idx] = v;
@@ -953,8 +983,9 @@ impl<'a> BytecodeGraphBuilder<'a> {
                 }
             }
             Code::Iinc => {
-                let idx = bc.get_u2(2).unwrap_or(0) as usize;
-                let c = i32::from(bc.get_s2(4).unwrap_or(0));
+                // wide iinc: u2 index, s2 const (JVMS layout).
+                let idx = bc.get_u2(1).unwrap_or(0) as usize;
+                let c = bc.get_s2(3).unwrap_or(0) as i32;
                 if idx < frame.locals.len() {
                     let k = self.gvn.con_i(c);
                     let cur = frame.locals[idx];
@@ -984,7 +1015,20 @@ impl<'a> BytecodeGraphBuilder<'a> {
     fn arith(&mut self, frame: &mut Frame, op: Opcode, cat2: bool) -> NodeId {
         let b = self.pop(frame);
         let a = self.pop(frame);
-        let n = self.gvn.transform(op, vec![a, b]);
+        // Integer div/rem can trap (ArithmeticException on a zero
+        // divisor), so they are control+memory dependent like loads:
+        // the extra inputs pin them to this program point, which both
+        // schedules them and keeps GVN from merging a trapping div
+        // inside a try region with an identical one outside it.
+        let n = if matches!(
+            op,
+            Opcode::DivI | Opcode::DivL | Opcode::RemI | Opcode::RemL
+        ) {
+            self.gvn
+                .transform(op, vec![frame.mem, frame.ctrl, a, b])
+        } else {
+            self.gvn.transform(op, vec![a, b])
+        };
         self.push(frame, n, cat2);
         n
     }
@@ -1860,12 +1904,17 @@ impl<'a> BytecodeGraphBuilder<'a> {
                 let ed = &self.exc_edges[eid];
                 (ed.handler_block, ed.slot)
             };
+            // Route the edge through a dedicated IfException token so every
+            // exception edge has a unique control point (the athrow node
+            // itself is the block terminator and may feed several handlers).
+            // Its value is never read: the handler sees `obj` directly.
+            let ie = self.gvn.alloc(Opcode::IfException, vec![athrow_node]);
             let stack = vec![StackVal {
                 node: obj,
                 cat2: false,
             }];
             let info = EdgeInfo {
-                ctrl: athrow_node,
+                ctrl: ie,
                 mem: frame.mem,
                 locals: frame.locals.clone(),
                 stack,

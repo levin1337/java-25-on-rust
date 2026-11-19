@@ -9,6 +9,37 @@ use crate::share::{
 };
 use std::io;
 
+/// Returns the single-letter primitive tag for a class name given either in
+/// internal mirror form (`:Z`), dotted Java form (`boolean`), or bare tag (`Z`).
+pub(crate) fn primitive_tag(name: &[u8]) -> Option<&'static [u8]> {
+    if let Some(tag) = name.strip_prefix(b":") {
+        return match tag {
+            b"Z" => Some(b"Z"),
+            b"B" => Some(b"B"),
+            b"C" => Some(b"C"),
+            b"S" => Some(b"S"),
+            b"I" => Some(b"I"),
+            b"J" => Some(b"J"),
+            b"F" => Some(b"F"),
+            b"D" => Some(b"D"),
+            b"V" => Some(b"V"),
+            _ => None,
+        };
+    }
+    match name {
+        b"boolean" => Some(b"Z"),
+        b"byte" => Some(b"B"),
+        b"char" => Some(b"C"),
+        b"short" => Some(b"S"),
+        b"int" => Some(b"I"),
+        b"long" => Some(b"J"),
+        b"float" => Some(b"F"),
+        b"double" => Some(b"D"),
+        b"void" => Some(b"V"),
+        _ => None,
+    }
+}
+
 fn primitiveName(tag: &[u8]) -> Option<&'static str> {
     match tag {
         b"Z" => Some("boolean"),
@@ -173,7 +204,18 @@ pub(crate) fn invoke<'a>(
     let value = match (name, descriptor) {
         (b"desiredAssertionStatus", b"()Z") => Value::Int(0),
         (b"isArray", b"()Z") => Value::Int(i32::from(class.starts_with(b"["))),
-        (b"isPrimitive", b"()Z") => Value::Int(i32::from(class.starts_with(b":"))),
+        (b"isPrimitive", b"()Z") => {
+            let prim = primitive_tag(class).is_some();
+            if std::env::var_os("JVM25_TRACE_ISPRIM").is_some() && prim {
+                eprintln!(
+                    "[isprim] class={} -> {} site={}",
+                    String::from_utf8_lossy(class),
+                    prim,
+                    crate::share::interpreter::bytecodeInterpreter::current_frame_site()
+                );
+            }
+            Value::Int(i32::from(prim))
+        }
         (b"getName", b"()Ljava/lang/String;") => {
             if let Some(name) = class.strip_prefix(b":").and_then(primitiveName) {
                 return Ok(Some(Value::HostString(name)));
@@ -397,11 +439,19 @@ pub(crate) fn materialize_class<'a>(
         &mut io::sink(),
         0,
     );
+    let componentType = invoke(loader, b"getComponentType", b"()Ljava/lang/Class;", &[value])?
+        .unwrap_or(Value::Null);
     let object = InstanceOop::new(klass.clone())?;
     let handle = loader.alloc_object(object);
     {
         let mut objects = loader.borrow_objects_mut();
         if let Some(object) = objects.get_mut(handle) {
+            if let Ok(slot) = klass.instanceField(b"primitive", b"Z") {
+                object.fields[slot] = Value::Int(i32::from(primitive_tag(name).is_some()));
+            }
+            if let Ok(slot) = klass.instanceField(b"componentType", b"Ljava/lang/Class;") {
+                object.fields[slot] = componentType;
+            }
             // Best-effort `name` field (JDK keeps the binary name there on
             // some versions); harmless when absent.
             if let Ok(slot) = klass.instanceField(b"name", b"Ljava/lang/String;")

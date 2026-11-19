@@ -344,14 +344,18 @@ impl<'a> X64Asm<'a> {
     }
 
     pub fn movzx_reg(&mut self, reg: Register) -> Result<(), CodeBufferError> {
+        // movzx r32, r/m8: the destination is the reg field and the
+        // source its own low byte in the rm field.
+        let e = reg.encoding() & 7;
         self.emit_rex(false, reg.needs_rex(), false, reg.needs_rex());
-        self.buf.write(&[0x0f, 0xb6, 0xc0 | (reg.encoding() & 7)])?;
+        self.buf.write(&[0x0f, 0xb6, 0xc0 | (e << 3) | e])?;
         Ok(())
     }
 
     pub fn movzx_reg16(&mut self, reg: Register) -> Result<(), CodeBufferError> {
+        let e = reg.encoding() & 7;
         self.emit_rex(false, reg.needs_rex(), false, reg.needs_rex());
-        self.buf.write(&[0x0f, 0xb7, 0xc0 | (reg.encoding() & 7)])?;
+        self.buf.write(&[0x0f, 0xb7, 0xc0 | (e << 3) | e])?;
         Ok(())
     }
 

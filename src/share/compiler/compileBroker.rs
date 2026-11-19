@@ -499,12 +499,22 @@ impl CompileBroker {
         self.initialized.load(Ordering::Acquire)
     }
 
-    /// Lazily registers the C1 backend and spawns the compiler thread that
-    /// drains the C1 queue.  C2 has no code-generation backend yet, so only
-    /// the C1 queue is serviced.  Idempotent and cheap (one atomic swap) —
-    /// safe to call from the interpreter's hot path.
+    /// Lazily registers the C1/C2 backends and spawns the compiler
+    /// thread that drains the C1 queue.  The C2 compiler object is
+    /// registered eagerly (its thread still spawns lazily on the first
+    /// C2 task) because compile_if_required consults
+    /// compiler_for_level before the per-level ensure runs.
+    /// Idempotent and cheap (one atomic swap each) — safe to call from
+    /// the interpreter's hot path.
     pub fn ensure_compiler_threads_started() {
         Self::ensure_compiler_thread_for_level(CompLevel::Simple);
+        static C2_REGISTERED: AtomicBool = AtomicBool::new(false);
+        if !C2_REGISTERED.swap(true, Ordering::AcqRel) {
+            let c2: Arc<Mutex<dyn AbstractCompiler>> = Arc::new(Mutex::new(
+                crate::share::opto::compiler::C2Compiler::new(),
+            ));
+            Self::global().register_compiler(c2);
+        }
     }
 
     /// Lazily spawn the compiler thread servicing `level`'s queue.
@@ -818,6 +828,18 @@ impl CompileBroker {
         if excluded || scale_zero {
             self.mark_not_compilable(method_key, comp_level, is_osr);
         }
+
+        // Merge broker-recorded failure bits: callers pass fresh
+        // MethodCompileFlags on every event, so `mark_not_compilable`
+        // results live only in `method_flags` and must be consulted here
+        // or permanently-failing methods are re-queued forever.
+        let recorded = self.method_flags(method_key);
+        let flags = MethodCompileFlags {
+            not_compilable_mask: flags.not_compilable_mask | recorded.not_compilable_mask,
+            not_osr_compilable_mask: flags.not_osr_compilable_mask
+                | recorded.not_osr_compilable_mask,
+            ..flags
+        };
 
         // Native methods are never JIT-compiled (HotSpot
         // `ciMethod::is_not_compilable`-equivalent).

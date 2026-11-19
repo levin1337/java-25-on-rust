@@ -1044,16 +1044,8 @@ impl<'a> GraphBuilder<'a> {
     fn dup_top(&self, cfg: &mut ControlFlowGraph, block_id: usize, stack: &mut Vec<StackValue>) {
         let Some(v) = stack.last_mut() else { return };
         let kind = v.kind;
-        if !expr_needs_spill(&v.expr) {
-            if let Some(top) = stack.last().cloned() {
-                stack.push(top);
-            }
-            return;
-        }
-        let expr = std::mem::replace(&mut v.expr, HirInstruction::ConstantInt(0));
-        let spilled = self.spill_value(cfg, block_id, expr, kind);
-        v.expr = spilled.clone();
-        stack.push(StackValue::new(spilled, kind));
+        let operand = self.dup_operand(cfg, block_id, v);
+        stack.push(StackValue::new(operand, kind));
     }
 
     /// Emits `StoreStack{spill_slot} = expr` into the current block
@@ -1088,12 +1080,11 @@ impl<'a> GraphBuilder<'a> {
         block_id: usize,
         value: &mut StackValue,
     ) -> HirInstruction {
-        let kind = value.kind;
-        if !expr_needs_spill(&value.expr) {
-            return value.expr.clone();
+        if expr_needs_spill(&value.expr) {
+            let expr = std::mem::replace(&mut value.expr, HirInstruction::ConstantInt(0));
+            value.expr = self.spill_value(cfg, block_id, expr, value.kind);
         }
-        let expr = std::mem::replace(&mut value.expr, HirInstruction::ConstantInt(0));
-        self.spill_value(cfg, block_id, expr, kind)
+        value.expr.clone()
     }
 
     fn dup_x(&self, cfg: &mut ControlFlowGraph, block_id: usize, stack: &mut Vec<StackValue>, below: usize, _wide: bool) {

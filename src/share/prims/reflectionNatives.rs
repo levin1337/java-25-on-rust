@@ -100,6 +100,8 @@ fn mirror_descriptor(name: &[u8]) -> Vec<u8> {
         name[1..].to_vec()
     } else if name.starts_with(b"[") {
         name.to_vec()
+    } else if let Some(tag) = crate::share::prims::classNatives::primitive_tag(name) {
+        tag.to_vec()
     } else {
         let mut descriptor = Vec::with_capacity(name.len() + 2);
         descriptor.push(b'L');
@@ -225,7 +227,6 @@ fn java_string<'a>(loader: &ClassLoader<'a>, value: Value<'a>) -> io::Result<Str
     Ok(text.into_owned())
 }
 
-/// Builds a `Class[]` object array holding the given internal class names.
 pub(crate) fn class_array<'a>(loader: &ClassLoader<'a>, names: &[&'a [u8]]) -> io::Result<Value<'a>> {
     let mut array = ObjArrayOop::withComponent(names.len() as i32, b"java/lang/Class")?;
     for (index, name) in names.iter().enumerate() {
@@ -300,15 +301,14 @@ fn new_throwable<'a>(
         }
         Ok(())
     })();
-    let root_position = {
-        let roots = loader.gc_extra_roots.borrow();
-        roots
-            .iter()
-            .rposition(|value| matches!(value, Value::Object(root) if *root == handle))
-    };
-    if let Some(position) = root_position {
-        loader.gc_extra_roots.borrow_mut().remove(position);
+    let mut roots = loader.gc_extra_roots.borrow_mut();
+    if let Some(position) = roots
+        .iter()
+        .rposition(|value| matches!(value, Value::Object(root) if *root == handle))
+    {
+        roots.remove(position);
     }
+    drop(roots);
     result?;
     Ok(handle)
 }
@@ -429,10 +429,9 @@ fn class_array_field<'a>(
         .ok_or_else(|| invalid("Invalid Class array"))?;
     let mut mirrors = Vec::with_capacity(array.elements.len());
     for element in &array.elements {
-        match element {
-            Value::ClassMirror(name) => mirrors.push(*name),
-            Value::Null => mirrors.push(b"".as_slice()),
-            _ => return Err(invalid("Invalid Class array element")),
+        match crate::share::prims::classNatives::class_value_name(loader, *element)? {
+            Some(name) => mirrors.push(name),
+            None => return Err(invalid("Invalid Class array element")),
         }
     }
     Ok(mirrors)
@@ -459,8 +458,11 @@ fn executable_info<'a>(
         return Err(iae(loader, "Expected reflective member object"));
     }
     let declaring = match member_field(loader, handle, &klass, b"clazz", b"Ljava/lang/Class;") {
-        Some(Value::ClassMirror(name)) => name,
-        _ => return Err(iae(loader, "Invalid member declaring class")),
+        Some(value) => match crate::share::prims::classNatives::class_value_name(loader, value)? {
+            Some(name) => name,
+            None => return Err(iae(loader, "Invalid member declaring class")),
+        },
+        None => return Err(iae(loader, "Invalid member declaring class")),
     };
     let parameters = class_array_field(loader, handle, &klass, b"parameterTypes")?;
     let result_mirror = member_field(loader, handle, &klass, b"returnType", b"Ljava/lang/Class;");
@@ -472,8 +474,11 @@ fn executable_info<'a>(
         None => Vec::new(),
     };
     let result = match result_mirror {
-        Some(Value::ClassMirror(mirror)) => descriptor_mirror(mirror),
-        _ => b":V".as_slice(),
+        Some(value) => match crate::share::prims::classNatives::class_value_name(loader, value)? {
+            Some(mirror) => descriptor_mirror(mirror),
+            None => b":V".as_slice(),
+        },
+        None => b":V".as_slice(),
     };
     Ok(ExecutableInfo {
         declaring,
@@ -897,15 +902,17 @@ pub(crate) fn constructor_new_instance0<'a>(
         Ok(())
     })();
 
-    let root_position = {
-        let roots = loader.gc_extra_roots.borrow();
-        roots
-            .iter()
-            .rposition(|value| matches!(value, Value::Object(root) if *root == object_handle))
-    };
-    if let Some(position) = root_position {
-        loader.gc_extra_roots.borrow_mut().remove(position);
+    // Find-and-remove must happen under a single mutable borrow: another
+    // thread can shrink `gc_extra_roots` between a `borrow()` position lookup
+    // and a later `borrow_mut().remove()`, leaving a stale index (panic).
+    let mut roots = loader.gc_extra_roots.borrow_mut();
+    if let Some(position) = roots
+        .iter()
+        .rposition(|value| matches!(value, Value::Object(root) if *root == object_handle))
+    {
+        roots.remove(position);
     }
+    drop(roots);
 
     match result {
         Ok(()) => Ok(Some(Value::Object(object_handle))),
@@ -981,15 +988,17 @@ fn class_new_instance<'a>(
         Ok(())
     })();
 
-    let root_position = {
-        let roots = loader.gc_extra_roots.borrow();
-        roots
-            .iter()
-            .rposition(|value| matches!(value, Value::Object(root) if *root == object_handle))
-    };
-    if let Some(position) = root_position {
-        loader.gc_extra_roots.borrow_mut().remove(position);
+    // Find-and-remove must happen under a single mutable borrow: another
+    // thread can shrink `gc_extra_roots` between a `borrow()` position lookup
+    // and a later `borrow_mut().remove()`, leaving a stale index (panic).
+    let mut roots = loader.gc_extra_roots.borrow_mut();
+    if let Some(position) = roots
+        .iter()
+        .rposition(|value| matches!(value, Value::Object(root) if *root == object_handle))
+    {
+        roots.remove(position);
     }
+    drop(roots);
 
     match result {
         Ok(()) => Ok(Some(Value::Object(object_handle))),

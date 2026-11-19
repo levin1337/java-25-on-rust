@@ -353,11 +353,23 @@ pub fn info(loader: &ClassLoader<'_>, handle: usize) -> Option<JavaThreadInfo> {
     loader.java_threads.borrow().get(&handle).cloned()
 }
 
+fn threadFieldHolder(thread: &crate::share::oops::instanceOop::InstanceOop<'_>) -> Option<usize> {
+    let slot = thread
+        .klass
+        .instanceField(b"holder", b"Ljava/lang/Thread$FieldHolder;")
+        .ok()?;
+    match thread.fields.get(slot) {
+        Some(Value::Object(handle)) => Some(*handle),
+        _ => None,
+    }
+}
+
 /// Marks a thread finished after `run()` returned (or died). Clears the
 /// `eetop`/`threadStatus` fields so `isAlive()`/`getState()` observe it,
 /// then broadcasts on the thread object's monitor so `join()` waiters wake.
 pub fn finish(loader: &ClassLoader<'_>, handle: usize) {
     crate::share::memory::heap::thread_finished();
+    loader.scopedValueCaches.borrow_mut().remove(&handle);
     {
         let mut threads = loader.java_threads.borrow_mut();
         if let Some(info) = threads.get_mut(&handle) {
@@ -393,15 +405,9 @@ pub fn finish(loader: &ClassLoader<'_>, handle: usize) {
     }
     let holder = {
         let objects = loader.borrow_objects();
-        objects.get(handle).and_then(|object| {
-            let slot = object
-                .klass
-                .instanceField(b"holder", b"Ljava/lang/Thread$FieldHolder;")
-                .ok()?;
-            object.fields.get(slot).copied()
-        })
+        objects.get(handle).and_then(threadFieldHolder)
     };
-    if let Some(Value::Object(holder_handle)) = holder {
+    if let Some(holder_handle) = holder {
         let status = {
             let objects = loader.borrow_objects();
             objects.get(holder_handle).and_then(|object| {
@@ -637,20 +643,22 @@ pub fn wait_non_daemon(loader: &ClassLoader<'_>) {
                     if info.state == ThreadState::Finished {
                         return false;
                     }
-                    // `daemon` is a `Z` field on java.lang.Thread; a
-                    // missing/unreadable field is treated as non-daemon
-                    // (the JDK default for user threads).
-                    objects
-                        .get(*handle)
-                        .and_then(|object| {
-                            let slot = object
+                    let Some(thread) = objects.get(*handle) else { return true };
+                    if crate::share::classfile::systemDictionary::SystemDictionary::is_subclass_of(
+                        &thread.klass, b"java/lang/BaseVirtualThread",
+                    ) {
+                        return false;
+                    }
+                    let daemon = threadFieldHolder(thread)
+                        .and_then(|holder| objects.get(holder))
+                        .and_then(|holder| {
+                            let slot = holder
                                 .klass
                                 .instanceField(b"daemon", b"Z")
                                 .ok()?;
-                            object.fields.get(slot).copied()
-                        })
-                        .map(|value| !matches!(value, Value::Int(1)))
-                        .unwrap_or(true)
+                            holder.fields.get(slot)
+                        });
+                    !matches!(daemon, Some(Value::Int(1)))
                 })
             }
         };

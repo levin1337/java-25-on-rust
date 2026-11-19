@@ -151,15 +151,15 @@ impl Optimizer {
         if let Some(v) = Self::fold_constants(&l, &r, op) {
             return v;
         }
-        let lz = Self::is_zero(&r);
-        let rz = Self::is_zero(&l);
         match op {
             Arith::Add => {
-                if lz { return r; }
-                if rz { return l; }
+                // x + 0 == x ; 0 + x == x
+                if Self::is_zero(&r) { return l; }
+                if Self::is_zero(&l) { return r; }
             }
             Arith::Sub => {
-                if lz { return r; }
+                // x - 0 == x  (0 - x == -x is not folded here)
+                if Self::is_zero(&r) { return l; }
             }
             Arith::Mul => {
                 if Self::is_one(&r) { return l; }

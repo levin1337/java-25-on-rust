@@ -42,7 +42,6 @@ use crate::share::c1::asm::codeBuffer::CodeBuffer;
 use crate::share::c1::c1_LIR::{RuntimeStub, StubSite};
 use crate::share::classfile::classLoader::ClassLoader;
 use crate::share::classfile::systemDictionary::SystemDictionary;
-use crate::share::code::codeCache::CodeCache;
 use crate::share::interpreter::bytecodeInterpreter::{self, Value};
 use crate::share::interpreter::linkResolver::LinkResolver;
 use crate::share::memory::heap;
@@ -70,10 +69,16 @@ fn arena() -> &'static Mutex<Vec<CodeBuffer>> {
 }
 
 /// Metadata `try_invoke` needs to root a compiled frame: how many
-/// 8-byte slots below `rbp` may contain references.
+/// 8-byte slots below `rbp` may contain references, plus the offset
+/// of an epilogue sequence `jit_unwind` can jump to so callee-saved
+/// registers are restored before returning to `invoke_raw`.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ExecutableMeta {
     pub frame_qwords: usize,
+    /// Byte offset of a `lea rsp,[rbp-8k]; <saved-reg pops>; pop rbp;
+    /// ret` sequence, or 0 when the code has no recognizable epilogue
+    /// (C1 frames unwind with the legacy rsp=rbp+16 path).
+    pub epilogue_off: u32,
 }
 
 static EXEC_META: OnceLock<Mutex<BTreeMap<usize, ExecutableMeta>>> = OnceLock::new();
@@ -108,20 +113,91 @@ pub fn frame_qwords_for(addr: usize) -> usize {
         .unwrap_or(0)
 }
 
-/// Parses the standard prologue (`push rbp; mov rbp,rsp; sub rsp,imm`)
-/// emitted by `X86Emitter::emit_prologue` to recover the frame size.
-fn prologue_frame_qwords(code: &[u8]) -> usize {
-    if code.len() >= 4 && code[0] == 0x55 && code[1] == 0x48 && code[2] == 0x89 && code[3] == 0xe5 {
-        if code.len() >= 11 && code[4] == 0x48 && code[5] == 0x81 && code[6] == 0xec {
-            let size = i32::from_le_bytes(code[7..11].try_into().unwrap()) as usize;
-            return size / 8;
+/// Epilogue offset registered for the nmethod at `addr` (0 = none).
+pub fn epilogue_off_for(addr: usize) -> u32 {
+    exec_meta()
+        .lock()
+        .unwrap()
+        .get(&addr)
+        .map(|m| m.epilogue_off)
+        .unwrap_or(0)
+}
+
+/// Scans emitted code for the C2 epilogue shape
+/// `48 8d 65 <disp8>` (`lea rsp,[rbp+disp8]`, disp8 = -8*saved) followed
+/// by exactly `saved` register pops and `5d c3` (`pop rbp; ret`).
+/// Every Return emits an identical epilogue, so the first match is a
+/// valid unwind landing pad.  Returns the offset or 0.
+fn find_epilogue_off(code: &[u8]) -> u32 {
+    for i in 0..code.len().saturating_sub(4) {
+        if code[i] != 0x48 || code[i + 1] != 0x8d || code[i + 2] != 0x65 {
+            continue;
         }
-        if code.len() >= 8 && code[4] == 0x48 && code[5] == 0x83 && code[6] == 0xec {
-            return (code[7] as usize) / 8;
+        let disp = code[i + 3] as i8 as i32;
+        if disp > 0 || disp % 8 != 0 {
+            continue;
         }
-        return 0;
+        let saved = (-disp / 8) as usize;
+        let mut j = i + 4;
+        let mut pops = 0usize;
+        while pops < saved {
+            if j >= code.len() {
+                break;
+            }
+            if code[j] == 0x41 && j + 1 < code.len() && (0x58..=0x5f).contains(&code[j + 1]) {
+                j += 2;
+            } else if (0x58..=0x5f).contains(&code[j]) {
+                j += 1;
+            } else {
+                break;
+            }
+            pops += 1;
+        }
+        if pops == saved
+            && j + 1 < code.len()
+            && code[j] == 0x5d
+            && code[j + 1] == 0xc3
+        {
+            return i as u32;
+        }
     }
     0
+}
+
+/// Parses the standard prologue (`push rbp; mov rbp,rsp`, then any
+/// callee-saved `push`es, then `sub rsp,imm`) emitted by
+/// `X86Emitter::emit_prologue` to recover the total frame size in
+/// qwords.  The C2 emitter pushes saved registers between `mov rbp,rsp`
+/// and `sub rsp`, so the scan must skip push encodings (`[REX] 50+r`)
+/// instead of expecting `sub` immediately at offset 4.
+fn prologue_frame_qwords(code: &[u8]) -> usize {
+    if code.len() < 4 || code[0] != 0x55 || code[1] != 0x48 || code[2] != 0x89 || code[3] != 0xe5 {
+        return 0;
+    }
+    let mut i = 4;
+    let mut pushes = 0usize;
+    loop {
+        // Skip an optional REX prefix (0x40-0x4f) — emit_push only emits
+        // one for r8-r15, but accept any here.
+        let mut j = i;
+        if j < code.len() && (0x40..=0x4f).contains(&code[j]) {
+            j += 1;
+        }
+        if j < code.len() && (0x50..=0x57).contains(&code[j]) {
+            pushes += 1;
+            i = j + 1;
+            continue;
+        }
+        break;
+    }
+    if i + 7 <= code.len() && code[i] == 0x48 && code[i + 1] == 0x81 && code[i + 2] == 0xec {
+        let size = i32::from_le_bytes(code[i + 3..i + 7].try_into().unwrap()) as usize;
+        return pushes + size / 8;
+    }
+    if i + 4 <= code.len() && code[i] == 0x48 && code[i + 1] == 0x83 && code[i + 2] == 0xec {
+        return pushes + (code[i + 3] as usize) / 8;
+    }
+    pushes
 }
 
 /// Publishes `code` at offset 0 of a fresh RWX region reserved to at
@@ -133,6 +209,7 @@ fn prologue_frame_qwords(code: &[u8]) -> usize {
 pub fn publish_executable(code: &[u8], reserve: usize) -> Option<usize> {
     let meta = ExecutableMeta {
         frame_qwords: prologue_frame_qwords(code),
+        epilogue_off: find_epilogue_off(code),
     };
     publish_executable_meta(code, reserve, meta)
 }
@@ -156,9 +233,14 @@ struct FrameRoots {
 }
 
 impl FrameRoots {
-    fn push(&mut self, value: Value<'static>) {
-        self.loader.gc_extra_roots.borrow_mut().push(value);
-        self.values.push(value);
+    fn register(loader: &Arc<ClassLoader<'static>>, values: Vec<Value<'static>>) -> Option<Self> {
+        if values.is_empty() {
+            return None;
+        }
+        let mut roots = loader.gc_extra_roots.borrow_mut();
+        let start = roots.len();
+        roots.extend_from_slice(&values);
+        Some(Self { loader: Arc::clone(loader), start, values })
     }
 }
 
@@ -192,11 +274,7 @@ fn frame_roots(loader: &Arc<ClassLoader<'static>>, frame: u64) -> Option<FrameRo
     let objects = loader.borrow_objects().len();
     let arrays = loader.arrays.borrow().len();
     let obj_arrays = loader.obj_arrays.borrow().len();
-    let mut roots = FrameRoots {
-        loader: Arc::clone(loader),
-        start: loader.gc_extra_roots.borrow().len(),
-        values: Vec::new(),
-    };
+    let mut roots = Vec::new();
     for i in 0..qwords {
         let addr = frame.wrapping_sub(8 + (i as u64) * 8);
         let raw = unsafe { (addr as *const u64).read_unaligned() };
@@ -219,10 +297,7 @@ fn frame_roots(loader: &Arc<ClassLoader<'static>>, frame: u64) -> Option<FrameRo
             roots.push(decode_ref(raw));
         }
     }
-    if roots.values.is_empty() {
-        return None;
-    }
-    Some(roots)
+    FrameRoots::register(loader, roots)
 }
 
 // ---------------------------------------------------------------------------
@@ -367,7 +442,16 @@ fn initialize_or_fail(
 /// Falls back to deoptimization when the throwable cannot be
 /// materialized (e.g. bootstrap without a loader) so the interpreter
 /// raises the failure itself.
+#[track_caller]
 fn throw_java(class_name: &'static [u8], message: Option<&str>) -> u64 {
+    static traceExceptions: OnceLock<bool> = OnceLock::new();
+    if *traceExceptions.get_or_init(|| std::env::var_os("JVM25_TRACE_EXC").is_some()) {
+        eprintln!(
+            "[jit-exception] {} at {}",
+            String::from_utf8_lossy(class_name),
+            std::panic::Location::caller()
+        );
+    }
     let Some(loader) = threading::jvm_loader() else {
         runtime::set_pending_deopt();
         return 0;
@@ -870,6 +954,28 @@ unsafe extern "C" fn h_unresolved_call(a: u64, b: u64, c: u64, d: u64, f: u64) -
     unsafe { h_call_method(a, b, c, d, f) }
 }
 
+/// `ExcCheck`: called by C2 code right after a *non-unwinding* stub
+/// call that may have recorded a pending outcome.  Consumes the
+/// channel and reports:
+///   - 0: nothing pending — execution continues normally.
+///   - a value >= 2: a throwable was thrown; the low result is
+///     `tagged_ref + 1`, so JIT code subtracts one to recover the
+///     `encode_ref` word for `Value::Object(handle)` (tag 0,
+///     slot = handle + 1).
+/// A pending deopt is re-armed and reported as 0: the trampoline's
+/// flow check then unwinds the frame exactly like an unwinding
+/// stub call would have, so JIT code never observes it.
+unsafe extern "C" fn h_exc_check(_a: u64, _b: u64, _c: u64, _d: u64, _f: u64) -> u64 {
+    match runtime::take_pending() {
+        runtime::Pending::None => 0,
+        runtime::Pending::Deoptimize => {
+            runtime::set_pending_deopt();
+            0
+        }
+        runtime::Pending::Thrown(handle) => (handle as u64) + 2,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Array operations.
 // ---------------------------------------------------------------------------
@@ -1059,7 +1165,6 @@ unsafe extern "C" fn h_float_rem(a: u64, b: u64, kind: u64, _d: u64, _frame: u64
     } else {
         sharedRuntime::drem(f64::from_bits(a), f64::from_bits(b)).to_bits()
     };
-    runtime::set_stub_xmm_result(bits);
     bits
 }
 
@@ -1109,25 +1214,11 @@ fn method_access_flags<'a>(
 }
 
 /// Converts an interpreter `Value` produced by a callee back into the
-/// raw word the JIT dst slot expects; float/double results additionally
-/// publish their bit pattern through the xmm channel.
+/// raw word the JIT destination slot expects.
 fn call_result_raw(loader: &ClassLoader<'static>, value: &Value<'static>) -> u64 {
-    match value {
-        Value::Float(f) => {
-            runtime::set_stub_xmm_result(*f as u64);
-            f.to_bits() as u64
-        }
-        Value::Double(d) => {
-            runtime::set_stub_xmm_result(d.to_bits());
-            d.to_bits()
-        }
-        _ => match heap_value_to_raw(loader, value) {
-            Some(raw) => raw,
-            None => {
-                runtime::set_pending_deopt();
-                0
-            }
-        },
+    match heap_value_to_raw(loader, value) {
+        Some(raw) => raw,
+        None => deopt(),
     }
 }
 
@@ -1139,9 +1230,7 @@ fn call_result_raw(loader: &ClassLoader<'static>, value: &Value<'static>) -> u64
 fn receiver_klass(
     loader: &Arc<ClassLoader<'static>>,
     receiver: Value<'static>,
-    frame: u64,
 ) -> Result<Arc<InstanceKlass<'static>>, u64> {
-    let _roots = frame_roots(loader, frame);
     match receiver {
         Value::Null => Err(throw_java(b"java/lang/NullPointerException", None)),
         Value::Object(handle) => {
@@ -1208,7 +1297,7 @@ unsafe extern "C" fn h_call_method(
     let Some(sig) = runtime::parse_signature(descriptor, is_static) else {
         return deopt();
     };
-    let expected = sig.params.len() + usize::from(sig.is_instance);
+    let expected = sig.params().len() + usize::from(sig.is_instance);
     if expected != n || (n > 0 && args_ptr == 0) {
         if std::env::var_os("JVM25_JIT_DEBUG").is_some() {
             eprintln!("[callmethod] arity mismatch n={n} expected={expected} args_ptr={args_ptr:#x}");
@@ -1223,11 +1312,7 @@ unsafe extern "C" fn h_call_method(
     // Flatten raw words into interpreter Values; reference arguments
     // are also pinned as GC roots for the duration of the call.
     let mut values: Vec<Value<'static>> = Vec::with_capacity(n);
-    let mut arg_roots = FrameRoots {
-        loader: Arc::clone(&loader),
-        start: loader.gc_extra_roots.borrow().len(),
-        values: Vec::new(),
-    };
+    let mut arg_roots = Vec::new();
     let mut index = 0usize;
     if sig.is_instance {
         let receiver = decode_ref(raw_args[0]);
@@ -1235,7 +1320,7 @@ unsafe extern "C" fn h_call_method(
         values.push(receiver);
         index = 1;
     }
-    for kind in &sig.params {
+    for kind in sig.params() {
         let raw = raw_args[index];
         index += 1;
         let value = match kind {
@@ -1251,9 +1336,10 @@ unsafe extern "C" fn h_call_method(
         }
         values.push(value);
     }
+    let _arg_roots = FrameRoots::register(&loader, arg_roots);
     let callerDepth = runtime::current_depth();
     let dispatched = (|| {
-        use crate::share::prims::{jdkIntrinsics, nativeLookup, stringNatives};
+        use crate::share::prims::{classNatives, jdkIntrinsics, nativeLookup, stringNatives};
 
         if is_static {
             if let Some(value) = jdkIntrinsics::invoke(&loader, owner, name, descriptor, &values)? {
@@ -1261,6 +1347,11 @@ unsafe extern "C" fn h_call_method(
             }
             nativeLookup::invokeStatic(&loader, owner, name, descriptor, &values, &mut io::sink(), callerDepth)
         } else {
+            if op == 0xb6 && owner == b"java/lang/Class"
+                && let Some(value) = classNatives::invoke(&loader, name, descriptor, &values)?
+            {
+                return Ok(Some(Some(value)));
+            }
             if matches!(op, 0xb6 | 0xb9)
                 && let Some(value) = stringNatives::invokeVirtual(&loader, owner, name, descriptor, &values)?
             {
@@ -1285,7 +1376,7 @@ unsafe extern "C" fn h_call_method(
     // resolve it up front so its NPE/ICCE outcomes propagate directly.
     let object_klass = if matches!(op, 0xb6 | 0xb9) {
         let receiver = values.first().copied().unwrap_or(Value::Null);
-        match receiver_klass(&loader, receiver, frame) {
+        match receiver_klass(&loader, receiver) {
             Ok(klass) => Some(klass),
             Err(raw) => return raw,
         }
@@ -1352,22 +1443,6 @@ unsafe extern "C" fn h_call_method(
         };
     }
     let flags = method_access_flags(&target, name, descriptor, is_static);
-    let addr = compiled_entry(&target.class.name, name, descriptor);
-    if addr != 0 && flags & (0x0100 | 0x0400 | 0x0020) == 0 {
-        match runtime::try_invoke(addr, descriptor, is_static, &values, depth) {
-            Some(runtime::CompiledResult::Value(value)) => {
-                return match value {
-                    Some(v) => call_result_raw(&loader, &v),
-                    None => 0,
-                };
-            }
-            Some(runtime::CompiledResult::Thrown(handle)) => {
-                runtime::set_pending_throw(handle);
-                return 0;
-            }
-            Some(runtime::CompiledResult::Deoptimize) | None => {}
-        }
-    }
     match bytecodeInterpreter::execute_labeled(
         &loader,
         &target,
@@ -1396,31 +1471,9 @@ unsafe extern "C" fn h_call_method(
     }
 }
 
-/// Entry point of the installed, in-use nmethod for
-/// `holder.name+descriptor`, or 0.
-fn compiled_entry(holder: &[u8], name: &[u8], descriptor: &[u8]) -> usize {
-    let holder = String::from_utf8_lossy(holder);
-    let name = String::from_utf8_lossy(name);
-    let descriptor = String::from_utf8_lossy(descriptor);
-    let cache = CodeCache::global();
-    let Some(nm) = cache.find_nmethod(holder.as_ref(), name.as_ref(), descriptor.as_ref()) else {
-        return 0;
-    };
-    if nm.is_in_use() && !nm.is_osr_method() && nm.entry_point() != 0 {
-        nm.entry_point()
-    } else {
-        0
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Stub escape / unwind.
 // ---------------------------------------------------------------------------
-
-/// Reads and clears the xmm result channel for the trampoline.
-extern "C" fn stub_xmm_result() -> u64 {
-    runtime::take_stub_xmm_result()
-}
 
 /// Unwind entry called by every trampoline when a pending outcome was
 /// recorded.  `frame` is the rbp of the JIT frame that called the
@@ -1438,7 +1491,28 @@ extern "C" fn stub_xmm_result() -> u64 {
 /// activation until it reaches the outermost `try_invoke`, covering
 /// JIT→JIT, JIT→stub→interpreter→JIT and interpreter-nested chains.
 /// Never returns.
+/// When the nmethod metadata carries an epilogue offset, the unwind
+/// jumps to `entry + epilogue_off` with `rbp` still pointing at the
+/// JIT frame: the epilogue's `lea rsp,[rbp-8k]; pops; pop rbp; ret`
+/// restores every callee-saved register the prologue pushed before
+/// returning to the `invoke_raw` landing pad.  The legacy
+/// `rsp = frame + 16` path skips those pops and would leave
+/// callee-saved registers corrupted for the Rust caller.
 pub unsafe extern "C" fn jit_unwind(frame: u64) -> ! {
+    let entry = runtime::current_nmethod();
+    let off = epilogue_off_for(entry);
+    if off != 0 {
+        let target = entry + off as usize;
+        unsafe {
+            core::arch::asm!(
+                "mov rbp, {frame}",
+                "jmp {target}",
+                frame = in(reg) frame,
+                target = in(reg) target,
+                options(noreturn),
+            );
+        }
+    }
     let saved_rbp = unsafe { *(frame as *const u64) };
     let rsp = frame + 16;
     let ret = unsafe { *((frame + 8) as *const u64) };
@@ -1494,6 +1568,7 @@ fn stub_entries() -> &'static [StubEntry] {
             StubEntry { stub: RuntimeStub::FloatConvert, handler: h_float_convert },
             StubEntry { stub: RuntimeStub::UnresolvedField, handler: h_unresolved_field },
             StubEntry { stub: RuntimeStub::UnresolvedCall, handler: h_unresolved_call },
+            StubEntry { stub: RuntimeStub::ExcCheck, handler: h_exc_check },
         ]
     })
 }
@@ -1506,10 +1581,7 @@ fn stub_entries() -> &'static [StubEntry] {
 ///   mov rax, <handler>
 ///   call rax                 ; -> extern "C" handler
 ///                            ;    (rcx..r9 = operands, stack arg = rbp)
-///   mov r11, rax             ; save stub result
-///   mov rax, <xmm_result>
-///   call rax                 ; -> xmm bits for float/double (0 else)
-///   movq xmm0, rax           ; JIT reads float results from xmm0
+///   mov [rsp+0x20], rax      ; save stub result
 ///   mov rax, <flow_check>
 ///   call rax                 ; -> pending outcome? 1 : 0
 ///   test eax, eax
@@ -1519,7 +1591,8 @@ fn stub_entries() -> &'static [StubEntry] {
 ///   mov rax, <jit_unwind>
 ///   jmp rax                  ; never returns
 /// ret_path:
-///   mov rax, r11
+///   mov rax, [rsp+0x20]
+///   movq xmm0, rax
 ///   add rsp, 0x28
 ///   ret
 /// ```
@@ -1532,7 +1605,6 @@ fn stub_entries() -> &'static [StubEntry] {
 /// into TLS by Rust.
 fn trampoline_bytes(handler_addr: usize) -> Vec<u8> {
     let check_addr = stub_flow_check as *const () as usize;
-    let xmm_addr = stub_xmm_result as *const () as usize;
     let unwind_addr = jit_unwind as *const () as usize;
     let mut b = Vec::with_capacity(112);
     b.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp,0x28
@@ -1542,11 +1614,7 @@ fn trampoline_bytes(handler_addr: usize) -> Vec<u8> {
     b.extend_from_slice(&[0x48, 0xB8]); // mov rax, imm64
     b.extend_from_slice(&(handler_addr as u64).to_le_bytes());
     b.extend_from_slice(&[0xFF, 0xD0]); // call rax
-    b.extend_from_slice(&[0x49, 0x89, 0xC3]); // mov r11,rax
-    b.extend_from_slice(&[0x48, 0xB8]); // mov rax, imm64
-    b.extend_from_slice(&(xmm_addr as u64).to_le_bytes());
-    b.extend_from_slice(&[0xFF, 0xD0]); // call rax
-    b.extend_from_slice(&[0x66, 0x48, 0x0F, 0x6E, 0xC0]); // movq xmm0,rax
+    b.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x20]);
     b.extend_from_slice(&[0x48, 0xB8]); // mov rax, imm64
     b.extend_from_slice(&(check_addr as u64).to_le_bytes());
     b.extend_from_slice(&[0xFF, 0xD0]); // call rax
@@ -1563,35 +1631,107 @@ fn trampoline_bytes(handler_addr: usize) -> Vec<u8> {
     let ret_pos = b.len();
     let rel = (ret_pos as i32) - ((jz_pos + 6) as i32);
     b[jz_pos + 2..jz_pos + 6].copy_from_slice(&rel.to_le_bytes());
-    b.extend_from_slice(&[0x4C, 0x89, 0xD8]); // mov rax,r11
+    b.extend_from_slice(&[0x48, 0x8B, 0x44, 0x24, 0x20]);
+    b.extend_from_slice(&[0x66, 0x48, 0x0F, 0x6E, 0xC0]);
+    b.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]); // add rsp,0x28
+    b.push(0xC3); // ret
+    b
+}
+
+/// Variant of `trampoline_bytes` that never unwinds: the handler's
+/// result is returned to the JIT call site even when a pending
+/// outcome was recorded.  C2 emits these for calls that are followed
+/// by an inline `ExcCheck` + handler dispatch; every other call keeps
+/// the unwinding trampoline so pending outcomes propagate unchanged.
+fn trampoline_bytes_no_unwind(handler_addr: usize) -> Vec<u8> {
+    let mut b = Vec::with_capacity(64);
+    b.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp,0x28
+    b.extend_from_slice(&[0x48, 0x89, 0x6C, 0x24, 0x20]); // mov [rsp+0x20],rbp
+    b.extend_from_slice(&[0x48, 0xB8]); // mov rax, imm64
+    b.extend_from_slice(&(handler_addr as u64).to_le_bytes());
+    b.extend_from_slice(&[0xFF, 0xD0]); // call rax
+    b.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x20]);
+    b.extend_from_slice(&[0x48, 0x8B, 0x44, 0x24, 0x20]); // mov rax,[rsp+0x20]
+    b.extend_from_slice(&[0x66, 0x48, 0x0F, 0x6E, 0xC0]); // movq xmm0,rax
     b.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]); // add rsp,0x28
     b.push(0xC3); // ret
     b
 }
 
 static STUB_MAP: OnceLock<BTreeMap<RuntimeStub, u64>> = OnceLock::new();
+static STUB_MAP_NO_UNWIND: OnceLock<BTreeMap<RuntimeStub, u64>> = OnceLock::new();
+
+fn emit_stub_map(unwind: bool) -> BTreeMap<RuntimeStub, u64> {
+    let entries = stub_entries();
+    let mut code = Vec::with_capacity(entries.len() * 80);
+    let mut offsets = Vec::with_capacity(entries.len());
+    for entry in entries {
+        offsets.push(code.len());
+        let bytes = if unwind {
+            trampoline_bytes(entry.handler as usize)
+        } else {
+            trampoline_bytes_no_unwind(entry.handler as usize)
+        };
+        code.extend_from_slice(&bytes);
+    }
+    let base = publish_executable(&code, code.len().max(4096)).unwrap_or(0);
+    let mut map = BTreeMap::new();
+    if base != 0 {
+        for (entry, off) in entries.iter().zip(offsets) {
+            map.insert(entry.stub, (base + off) as u64);
+        }
+    }
+    map
+}
 
 /// Builds the stub table once: emits every trampoline into a single
 /// RWX page and maps each `RuntimeStub` to its trampoline address.
 /// These are the addresses `BackendOptions.stubs` receives.
 pub fn stub_map() -> BTreeMap<RuntimeStub, u64> {
-    STUB_MAP
-        .get_or_init(|| {
-            let entries = stub_entries();
-            let mut code = Vec::with_capacity(entries.len() * 80);
-            let mut offsets = Vec::with_capacity(entries.len());
-            for entry in entries {
-                offsets.push(code.len());
-                code.extend_from_slice(&trampoline_bytes(entry.handler as usize));
-            }
-            let base = publish_executable(&code, code.len().max(4096)).unwrap_or(0);
-            let mut map = BTreeMap::new();
-            if base != 0 {
-                for (entry, off) in entries.iter().zip(offsets) {
-                    map.insert(entry.stub, (base + off) as u64);
-                }
-            }
-            map
-        })
+    STUB_MAP.get_or_init(|| emit_stub_map(true)).clone()
+}
+
+/// Same stub table as `stub_map` but with non-unwinding trampolines:
+/// handlers always return to the JIT call site so the caller can run
+/// its own pending-outcome dispatch (`ExcCheck`) for exception
+/// handlers.  Used by the C2 backend for calls inside `try` regions.
+pub fn stub_map_no_unwind() -> BTreeMap<RuntimeStub, u64> {
+    STUB_MAP_NO_UNWIND
+        .get_or_init(|| emit_stub_map(false))
         .clone()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::prologue_frame_qwords;
+
+    #[test]
+    fn prologue_frame_qwords_c1_style() {
+        // push rbp; mov rbp,rsp; sub rsp,0x80  ->  16 qwords
+        let code = [0x55, 0x48, 0x89, 0xe5, 0x48, 0x81, 0xec, 0x80, 0, 0, 0];
+        assert_eq!(prologue_frame_qwords(&code), 16);
+    }
+
+    #[test]
+    fn prologue_frame_qwords_c2_saved_regs() {
+        // push rbp; mov rbp,rsp; push rbx; push r12; sub rsp,0x40
+        // -> 2 saved + 8 frame qwords = 10
+        let code = [
+            0x55, 0x48, 0x89, 0xe5, 0x53, 0x41, 0x54, 0x48, 0x81, 0xec, 0x40, 0, 0, 0,
+        ];
+        assert_eq!(prologue_frame_qwords(&code), 10);
+    }
+
+    #[test]
+    fn prologue_frame_qwords_imm8_and_no_frame() {
+        // push rbp; mov rbp,rsp; push rbp? no — push rax; sub rsp,0x18
+        // -> 1 saved + 3 frame qwords = 4
+        let code = [0x55, 0x48, 0x89, 0xe5, 0x50, 0x48, 0x83, 0xec, 0x18];
+        assert_eq!(prologue_frame_qwords(&code), 4);
+        // prologue only, no frame body -> just the pushes
+        let code = [0x55, 0x48, 0x89, 0xe5, 0x53, 0x5d, 0xc3];
+        assert_eq!(prologue_frame_qwords(&code), 1);
+        // not a prologue at all
+        assert_eq!(prologue_frame_qwords(&[0x90, 0x90]), 0);
+    }
 }

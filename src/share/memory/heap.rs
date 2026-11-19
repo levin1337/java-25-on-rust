@@ -52,20 +52,30 @@ impl Handle {
     }
 }
 
-#[derive(Default)]
 struct Marks {
-    objects: HashSet<usize>,
-    type_arrays: HashSet<usize>,
-    obj_arrays: HashSet<usize>,
+    objects: Vec<bool>,
+    type_arrays: Vec<bool>,
+    obj_arrays: Vec<bool>,
 }
 
 impl Marks {
-    fn insert(&mut self, handle: Handle) -> bool {
-        match handle {
-            Handle::Object(index) => self.objects.insert(index),
-            Handle::TypeArray(index) => self.type_arrays.insert(index),
-            Handle::ObjArray(index) => self.obj_arrays.insert(index),
+    fn new(objects: usize, typeArrays: usize, objArrays: usize) -> Self {
+        Self {
+            objects: vec![false; objects],
+            type_arrays: vec![false; typeArrays],
+            obj_arrays: vec![false; objArrays],
         }
+    }
+
+    fn insert(&mut self, handle: Handle) -> bool {
+        let (marks, index) = match handle {
+            Handle::Object(index) => (&mut self.objects, index),
+            Handle::TypeArray(index) => (&mut self.type_arrays, index),
+            Handle::ObjArray(index) => (&mut self.obj_arrays, index),
+        };
+        marks
+            .get_mut(index)
+            .is_some_and(|marked| !std::mem::replace(marked, true))
     }
 }
 
@@ -129,7 +139,8 @@ fn drain_parallel<'a>(
     obj_arrays: &[ObjArrayOop<'a>],
     seeds: Vec<Handle>,
     workers: usize,
-) -> Marks {
+    marks: &mut Marks,
+) {
     let worklist = Mutex::new(seeds);
     let claimed = Mutex::new(HashSet::new());
     let busy = AtomicUsize::new(0);
@@ -191,11 +202,9 @@ fn drain_parallel<'a>(
             });
         }
     });
-    let mut marks = Marks::default();
     for handle in claimed.into_inner() {
         marks.insert(handle);
     }
-    marks
 }
 
 /// Sweeps one contiguous range-partition of an arena in parallel.
@@ -205,7 +214,7 @@ fn drain_parallel<'a>(
 fn sweep_space<T: Send>(
     items: &mut [T],
     live: &mut [bool],
-    marked: &HashSet<usize>,
+    marked: &[bool],
     workers: usize,
     clear: fn(&mut T),
 ) -> Vec<usize> {
@@ -239,7 +248,7 @@ fn sweep_space<T: Send>(
                     for (offset, (item, was_live)) in
                         items.iter_mut().zip(live.iter_mut()).enumerate()
                     {
-                        if *was_live && !marked.contains(&(base + offset)) {
+                        if *was_live && !marked.get(base + offset).copied().unwrap_or(false) {
                             *was_live = false;
                             clear(item);
                             freed.push(base + offset);
@@ -315,8 +324,7 @@ fn sweep_parallel(loader: &ClassLoader<'_>, marks: &Marks, workers: usize) {
 /// field the marker must skip so referent liveness is decided by
 /// reachability from other roots only.
 fn reference_referent_slot(object: &InstanceOop<'_>) -> Option<usize> {
-    let mut klass = Some(std::sync::Arc::clone(&object.klass));
-    let mut is_reference = false;
+    let mut klass = Some(object.klass.as_ref());
     while let Some(k) = klass {
         let name = k.class.name;
         // Soft references are only cleared under real memory pressure;
@@ -325,28 +333,24 @@ fn reference_referent_slot(object: &InstanceOop<'_>) -> Option<usize> {
             return None;
         }
         if name == b"java/lang/ref/Reference" {
-            is_reference = true;
-            break;
+            return object
+                .klass
+                .instanceField(b"referent", b"Ljava/lang/Object;")
+                .ok();
         }
-        klass = k.super_klass();
+        klass = k.super_klass.as_deref();
     }
-    if !is_reference {
-        return None;
-    }
-    object
-        .klass
-        .instanceField(b"referent", b"Ljava/lang/Object;")
-        .ok()
+    None
 }
 
 /// `true` when `object` is a `java.lang.ref.Finalizer` (or subclass).
 fn is_finalizer_reference(object: &InstanceOop<'_>) -> bool {
-    let mut klass = Some(std::sync::Arc::clone(&object.klass));
+    let mut klass = Some(object.klass.as_ref());
     while let Some(k) = klass {
         if k.class.name == b"java/lang/ref/Finalizer" {
             return true;
         }
-        klass = k.super_klass();
+        klass = k.super_klass.as_deref();
     }
     false
 }
@@ -829,6 +833,10 @@ fn collect_mark_sweep<'a>(
         Some(guard) => guard,
         None => return Ok(()),
     };
+    let scopedValueCaches = match loader.scopedValueCaches.try_borrow() {
+        Some(guard) => guard,
+        None => return Ok(()),
+    };
     let current_java_thread = match loader.current_java_thread.try_borrow() {
         Some(guard) => guard,
         None => return Ok(()),
@@ -867,6 +875,7 @@ fn collect_mark_sweep<'a>(
     for &handle in thread_ready.iter().chain(java_threads.keys()) {
         worklist.push(Handle::Object(handle));
     }
+    worklist.extend(scopedValueCaches.values().copied().map(Handle::ObjArray));
     for value in extra_roots.iter() {
         mark_value(value, &mut worklist);
     }
@@ -906,13 +915,21 @@ fn collect_mark_sweep<'a>(
         });
     }
 
-    let mut marks = if workers > 1 {
-        drain_parallel(objects.as_slice(), obj_arrays.as_slice(), worklist, workers)
-    } else {
-        let mut marks = Marks::default();
-        drain(&objects, &obj_arrays, &mut marks, &mut worklist);
-        marks
+    let Some(typeArrayCount) = loader.arrays.try_borrow().map(|arrays| arrays.len()) else {
+        return Ok(());
     };
+    let mut marks = Marks::new(objects.len(), typeArrayCount, obj_arrays.len());
+    if workers > 1 {
+        drain_parallel(
+            objects.as_slice(),
+            obj_arrays.as_slice(),
+            worklist,
+            workers,
+            &mut marks,
+        );
+    } else {
+        drain(&objects, &obj_arrays, &mut marks, &mut worklist);
+    }
     drop((
         objects,
         obj_arrays,
@@ -927,6 +944,7 @@ fn collect_mark_sweep<'a>(
         class_objects,
         thread_ready,
         java_threads,
+        scopedValueCaches,
         current_java_thread,
     ));
 
@@ -946,7 +964,7 @@ fn collect_mark_sweep<'a>(
         live.resize(objects.len(), true);
         let mut free = loader.free_objects_handle().try_borrow_mut();
         for index in 0..objects.len() {
-            if live[index] && !marks.objects.contains(&index) {
+            if live[index] && !marks.objects.get(index).copied().unwrap_or(false) {
                 live[index] = false;
                 objects[index].fields = Vec::new();
                 if let Some(free) = free.as_deref_mut() {
@@ -962,7 +980,7 @@ fn collect_mark_sweep<'a>(
         live.resize(arrays.len(), true);
         let mut free = loader.free_type_arrays_handle().try_borrow_mut();
         for index in 0..arrays.len() {
-            if live[index] && !marks.type_arrays.contains(&index) {
+            if live[index] && !marks.type_arrays.get(index).copied().unwrap_or(false) {
                 live[index] = false;
                 arrays[index] = crate::share::oops::typeArrayOop::TypeArrayOop::Byte(Vec::new());
                 if let Some(free) = free.as_deref_mut() {
@@ -978,7 +996,7 @@ fn collect_mark_sweep<'a>(
         live.resize(arrays.len(), true);
         let mut free = loader.free_obj_arrays_handle().try_borrow_mut();
         for index in 0..arrays.len() {
-            if live[index] && !marks.obj_arrays.contains(&index) {
+            if live[index] && !marks.obj_arrays.get(index).copied().unwrap_or(false) {
                 live[index] = false;
                 arrays[index].elements = Vec::new();
                 if let Some(free) = free.as_deref_mut() {
@@ -1004,7 +1022,7 @@ fn process_references(loader: &ClassLoader<'_>, marks: &mut Marks) {
     let mut pending: Vec<usize> = Vec::new();
     let mut resurrect: Vec<Handle> = Vec::new();
     for (index, object) in objects.iter_mut().enumerate() {
-        if !marks.objects.contains(&index) {
+        if !marks.objects.get(index).copied().unwrap_or(false) {
             continue;
         }
         let Some(referent_slot) = reference_referent_slot(object) else {
@@ -1015,9 +1033,9 @@ fn process_references(loader: &ClassLoader<'_>, marks: &mut Marks) {
         }
         let referent_dead = match object.fields[referent_slot] {
             Value::Null => false,
-            Value::Object(h) => !marks.objects.contains(&h),
-            Value::PrimitiveArray(h) => !marks.type_arrays.contains(&h),
-            Value::ObjectArray(h) => !marks.obj_arrays.contains(&h),
+            Value::Object(h) => !marks.objects.get(h).copied().unwrap_or(false),
+            Value::PrimitiveArray(h) => !marks.type_arrays.get(h).copied().unwrap_or(false),
+            Value::ObjectArray(h) => !marks.obj_arrays.get(h).copied().unwrap_or(false),
             _ => false,
         };
         if !referent_dead {

@@ -769,6 +769,15 @@ impl CodeCache {
         None
     }
 
+    pub(crate) fn isLiveEntry(&self, addr: usize) -> bool {
+        self.pc_index
+            .lock()
+            .unwrap()
+            .range(..=addr)
+            .next_back()
+            .is_some_and(|(_, method)| addr == method.entry_point() && method.is_in_use())
+    }
+
     /// Exact nmethod containing `addr`, scanning all (fallback used by
     /// tests and rare paths).
     pub fn find_any_nmethod_at(&self, addr: usize) -> Option<NMethod> {

@@ -10,8 +10,13 @@ Goal: full Minecraft 26.3 + Fabric on Rust JVM, JIT enabled, no crashes.
   OsrSmoke.java (50M-iter single-call loop, correct result).
 - C1 rejects is_osr tasks (no OSR entry support); interpreter requests
   max_osr_level=FullOptimization.
-- Known C2 gaps -> interpreter fallback: typed catches, invokedynamic,
-  precise deopt, GC barriers in JIT code (conservative frame scan only).
+- Typed catches work: one IfException token per covering handler
+  (catch site + table priority); codegen emits an ordered
+  ExcCheck->InstanceOf dispatch chain with rethrow-on-miss.
+  Verified by e2e_typed_catch (match / non-match propagate /
+  typed-fail -> catch-all).
+- Known C2 gaps -> interpreter fallback: invokedynamic, precise deopt,
+  GC barriers in JIT code (conservative frame scan only).
 
 ## Build/run
 - `cargo build --release` -> `target/release/jvm25-rust.exe`; MUST `cp` to `release/jvm25-rust.exe` (ps1 uses release/).

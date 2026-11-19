@@ -195,6 +195,10 @@ struct Block {
 struct ExcEdge {
     handler_block: usize,
     slot: usize,
+    /// Exception-table `catch_type` CP index; 0 = catch-all.
+    catch_type: u32,
+    /// Handler's index in the exception table — dispatch priority.
+    prio: u32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -739,7 +743,6 @@ impl<'a> BytecodeGraphBuilder<'a> {
                 Some(b) => b,
                 None => continue,
             };
-            let _ = hi;
             let (s, e) = (h.start_pc as usize, h.end_pc as usize);
             for bci in self.throwing_bcis(s, e) {
                 let edge_id = self.exc_edges.len();
@@ -748,6 +751,8 @@ impl<'a> BytecodeGraphBuilder<'a> {
                 self.exc_edges.push(ExcEdge {
                     handler_block: hb,
                     slot,
+                    catch_type: h.catch_type,
+                    prio: hi as u32,
                 });
                 self.exc_at.entry(bci).or_default().push(edge_id);
             }
@@ -2030,6 +2035,31 @@ impl<'a> BytecodeGraphBuilder<'a> {
         }
     }
 
+    /// Builds the `IfException` token for one exception edge:
+    /// `[trap, catch_site, prio]` where `catch_site` is a `SitePtr`
+    /// node for the handler's `catch_type` class (0 = catch-all) and
+    /// `prio` the exception-table index used to order the dispatch
+    /// chain.  Returns `None` (recording `unsupported`) when a typed
+    /// catch has no resolved site.
+    fn exc_if_node(&mut self, bci: usize, trap_node: NodeId, ed: &ExcEdge) -> Option<NodeId> {
+        let site = if ed.catch_type == 0 {
+            self.gvn.transform(Opcode::SitePtr(0), vec![])
+        } else {
+            let cp = ed.catch_type as u16;
+            if ed.catch_type > u16::MAX as u32 || !self.ctx.sites.contains_key(&cp) {
+                self.unsupported(bci, "unresolved catch type");
+                return None;
+            }
+            self.site_node(cp)
+        };
+        let prio = self.gvn.transform(Opcode::ConI(ed.prio as i32), vec![]);
+        // inputs[3] tags the throwing bci so the scheduler can tell a
+        // legitimate same-site typed-catch chain apart from a CSE'd
+        // trapping node shared across different handler sets.
+        let bci_n = self.gvn.transform(Opcode::ConI(bci as i32), vec![]);
+        Some(self.gvn.alloc(Opcode::IfException, vec![trap_node, site, prio, bci_n]))
+    }
+
     fn maybe_throw(&mut self, bci: usize, trap_node: NodeId, frame: &Frame) {
         let edges = match self.exc_at.get(&bci) {
             Some(e) => e.clone(),
@@ -2040,7 +2070,10 @@ impl<'a> BytecodeGraphBuilder<'a> {
                 let ed = &self.exc_edges[eid];
                 (ed.handler_block, ed.slot)
             };
-            let ie = self.gvn.alloc(Opcode::IfException, vec![trap_node]);
+            let ed = self.exc_edges[eid];
+            let Some(ie) = self.exc_if_node(bci, trap_node, &ed) else {
+                continue;
+            };
             let stack = vec![StackVal {
                 node: ie,
                 cat2: false,
@@ -2069,7 +2102,10 @@ impl<'a> BytecodeGraphBuilder<'a> {
             // exception edge has a unique control point (the athrow node
             // itself is the block terminator and may feed several handlers).
             // Its value is never read: the handler sees `obj` directly.
-            let ie = self.gvn.alloc(Opcode::IfException, vec![athrow_node]);
+            let ed = self.exc_edges[eid];
+            let Some(ie) = self.exc_if_node(bci, athrow_node, &ed) else {
+                continue;
+            };
             let stack = vec![StackVal {
                 node: obj,
                 cat2: false,

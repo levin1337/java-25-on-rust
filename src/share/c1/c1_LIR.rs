@@ -95,6 +95,10 @@ pub enum RuntimeStub {
     /// tagged reference word of the thrown object plus one (the JIT
     /// subtracts one to recover the `encode_ref` encoding).
     ExcCheck,
+    /// Re-arms `Pending::Thrown` for an exception reference that
+    /// matched no typed handler and unwinds to `invoke_raw` — the
+    /// typed-catch dispatch fallthrough.
+    RethrowExc,
 }
 
 /// Resolved constant-pool site passed to JIT runtime stubs.  One

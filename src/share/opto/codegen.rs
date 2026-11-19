@@ -117,6 +117,17 @@ pub struct EmitResult {
     pub block_offsets: HashMap<usize, usize>,
 }
 
+/// One exception-handler edge out of a trapping node, ordered by
+/// exception-table priority for the typed-catch dispatch chain.
+#[derive(Clone, Copy)]
+struct ExcDispatch {
+    block: usize,
+    ctrl: NodeId,
+    /// `SitePtr` node for the catch type; `NONE`/`SitePtr(0)` = catch-all.
+    site: NodeId,
+    prio: i32,
+}
+
 #[derive(Clone, Copy)]
 struct BranchPatch {
     disp: usize,
@@ -142,9 +153,9 @@ pub struct X86Emitter<'a> {
     pc_descs: Vec<PcDesc>,
     temp_sp: usize,
     param_kinds: HashMap<usize, ParamKind>,
-    /// Trapping node -> (handler block, IfException token) for nodes
-    /// that have an exception-handler edge.
-    exc_by_trap: HashMap<NodeId, (usize, NodeId)>,
+    /// Trapping node -> ordered exception-handler dispatches
+    /// (exception-table priority order) for nodes with handler edges.
+    exc_by_trap: HashMap<NodeId, Vec<ExcDispatch>>,
 }
 
 impl<'a> X86Emitter<'a> {
@@ -162,19 +173,36 @@ impl<'a> X86Emitter<'a> {
             .iter()
             .map(|p| (p.local_slot, p.kind))
             .collect();
-        let mut exc_by_trap: HashMap<NodeId, (usize, NodeId)> = HashMap::new();
+        let mut exc_by_trap: HashMap<NodeId, Vec<ExcDispatch>> = HashMap::new();
         for block in &schedule.blocks {
             for e in &block.exc_succs {
                 let cn = gvn.node(e.ctrl);
-                let trap = if cn.op == Opcode::IfException {
-                    cn.inputs.first().copied().unwrap_or(NONE)
+                let (trap, site, prio) = if cn.op == Opcode::IfException {
+                    let ins = &cn.inputs;
+                    let site = ins.get(1).copied().unwrap_or(NONE);
+                    let prio = ins
+                        .get(2)
+                        .and_then(|&p| match gvn.node(p).op {
+                            Opcode::ConI(v) => Some(v),
+                            _ => None,
+                        })
+                        .unwrap_or(0);
+                    (ins.first().copied().unwrap_or(NONE), site, prio)
                 } else {
-                    e.ctrl
+                    (e.ctrl, NONE, 0)
                 };
                 if trap != NONE {
-                    exc_by_trap.entry(trap).or_insert((e.block, e.ctrl));
+                    exc_by_trap.entry(trap).or_default().push(ExcDispatch {
+                        block: e.block,
+                        ctrl: e.ctrl,
+                        site,
+                        prio,
+                    });
                 }
             }
+        }
+        for v in exc_by_trap.values_mut() {
+            v.sort_by_key(|d| d.prio);
         }
         Self {
             buf,
@@ -903,20 +931,73 @@ impl<'a> X86Emitter<'a> {
     /// `ExcCheck` returns 0 when nothing is pending and `tagged + 1`
     /// for a thrown object (a pending deopt re-arms itself and the
     /// trampoline unwinds before this point).  On a throw the tagged
-    /// reference is stored into the `IfException` token's location,
-    /// phi copies run, and control jumps to the handler block.
+    /// reference is kept in a temp slot and the covering handlers are
+    /// tried in exception-table order: catch-all entries dispatch
+    /// unconditionally, typed entries first run `InstanceOf` against
+    /// the catch class.  If nothing matches, `RethrowExc` re-arms the
+    /// pending throw and unwinds to the caller.
     fn emit_exc_dispatch(&mut self, b: usize, node: NodeId) -> Result<(), BackendError> {
-        let Some(&(tb, ctrl)) = self.exc_by_trap.get(&node) else {
+        let Some(disp) = self.exc_by_trap.get(&node) else {
             return Ok(());
         };
+        let disp = disp.clone();
         self.emit_runtime_call_addr(RuntimeStub::ExcCheck)?;
         self.asm.emit_rex(true, false, false, false);
         self.buf.write(&[0x85, 0xc0])?; // test rax,rax
         let jz = self.emit_jmp_local_cc(XCond::E)?;
         self.buf.write(&[0x48, 0xff, 0xc8])?; // dec rax -> tagged ref
-        self.store_gp_loc(ctrl, Register::RAX, true)?;
-        self.emit_phi_moves(b, tb, ctrl)?;
-        self.emit_jmp_block(tb)?;
+        // Preserve the tagged reference across InstanceOf calls.
+        let t = self.alloc_temp()?;
+        self.store_gp_to_temp(t, Register::RAX, true)?;
+        let instance_of = self
+            .options
+            .stubs
+            .get(&RuntimeStub::InstanceOf)
+            .copied()
+            .ok_or(BackendError::MissingRuntimeStub(RuntimeStub::InstanceOf))?;
+        let rethrow = self
+            .options
+            .stubs
+            .get(&RuntimeStub::RethrowExc)
+            .copied()
+            .ok_or(BackendError::MissingRuntimeStub(RuntimeStub::RethrowExc))?;
+        let mut fell_through = true;
+        for d in &disp {
+            let site_ptr = match self.gvn.node(d.site).op {
+                Opcode::SitePtr(p) if p != 0 => p,
+                _ => 0,
+            };
+            if site_ptr == 0 {
+                // catch-all: unconditional dispatch, chain terminates.
+                self.load_gp_from_temp(t, Register::RAX, true)?;
+                self.store_gp_loc(d.ctrl, Register::RAX, true)?;
+                self.emit_phi_moves(b, d.block, d.ctrl)?;
+                self.emit_jmp_block(d.block)?;
+                fell_through = false;
+                break;
+            }
+            // typed: InstanceOf(exc, catch_class) -> 0/1
+            self.load_gp_from_temp(t, Register::RCX, true)?;
+            self.asm.mov_imm(Register::RDX, site_ptr as i64)?;
+            self.asm.emit_abs_call(instance_of)?;
+            self.asm.emit_rex(true, false, false, false);
+            self.buf.write(&[0x85, 0xc0])?; // test rax,rax
+            let jno = self.emit_jmp_local_cc(XCond::E)?;
+            self.load_gp_from_temp(t, Register::RAX, true)?;
+            self.store_gp_loc(d.ctrl, Register::RAX, true)?;
+            self.emit_phi_moves(b, d.block, d.ctrl)?;
+            self.emit_jmp_block(d.block)?;
+            let next = self.pos();
+            self.patch_local(jno, next)?;
+        }
+        if fell_through {
+            // No handler matched: re-arm pending and unwind.
+            self.load_gp_from_temp(t, Register::RCX, true)?;
+            self.asm.emit_abs_call(rethrow)?;
+            // The trampoline always unwinds on pending; ud2 if not.
+            self.buf.write(&[0x0f, 0x0b])?;
+        }
+        self.free_temp();
         let cont = self.pos();
         self.patch_local(jz, cont)?;
         Ok(())

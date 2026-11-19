@@ -2059,6 +2059,96 @@ mod tests {
         }
     }
     #[test]
+    fn e2e_typed_catch() {
+        // Typed exception handlers: the dispatch chain must run
+        // InstanceOf against each covering catch type in exception-table
+        // order — match -> handler, no match -> next handler / rethrow.
+        //
+        //   0: iload_0 ; 1: iload_1 ; 2: idiv ; 3: ireturn
+        //   4: pop          <- handler_pc
+        //   5: bipush 7 ; 7: ireturn
+        use super::super::builder::{ExceptionHandler, SiteInfo};
+        use std::collections::HashMap;
+        let _ = test_loader();
+        let loader = crate::share::runtime::threading::jvm_loader().unwrap();
+        register_klass(&loader, b"java/lang/ArithmeticException", &[]);
+        register_klass(&loader, b"java/lang/NullPointerException", &[]);
+        let code: &[u8] = &[
+            0x1a, // 0: iload_0
+            0x1b, // 1: iload_1
+            0x6c, // 2: idiv
+            0xac, // 3: ireturn
+            0x57, // 4: pop (handler)
+            0x10, 0x07, // 5: bipush 7
+            0xac, // 7: ireturn
+        ];
+        let site = |class: &str| SiteInfo {
+            class: class.to_string(),
+            name: String::new(),
+            desc: String::new(),
+        };
+        let mut sites: HashMap<u16, SiteInfo> = HashMap::new();
+        sites.insert(100, site("java/lang/ArithmeticException"));
+        sites.insert(101, site("java/lang/NullPointerException"));
+        let fields = HashMap::new();
+        let methods = HashMap::new();
+        let constants = HashMap::new();
+        let ctx = super::super::builder::BuilderContext {
+            fields: &fields,
+            methods: &methods,
+            constants: &constants,
+            sites: &sites,
+        };
+        let options = BackendOptions {
+            params: vec![iparam(0), iparam(1)],
+            stubs: jit_stub_map(),
+            stubs_no_unwind: jit_stub_map_no_unwind(),
+            ..BackendOptions::default()
+        };
+        let compile = |handlers: &[ExceptionHandler]| {
+            let m = MethodCode {
+                name: "test",
+                max_locals: 2,
+                max_stack: 8,
+                param_slots: 2,
+                code,
+                handlers,
+            };
+            let mut c = Compile::compile(&m, &ctx);
+            c.optimize();
+            let emitted = c.backend(&m, &ctx, &options).expect("emit");
+            publish_executable(&emitted.code, emitted.code.len()).expect("publish")
+        };
+        let invoke = |addr: usize| {
+            try_invoke(addr, b"(II)I", true, &[Value::Int(20), Value::Int(0)], 0).unwrap()
+        };
+        // 1. catch(ArithmeticException): thrown AE matches -> 7.
+        let h = [ExceptionHandler { start_pc: 0, end_pc: 3, handler_pc: 4, catch_type: 100 }];
+        let addr = compile(&h);
+        match invoke(addr) {
+            CompiledResult::Value(Some(Value::Int(v))) => assert_eq!(v, 7),
+            other => panic!("matching typed catch: {:?}", other),
+        }
+        // 2. catch(NullPointerException) only: AE does not match -> rethrow.
+        let h = [ExceptionHandler { start_pc: 0, end_pc: 3, handler_pc: 4, catch_type: 101 }];
+        let addr = compile(&h);
+        match invoke(addr) {
+            CompiledResult::Thrown(_) => {}
+            other => panic!("non-matching typed catch should rethrow: {:?}", other),
+        }
+        // 3. catch(NPE) then catch-all: typed fails, catch-all catches -> 7.
+        let h = [
+            ExceptionHandler { start_pc: 0, end_pc: 3, handler_pc: 4, catch_type: 101 },
+            ExceptionHandler { start_pc: 0, end_pc: 3, handler_pc: 4, catch_type: 0 },
+        ];
+        let addr = compile(&h);
+        match invoke(addr) {
+            CompiledResult::Value(Some(Value::Int(v))) => assert_eq!(v, 7),
+            other => panic!("typed-then-catchall: {:?}", other),
+        }
+    }
+
+    #[test]
     fn e2e_try_catch_shared_handler_phi() {
         // Two adjacent protected ranges feed ONE catch-all handler, so the
         // handler entry is a Region merge of two IfException edges and the

@@ -184,16 +184,9 @@ impl AbstractCompiler for C2Compiler {
                 catch_type: e.catch_type as u32,
             })
             .collect();
-        // C2 dispatches every exception edge to the first covering
-        // handler unconditionally; typed catches (catch_type != 0) need
-        // runtime assignability checks that are not implemented yet, so
-        // methods containing them stay in the interpreter.
-        if handlers.iter().any(|h| h.catch_type != 0) {
-            return Err(CompileError::unsupported(
-                "typed exception handlers are not supported by C2 yet",
-                CompLevel::FullOptimization,
-            ));
-        }
+        // Typed catches dispatch through per-handler InstanceOf checks
+        // in the emitted code; each catch_type CP index resolves to a
+        // SiteInfo carrying the exception class's internal name.
         let method_code = MethodCode {
             name: task.method.method_name.as_str(),
             max_locals: method.max_locals() as usize,
@@ -237,6 +230,35 @@ impl AbstractCompiler for C2Compiler {
                     _ => continue,
                 };
                 constants.insert(idx as u16, v);
+            }
+            // Typed-catch sites: catch_type is a CP index of a Class
+            // constant; expose its internal name through the same
+            // SiteInfo channel field/method sites use.
+            for h in &handlers {
+                let cp = h.catch_type;
+                if cp == 0 || cp > u16::MAX as u32 {
+                    continue;
+                }
+                let cp = cp as u16;
+                if sites.contains_key(&cp) {
+                    continue;
+                }
+                let Ok(crate::share::classfile::classFileParser::Constant::Class(name_idx)) =
+                    klass.constant(cp)
+                else {
+                    continue;
+                };
+                let Ok(name) = klass.utf8(*name_idx) else {
+                    continue;
+                };
+                sites.insert(
+                    cp,
+                    super::builder::SiteInfo {
+                        class: String::from_utf8_lossy(name).into_owned(),
+                        name: String::new(),
+                        desc: String::new(),
+                    },
+                );
             }
         }
         if let Some(md) = &task.jit_metadata {

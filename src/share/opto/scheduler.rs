@@ -231,7 +231,7 @@ pub struct Scheduler<'a> {
     /// Trapping node -> [(handler entry control, IfException token)].
     /// The entry control is the handler Region for merged handlers or
     /// the `IfException` node itself for single-predecessor handlers.
-    exc_edges_of: HashMap<NodeId, Vec<(NodeId, NodeId)>>,
+    exc_edges_of: HashMap<NodeId, Vec<(NodeId, NodeId, i32)>>,
     /// Memory state delivered to each exception-edge entry control.
     exc_entry_mem: HashMap<NodeId, NodeId>,
     /// IfException token -> (source block, position) definition site.
@@ -275,7 +275,7 @@ impl<'a> Scheduler<'a> {
         // trapping node (inputs[0]) and is either a Region input
         // (merged handler) or a standalone control entry
         // (single-predecessor handler).
-        let mut exc_edges_of: HashMap<NodeId, Vec<(NodeId, NodeId)>> = HashMap::new();
+        let mut exc_edges_of: HashMap<NodeId, Vec<(NodeId, NodeId, i32)>> = HashMap::new();
         let mut region_inputs: HashSet<NodeId> = HashSet::new();
         for node in &gvn.nodes {
             if node.op == Opcode::Region {
@@ -294,6 +294,16 @@ impl<'a> Scheduler<'a> {
             if trap == NONE {
                 continue;
             }
+            // inputs[3] carries the throwing bci (0 for legacy 3-input
+            // tokens); edges from one site share it, CSE'd sites differ.
+            let bci = node
+                .inputs
+                .get(3)
+                .and_then(|&b| match gvn.node(b).op {
+                    Opcode::ConI(v) => Some(v),
+                    _ => None,
+                })
+                .unwrap_or(0);
             if region_inputs.contains(&node.id) {
                 // Find every Region that consumes this token.
                 for r in &gvn.nodes {
@@ -301,7 +311,7 @@ impl<'a> Scheduler<'a> {
                         exc_edges_of
                             .entry(trap)
                             .or_default()
-                            .push((r.id, node.id));
+                            .push((r.id, node.id, bci));
                     }
                 }
             } else {
@@ -310,7 +320,7 @@ impl<'a> Scheduler<'a> {
                 exc_edges_of
                     .entry(trap)
                     .or_default()
-                    .push((node.id, node.id));
+                    .push((node.id, node.id, bci));
             }
         }
         Self {
@@ -615,14 +625,22 @@ impl<'a> Scheduler<'a> {
         let Some(list) = self.exc_edges_of.get(&trap).cloned() else {
             return;
         };
-        if list.len() > 1 {
+        // Multiple edges are legal only when they all originate from the
+        // same throwing bci — a typed-catch dispatch chain.  Edges with
+        // distinct bcis mean the trapping node was CSE'd across sites
+        // with different handler sets: ambiguous, reject.
+        let mut bcis = std::collections::HashSet::new();
+        for &(_, _, bci) in &list {
+            bcis.insert(bci);
+        }
+        if bcis.len() > 1 {
             self.unsupported.push(format!(
                 "ambiguous exception edges on node {}",
                 trap
             ));
             return;
         }
-        for (entry, ctrl) in list {
+        for (entry, ctrl, _) in list {
             if let Some(eb) =
                 self.block_for_control_or_add(entry, blocks, &mut Vec::new())
             {

@@ -985,6 +985,23 @@ unsafe extern "C" fn h_exc_check(_a: u64, _b: u64, _c: u64, _d: u64, _f: u64) ->
     }
 }
 
+/// `RethrowExc`: called by C2 typed-catch dispatch when the thrown
+/// object matches no covering handler.  Re-arms `Pending::Thrown`
+/// with the tagged reference and returns; the unwinding trampoline
+/// then escapes to `invoke_raw`, which reports `CompiledResult::Thrown`
+/// exactly like an unwinding stub escape.
+unsafe extern "C" fn h_rethrow_exc(value: u64, _b: u64, _c: u64, _d: u64, frame: u64) -> u64 {
+    let Some(loader) = loader_or_deopt() else { return 0 };
+    let _roots = frame_roots(&loader, frame);
+    match decode_ref(value) {
+        Value::Object(handle) => {
+            runtime::set_pending_throw(handle);
+            0
+        }
+        _ => deopt(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Array operations.
 // ---------------------------------------------------------------------------
@@ -1578,6 +1595,7 @@ fn stub_entries() -> &'static [StubEntry] {
             StubEntry { stub: RuntimeStub::UnresolvedField, handler: h_unresolved_field },
             StubEntry { stub: RuntimeStub::UnresolvedCall, handler: h_unresolved_call },
             StubEntry { stub: RuntimeStub::ExcCheck, handler: h_exc_check },
+            StubEntry { stub: RuntimeStub::RethrowExc, handler: h_rethrow_exc },
         ]
     })
 }

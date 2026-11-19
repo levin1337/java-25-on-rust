@@ -846,4 +846,118 @@ mod tests {
             .is_err()
         );
     }
+
+    #[test]
+    fn compiles_drem_via_stub() {
+        // aload_0 ; iconst_0 ; daload ; aload_0 ; iconst_1 ; daload ; drem ; dreturn
+        let code: &[u8] = &[0x2a, 0x03, 0x31, 0x2a, 0x04, 0x31, 0x73, 0xaf];
+        let options = BackendOptions {
+            params: ref_param(),
+            stubs: stub_map(&[
+                (crate::share::c1::c1_LIR::RuntimeStub::ArrayLoad, 0x9100),
+                (crate::share::c1::c1_LIR::RuntimeStub::FloatRem, 0x9101),
+            ]),
+            ..BackendOptions::default()
+        };
+        let mut c = Compile::compile(&method(code, 1), &BuilderContext::empty());
+        let emitted = c
+            .backend(&method(code, 1), &BuilderContext::empty(), &options)
+            .expect("drem should emit");
+        assert!(
+            has_stub_call(&emitted.code, 0x9100),
+            "array load stub missing: {:02x?}",
+            emitted.code
+        );
+        assert!(
+            has_stub_call(&emitted.code, 0x9101),
+            "float rem stub missing: {:02x?}",
+            emitted.code
+        );
+        assert!(emitted.code.iter().any(|&b| b == 0xc3));
+    }
+
+    #[test]
+    fn compiles_frem_via_stub() {
+        // aload_0 ; iconst_0 ; faload ; aload_0 ; iconst_1 ; faload ; frem ; freturn
+        let code: &[u8] = &[0x2a, 0x03, 0x30, 0x2a, 0x04, 0x30, 0x72, 0xae];
+        let options = BackendOptions {
+            params: ref_param(),
+            stubs: stub_map(&[
+                (crate::share::c1::c1_LIR::RuntimeStub::ArrayLoad, 0x9110),
+                (crate::share::c1::c1_LIR::RuntimeStub::FloatRem, 0x9111),
+            ]),
+            ..BackendOptions::default()
+        };
+        let mut c = Compile::compile(&method(code, 1), &BuilderContext::empty());
+        let emitted = c
+            .backend(&method(code, 1), &BuilderContext::empty(), &options)
+            .expect("frem should emit");
+        assert!(
+            has_stub_call(&emitted.code, 0x9111),
+            "float rem stub missing: {:02x?}",
+            emitted.code
+        );
+    }
+
+    #[test]
+    fn compiles_f2i_via_stub() {
+        // aload_0 ; iconst_0 ; faload ; f2i ; ireturn
+        let code: &[u8] = &[0x2a, 0x03, 0x30, 0x8b, 0xac];
+        let options = BackendOptions {
+            params: ref_param(),
+            stubs: stub_map(&[
+                (crate::share::c1::c1_LIR::RuntimeStub::ArrayLoad, 0x9120),
+                (crate::share::c1::c1_LIR::RuntimeStub::FloatConvert, 0x9121),
+            ]),
+            ..BackendOptions::default()
+        };
+        let mut c = Compile::compile(&method(code, 1), &BuilderContext::empty());
+        let emitted = c
+            .backend(&method(code, 1), &BuilderContext::empty(), &options)
+            .expect("f2i should emit");
+        assert!(
+            has_stub_call(&emitted.code, 0x9121),
+            "float convert stub missing: {:02x?}",
+            emitted.code
+        );
+    }
+
+    #[test]
+    fn compiles_d2l_via_stub() {
+        // aload_0 ; iconst_0 ; daload ; d2l ; lreturn
+        let code: &[u8] = &[0x2a, 0x03, 0x31, 0x8f, 0xad];
+        let options = BackendOptions {
+            params: ref_param(),
+            stubs: stub_map(&[
+                (crate::share::c1::c1_LIR::RuntimeStub::ArrayLoad, 0x9130),
+                (crate::share::c1::c1_LIR::RuntimeStub::FloatConvert, 0x9131),
+            ]),
+            ..BackendOptions::default()
+        };
+        let mut c = Compile::compile(&method(code, 1), &BuilderContext::empty());
+        let emitted = c
+            .backend(&method(code, 1), &BuilderContext::empty(), &options)
+            .expect("d2l should emit");
+        assert!(
+            has_stub_call(&emitted.code, 0x9131),
+            "float convert stub missing: {:02x?}",
+            emitted.code
+        );
+    }
+
+    #[test]
+    fn float_rem_requires_stub() {
+        // Same drem program without the FloatRem stub must be rejected.
+        let code: &[u8] = &[0x2a, 0x03, 0x31, 0x2a, 0x04, 0x31, 0x73, 0xaf];
+        let options = BackendOptions {
+            params: ref_param(),
+            stubs: stub_map(&[(crate::share::c1::c1_LIR::RuntimeStub::ArrayLoad, 0x9140)]),
+            ..BackendOptions::default()
+        };
+        let mut c = Compile::compile(&method(code, 1), &BuilderContext::empty());
+        assert!(
+            c.backend(&method(code, 1), &BuilderContext::empty(), &options)
+                .is_err()
+        );
+    }
 }

@@ -256,6 +256,33 @@ impl Opcode {
         )
     }
 
+    /// Nodes that read the heap or can trap even when their result value
+    /// is unused (dead-code elimination must treat them as live roots).
+    /// Loads may fault on null receivers, `checkcast`/`instanceof` observe
+    /// heap/class state, `arraylength` can NPE, and integer div/rem raise
+    /// `ArithmeticException` on zero divisors.
+    pub fn is_effectful_value(&self) -> bool {
+        use Opcode::*;
+        matches!(
+            self,
+            LoadI
+                | LoadL
+                | LoadF
+                | LoadD
+                | LoadP
+                | LoadB
+                | LoadC
+                | LoadS
+                | ArrayLength
+                | CheckCast(_)
+                | InstanceOf(_)
+                | DivI
+                | RemI
+                | DivL
+                | RemL
+        )
+    }
+
     pub fn is_const(&self) -> bool {
         matches!(
             self,

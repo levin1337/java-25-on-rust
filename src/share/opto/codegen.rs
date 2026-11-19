@@ -544,11 +544,13 @@ impl<'a> X86Emitter<'a> {
                 | Opcode::SubF
                 | Opcode::MulF
                 | Opcode::DivF
+                | Opcode::RemF
                 | Opcode::NegF
                 | Opcode::AddD
                 | Opcode::SubD
                 | Opcode::MulD
                 | Opcode::DivD
+                | Opcode::RemD
                 | Opcode::NegD
                 | Opcode::CmpI
                 | Opcode::CmpL
@@ -1250,6 +1252,28 @@ impl<'a> X86Emitter<'a> {
                 self.buf.write(&[0x0f, 0xbf, 0xc0])?; // movsx eax,ax
                 Ok(())
             }
+            Opcode::F2I | Opcode::F2L | Opcode::D2I | Opcode::D2L => {
+                // Float->int needs the SharedRuntime rules (NaN -> 0,
+                // saturate on overflow) that raw cvttss2si/cvttsd2si do
+                // not implement, so it goes through the FloatConvert
+                // stub: rcx = source bits, r8 = conversion kind.
+                let kind = match op {
+                    Opcode::F2I => 0,
+                    Opcode::F2L => 1,
+                    Opcode::D2I => 2,
+                    _ => 3,
+                };
+                let double = matches!(op, Opcode::D2I | Opcode::D2L);
+                self.emit_xmm_to(inputs[0], XMMRegister::XMM0)?;
+                if double {
+                    self.asm.movq_xmm_to_gp(Register::RAX, XMMRegister::XMM0)?;
+                } else {
+                    self.asm.movd_xmm_to_gp(Register::RAX, XMMRegister::XMM0)?;
+                }
+                self.asm.mov_reg_reg(Register::RCX, Register::RAX, true)?;
+                self.asm.mov_imm32(Register::R8, kind)?;
+                self.emit_runtime_call_addr(RuntimeStub::FloatConvert)
+            }
             Opcode::CmpF(greater_nan) | Opcode::CmpD(greater_nan) => {
                 let double = matches!(op, Opcode::CmpD(_));
                 self.emit_fp_cmp_value(inputs[0], inputs[1], double, greater_nan)
@@ -1445,6 +1469,7 @@ impl<'a> X86Emitter<'a> {
                     .cvtsd2ss(XMMRegister::XMM0, XMMRegister::XMM0)
                     .map_err(BackendError::from)
             }
+            Opcode::RemF | Opcode::RemD => self.emit_float_rem(&op, &inputs),
             _ => Err(BackendError::Unsupported(format!("pure xmm op {:?}", op))),
         }
     }
@@ -1492,6 +1517,36 @@ impl<'a> X86Emitter<'a> {
         self.patch_local(end3, self.pos())?;
         let _ = start;
         Ok(())
+    }
+
+    /// `frem`/`drem` have no SSE equivalent, so they go through the
+    /// FloatRem stub which applies the exact SharedRuntime semantics
+    /// (fmod + Win64 infinity rule).  rcx/rdx carry the operand bit
+    /// patterns staged through temp slots (evaluating the second
+    /// operand may itself emit stub calls), r8 selects f32/f64, and
+    /// the result arrives in xmm0 through the stub xmm channel.
+    fn emit_float_rem(&mut self, op: &Opcode, inputs: &[NodeId]) -> Result<(), BackendError> {
+        let double = matches!(op, Opcode::RemD);
+        let kind = if double { 1 } else { 0 };
+        let stage = |this: &mut Self, value: NodeId| -> Result<usize, BackendError> {
+            let t = this.alloc_temp()?;
+            this.emit_xmm_to(value, XMMRegister::XMM0)?;
+            if double {
+                this.asm.movq_xmm_to_gp(Register::RAX, XMMRegister::XMM0)?;
+            } else {
+                this.asm.movd_xmm_to_gp(Register::RAX, XMMRegister::XMM0)?;
+            }
+            this.store_gp_to_temp(t, Register::RAX, true)?;
+            Ok(t)
+        };
+        let ta = stage(self, inputs[0])?;
+        let tb = stage(self, inputs[1])?;
+        self.load_gp_from_temp(ta, Register::RCX, true)?;
+        self.load_gp_from_temp(tb, Register::RDX, true)?;
+        self.free_temp();
+        self.free_temp();
+        self.asm.mov_imm32(Register::R8, kind)?;
+        self.emit_runtime_call_addr(RuntimeStub::FloatRem)
     }
 
     // ---- safepoint ---------------------------------------------------------
@@ -1695,7 +1750,6 @@ pub fn validate_supported(gvn: &PhaseGVN) -> Result<(), BackendError> {
                     n.inputs.len() != 6
                 }
             }
-            Opcode::RemF | Opcode::RemD => true,
             Opcode::ConP(v) => v != 0,
             _ => false,
         };

@@ -1043,6 +1043,42 @@ unsafe extern "C" fn h_array_store(
 }
 
 // ---------------------------------------------------------------------------
+// Floating-point remainder / conversions (SharedRuntime math intrinsics).
+// ---------------------------------------------------------------------------
+
+/// `frem`/`drem`: arg0/arg1 carry the raw operand bit patterns (the f32
+/// payload sits in the low 32 bits when kind == 0), arg2 selects single
+/// (`0`) or double (`1`) precision.  Java remainder is fmod plus the
+/// Win64 infinity rule — `sharedRuntime::{frem,drem}` implement it
+/// exactly; the result leaves through the xmm channel like every other
+/// floating-point stub result.
+unsafe extern "C" fn h_float_rem(a: u64, b: u64, kind: u64, _d: u64, _frame: u64) -> u64 {
+    use crate::share::runtime::sharedRuntime;
+    let bits = if kind == 0 {
+        sharedRuntime::frem(f32::from_bits(a as u32), f32::from_bits(b as u32)).to_bits() as u64
+    } else {
+        sharedRuntime::drem(f64::from_bits(a), f64::from_bits(b)).to_bits()
+    };
+    runtime::set_stub_xmm_result(bits);
+    bits
+}
+
+/// `f2i`/`f2l`/`d2i`/`d2l`: arg0 carries the source bit pattern, arg2
+/// selects the conversion (0 = F2I, 1 = F2L, 2 = D2I, 3 = D2L).  The
+/// sharedRuntime helpers implement the Java rules (NaN -> 0, saturate
+/// on overflow, round toward zero) that a raw `cvttss2si` does not, so
+/// the result goes out in rax as a plain GP word.
+unsafe extern "C" fn h_float_convert(value: u64, _b: u64, kind: u64, _d: u64, _frame: u64) -> u64 {
+    use crate::share::runtime::sharedRuntime;
+    match kind {
+        0 => u64::from(sharedRuntime::f2i(f32::from_bits(value as u32)) as u32),
+        1 => sharedRuntime::f2l(f32::from_bits(value as u32)) as u64,
+        2 => u64::from(sharedRuntime::d2i(f64::from_bits(value)) as u32),
+        _ => sharedRuntime::d2l(f64::from_bits(value)) as u64,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Method calls (HotSpot `call`/`stub` analogue).
 // ---------------------------------------------------------------------------
 
@@ -1454,6 +1490,8 @@ fn stub_entries() -> &'static [StubEntry] {
             StubEntry { stub: RuntimeStub::ArrayLength, handler: h_array_length },
             StubEntry { stub: RuntimeStub::ArrayLoad, handler: h_array_load },
             StubEntry { stub: RuntimeStub::ArrayStore, handler: h_array_store },
+            StubEntry { stub: RuntimeStub::FloatRem, handler: h_float_rem },
+            StubEntry { stub: RuntimeStub::FloatConvert, handler: h_float_convert },
             StubEntry { stub: RuntimeStub::UnresolvedField, handler: h_unresolved_field },
             StubEntry { stub: RuntimeStub::UnresolvedCall, handler: h_unresolved_call },
         ]

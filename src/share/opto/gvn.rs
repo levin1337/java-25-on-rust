@@ -178,6 +178,16 @@ impl PhaseGVN {
             return live;
         }
         let mut stack = vec![self.root];
+        // Effectful value nodes are additional roots: loads, casts and
+        // arraylength read the heap and can trap (NPE / ClassCastException)
+        // even when their result value is unused, so dead-code elimination
+        // must never remove them — same rule HotSpot applies to nodes
+        // pinned on the control chain.
+        for node in &self.nodes {
+            if node.op.is_effectful_value() {
+                stack.push(node.id);
+            }
+        }
         while let Some(id) = stack.pop() {
             if id == NONE || id >= self.nodes.len() || live[id] {
                 continue;

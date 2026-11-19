@@ -2270,6 +2270,55 @@ pub fn resolve_sites(
                 | Code::Invokedynamic
         );
         if is_field || is_method {
+            if op == Code::Invokedynamic {
+                // InvokeDynamic entries carry (bsm_attr_idx, nat_idx);
+                // memberRef cannot resolve them.  The site needs the
+                // *caller* class (its BootstrapMethods attribute and
+                // constant pool drive linkage) plus the call-site
+                // name/descriptor from the NameAndType.
+                let resolved = (|| {
+                    let crate::share::classfile::classFileParser::Constant::InvokeDynamic(
+                        _,
+                        nat,
+                    ) = klass.constant(cp).ok()?
+                    else {
+                        return None;
+                    };
+                    let crate::share::classfile::classFileParser::Constant::NameAndType(
+                        name_idx,
+                        desc_idx,
+                    ) = klass.constant(*nat).ok()?
+                    else {
+                        return None;
+                    };
+                    Some((
+                        klass.utf8(*name_idx).ok()?,
+                        klass.utf8(*desc_idx).ok()?,
+                    ))
+                })();
+                if std::env::var("JVM25_DBG_INDY").is_ok() {
+                    eprintln!(
+                        "[indy-site] cp={} resolved={} class={}",
+                        cp,
+                        resolved.is_some(),
+                        String::from_utf8_lossy(klass.class.name)
+                    );
+                }
+                if let Some((name, desc)) = resolved {
+                    sites.insert(
+                        cp,
+                        SiteInfo {
+                            class: String::from_utf8_lossy(
+                                klass.class.name,
+                            )
+                            .into_owned(),
+                            name: String::from_utf8_lossy(name).into_owned(),
+                            desc: String::from_utf8_lossy(desc).into_owned(),
+                        },
+                    );
+                }
+                continue;
+            }
             if let Ok([owner, name, desc]) = klass.memberRef(cp, is_field) {
                 sites.insert(
                     cp,

@@ -40,6 +40,7 @@ use super::runtime::{
 };
 use crate::share::c1::asm::codeBuffer::CodeBuffer;
 use crate::share::c1::c1_LIR::{RuntimeStub, StubSite};
+use crate::share::classfile::classFileParser::Constant;
 use crate::share::classfile::classLoader::ClassLoader;
 use crate::share::classfile::systemDictionary::SystemDictionary;
 use crate::share::interpreter::bytecodeInterpreter::{self, Value};
@@ -963,6 +964,102 @@ unsafe extern "C" fn h_unresolved_call(a: u64, b: u64, c: u64, d: u64, f: u64) -
     unsafe { h_call_method(a, b, c, d, f) }
 }
 
+/// `InvokeDynamic`: arg0 `StubSite` carrying the caller class name in
+/// `class` and the call-site name/descriptor in `name`/`desc`, arg1 a
+/// pointer to the marshalled argument words, arg2 the argument count,
+/// arg3 the constant-pool index of the `InvokeDynamic` entry (which
+/// carries the bootstrap-method attribute index), arg4 the frame.
+/// Shares `invokeDynamic::dispatch` with the interpreter's `0xba` arm.
+unsafe extern "C" fn h_invoke_dynamic(
+    site_ptr: u64,
+    args_ptr: u64,
+    n_args: u64,
+    cp_index: u64,
+    frame: u64,
+) -> u64 {
+    let Some(loader) = loader_or_deopt() else { return 0 };
+    let _roots = frame_roots(&loader, frame);
+    let Some((owner, name, descriptor)) = site_slices(site_ptr) else {
+        return deopt();
+    };
+    let Some(sig) = runtime::parse_signature(descriptor, true) else {
+        return deopt();
+    };
+    let n = n_args as usize;
+    if n > MAX_CALL_ARGS || sig.params().len() != n || (n > 0 && args_ptr == 0) {
+        return deopt();
+    }
+    let raw_args = if n == 0 {
+        &[][..]
+    } else {
+        unsafe { std::slice::from_raw_parts(args_ptr as *const u64, n) }
+    };
+    let mut values: Vec<Value<'static>> = Vec::with_capacity(n);
+    let mut arg_roots = Vec::new();
+    for (index, kind) in sig.params().iter().enumerate() {
+        let raw = raw_args[index];
+        let value = match kind {
+            runtime::SlotKind::Int32 => Value::Int(raw as u32 as i32),
+            runtime::SlotKind::Int64 => Value::Long(raw as i64),
+            runtime::SlotKind::Float32 => Value::Float(f32::from_bits(raw as u32)),
+            runtime::SlotKind::Float64 => Value::Double(f64::from_bits(raw)),
+            runtime::SlotKind::Ref => decode_ref(raw),
+            runtime::SlotKind::Void => return deopt(),
+        };
+        if matches!(kind, runtime::SlotKind::Ref) {
+            arg_roots.push(value);
+        }
+        values.push(value);
+    }
+    let _arg_roots = FrameRoots::register(&loader, arg_roots);
+    if cp_index > u16::MAX as u64 {
+        return deopt();
+    }
+    let caller = match loader.load(owner) {
+        Ok(klass) => klass,
+        Err(_) => return deopt(),
+    };
+    let bs_info = (|| {
+        let Constant::InvokeDynamic(bsm_attr_idx, _) =
+            caller.constant(cp_index as u16).ok()?
+        else {
+            return None;
+        };
+        LinkResolver::resolve_invokedynamic(
+            &loader,
+            &caller,
+            *bsm_attr_idx,
+            name,
+            descriptor,
+        )
+        .ok()
+    })();
+    let Some(bs_info) = bs_info else {
+        return deopt();
+    };
+    let depth = runtime::current_depth();
+    match crate::share::interpreter::invokeDynamic::dispatch(
+        &loader,
+        &caller,
+        &bs_info,
+        name,
+        descriptor,
+        &values,
+        &mut io::sink(),
+        depth,
+    ) {
+        Ok(Some(value)) => call_result_raw(&loader, &value),
+        Ok(None) => 0,
+        Err(error) => {
+            if let Some(handle) = bytecodeInterpreter::throwable_of(&error) {
+                runtime::set_pending_throw(handle);
+                return 0;
+            }
+            deopt()
+        }
+    }
+}
+
 /// `ExcCheck`: called by C2 code right after a *non-unwinding* stub
 /// call that may have recorded a pending outcome.  Consumes the
 /// channel and reports:
@@ -1596,6 +1693,7 @@ fn stub_entries() -> &'static [StubEntry] {
             StubEntry { stub: RuntimeStub::UnresolvedCall, handler: h_unresolved_call },
             StubEntry { stub: RuntimeStub::ExcCheck, handler: h_exc_check },
             StubEntry { stub: RuntimeStub::RethrowExc, handler: h_rethrow_exc },
+            StubEntry { stub: RuntimeStub::InvokeDynamic, handler: h_invoke_dynamic },
         ]
     })
 }

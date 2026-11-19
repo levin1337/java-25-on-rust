@@ -849,7 +849,11 @@ impl<'a> X86Emitter<'a> {
     }
 
     fn emit_call(&mut self, node: NodeId, payload: u64) -> Result<(), BackendError> {
-        let (_cp, invoke_op, result) = call_unpack(payload);
+        let (cp, invoke_op, result) = call_unpack(payload);
+        // invokedynamic (0xba) resolves its bootstrap through the
+        // constant-pool index, which travels in the opcode slot; the
+        // InvokeDynamic stub reads it from there.
+        let is_indy = invoke_op == 0xba;
         let inputs = self.gvn.node(node).inputs.clone();
         let site = inputs.last().copied().unwrap_or(NONE);
         let end = inputs.len().saturating_sub(1).max(2);
@@ -884,8 +888,16 @@ impl<'a> X86Emitter<'a> {
             self.buf.write_i32(disp)?;
         }
         self.asm.mov_imm32(Register::R8, n as i32)?;
-        self.asm.mov_imm32(Register::R9, invoke_op as i32)?;
-        self.emit_stub_call(node, RuntimeStub::UnresolvedCall)?;
+        self.asm
+            .mov_imm32(Register::R9, if is_indy { cp as i32 } else { invoke_op as i32 })?;
+        self.emit_stub_call(
+            node,
+            if is_indy {
+                RuntimeStub::InvokeDynamic
+            } else {
+                RuntimeStub::UnresolvedCall
+            },
+        )?;
         self.temp_sp = base;
         match result {
             CallResult::Void => Ok(()),

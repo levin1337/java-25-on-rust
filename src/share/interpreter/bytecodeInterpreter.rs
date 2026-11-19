@@ -12,7 +12,6 @@ use super::numeric;
 use crate::classfile::decodeString;
 use crate::share::classfile::classLoader::{CallSiteKey, ClassLoader};
 use crate::share::classfile::systemDictionary::SystemDictionary;
-use crate::share::interpreter::bootstrapInfo::BootstrapArg;
 use crate::share::oops::instanceOop::InstanceOop;
 use crate::share::oops::{arrayKlass::ArrayKlass, typeArrayOop::Element};
 use crate::share::runtime::javaCalls::{JavaCallArguments, JavaCalls};
@@ -810,7 +809,7 @@ pub(crate) fn describeValue<'a>(
     describeValueKind(loader, value, false, output, depth)
 }
 
-fn describeValueKind<'a>(
+pub(crate) fn describeValueKind<'a>(
     loader: &ClassLoader<'a>,
     value: Value<'a>,
     as_boolean: bool,
@@ -3541,117 +3540,17 @@ fn step<'a>(
                 slots += val.slots();
             }
 
-            let mut is_string_concat = name == b"makeConcat" || name == b"makeConcatWithConstants";
-            if !is_string_concat {
-                if let Some(target) = bs_info.resolved_target() {
-                    if target.contains("StringConcatFactory") {
-                        is_string_concat = true;
-                    }
-                }
+            let captured = frame.stack[start..].to_vec();
+            frame.stack.truncate(start);
+            frame.stackSlots -= slots;
+            // Shared with the C2 InvokeDynamic stub: concat fast path,
+            // ObjectMethods, LambdaMetafactory, generic JVMS linkage.
+            if let Some(value) = super::invokeDynamic::dispatch(
+                loader, klass, &bs_info, name, descriptor, &captured, output, depth,
+            )? {
+                frame.push(value)?;
             }
-
-            if is_string_concat {
-                let mut formatted = String::new();
-                let recipe = bs_info.arguments().first().and_then(|arg| {
-                    if let BootstrapArg::String(s) = arg {
-                        Some(s.as_str())
-                    } else {
-                        None
-                    }
-                });
-
-                let mut boolean_params = Vec::new();
-                {
-                    let mut rest = descriptor.strip_prefix(b"(").unwrap_or(descriptor);
-                    while !rest.is_empty() && rest[0] != b')' {
-                        let dims = rest.iter().take_while(|byte| **byte == b'[').count();
-                        let tag = rest.get(dims).copied().unwrap_or(0);
-                        boolean_params.push(tag == b'Z');
-                        let len = if tag == b'L' {
-                            dims + 1
-                                + rest[dims + 1..]
-                                    .iter()
-                                    .position(|byte| *byte == b';')
-                                    .map(|pos| pos + 1)
-                                    .unwrap_or(rest.len().saturating_sub(dims + 1))
-                        } else {
-                            dims + 1
-                        };
-                        rest = rest.get(len..).unwrap_or(&[]);
-                    }
-                }
-                let mut dynamic_args = Vec::with_capacity(frame.stack.len() - start);
-                for (arg_index, value) in frame.stack[start..].iter().enumerate() {
-                    dynamic_args.push(describeValueKind(
-                        loader,
-                        *value,
-                        boolean_params.get(arg_index).copied().unwrap_or(false),
-                        output,
-                        depth + 1,
-                    )?);
-                }
-
-                if let Some(recipe_str) = recipe {
-                    let mut arg_iter = dynamic_args.into_iter();
-                    let mut const_iter = bs_info.arguments().iter().skip(1);
-                    for ch in recipe_str.chars() {
-                        if ch == '\u{0001}' {
-                            if let Some(arg_val) = arg_iter.next() {
-                                formatted.push_str(&arg_val);
-                            }
-                        } else if ch == '\u{0002}' {
-                            if let Some(c) = const_iter.next() {
-                                match c {
-                                    BootstrapArg::String(s) => formatted.push_str(s),
-                                    BootstrapArg::Int(i) => formatted.push_str(&i.to_string()),
-                                    BootstrapArg::Long(l) => formatted.push_str(&l.to_string()),
-                                    _ => {}
-                                }
-                            }
-                        } else {
-                            formatted.push(ch);
-                        }
-                    }
-                } else {
-                    for arg_val in dynamic_args {
-                        formatted.push_str(&arg_val);
-                    }
-                }
-
-                frame.stack.truncate(start);
-                frame.stackSlots -= slots;
-                let allocated_str = loader.storage.alloc_str(&formatted);
-                Value::HostString(allocated_str)
-            } else {
-                let captured = frame.stack[start..].to_vec();
-                frame.stack.truncate(start);
-                frame.stackSlots -= slots;
-                if let Some(value) =
-                    super::objectMethods::invoke(loader, klass, &bs_info, &captured, output, depth)?
-                {
-                    frame.push(value)?;
-                    return Ok(Step::Continue);
-                }
-                match super::lambdaMetafactory::invoke(
-                    loader, klass, &bs_info, name, descriptor, &captured,
-                )? {
-                    Some(value) => {
-                        frame.push(value)?;
-                        return Ok(Step::Continue);
-                    }
-                    None => {
-                        // Generic JVMS linkage: run the real bootstrap
-                        // method, link the CallSite, and invoke its target.
-                        if let Some(value) = super::genericBootstrap::invoke(
-                            loader, klass, &bs_info, name, descriptor, &captured,
-                            output, depth,
-                        )? {
-                            frame.push(value)?;
-                        }
-                        return Ok(Step::Continue);
-                    }
-                }
-            }
+            return Ok(Step::Continue);
         }
         0xbb => {
             let name = klass.className(u16::from_be_bytes(frame.read()?))?;

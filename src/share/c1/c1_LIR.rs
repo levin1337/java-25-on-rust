@@ -99,6 +99,10 @@ pub enum RuntimeStub {
     /// matched no typed handler and unwinds to `invoke_raw` — the
     /// typed-catch dispatch fallthrough.
     RethrowExc,
+    /// `invokedynamic`: resolves the bootstrap call site named by the
+    /// constant-pool index passed in the opcode slot and invokes the
+    /// linked target with the marshalled arguments.
+    InvokeDynamic,
 }
 
 /// Resolved constant-pool site passed to JIT runtime stubs.  One

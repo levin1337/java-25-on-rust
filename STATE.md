@@ -33,10 +33,28 @@ Goal: full Minecraft 26.3 CLIENT + Fabric on Rust JVM, JIT enabled, no crashes.
   String.toLowerCase -> C2 OSR of StringLatin1.toLowerCase crashed
   at [encoded-ref+8]; NettyProbe (PlatformDependent clinit) crashed
   the same way. VEH crash handler now prints fault RIP -> nmethod.
+- FIXED (5a42624): scheduler emitted trapping value producers
+  (RemI/DivI/LoadP/...) in candidate order gated only on the memory
+  token — a consumer created before its producer read an uninitialized
+  spill slot (C2Stress AIOOBE / "arraylength on non-array").
+  `ArrayLength` also missed `mem_index()` (layout [mem,ctrl,arr]).
+  `reorder_instrs()` now topologically orders non-memory-producers
+  inside each memory-producer segment; cross-barrier deps -> unsupported.
+  Array stubs: throw helpers no longer run under live obj_arrays/arrays
+  borrows ("already borrowed" panic on exception materialization).
+  Verified: C2StressP acc bit-identical JIT-on vs interpreter.
+- FIXED (5f4f9e4): GC safepoint deadlock — compiler/attach/watchdog
+  threads registered via contended Share borrows but never safepoint,
+  so every collection waited on them forever (frozen CPU under JIT+GC
+  load). `heap::set_gc_exempt()` at service spawn sites +
+  `ThreadEntry.safepointed` drops never-safepointed entries on
+  unquiesce. `JVM25_GC=epsilon|serial|parallel` selects the engine.
 - Known C2 gaps -> interpreter fallback: precise deopt.
   GC barriers are N/A in this design (stores go through Rust stubs;
   safety via gc_extra_roots/frame_roots conservative scan).
-- Tests: 104/104 opto, 35/35 jitruntime, 25/25 compiler green.
+- Tests: 104/105 opto (e2e_athrow fails on clean HEAD too —
+  pre-existing), 19/20 heap-filtered (compressedOops env failure,
+  unrelated), new scheduler regression test green.
 
 ## Build/run
 - `cargo build --release` -> `target/release/jvm25-rust.exe`.

@@ -532,6 +532,122 @@ fn manifest_object<'a>(loader: &ClassLoader<'a>, bytes: &[u8]) -> io::Result<Val
     Ok(Value::Object(handle))
 }
 
+/// `JarURLConnection.connect()`: eagerly opens the underlying jar through a
+/// real `java.util.jar.JarFile` and stores it (plus the resolved entry)
+/// into the connection's `jarFile`/`jarEntry` fields, so the inherited JDK
+/// accessors (`getJarFile`, `getJarEntry`, `getContentType`, `getContent`)
+/// behave like on HotSpot.  `connected` is set so repeat calls are no-ops.
+fn jar_connect<'a>(
+    loader: &ClassLoader<'a>,
+    arguments: &[Value<'a>],
+) -> io::Result<Value<'a>> {
+    let receiver = arguments.first().copied().unwrap_or(Value::Null);
+    let Value::Object(handle) = receiver else {
+        return Ok(Value::Null);
+    };
+    let klass = loader.load(b"sun/net/www/protocol/jar/JarURLConnection")?;
+    {
+        let objects = loader.borrow_objects();
+        let Some(object) = objects.get(handle) else {
+            return Err(invalid("Invalid object reference"));
+        };
+        if let Ok(slot) = klass.instanceField(b"connected", b"Z")
+            && matches!(object.fields.get(slot), Some(Value::Int(1)))
+        {
+            return Ok(Value::Null);
+        }
+    }
+    let url = object_field(loader, receiver, b"url", b"Ljava/net/URL;")?;
+    let (protocol, file) = url_parts(loader, url)?;
+    let (Some(protocol), Some(file)) = (protocol, file) else {
+        return Err(io_exception(loader, "JarURLConnection has no URL"));
+    };
+    if protocol != "jar" {
+        return Err(io_exception(loader, "JarURLConnection URL is not a jar: URL"));
+    }
+    let (jar_path, _) = parse_jar_spec(loader, &file)?;
+    let entry_name = string_field(loader, receiver, b"entryName", b"Ljava/lang/String;")?
+        .map(|name| percent_decode(&name))
+        .filter(|name| !name.is_empty());
+
+    // new JarFile(jar_path)
+    let jar_klass = loader.load(b"java/util/jar/JarFile")?;
+    let _ = bytecodeInterpreter::initialize(loader, &jar_klass, &mut sink(), 0);
+    let jar_object = InstanceOop::new(jar_klass.clone())?;
+    let jar_handle = loader.alloc_object(jar_object);
+    let path_string = stringNatives::materialize(
+        loader,
+        Value::HostString(loader.storage.alloc_str(&jar_path)),
+        &mut sink(),
+        0,
+    )?
+    .unwrap_or(Value::HostString(loader.storage.alloc_str(&jar_path)));
+    let mut call_args = JavaCallArguments::new();
+    call_args.push_oop(Value::Object(jar_handle));
+    call_args.push_oop(path_string);
+    JavaCalls::call_special(
+        loader,
+        &jar_klass,
+        b"<init>",
+        b"(Ljava/lang/String;)V",
+        &call_args,
+        &mut sink(),
+    )?;
+
+    // jarFile.getEntry(entryName) — mirrors connect()'s validation order:
+    // a missing entry raises FileNotFoundException before `connected`.
+    let jar_entry = match &entry_name {
+        Some(name) => {
+            let entry_string = stringNatives::materialize(
+                loader,
+                Value::HostString(loader.storage.alloc_str(name)),
+                &mut sink(),
+                0,
+            )?
+            .unwrap_or(Value::HostString(loader.storage.alloc_str(name)));
+            let mut call_args = JavaCallArguments::new();
+            call_args.push_oop(Value::Object(jar_handle));
+            call_args.push_oop(entry_string);
+            let entry = JavaCalls::call_virtual(
+                loader,
+                &jar_klass,
+                b"getEntry",
+                b"(Ljava/lang/String;)Ljava/util/zip/ZipEntry;",
+                &call_args,
+                &mut sink(),
+            )?;
+            match entry {
+                Some(Value::Object(_)) | Some(Value::HostString(_)) => entry,
+                _ => {
+                    return Err(file_not_found(
+                        loader,
+                        &format!("JAR entry {name} not found in jar file {jar_path}"),
+                    ));
+                }
+            }
+        }
+        None => None,
+    };
+
+    let mut objects = loader.borrow_objects_mut();
+    let Some(object) = objects.get_mut(handle) else {
+        return Err(invalid("Invalid object reference"));
+    };
+    if let Ok(slot) = klass.instanceField(b"jarFile", b"Ljava/util/jar/JarFile;") {
+        object.fields[slot] = Value::Object(jar_handle);
+    }
+    if let (Ok(slot), Some(entry)) = (
+        klass.instanceField(b"jarEntry", b"Ljava/util/jar/JarEntry;"),
+        jar_entry,
+    ) {
+        object.fields[slot] = entry;
+    }
+    if let Ok(slot) = klass.instanceField(b"connected", b"Z") {
+        object.fields[slot] = Value::Int(1);
+    }
+    Ok(Value::Null)
+}
+
 /// `JarURLConnection.getManifest()`: reads `META-INF/MANIFEST.MF` from the
 /// underlying jar and wraps it in a real `java.util.jar.Manifest` built
 /// through its `Manifest(InputStream)` constructor.
@@ -655,6 +771,36 @@ pub(crate) fn classResource<'a>(
             .map(|end| &component[..end + 1]).unwrap_or_default();
         format!("{}{}", crate::classfile::decodeString(prefix)?, name)
     };
+    // Classes defined through a Java `ClassLoader` (URLClassLoader and
+    // friends) own their own classpath: delegate `getResource` to that
+    // loader's real method so jar/directory code sources resolve.
+    if let Some(loader_handle) = loader.defining_loader(class) {
+        let loader_klass = {
+            let objects = loader.borrow_objects();
+            objects.get(loader_handle).map(|object| object.klass.clone())
+        };
+        if let Some(loader_klass) = loader_klass {
+            let resource = stringNatives::materialize(
+                loader,
+                Value::HostString(loader.storage.alloc_str(&name)),
+                &mut sink(),
+                0,
+            )?
+            .unwrap_or(Value::HostString(loader.storage.alloc_str(&name)));
+            let mut call_args = JavaCallArguments::new();
+            call_args.push_oop(Value::Object(loader_handle));
+            call_args.push_oop(resource);
+            let result = JavaCalls::call_virtual(
+                loader,
+                &loader_klass,
+                b"getResource",
+                b"(Ljava/lang/String;)Ljava/net/URL;",
+                &call_args,
+                &mut sink(),
+            )?;
+            return Ok(result.unwrap_or(Value::Null));
+        }
+    }
     let Some(spec) = resource_specs(loader, &name)?.into_iter().next() else {
         return Ok(Value::Null);
     };
@@ -926,10 +1072,13 @@ pub(crate) fn invoke_instance<'a>(
         }
         // `sun.net.www.protocol.jar.JarURLConnection` produced by the jar:
         // openConnection path above.  `getInputStream` reads the `!/entry`
-        // payload through the same zip reader as `jvm25.url.UrlConnection`;
-        // `connect` is a no-op because reads are eager.
+        // payload through the same zip reader as `jvm25.url.UrlConnection`.
+        // `connect` materializes a real `java.util.jar.JarFile` into the
+        // `jarFile`/`jarEntry` fields so `getJarFile`, `getJarEntry`,
+        // `getContentType`, `getContent` and `JarFile`-based callers
+        // (e.g. `JarManifests.manifest`) work like on HotSpot.
         (b"sun/net/www/protocol/jar/JarURLConnection", b"connect", b"()V") => {
-            Ok(Some(None))
+            jar_connect(loader, arguments).map(|_| Some(None))
         }
         (b"sun/net/www/protocol/jar/JarURLConnection", b"getUseCaches", b"()Z") => {
             let receiver = arguments.first().copied().unwrap_or(Value::Null);
@@ -960,9 +1109,6 @@ pub(crate) fn invoke_instance<'a>(
             {
                 loader.objects.borrow_mut()[handle].fields[slot] = flag;
             }
-            Ok(Some(None))
-        }
-        (b"sun/net/www/protocol/jar/JarURLConnection", b"setUseCaches", b"(Z)V") => {
             Ok(Some(None))
         }
         (b"sun/net/www/protocol/jar/JarURLConnection", b"getManifest", b"()Ljava/util/jar/Manifest;") => {

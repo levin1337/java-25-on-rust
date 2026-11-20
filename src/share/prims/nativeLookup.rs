@@ -564,10 +564,22 @@ fn invokeInstanceInner<'a>(
         }
         let internal = binary.replace('.', "/");
         let internal = loader.storage.alloc_str(&internal);
-        return match loader.load(internal.as_bytes()) {
-            Ok(_) => Ok(Some(Some(Value::ClassMirror(internal.as_bytes())))),
-            Err(_) => Ok(Some(Some(Value::Null))),
+        // `findLoadedClass0` reports only classes this loader already
+        // defined — it must not trigger a load (JVMS: lookup only).
+        // `findBootstrapClass` sees boot-image classes exclusively;
+        // returning classpath classes here breaks parent delegation and
+        // lets custom loaders "inherit" app classes they should define
+        // themselves (wrong defining loader, broken ServiceLoader).
+        let found = if name == b"findBootstrapClass" {
+            loader.is_boot_class(internal.as_bytes()).unwrap_or(false)
+        } else {
+            loader.is_defined(internal.as_bytes())
         };
+        return Ok(Some(Some(if found {
+            Value::ClassMirror(internal.as_bytes())
+        } else {
+            Value::Null
+        })));
     }
 
     // Resolve inherited natives to their declaring class before dispatch.

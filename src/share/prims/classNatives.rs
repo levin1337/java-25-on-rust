@@ -232,12 +232,10 @@ pub(crate) fn invoke<'a>(
         | (b"getClassLoader0", b"()Ljava/lang/ClassLoader;") => {
             if class.starts_with(b"[") || class.starts_with(b":") {
                 Value::Null
-            } else if loader.bootImage.is_some() {
-                if loader.is_boot_class(class)? {
-                    Value::Null
-                } else {
-                    Value::Object(loader.systemClassLoaderObject()?)
-                }
+            } else if loader.bootImage.is_some() && loader.is_boot_class(class)? {
+                Value::Null
+            } else if let Some(handle) = loader.defining_loader(class) {
+                Value::Object(handle)
             } else {
                 Value::Object(loader.systemClassLoaderObject()?)
             }

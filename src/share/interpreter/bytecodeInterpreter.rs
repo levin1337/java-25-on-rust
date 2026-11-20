@@ -476,11 +476,13 @@ impl<'a> Frame<'a> {
         let slots = self.stackSlots + value.slots();
         if slots > self.code.maxStack {
             return Err(Error::other(format!(
-                "Operand stack overflow: {} slots needed, {} max at pc {} in {}",
+                "Operand stack overflow: {} slots needed, {} max at pc {} in {}.{}{}",
                 slots,
                 self.code.maxStack,
                 self.pc,
-                String::from_utf8_lossy(self.owner)
+                String::from_utf8_lossy(self.owner),
+                String::from_utf8_lossy(self.code.name),
+                String::from_utf8_lossy(self.code.descriptor)
             )));
         }
         self.stack.push(value);

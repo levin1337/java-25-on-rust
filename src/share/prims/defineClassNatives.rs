@@ -99,6 +99,12 @@ pub(crate) fn define_class0<'a>(
         .unwrap_or(0) as usize;
     let protection_domain = arguments.get(6).copied().unwrap_or(Value::Null);
     let result = define_from_window(loader, bytes_value, offset, length, protection_domain)?;
+    if let (Value::ClassMirror(name), Value::Object(loader_handle)) = (
+        result,
+        arguments.first().copied().unwrap_or(Value::Null),
+    ) {
+        loader.record_defining_loader(name, loader_handle);
+    }
     if std::env::var_os("JVM25_TRACE_DEFINE").is_some() {
         eprintln!(
             "[define0] flags={flags:#x} lookup={:?} result={:?}",
@@ -211,6 +217,9 @@ pub(crate) fn define_class2<'a>(
         }
         loader.record_class_protection_domain(name, handle);
     }
+    if let Value::Object(loader_handle) = arguments.first().copied().unwrap_or(Value::Null) {
+        loader.record_defining_loader(name, loader_handle);
+    }
     Ok(Some(Value::ClassMirror(name)))
 }
 
@@ -235,5 +244,32 @@ pub(crate) fn define_class1<'a>(
         .and_then(|value| value.int().ok())
         .unwrap_or(0) as usize;
     let protection_domain = arguments.get(5).copied().unwrap_or(Value::Null);
-    define_from_window(loader, bytes_value, offset, length, protection_domain).map(Some)
+    let traced = std::env::var_os("JVM25_TRACE_DEFINE").is_some();
+    let result = match define_from_window(loader, bytes_value, offset, length, protection_domain) {
+        Ok(result) => result,
+        Err(error) => {
+            if traced {
+                let name_arg = arguments.get(1).copied().unwrap_or(Value::Null);
+                let name_str = match name_arg {
+                    Value::HostString(s) => Some(s.to_string()),
+                    _ => None,
+                };
+                eprintln!("[define1-err] name={name_str:?} err={error}");
+            }
+            return Err(error);
+        }
+    };
+    if let (Value::ClassMirror(name), Value::Object(loader_handle)) = (
+        result,
+        arguments.first().copied().unwrap_or(Value::Null),
+    ) {
+        if std::env::var_os("JVM25_TRACE_DEFINE").is_some() {
+            eprintln!(
+                "[define1] name={} loader={loader_handle}",
+                String::from_utf8_lossy(name)
+            );
+        }
+        loader.record_defining_loader(name, loader_handle);
+    }
+    Ok(Some(result))
 }

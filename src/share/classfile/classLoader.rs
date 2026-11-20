@@ -966,6 +966,16 @@ impl<'a> ClassLoader<'a> {
         self.nest_host_overrides.borrow().get(name).cloned()
     }
 
+    /// Hidden classes whose VM-assigned nest host is `host`.
+    pub fn hidden_nest_members(&self, host: &[u8]) -> Vec<Vec<u8>> {
+        self.nest_host_overrides
+            .borrow()
+            .iter()
+            .filter(|(_, h)| h.as_slice() == host)
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
     /// Reads a non-class resource (properties files, data files, ...).
     /// Returns `Ok(None)` when the resource does not exist.
     pub fn open_resource(&self, name: &[u8]) -> io::Result<Option<Vec<u8>>> {

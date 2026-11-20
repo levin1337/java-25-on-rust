@@ -2709,6 +2709,17 @@ pub(crate) fn class_invoke<'a>(
                 if !names.iter().any(|name| *name == klass.class.name) {
                     names.push(klass.class.name);
                 }
+                // Hidden nestmates carry no NestMembers attribute entry;
+                // they belong to the nest of their VM-assigned host.
+                let host = loader
+                    .hidden_nest_host(klass.class.name)
+                    .or_else(|| klass.class.nest_host().map(|h| h.to_vec()))
+                    .unwrap_or_else(|| klass.class.name.to_vec());
+                for member in loader.hidden_nest_members(&host) {
+                    if !names.iter().any(|name| *name == member.as_slice()) {
+                        names.push(&*loader.storage.alloc_slice_copy(&member));
+                    }
+                }
                 class_array(loader, &names)?
             }
         }

@@ -164,8 +164,10 @@ cargo test --test asm_x86  # ассемблерный слой
 
 - **C2 в проде**: invocation + OSR-компиляция, typed catches, `invokedynamic`, все сигнатуры — верифицировано smoke-тестами (`OsrSmoke`, `C2Catch`, `C2Indy`, `C2Fields`, `ProxyStress`, `ToLowerCrash`).
 - **Критические баги MC-path закрыты**: OSR nmethod публиковался в обычный dispatch → segfault на первом `OsrArg`; hidden classes не имели nest host → `LambdaMetafactory` падал.
-- **Диагности**: Windows VEH crash handler (RIP→nmethod), `JVM25_NO_C2`, `JVM25_DUMP_C2`, `JVM25_TRACE_DEFINE`, `JVM25_TRACE_WIN`, `JVM25_TRACE` unsafe-spin stack dumps.
-- **Следующий шаг**: полный прогон Leaf bootstrap на текущем бинаре — смотреть, что идёт после `PlatformDependent.<clinit>`; затем либо `jvm.dll`-экспорты (`JNI_CreateJavaVM` уже есть, нужны `JVM_*`), либо точная деоптимизация в C2.
+- **Диагности**: Windows VEH crash handler (RIP→nmethod), `JVM25_NO_C2`, `JVM25_DUMP_C2`, `JVM25_TRACE_DEFINE`, `JVM25_TRACE_WIN`, `JVM25_TRACE` unsafe-spin stack dumps, `JVM25_DUMP` watchdog (стеки Java-потоков каждые 5с).
+- **Classloader/ServiceLoader (566cd8a)**: трекинг defining loader через `defineClass*`, `getClassLoader0` возвращает реальный loader, `findLoadedClass0`/`findBootstrapClass` по JVMS, `JarURLConnection.connect()` заполняет настоящий `JarFile`/`JarEntry`. `ServiceLoader` для `io.papermc.paper.ServerBuildInfo` работает (провайдер инстанцируется).
+- **Leaf bootstrap (dev-classpath)**: прошёл старый краш `ServerBuildInfo Optional.empty`; сейчас глубоко внутри `PaperBootstrap.<clinit>` → log4j2 init — чистая интерпретаторная медлительность, ошибок нет. ВНИМАНИЕ: `leaf-runner` по умолчанию берёт устаревший клон `Leaf-ver-1.21.11/java-25-on-rust` — передавать `--jvm`/`JVM25_RUST` на этот репозиторий.
+- **Следующий шаг**: дождаться конца log4j init / `PaperBootstrap.boot()` — смотреть следующий блокер; затем либо `jvm.dll`-экспорты (`JNI_CreateJavaVM` уже есть, нужны `JVM_*`), либо точная деоптимизация в C2.
 
 ---
 

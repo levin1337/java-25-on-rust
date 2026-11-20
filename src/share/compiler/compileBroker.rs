@@ -539,6 +539,7 @@ impl CompileBroker {
                 .name("C2 CompilerThread0".to_string())
                 .stack_size(16 * 1024 * 1024)
                 .spawn(move || {
+                    crate::share::memory::heap::set_gc_exempt();
                     broker.compiler_thread_loop(CompLevel::FullOptimization, None);
                 });
         } else {
@@ -554,6 +555,7 @@ impl CompileBroker {
                 .name("C1 CompilerThread0".to_string())
                 .stack_size(16 * 1024 * 1024)
                 .spawn(move || {
+                    crate::share::memory::heap::set_gc_exempt();
                     broker.compiler_thread_loop(CompLevel::Simple, None);
                 });
         }

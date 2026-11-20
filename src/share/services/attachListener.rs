@@ -926,6 +926,7 @@ impl AttachListener {
 }
 
 fn thread_entry() {
+    crate::share::memory::heap::set_gc_exempt();
     let streaming = Management::global()
         .runtime_mxbean()
         .system_properties()

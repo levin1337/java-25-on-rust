@@ -167,6 +167,7 @@ pub fn ensure_watchdog() {
         .name("jvm-watchdog".to_string())
         .stack_size(1024 * 1024)
         .spawn(|| loop {
+            crate::share::memory::heap::set_gc_exempt();
             std::thread::sleep(Duration::from_secs(5));
             let snapshot: Vec<(std::thread::ThreadId, DebugInfo)> = THREAD_DEBUG
                 .lock()

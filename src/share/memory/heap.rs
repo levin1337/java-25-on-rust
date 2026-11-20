@@ -380,6 +380,12 @@ struct ThreadEntry {
     id: ThreadId,
     roots: Vec<Handle>,
     state: ThreadGcState,
+    /// Set once the thread reports through `safepoint()` — proof it
+    /// executes Java and will keep reporting.  Entries created only by
+    /// `quiesce()` (service threads parked on a contended `Share`)
+    /// never safepoint again, so `unquiesce` drops them instead of
+    /// leaving them `Running` where every later collection would wait.
+    safepointed: bool,
 }
 
 struct GcShared {
@@ -394,6 +400,27 @@ static GC_STATE: Mutex<GcShared> = Mutex::new(GcShared {
     threads: Vec::new(),
 });
 static GC_CV: Condvar = Condvar::new();
+
+// Service threads that never execute Java (compiler threads, the
+// attach listener, the dump watchdog) must not join the stop-the-world
+// registry: they only get an entry when a contended `Share` borrow
+// parks them in `quiesce()`, after which `unquiesce()` would leave
+// them `Running` forever — they have no safepoint to report to, so
+// every later collection would wait on them indefinitely.  Their
+// arena borrows are already tolerated by the sweep's `try_borrow`
+// fast path, so skipping registration is safe.
+thread_local! {
+    static GC_EXEMPT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Marks the calling thread as GC-exempt; call once at thread start.
+pub fn set_gc_exempt() {
+    GC_EXEMPT.with(|flag| flag.set(true));
+}
+
+fn gc_exempt() -> bool {
+    GC_EXEMPT.with(|flag| flag.get())
+}
 /// Serializes `#[cfg(test)]` code paths that drive `collect_cycle`:
 /// the pending-GC guard would otherwise let a concurrent test's
 /// collection return early without sweeping, making assertions flaky.
@@ -412,6 +439,7 @@ fn entry_mut<'a>(state: &'a mut GcShared, id: ThreadId) -> &'a mut ThreadEntry {
             id,
             roots: Vec::new(),
             state: ThreadGcState::Running,
+            safepointed: false,
         });
         state.threads.last_mut().unwrap()
     }
@@ -511,11 +539,15 @@ fn snapshot_handles() -> Vec<Handle> {
 /// wakeup so a new cycle started while this thread was still parked
 /// cannot strand it.
 pub fn safepoint() {
+    if gc_exempt() {
+        return;
+    }
     let id = crate::share::prims::jniReferences::current_thread_id();
     loop {
         let mut state = GC_STATE.lock();
         if !state.pending {
             let entry = entry_mut(&mut state, id);
+            entry.safepointed = true;
             if entry.state != ThreadGcState::Blocked {
                 entry.state = ThreadGcState::Running;
                 entry.roots = Vec::new();
@@ -527,6 +559,7 @@ pub fn safepoint() {
             let entry = entry_mut(&mut state, id);
             entry.roots = roots;
             entry.state = ThreadGcState::Quiesced;
+            entry.safepointed = true;
         }
         if std::env::var_os("JVM25_BLOCKTRACE").is_some() {
             eprintln!("[block] safepoint-park tid={id:?}");
@@ -540,6 +573,9 @@ pub fn safepoint() {
 /// are captured now; while blocked the frames cannot change, so the
 /// snapshot stays valid until `unquiesce`.
 pub fn quiesce() {
+    if gc_exempt() {
+        return;
+    }
     let mut state = GC_STATE.lock();
     let id = crate::share::prims::jniReferences::current_thread_id();
     let roots = snapshot_handles();
@@ -551,13 +587,26 @@ pub fn quiesce() {
 
 /// Called when a previously blocked thread resumes execution.
 pub fn unquiesce() {
+    if gc_exempt() {
+        return;
+    }
     let mut state = GC_STATE.lock();
     let id = crate::share::prims::jniReferences::current_thread_id();
-    if let Some(entry) = state.threads.iter_mut().find(|entry| entry.id == id)
-        && entry.state == ThreadGcState::Blocked
-    {
-        entry.state = ThreadGcState::Running;
-        entry.roots = Vec::new();
+    if let Some(position) = state.threads.iter().position(|entry| entry.id == id) {
+        let entry = &mut state.threads[position];
+        if entry.state == ThreadGcState::Blocked {
+            if entry.safepointed {
+                entry.state = ThreadGcState::Running;
+                entry.roots = Vec::new();
+            } else {
+                // Never reported through `safepoint()`: a service
+                // thread that only touched the registry via a
+                // contended `Share` borrow.  It will never safepoint
+                // again, so keeping it `Running` would stall every
+                // later collection; drop the entry instead.
+                state.threads.remove(position);
+            }
+        }
     }
 }
 
@@ -653,7 +702,7 @@ fn arena_total<'a>(loader: &ClassLoader<'a>) -> usize {
 /// `SWEEP_THRESHOLD` slots since the last completed sweep.
 pub fn collect<'a>(loader: &ClassLoader<'a>) -> io::Result<()> {
     let mode = heap_gc_mode();
-    if mode == HeapGcMode::NoCollect {
+    if mode == HeapGcMode::NoCollect || gc_exempt() {
         return Ok(());
     }
     let total = arena_total(loader);
@@ -671,7 +720,7 @@ pub fn collect<'a>(loader: &ClassLoader<'a>) -> io::Result<()> {
 /// WhiteBox, explicit `CollectedHeap::collect` calls).
 pub fn collect_now<'a>(loader: &ClassLoader<'a>) -> io::Result<()> {
     let mode = heap_gc_mode();
-    if mode == HeapGcMode::NoCollect {
+    if mode == HeapGcMode::NoCollect || gc_exempt() {
         return Ok(());
     }
     collect_cycle(loader, mode, arena_total(loader), gc_workers(mode))

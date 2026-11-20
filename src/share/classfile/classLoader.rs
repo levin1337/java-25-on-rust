@@ -963,12 +963,16 @@ impl<'a> ClassLoader<'a> {
     /// Records the `ClassLoader` object that defined `name` via a
     /// `defineClass*` native, keeping it alive as a GC root.
     pub(crate) fn record_defining_loader(&self, name: &[u8], handle: usize) {
-        self.defining_loaders
+        if self
+            .defining_loaders
             .borrow_mut()
-            .insert(name.to_vec(), handle);
-        self.gc_extra_roots
-            .borrow_mut()
-            .push(Value::Object(handle));
+            .insert(name.to_vec(), handle)
+            .is_none()
+        {
+            self.gc_extra_roots
+                .borrow_mut()
+                .push(Value::Object(handle));
+        }
     }
 
     /// `ClassLoader` object handle that defined `name`, if recorded.

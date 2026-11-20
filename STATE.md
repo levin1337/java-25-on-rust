@@ -109,6 +109,18 @@ real goal = Minecraft 26.3 client + Fabric)
   (~1.5s per jar open x ~160 jars + heavy MH/LambdaForm work).
 - Pending other bugs (from earlier runs): coerce_value->Empty,
   Log4j newInstance, JNA field-order, OSHI, javac arg0 field.
+- 566cd8a classloader fixes (defining-loader tracking, real
+  JarURLConnection.connect, findLoadedClass semantics): ServiceLoader
+  for io.papermc.paper.ServerBuildInfo now discovers + instantiates
+  ServerBuildInfoImpl (verified via SvcProbe — provider ctor runs,
+  only probe-classpath deps missing). Full Leaf dev-classpath run
+  (leaf-dev4.log, JVM25_DUMP watchdog) gets PAST the old
+  ServerBuildInfo Optional.empty crash and is now deep inside
+  PaperBootstrap.<clinit> -> slf4j/log4j2 init (ZipFile CEN parsing,
+  annotation parsing, plugin assembly) — pure interpreted-slowness,
+  no error so far. NOTE: leaf-runner defaults to the STALE clone at
+  Leaf-ver-1.21.11/java-25-on-rust (Nov 17 binary); always pass
+  --jvm or JVM25_RUST pointing at this repo's target/release.
 
 ## FFM scope audit (for MC client / LWJGL 3.3+)
 - java.lang.foreign / jdk.internal.foreign are ~all Java-level; the

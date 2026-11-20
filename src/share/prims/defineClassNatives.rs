@@ -73,11 +73,21 @@ pub(crate) fn define_class0<'a>(
     loader: &ClassLoader<'a>,
     arguments: &[Value<'a>],
 ) -> io::Result<Option<Value<'a>>> {
-    // (loader, pdClass, name, bytes, offset, length, protectionDomain,
-    //  initialize, mode, classData)
+    // (loader, lookupClass, name, bytes, offset, length, protectionDomain,
+    //  initialize, flags, classData)
     if let Value::Object(handle) = arguments.first().copied().unwrap_or(Value::Null) {
         loader.register_delegate_loader(handle);
     }
+    // NESTMATE_CLASS (0x1): hidden class whose nest host is the lookup
+    // class's nest host, mirroring HotSpot's define-from-stream path.
+    let flags = arguments
+        .get(8)
+        .and_then(|value| value.int().ok())
+        .unwrap_or(0);
+    let lookup_name = match arguments.get(1).copied().unwrap_or(Value::Null) {
+        Value::ClassMirror(name) => Some(name),
+        _ => None,
+    };
     let bytes_value = arguments.get(3).copied().unwrap_or(Value::Null);
     let offset = arguments
         .get(4)
@@ -88,7 +98,37 @@ pub(crate) fn define_class0<'a>(
         .and_then(|value| value.int().ok())
         .unwrap_or(0) as usize;
     let protection_domain = arguments.get(6).copied().unwrap_or(Value::Null);
-    define_from_window(loader, bytes_value, offset, length, protection_domain).map(Some)
+    let result = define_from_window(loader, bytes_value, offset, length, protection_domain)?;
+    if std::env::var_os("JVM25_TRACE_DEFINE").is_some() {
+        eprintln!(
+            "[define0] flags={flags:#x} lookup={:?} result={:?}",
+            lookup_name.map(|n| String::from_utf8_lossy(n).into_owned()),
+            match &result {
+                Value::ClassMirror(n) => Some(String::from_utf8_lossy(n).into_owned()),
+                _ => None,
+            }
+        );
+    }
+    if flags & 0x1 != 0
+        && let (Value::ClassMirror(class_name), Some(lookup_name)) = (&result, lookup_name)
+    {
+        // Host = the lookup class's own nest host (top-level classes are
+        // their own host).
+        let host = loader
+            .load(lookup_name)
+            .ok()
+            .and_then(|klass| {
+                klass
+                    .class
+                    .nest_host()
+                    .map(|h| h.to_vec())
+                    .or_else(|| Some(lookup_name.to_vec()))
+            });
+        if let Some(host) = host {
+            loader.record_nest_host(*class_name, &host);
+        }
+    }
+    Ok(Some(result))
 }
 
 /// Reads an instance field of a buffer object, walking the hierarchy.

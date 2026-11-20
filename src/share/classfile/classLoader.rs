@@ -318,6 +318,11 @@ pub struct ClassLoader<'a> {
     /// keyed by internal class name. Mirrors the PD a real VM attaches to
     /// the `InstanceKlass` at definition time.
     pub(crate) class_protection_domains: Share<HashMap<Vec<u8>, usize>>,
+    /// Nest-host overrides for hidden classes defined via `defineClass0`
+    /// with `NESTMATE_CLASS`: internal name -> host internal name. Hidden
+    /// class bytes carry no `NestHost` attribute; the VM assigns the host
+    /// from the lookup class at definition time.
+    pub(crate) nest_host_overrides: Share<HashMap<Vec<u8>, Vec<u8>>>,
     /// Resolved invoke* targets (klass + parsed Code) keyed by call site.
     /// Method resolution is deterministic per receiver class, so hits skip
     /// the vtable scan and `Code::parse` on every call.
@@ -639,6 +644,7 @@ impl<'a> ClassLoader<'a> {
             class_object_names: Share::new(HashMap::new()),
             class_origins: Share::new(HashMap::new()),
             class_protection_domains: Share::new(HashMap::new()),
+            nest_host_overrides: Share::new(HashMap::new()),
             invoke_cache: Share::new(HashMap::new()),
             native_declaring_cache: Share::new(HashMap::new()),
             loader_type: ClassLoaderType::AppLoader,
@@ -736,6 +742,7 @@ impl<'a> ClassLoader<'a> {
             class_object_names: Share::new(HashMap::new()),
             class_origins: Share::new(HashMap::new()),
             class_protection_domains: Share::new(HashMap::new()),
+            nest_host_overrides: Share::new(HashMap::new()),
             invoke_cache: Share::new(HashMap::new()),
             native_declaring_cache: Share::new(HashMap::new()),
             loader_type: ClassLoaderType::AppLoader,
@@ -944,6 +951,19 @@ impl<'a> ClassLoader<'a> {
     /// `ProtectionDomain` object handle recorded for `name`, if any.
     pub fn class_protection_domain(&self, name: &[u8]) -> Option<usize> {
         self.class_protection_domains.borrow().get(name).copied()
+    }
+
+    /// Records the VM-assigned nest host for a hidden class.
+    pub(crate) fn record_nest_host(&self, name: &[u8], host: &[u8]) {
+        self.nest_host_overrides
+            .borrow_mut()
+            .insert(name.to_vec(), host.to_vec());
+    }
+
+    /// VM-assigned nest host for `name`, if the class was defined as a
+    /// hidden nestmate without a `NestHost` classfile attribute.
+    pub fn hidden_nest_host(&self, name: &[u8]) -> Option<Vec<u8>> {
+        self.nest_host_overrides.borrow().get(name).cloned()
     }
 
     /// Reads a non-class resource (properties files, data files, ...).

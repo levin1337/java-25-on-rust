@@ -47,6 +47,16 @@ Goal: full Minecraft 26.3 + Fabric on Rust JVM, JIT enabled, no crashes.
   Or `-jar leaf-server/build/libs/leaf-*.jar`.
 - Kill stale: `taskkill //F //IM jvm25-rust.exe` before rebuild (exe lock).
 
+## FIXED this session (cont.)
+- Hidden-class nest hosts: `defineClass0` now reads the lookup `Class`
+  mirror + flags; `NESTMATE_CLASS` (0x1) records a `nest_host_overrides`
+  entry (host = lookup class's nest host). `getNestHost0`,
+  `Reflection.areNestMates` and linkResolver's `nestmates` all consult
+  the override. Verified: direct `LambdaMetafactory.metafactory` call
+  spins `MiniMeta$$Lambda`, private ctor access passes, `META=ok`
+  (was LambdaConversionException "member is private"). BmhProbe
+  (bindTo/insertArguments/lambda indy/method ref) all pass.
+
 ## Diagnostics
 - VEH crash handler (always on, Windows): on AV prints
   `[crash] AV rip=.. rw=.. -> nmethod holder.name(sig)` and writes
@@ -60,7 +70,7 @@ Goal: full Minecraft 26.3 + Fabric on Rust JVM, JIT enabled, no crashes.
   `JVM25_DUMP_JIT`/`JVM25_DUMP_LIR` (C1), `JVM25_NO_JIT`,
   `JVM25_C1_THRESHOLD`, `JVM25_JIT_SKIP`, `JVM25_STACK_MB`,
   `JVM25_TRACE_EXC`, `JVM25_DBG_EXC`, `JVM25_DBG_INDY`,
-  `JVM25_DBG_PHASES`.
+  `JVM25_DBG_PHASES`, `JVM25_TRACE_DEFINE` (defineClass0 flags/lookup).
 
 ## MC bootstrap status (Leaf 1.21.11, Paper/Leaf server jar)
 - Previous blocker `areturn`+`Int` in JDK proxies did NOT reproduce in

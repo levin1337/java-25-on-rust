@@ -2683,10 +2683,13 @@ pub(crate) fn class_invoke<'a>(
             if is_array || is_primitive {
                 Value::Null
             } else {
-                match klass
-                    .as_ref()
-                    .and_then(|klass| klass.class.nest_host())
-                {
+                let host = klass.as_ref().and_then(|klass| {
+                    loader
+                        .hidden_nest_host(klass.class.name)
+                        .map(|h| &*loader.storage.alloc_slice_copy(&h))
+                        .or_else(|| klass.class.nest_host())
+                });
+                match host {
                     Some(host) => Value::ClassMirror(host),
                     None => Value::ClassMirror(class),
                 }

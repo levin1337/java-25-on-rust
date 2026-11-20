@@ -2705,16 +2705,17 @@ fn invokeStaticInner<'a>(
                 if name.starts_with(b":") {
                     return None;
                 }
-                loader
-                    .load(name)
-                    .ok()
-                    .map(|klass| {
-                        klass
-                            .class
-                            .nest_host()
-                            .map(|host| host.to_vec())
-                            .unwrap_or_else(|| klass.class.name.to_vec())
-                    })
+                loader.load(name).ok().map(|klass| {
+                    loader
+                        .hidden_nest_host(klass.class.name)
+                        .or_else(|| {
+                            klass
+                                .class
+                                .nest_host()
+                                .map(|host| host.to_vec())
+                        })
+                        .unwrap_or_else(|| klass.class.name.to_vec())
+                })
             };
             let first = arguments.first().and_then(host_of);
             let second = arguments.get(1).and_then(host_of);

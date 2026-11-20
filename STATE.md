@@ -92,11 +92,23 @@ real goal = Minecraft 26.3 client + Fabric)
 - Pending other bugs (from earlier runs): coerce_value->Empty,
   Log4j newInstance, JNA field-order, OSHI, javac arg0 field.
 
+## FFM scope audit (for MC client / LWJGL 3.3+)
+- java.lang.foreign / jdk.internal.foreign are ~all Java-level; the
+  native surface is small: NativeEntryPoint (3), UpcallLinker (2),
+  UpcallStubs (2), ScopedMemoryAccess (2). Memory alloc likely rides on
+  existing Unsafe natives; SymbolLookup.libraryLookup needs dlopen/
+  LoadLibrary (JVM_LoadLibrary extern declared in jvm.rs).
+- The HARD part is not natives count but the downcall trampoline:
+  HotSpot does it in foreignCalls.cpp asm. We need Win64 (and later
+  SysV) ABI marshalling — either hand-written machine-code stubs or a
+  vendored libffi. Estimate: the single biggest remaining subsystem
+  for the client goal.
+- LWJGL 3.3+ requires java.lang.foreign (FFM) for GLFW/OpenGL/OpenAL;
+  no JNI fallback in current versions.
+
 ## NEXT
 - Leaf server run = stress test only. For the real client goal the
-  heavy remaining subsystems are FFM/libffi (LWJGL needs it), OpenAL,
-  GLFW native loading — audit which of the ~77 missing natives block
-  the client first.
+  critical path is FFM (above), then OpenAL/GLFW native loading.
 - Re-run full Leaf bootstrap (leaf-runner) on the fixed binary when
   convenient; watch for the next blocker past PlatformDependent clinit.
 - If clinit speed blocks iteration, consider -XX:TieredStopAtLevel

@@ -1100,6 +1100,14 @@ pub fn execute_labeled<'a>(
             compiled_addr = 0;
         }
     }
+    if compiled_addr != 0 && std::env::var_os("JVM25_JIT_DEBUG").is_some() {
+        eprintln!(
+            "[jit-dispatch] {}.{}{} key={code_key:#x} -> {compiled_addr:#x}",
+            String::from_utf8_lossy(owner),
+            String::from_utf8_lossy(code.name),
+            String::from_utf8_lossy(code.descriptor)
+        );
+    }
     if compiled_addr != 0
         && access_flags & (0x0100 | 0x0400 | 0x0020) == 0
     {

@@ -210,6 +210,22 @@ impl Compile {
                 schedule.unsupported.join("; ")
             )));
         }
+        if std::env::var("JVM25_DBG_SCHED").is_ok() {
+            eprintln!("[sched] {} blocks={}", method.name, schedule.blocks.len());
+            for (bi, b) in schedule.blocks.iter().enumerate() {
+                let ops: Vec<String> = b
+                    .instrs
+                    .iter()
+                    .map(|&n| {
+                        let node = self.gvn.node(n);
+                        let ins: Vec<String> =
+                            node.inputs.iter().map(|&i| format!("N{i}")).collect();
+                        format!("N{}:{:?}({})", n, node.op, ins.join(","))
+                    })
+                    .collect();
+                eprintln!("  blk{} rpo={} entry=N{}: {}", bi, b.rpo, b.entry, ops.join(" "));
+            }
+        }
         let alloc = RegisterAllocator::new(&self.gvn, &schedule)
             .allocate(method.param_slots)
             .map_err(BackendError::InvalidGraph)?;

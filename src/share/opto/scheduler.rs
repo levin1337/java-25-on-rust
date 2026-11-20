@@ -98,7 +98,7 @@ pub fn mem_index(op: &Opcode) -> Option<usize> {
         LoadI | LoadL | LoadF | LoadD | LoadP | LoadB | LoadC | LoadS | StoreI | StoreL
         | StoreF | StoreD | StoreP | StoreB | StoreC | StoreS | New(_) | NewArray(_)
         | NewArrayRef(_) | MultianewArray | Call(_) | CheckCast(_) | InstanceOf(_)
-        | MonitorEnter | MonitorExit | Athrow | DivI | DivL | RemI | RemL => Some(0),
+        | MonitorEnter | MonitorExit | Athrow | ArrayLength | DivI | DivL | RemI | RemL => Some(0),
         _ => None,
     }
 }
@@ -566,6 +566,7 @@ impl<'a> Scheduler<'a> {
             // control point, so there is nothing more to emit.
             break;
         }
+        let instrs = self.reorder_instrs(instrs);
         blocks[bid].instrs = instrs.clone();
         blocks[bid].term = term.clone();
         blocks[bid].succs = succs.clone();
@@ -606,6 +607,76 @@ impl<'a> Scheduler<'a> {
         blocks[bid].exc_succs = exc_succs.clone();
         let _ = entry_op;
         succs
+    }
+
+    /// Reorders a block's scheduled effects so every instruction is
+    /// emitted after the same-block instruction nodes it consumes as
+    /// values.  The candidate walk only gates on the memory token, so
+    /// a trapping value producer (`RemI`/`DivI`/loads/...) created
+    /// after a consumer can be scheduled later; emitting in candidate
+    /// order then reads the consumer's spill slot before the producer
+    /// wrote it.
+    ///
+    /// Memory producers (stores/news/calls/monitors) are barriers:
+    /// non-producers may be reordered freely inside a segment but
+    /// never across one, preserving both the memory-chain order and
+    /// the per-instruction memory state recorded for exception edges.
+    /// A value dependency that cannot be satisfied inside its segment
+    /// is reported as unsupported rather than miscompiled.
+    fn reorder_instrs(&mut self, instrs: Vec<NodeId>) -> Vec<NodeId> {
+        let set: HashSet<NodeId> = instrs.iter().copied().collect();
+        let mut out: Vec<NodeId> = Vec::with_capacity(instrs.len());
+        let mut done: HashSet<NodeId> = HashSet::new();
+        let mut i = 0;
+        while i < instrs.len() {
+            if produces_mem(&self.gvn.node(instrs[i]).op) {
+                out.push(instrs[i]);
+                done.insert(instrs[i]);
+                i += 1;
+                continue;
+            }
+            let mut j = i;
+            while j < instrs.len() && !produces_mem(&self.gvn.node(instrs[j]).op) {
+                j += 1;
+            }
+            let seg = &instrs[i..j];
+            let seg_set: HashSet<NodeId> = seg.iter().copied().collect();
+            let mut seg_done: HashSet<NodeId> = HashSet::new();
+            let mut pending: Vec<NodeId> = seg.to_vec();
+            while !pending.is_empty() {
+                let mut progress = false;
+                let mut next: Vec<NodeId> = Vec::with_capacity(pending.len());
+                for &m in &pending {
+                    let ready = self.gvn.node(m).inputs.iter().all(|&inp| {
+                        inp == NONE
+                            || !set.contains(&inp)
+                            || done.contains(&inp)
+                            || seg_done.contains(&inp)
+                    });
+                    if ready {
+                        out.push(m);
+                        done.insert(m);
+                        seg_done.insert(m);
+                        progress = true;
+                    } else {
+                        next.push(m);
+                    }
+                }
+                if !progress {
+                    for &m in &next {
+                        self.unsupported.push(format!(
+                            "unschedulable value dependency on node {}",
+                            m
+                        ));
+                        out.push(m);
+                    }
+                    break;
+                }
+                pending = next;
+            }
+            i = j;
+        }
+        out
     }
 
     /// Records the exception edges of one trapping node as successor
@@ -838,4 +909,51 @@ pub fn phis_of_region(gvn: &PhaseGVN, region: NodeId) -> Vec<NodeId> {
         .filter(|n| n.op == Opcode::Phi && n.inputs.last().copied() == Some(region))
         .map(|n| n.id)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::share::opto::gvn::PhaseGVN;
+    use crate::share::opto::node::Opcode;
+
+    /// Regression: the candidate walk gates effects only on the memory
+    /// token, so a `LoadP` created before the `RemI` that produces its
+    /// index used to be scheduled first and read the index spill slot
+    /// before it was written.  The reorder pass must emit the producer
+    /// first while keeping the store as a memory barrier.
+    #[test]
+    fn value_producer_scheduled_before_consumer() {
+        let mut gvn = PhaseGVN::new();
+        let start = gvn.alloc(Opcode::Start, vec![]);
+        gvn.start = start;
+        let root = gvn.alloc(Opcode::Root, vec![start]);
+        gvn.root = root;
+        let arr = gvn.alloc(Opcode::ConP(0x1000), vec![]);
+        let idx = gvn.alloc(Opcode::ConI(0), vec![]);
+        let val = gvn.alloc(Opcode::ConI(1), vec![]);
+        // mem producer: [mem, ctrl, obj, index, value]
+        let store = gvn.alloc(
+            Opcode::StoreI,
+            vec![start, start, arr, idx, val],
+        );
+        // consumer allocated BEFORE its index producer (id order is what
+        // ctrl_users preserves); inputs patched once `rem` exists.
+        let load = gvn.alloc(
+            Opcode::LoadP,
+            vec![store, start, arr, idx, idx],
+        );
+        // [mem, ctrl, lhs, rhs]
+        let rem = gvn.alloc(Opcode::RemI, vec![store, start, idx, idx]);
+        gvn.node_mut(load).inputs[3] = rem;
+        let ret = gvn.alloc(Opcode::Return, vec![start, store, rem]);
+        gvn.node_mut(root).inputs.push(ret);
+
+        let sched = Scheduler::new(&gvn).schedule();
+        assert!(sched.unsupported.is_empty(), "{:?}", sched.unsupported);
+        assert_eq!(sched.blocks.len(), 1);
+        let instrs = &sched.blocks[0].instrs;
+        let pos = |n: NodeId| instrs.iter().position(|&x| x == n).unwrap();
+        assert!(pos(rem) < pos(load), "instrs={instrs:?}");
+    }
 }

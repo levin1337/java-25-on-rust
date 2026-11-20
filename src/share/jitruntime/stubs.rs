@@ -1136,6 +1136,9 @@ unsafe extern "C" fn h_array_length(array: u64, _b: u64, _c: u64, _d: u64, frame
 }
 
 fn index_out_of_bounds() -> u64 {
+    if std::env::var_os("JVM25_JIT_OOB").is_some() {
+        eprintln!("[oob] index_out_of_bounds");
+    }
     throw_java(b"java/lang/ArrayIndexOutOfBoundsException", None)
 }
 
@@ -1154,46 +1157,70 @@ unsafe extern "C" fn h_array_load(array: u64, index: u64, kind: u64, _d: u64, fr
             Value::ObjectArray(handle) => handle,
             _ => return throw_java(b"java/lang/NullPointerException", None),
         };
-        let value = {
+        // The borrow must end before any throwing helper runs:
+        // `throw_java` materializes the exception through the
+        // interpreter, which allocates object arrays.
+        enum Load {
+            Value(Value<'static>),
+            Oob,
+            Deopt,
+        }
+        let loaded = {
             let arrays = loader.obj_arrays.borrow();
-            let Some(a) = arrays.get(handle) else {
-                return deopt();
-            };
-            match a.get(idx) {
-                Ok(value) => value,
-                Err(_) => return index_out_of_bounds(),
+            match arrays.get(handle) {
+                Some(a) => {
+                    if std::env::var_os("JVM25_JIT_OOB").is_some() && idx >= a.len() {
+                        eprintln!("[objload-oob] idx={idx} len={} frame={frame:#x}", a.len());
+                    }
+                    match a.get(idx) {
+                        Ok(value) => Load::Value(value),
+                        Err(_) => Load::Oob,
+                    }
+                }
+                None => Load::Deopt,
             }
         };
-        return match heap_value_to_raw(&loader, &value) {
-            Some(raw) => raw,
-            None => deopt(),
+        return match loaded {
+            Load::Value(value) => match heap_value_to_raw(&loader, &value) {
+                Some(raw) => raw,
+                None => deopt(),
+            },
+            Load::Oob => index_out_of_bounds(),
+            Load::Deopt => deopt(),
         };
     }
     let handle = match decode_ref(array) {
         Value::PrimitiveArray(handle) => handle,
         _ => return throw_java(b"java/lang/NullPointerException", None),
     };
-    let arrays = loader.arrays.borrow();
-    let Some(a) = arrays.get(handle) else {
-        return deopt();
-    };
-    if std::env::var_os("JVM25_JIT_OOB").is_some() && idx >= a.len() {
-        eprintln!("[arrayload-oob] idx={idx} len={} kind={kind} frame={frame:#x}", a.len());
+    enum Load {
+        Element(Element),
+        Oob,
+        Deopt,
     }
-    match a.load(kind as u8, idx) {
-        Ok(element) => match element {
+    let loaded = {
+        let arrays = loader.arrays.borrow();
+        let Some(a) = arrays.get(handle) else {
+            return deopt();
+        };
+        if std::env::var_os("JVM25_JIT_OOB").is_some() && idx >= a.len() {
+            eprintln!("[arrayload-oob] idx={idx} len={} kind={kind} frame={frame:#x}", a.len());
+        }
+        match a.load(kind as u8, idx) {
+            Ok(element) => Load::Element(element),
+            Err(error) if error.to_string().contains("bounds") => Load::Oob,
+            Err(_) => Load::Deopt,
+        }
+    };
+    match loaded {
+        Load::Element(element) => match element {
             Element::Int(v) => v as u32 as u64,
             Element::Long(v) => v as u64,
             Element::Float(f) => f.to_bits() as u64,
             Element::Double(d) => d.to_bits(),
         },
-        Err(error) => {
-            if error.to_string().contains("bounds") {
-                index_out_of_bounds()
-            } else {
-                deopt()
-            }
-        }
+        Load::Oob => index_out_of_bounds(),
+        Load::Deopt => deopt(),
     }
 }
 
@@ -1219,15 +1246,33 @@ unsafe extern "C" fn h_array_store(
             _ => return throw_java(b"java/lang/NullPointerException", None),
         };
         let stored = decode_ref(value);
-        let component = {
+        // Borrows end before throwing helpers run: `throw_java`
+        // materializes the exception through the interpreter, which
+        // allocates object arrays.
+        enum Probe {
+            Component(&'static [u8]),
+            Oob,
+            Deopt,
+        }
+        let probe = {
             let arrays = loader.obj_arrays.borrow();
-            let Some(a) = arrays.get(handle) else {
-                return deopt();
-            };
-            match a.get(idx) {
-                Ok(_) => a.component,
-                Err(_) => return index_out_of_bounds(),
+            match arrays.get(handle) {
+                Some(a) => {
+                    if std::env::var_os("JVM25_JIT_OOB").is_some() && idx >= a.len() {
+                        eprintln!("[objstore-oob] idx={idx} len={} frame={frame:#x}", a.len());
+                    }
+                    match a.get(idx) {
+                        Ok(_) => Probe::Component(a.component),
+                        Err(_) => Probe::Oob,
+                    }
+                }
+                None => Probe::Deopt,
             }
+        };
+        let component = match probe {
+            Probe::Component(component) => component,
+            Probe::Oob => return index_out_of_bounds(),
+            Probe::Deopt => return deopt(),
         };
         match loader.referenceAssignable(stored, component) {
             Ok(true) => {}
@@ -1236,11 +1281,14 @@ unsafe extern "C" fn h_array_store(
             }
             Err(_) => return deopt(),
         }
-        let mut arrays = loader.obj_arrays.borrow_mut();
-        let Some(a) = arrays.get_mut(handle) else {
-            return deopt();
+        let stored_ok = {
+            let mut arrays = loader.obj_arrays.borrow_mut();
+            match arrays.get_mut(handle) {
+                Some(a) => a.set(idx, stored).is_ok(),
+                None => false,
+            }
         };
-        if a.set(idx, stored).is_err() {
+        if !stored_ok {
             return deopt();
         }
         return 0;
@@ -1255,19 +1303,26 @@ unsafe extern "C" fn h_array_store(
         3 => Element::Double(f64::from_bits(value)),
         _ => Element::Int(value as u32 as i32),
     };
-    let mut arrays = loader.arrays.borrow_mut();
-    let Some(a) = arrays.get_mut(handle) else {
-        return deopt();
-    };
-    match a.store(kind as u8, idx, element) {
-        Ok(()) => 0,
-        Err(error) => {
-            if error.to_string().contains("bounds") {
-                index_out_of_bounds()
-            } else {
-                deopt()
-            }
+    enum Store {
+        Ok,
+        Oob,
+        Deopt,
+    }
+    let stored = {
+        let mut arrays = loader.arrays.borrow_mut();
+        match arrays.get_mut(handle) {
+            Some(a) => match a.store(kind as u8, idx, element) {
+                Ok(()) => Store::Ok,
+                Err(error) if error.to_string().contains("bounds") => Store::Oob,
+                Err(_) => Store::Deopt,
+            },
+            None => Store::Deopt,
         }
+    };
+    match stored {
+        Store::Ok => 0,
+        Store::Oob => index_out_of_bounds(),
+        Store::Deopt => deopt(),
     }
 }
 
@@ -1804,6 +1859,12 @@ fn emit_stub_map(unwind: bool) -> BTreeMap<RuntimeStub, u64> {
     if base != 0 {
         for (entry, off) in entries.iter().zip(offsets) {
             map.insert(entry.stub, (base + off) as u64);
+        }
+    }
+    if std::env::var_os("JVM25_DUMP_STUBS").is_some() {
+        eprintln!("[stub-map] unwind={unwind} base={base:#x} len={:#x}", code.len());
+        for (k, v) in map.iter() {
+            eprintln!("  {k:?} -> {v:#x} (off {:#x})", v - base as u64);
         }
     }
     map

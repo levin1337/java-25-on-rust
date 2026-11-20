@@ -43,6 +43,9 @@ pub struct Share<T> {
     /// `&'static Location` of the callsite that acquired the lock,
     /// stored as a raw pointer for debug printing.
     holder_site: AtomicUsize,
+    /// Leaked `Backtrace` captured at the last 0->1 borrow when
+    /// `JVM25_SHARE_TRACE` is set; printed by `borrow_mut` conflicts.
+    holder_bt: AtomicUsize,
 }
 
 impl<T> Share<T> {
@@ -54,6 +57,7 @@ impl<T> Share<T> {
             }),
             holder: AtomicU64::new(0),
             holder_site: AtomicUsize::new(0),
+            holder_bt: AtomicUsize::new(0),
         }
     }
 
@@ -62,6 +66,12 @@ impl<T> Share<T> {
         self.holder.store(os_tid(), Ordering::Relaxed);
         self.holder_site
             .store(std::panic::Location::caller() as *const _ as usize, Ordering::Relaxed);
+        if std::env::var_os("JVM25_SHARE_TRACE").is_some()
+            && std::any::type_name::<T>().contains("ObjArrayOop")
+        {
+            let bt = Box::new(std::backtrace::Backtrace::force_capture());
+            self.holder_bt.store(Box::into_raw(bt) as usize, Ordering::Relaxed);
+        }
     }
 
     fn holder_desc(&self) -> String {
@@ -139,10 +149,27 @@ impl<T> Share<T> {
             }
         };
         if guard.borrows.get() != 0 {
+            if std::env::var_os("JVM25_SHARE_TRACE").is_some() {
+                let bt = self.holder_bt.load(Ordering::Relaxed);
+                let bt_txt = if bt != 0 {
+                    format!("\n{}", unsafe { &*(bt as *const std::backtrace::Backtrace) })
+                } else {
+                        String::new()
+                };
+                eprintln!(
+                    "[share-busy] Share<{}> borrows={}{}{}\n{}",
+                    std::any::type_name::<T>(),
+                    guard.borrows.get(),
+                    self.holder_desc(),
+                    bt_txt,
+                    std::backtrace::Backtrace::force_capture()
+                );
+            }
             panic!(
-                "already borrowed: Share<{}> borrows={}",
+                "already borrowed: Share<{}> borrows={}{}",
                 std::any::type_name::<T>(),
-                guard.borrows.get()
+                guard.borrows.get(),
+                self.holder_desc()
             );
         }
         self.mark_holder();

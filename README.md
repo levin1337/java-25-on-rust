@@ -25,7 +25,7 @@
 
 - 🏗️ **Полную структуру оригинальной JVM** — каждый модуль `share/` из `srcJVMc++` (C++-референс OpenJDK 25 в репозитории) имеет свой аналог в `src/share/`
 - ⚡ **Максимальную производительность** — чистый оптимизированный код, arena-аллокации, JIT C1+C2
-- ✅ **Совместимость** — запуск любых Java-приложений, включая тяжёлые, цель — **Minecraft без ошибок**
+- ✅ **Совместимость** — запуск любых Java-приложений, включая тяжёлые, цель — **Minecraft client без ошибок**
 - 🧪 **Полный тестовый прогон** — все тесты JVM должны проходить на Rust-версии
 
 ---
@@ -140,7 +140,7 @@ cargo test --test asm_x86  # ассемблерный слой
 | **jvm.dll** | Экспорты `JNI_CreateJavaVM`/`JVM_*` для запуска штатным `java.exe` — в работе. |
 | **interpreter/** | Доводка `templateInterpreter*`, `zero/`, `bytecodeUtils`, `rewriter` до полной структуры. |
 | **JFR события** | Каркас готов; генерация всех ~171 событий из events.xml и emit-точки — впереди. |
-| **Minecraft** | Leaf/Paper server 1.21.11 (цель 26.3): bootstrap доходит до Netty `PlatformDependent.<clinit>`; критические баги исправлены — OSR-dispatch segfault (`f85c2e6`), hidden-class nest hosts (`32e8c95`). Клиент — упирается в скорость интерпретатора до завершения JIT. |
+| **Minecraft** | **Цель — клиент** (26.3 + Fabric). Leaf/Paper server 1.21.11 используется как стресс-тест bootstrap: доходит до Netty `PlatformDependent.<clinit>`; критические баги исправлены — OSR-dispatch segfault (`f85c2e6`), hidden-class nest hosts (`32e8c95`). Для клиента дополнительно нужны: LWJGL/FFM нативы, OpenAL, GLFW — это самые тяжёлые оставшиеся подсистемы. |
 
 ### 🔴 Осталось
 
@@ -149,7 +149,7 @@ cargo test --test asm_x86  # ассемблерный слой
 3. **Производительность JIT** — FrameRoots (консервативный скан) заменить точными oop-maps; интерпретатор всё ещё быстрее JIT на части нагрузок.
 4. **jvm.dll + CDS-загрузка JDK-архивов**.
 5. **FFM (libffi)**, Windows ACL, host-locale — остаток ~77 нативов.
-6. **Minecraft client/server до конца** — bootstrap Leaf-сервера, затем Fabric/Knot и клиент.
+6. **Minecraft client до конца** — bootstrap Leaf-сервера как стресс-тест, затем Fabric/Knot клиент (LWJGL, OpenAL, GLFW — самые тяжёлые оставшиеся подсистемы).
 
 ### 📊 JIT-бенчмарк (JitBench scale=1, release)
 

@@ -1,5 +1,6 @@
 # JVM25-Rust Minecraft bootstrap state
-Goal: full Minecraft 26.3 + Fabric on Rust JVM, JIT enabled, no crashes.
+Goal: full Minecraft 26.3 CLIENT + Fabric on Rust JVM, JIT enabled, no crashes.
+(Leaf/Paper server runs are used as a bootstrap stress-test, not the goal.)
 
 ## JIT progress (opto/C2) — production enabled
 - C2 enabled in tiered pipeline; invocation-entry compiles work for all
@@ -72,7 +73,8 @@ Goal: full Minecraft 26.3 + Fabric on Rust JVM, JIT enabled, no crashes.
   `JVM25_TRACE_EXC`, `JVM25_DBG_EXC`, `JVM25_DBG_INDY`,
   `JVM25_DBG_PHASES`, `JVM25_TRACE_DEFINE` (defineClass0 flags/lookup).
 
-## MC bootstrap status (Leaf 1.21.11, Paper/Leaf server jar)
+## MC bootstrap status (Leaf 1.21.11 server jar — stress test only;
+real goal = Minecraft 26.3 client + Fabric)
 - Previous blocker `areturn`+`Int` in JDK proxies did NOT reproduce in
   isolated tests (ProxyStress: generics/default/void/arrays all pass;
   real JNA Native.load works). Context-dependent (Knot/Fabric+Mixin)
@@ -91,8 +93,12 @@ Goal: full Minecraft 26.3 + Fabric on Rust JVM, JIT enabled, no crashes.
   Log4j newInstance, JNA field-order, OSHI, javac arg0 field.
 
 ## NEXT
-- Re-run full Leaf bootstrap (leaf-runner) on the fixed binary; watch
-  for the next blocker past PlatformDependent clinit.
+- Leaf server run = stress test only. For the real client goal the
+  heavy remaining subsystems are FFM/libffi (LWJGL needs it), OpenAL,
+  GLFW native loading — audit which of the ~77 missing natives block
+  the client first.
+- Re-run full Leaf bootstrap (leaf-runner) on the fixed binary when
+  convenient; watch for the next blocker past PlatformDependent clinit.
 - If clinit speed blocks iteration, consider -XX:TieredStopAtLevel
   equivalent or raising JIT thresholds for bootstrap.
 - Remaining C2 gap: precise deopt. Then jvm.dll exports for java.exe.

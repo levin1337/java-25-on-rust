@@ -102,15 +102,15 @@ cargo test --test asm_x86  # ассемблерный слой
 
 ## 📈 Статус разработки
 
-Актуально на 2026-11-20. **~201k строк Rust** в `src/share/` (было ~73k до волны портирования GC/JIT/инфраструктуры).
+Актуально на 2026-11-20. **~202k строк Rust** в `src/share/` (было ~73k до волны портирования GC/JIT/инфраструктуры).
 
 ### ✅ Работает и проверено тестами
 
 | Подсистема | Что сделано |
 |---|---|
 | **Classfile / ClassLoader** | Полный парсер class-файлов Java 25: все JVMS-атрибуты структурно (`attributes.rs` ~1250 строк — BootstrapMethods/indy/condy, Signature grammar, Annotations, Module, Record, StackMapTable-декодер), верификатор с JVMS-проверками, загрузка из директорий/JAR/**JImage `lib/modules`**. |
-| **Иерархия и линковка** | Резолюция методов/полей, itable/vtable, default-методы, `<clinit>` порядок JVMS 5.5, реальные Java-исключения связывания. |
-| **Рефлексия / indy** | `java.lang.reflect`, `LambdaMetafactory`, `StringConcatFactory`, generic bootstrap, condy. |
+| **Иерархия и линковка** | Резолюция методов/полей, itable/vtable, default-методы, `<clinit>` порядок JVMS 5.5, реальные Java-исключения связывания. **Hidden classes**: `defineClass0` обрабатывает `NESTMATE_CLASS`/lookup-миррор — nest host для классов, которые спинит `LambdaMetafactory`/`LambdaForm`; `getNestHost0`/`areNestMates`/`getNestMembers0` учитывают VM-назначенный хост. |
+| **Рефлексия / indy** | `java.lang.reflect`, `LambdaMetafactory` (включая прямые вызовы `metafactory` — спиннинг hidden-классов и приватный доступ), `StringConcatFactory`, generic bootstrap, condy, `BoundMethodHandle` species через `lambda_form_invoke`. |
 | **Потоки / синхронизация** | Java-потоки на OS-потоках, мониторы, wait/notify, park/unpark, shutdown hooks. |
 | **Память и GC** | Рабочий mark-sweep с safepoints и `gc_extra_roots`; reference processing починен (pending-list — GC-корень). |
 | **Файлы / NIO / Сеть / ZIP** | FileDispatcher (pread/pwrite/mmap/locks), Selector/WEPoll, TCP/UDP, `java.util.zip` Inflater — всё проверено e2e. |
@@ -140,7 +140,7 @@ cargo test --test asm_x86  # ассемблерный слой
 | **jvm.dll** | Экспорты `JNI_CreateJavaVM`/`JVM_*` для запуска штатным `java.exe` — в работе. |
 | **interpreter/** | Доводка `templateInterpreter*`, `zero/`, `bytecodeUtils`, `rewriter` до полной структуры. |
 | **JFR события** | Каркас готов; генерация всех ~171 событий из events.xml и emit-точки — впереди. |
-| **Minecraft** | Leaf/Paper server 1.21.11 (цель 26.3): bootstrap доходит до Netty `PlatformDependent.<clinit>`; критический OSR-dispatch segfault исправлен (`f85c2e6`). Клиент — упирается в скорость интерпретатора до завершения JIT. |
+| **Minecraft** | Leaf/Paper server 1.21.11 (цель 26.3): bootstrap доходит до Netty `PlatformDependent.<clinit>`; критические баги исправлены — OSR-dispatch segfault (`f85c2e6`), hidden-class nest hosts (`32e8c95`). Клиент — упирается в скорость интерпретатора до завершения JIT. |
 
 ### 🔴 Осталось
 
@@ -159,6 +159,13 @@ cargo test --test asm_x86  # ассемблерный слой
 | C1 JIT | ~64s (вкл. компиляцию ~150 методов) | ✅ **побайтово идентичен** |
 
 Корректность JIT полная; скорость пока ниже интерпретатора — FrameRoots-скан на каждый stub-вызов доминирует. Ускорение ожидается после oop-maps и C2.
+
+### 🎯 Текущая точка (2026-11-20)
+
+- **C2 в проде**: invocation + OSR-компиляция, typed catches, `invokedynamic`, все сигнатуры — верифицировано smoke-тестами (`OsrSmoke`, `C2Catch`, `C2Indy`, `C2Fields`, `ProxyStress`, `ToLowerCrash`).
+- **Критические баги MC-path закрыты**: OSR nmethod публиковался в обычный dispatch → segfault на первом `OsrArg`; hidden classes не имели nest host → `LambdaMetafactory` падал.
+- **Диагности**: Windows VEH crash handler (RIP→nmethod), `JVM25_NO_C2`, `JVM25_DUMP_C2`, `JVM25_TRACE_DEFINE`, `JVM25_TRACE_WIN`, `JVM25_TRACE` unsafe-spin stack dumps.
+- **Следующий шаг**: полный прогон Leaf bootstrap на текущем бинаре — смотреть, что идёт после `PlatformDependent.<clinit>`; затем либо `jvm.dll`-экспорты (`JNI_CreateJavaVM` уже есть, нужны `JVM_*`), либо точная деоптимизация в C2.
 
 ---
 

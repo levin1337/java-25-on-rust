@@ -96,13 +96,13 @@ cargo test --test asm_x86  # ассемблерный слой
 # JIT e2e: tests/jit/run-jit-tests.ps1 (JitBench: interpreter vs JIT diff)
 ```
 
-Отладочные флаги: `JVM25_TRACE`, `JVM25_DUMP`, `JVM25_BLOCKTRACE`, `JVM25_TRACE_COMPILE`, `JVM25_C1_THRESHOLD`, `JVM25_NO_JIT`, `JVM25_PROFILE_NATIVE`, `JVM25_MEMSTAT`, `JVM25_STACK_MB`, `JVM25_NO_VERIFY`, `JVM25_DUMP_JIT`, `JVM25_DUMP_LIR`.
+Отладочные флаги: `JVM25_TRACE`, `JVM25_DUMP`, `JVM25_BLOCKTRACE`, `JVM25_TRACE_COMPILE`, `JVM25_C1_THRESHOLD`, `JVM25_NO_JIT`, `JVM25_NO_C2`, `JVM25_PROFILE_NATIVE`, `JVM25_MEMSTAT`, `JVM25_STACK_MB`, `JVM25_NO_VERIFY`, `JVM25_DUMP_JIT`, `JVM25_DUMP_LIR`, `JVM25_DUMP_C2`, `JVM25_TRACE_WIN`, `JVM25_TRACE_EXC`, `JVM25_DBG_INDY`, `JVM25_DBG_PHASES`. На Windows при SIGSEGV печатается `[crash]` с RIP→nmethod-маппингом.
 
 ---
 
 ## 📈 Статус разработки
 
-Актуально на 2026-11-15. **~103k+ строк Rust** в `src/share/` (было ~73k до волны портирования GC/JIT/инфраструктуры).
+Актуально на 2026-11-20. **~201k строк Rust** в `src/share/` (было ~73k до волны портирования GC/JIT/инфраструктуры).
 
 ### ✅ Работает и проверено тестами
 
@@ -116,7 +116,7 @@ cargo test --test asm_x86  # ассемблерный слой
 | **Файлы / NIO / Сеть / ZIP** | FileDispatcher (pread/pwrite/mmap/locks), Selector/WEPoll, TCP/UDP, `java.util.zip` Inflater — всё проверено e2e. |
 | **Нативные методы** | **~700/777 нативов java.base** (аудит против src.zip JDK 25). Остаток ~77: FFM/libffi, Windows ACL, host-locale — capability-gated. |
 | **C1 JIT** | **Работает e2e**: heap-стабы (getfield/putfield/array/new/cast/instanceof/athrow с семантикой интерпретатора), JIT→JIT прямые вызовы, JIT→интерпретатор через stub, non-leaf unwind, рекурсия, проброс исключений, deopt/OSR-fallback. GC-безопасность JIT-фреймов через `FrameRoots`+`gc_extra_roots`. |
-| **C2 JIT (opto)** | Типы/ноды/GVN/scheduler/liveness+interference/x64-эмиттер; рабочее подмножество: примитивная арифметика, idiv с исключениями, массивы через стабы, float/double SSE. 45/45 тестов. |
+| **C2 JIT (opto)** | **В проде tiered-пайплайне**: типы/ноды/GVN/scheduler/liveness/x64-эмиттер; все сигнатуры (примитивы, float/double, ref/array), поля, вызовы, свитчи, массивы; **typed catches** (упорядоченная цепочка ExcCheck→InstanceOf→rethrow), **OSR** (marshal-буфер в rcx, `invoke_osr`), **`invokedynamic`** (общий с интерпретатором callsite-resolution стаб). 104/104 тестов. |
 | **asm/ (MacroAssembler)** | Полный порт: register/reloc/codeBuffer/x86_64 кодировки/MacroAssembler с oopmaps, safepoint_poll, G1 write barriers. 12/12 тестов. |
 | **code/ + compiler/** | CompileBroker с реальными C1/C2 очередями и worker-потоками, policy, nmethod с PcDesc/DeoptLiveMap, CodeCache с адаптерами и vtable-стабами (реальный x64-код). |
 | **ci/** | Compiler Interface: CiEnv/CiInstanceKlass/CiMethod/CiField/CIType/ciLiveness (полный MethodLiveness). |
@@ -134,23 +134,22 @@ cargo test --test asm_x86  # ассемблерный слой
 
 | Подсистема | Состояние |
 |---|---|
-| **C2 покрытие** | Расширение опкодов: fields/calls/ref-arrays в работе; полный regalloc (Chaitin), интеграция с `asm/` MacroAssembler. |
-| **Настоящий OSR** | Сейчас best-effort whole-method вызов; нужен перенос locals/stack в OSR-entry. |
+| **C2 покрытие** | Основное покрыто и в проде (см. выше). Осталось: точная деоптимизация (сейчас fallback = переисполнение метода), интеграция с `asm/` MacroAssembler для output-слоя. |
 | **Деоптимизация** | Fallback = переисполнение метода; нужен точный frame-state restore с BCI. |
-| **GC-интеграция** | Коллекторы портированы структурно, но выбор коллектора/барьеры в JIT-коде не подключены; рабочий путь — mark-sweep. |
+| **GC-интеграция** | Коллекторы портированы структурно; write-барьеры в этом дизайне не нужны (сторы идут через Rust-стабы, безопасность — `gc_extra_roots`/консервативный скан фреймов). Рабочий путь — mark-sweep. |
 | **jvm.dll** | Экспорты `JNI_CreateJavaVM`/`JVM_*` для запуска штатным `java.exe` — в работе. |
 | **interpreter/** | Доводка `templateInterpreter*`, `zero/`, `bytecodeUtils`, `rewriter` до полной структуры. |
 | **JFR события** | Каркас готов; генерация всех ~171 событий из events.xml и emit-точки — впереди. |
-| **Minecraft** | Fabric-сервер 1.16.1 проходит bootstrap; client — упирается в скорость интерпретатора до завершения JIT. |
+| **Minecraft** | Leaf/Paper server 1.21.11 (цель 26.3): bootstrap доходит до Netty `PlatformDependent.<clinit>`; критический OSR-dispatch segfault исправлен (`f85c2e6`). Клиент — упирается в скорость интерпретатора до завершения JIT. |
 
 ### 🔴 Осталось
 
 1. **Стабилизация сборки** — параллельная работа агентов оставляет временные ошибки компиляции в WIP-областях.
-2. **C2 codegen** — matcher/regalloc/output через новый `asm/` слой.
-3. **Производительность JIT** — FrameRoots (консервативный скан) заменить точными oop-maps; сейчас JIT scale=1 медленнее интерпретатора (~63s vs ~25s на JitBench).
+2. **C2 codegen** — output-слой через новый `asm/` MacroAssembler; точная деоптимизация.
+3. **Производительность JIT** — FrameRoots (консервативный скан) заменить точными oop-maps; интерпретатор всё ещё быстрее JIT на части нагрузок.
 4. **jvm.dll + CDS-загрузка JDK-архивов**.
 5. **FFM (libffi)**, Windows ACL, host-locale — остаток ~77 нативов.
-6. **Minecraft client** — финальная цель.
+6. **Minecraft client/server до конца** — bootstrap Leaf-сервера, затем Fabric/Knot и клиент.
 
 ### 📊 JIT-бенчмарк (JitBench scale=1, release)
 

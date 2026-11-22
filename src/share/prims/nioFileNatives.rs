@@ -1071,6 +1071,11 @@ pub(crate) fn dispatcher<'a>(
                     desired_access: u32,
                     token: *mut *mut core::ffi::c_void,
                 ) -> i32;
+                fn DuplicateToken(
+                    token: *mut core::ffi::c_void,
+                    impersonationLevel: i32,
+                    duplicate: *mut *mut core::ffi::c_void,
+                ) -> i32;
                 fn MapGenericMask(access: *mut u32, mapping: *const GenericMapping);
                 fn AccessCheck(
                     security_descriptor: *const u8,
@@ -1087,13 +1092,15 @@ pub(crate) fn dispatcher<'a>(
             unsafe extern "system" {
                 fn CloseHandle(handle: *mut core::ffi::c_void) -> i32;
             }
-            const TOKEN_QUERY: u32 = 0x0008;
+            let sd_size = security_descriptor_size(sd_address)?;
+            let sd = OffHeapMemory::global().read_bytes(sd_address as u64, sd_size)?;
 
             // The JDK hands us a token handle produced by our own
             // OpenProcessToken stub; obtain a real process token instead.
             let mut token: *mut core::ffi::c_void = std::ptr::null_mut();
             let pseudo_process = (-1isize) as *mut core::ffi::c_void;
-            let opened = unsafe { OpenProcessToken(pseudo_process, TOKEN_QUERY, &mut token) };
+            let tokenDuplicate = 0x0002;
+            let opened = unsafe { OpenProcessToken(pseudo_process, tokenDuplicate, &mut token) };
             if opened == 0 || token.is_null() {
                 return Err(windows_exception(
                     loader,
@@ -1102,8 +1109,14 @@ pub(crate) fn dispatcher<'a>(
                 ));
             }
 
-            let sd_size = security_descriptor_size(sd_address)?;
-            let sd = OffHeapMemory::global().read_bytes(sd_address as u64, sd_size)?;
+            let mut clientToken = std::ptr::null_mut();
+            let securityImpersonation = 2;
+            let duplicated = unsafe { DuplicateToken(token, securityImpersonation, &mut clientToken) };
+            let duplicateError = (duplicated == 0).then(io::Error::last_os_error);
+            unsafe { CloseHandle(token) };
+            if let Some(error) = duplicateError {
+                return Err(win32_error(loader, &error));
+            }
 
             let mut mapping = GenericMapping {
                 generic_read,
@@ -1112,33 +1125,27 @@ pub(crate) fn dispatcher<'a>(
                 generic_all,
             };
             let mut mask = access_mask;
-            // PRIVILEGE_SET with PrivilegeCount = 0, as the JDK passes.
-            let mut privilege_set = [0u8; 4];
-            let mut privilege_set_length = privilege_set.len() as u32;
+            let mut privilege_set = [0u32; 16];
+            let mut privilege_set_length = std::mem::size_of_val(&privilege_set) as u32;
             let mut granted_access = 0u32;
             let mut access_status = 0i32;
             let ok = unsafe {
                 MapGenericMask(&mut mask, &mapping);
                 AccessCheck(
                     sd.as_ptr(),
-                    token,
+                    clientToken,
                     mask,
                     &mapping,
-                    privilege_set.as_mut_ptr(),
+                    privilege_set.as_mut_ptr().cast(),
                     &mut privilege_set_length,
                     &mut granted_access,
                     &mut access_status,
                 )
             };
-            unsafe {
-                CloseHandle(token);
-            }
-            if ok == 0 {
-                return Err(windows_exception(
-                    loader,
-                    io::Error::last_os_error().raw_os_error().unwrap_or(0) as i32,
-                    "AccessCheck failed",
-                ));
+            let accessError = (ok == 0).then(io::Error::last_os_error);
+            unsafe { CloseHandle(clientToken) };
+            if let Some(error) = accessError {
+                return Err(win32_error(loader, &error));
             }
             return Ok(Some(Value::Int(i32::from(access_status != 0))));
         }

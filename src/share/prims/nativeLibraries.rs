@@ -160,7 +160,23 @@ impl NativeLibraries {
                 return Ok(loaded.handle);
             }
         }
-        let library = unsafe { Library::new(&loadPath) }.map_err(Error::other)?;
+        #[cfg(windows)]
+        let library: Library = {
+            use libloading::os::windows::{
+                Library as WindowsLibrary, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
+                LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR,
+            };
+            unsafe {
+                WindowsLibrary::load_with_flags(
+                    &path,
+                    LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
+                )
+            }
+            .map_err(|error| Error::other(format!("{}: {error}", path.display())))?
+            .into()
+        };
+        #[cfg(not(windows))]
+        let library = unsafe { Library::new(&path) }.map_err(Error::other)?;
 
         // Resolve JNI lifecycle exports before registering the library.
         let on_load = unsafe {
@@ -210,6 +226,8 @@ impl NativeLibraries {
             on_unload,
         };
         self.loadedLibraries.lock().unwrap().push(loaded);
+        super::jniInvocation::clearDllMisses();
+        super::nativeLookup::clear_native_misses();
         Ok(handle)
     }
 
@@ -222,6 +240,7 @@ impl NativeLibraries {
             .position(|loaded| loaded.path == canonical)
             .ok_or_else(|| Error::new(io::ErrorKind::NotFound, "Library not loaded"))?;
         let loaded = libraries.swap_remove(position);
+        drop(libraries);
         if let Some(on_unload) = loaded.on_unload {
             let vm = crate::share::prims::jniInvocation::JavaVm::global();
             unsafe { on_unload(vm, std::ptr::null_mut()) };
@@ -238,6 +257,7 @@ impl NativeLibraries {
             .position(|loaded| loaded.handle == handle)
             .ok_or_else(|| Error::new(io::ErrorKind::NotFound, "Library not loaded"))?;
         let loaded = libraries.swap_remove(position);
+        drop(libraries);
         if let Some(on_unload) = loaded.on_unload {
             let vm = crate::share::prims::jniInvocation::JavaVm::global();
             unsafe { on_unload(vm, std::ptr::null_mut()) };
@@ -247,15 +267,13 @@ impl NativeLibraries {
     }
 
     /// Resolves an exported symbol address for `NativeLibrary.findEntry0`.
-    /// Scans loaded libraries in load order, matching JNI `find` semantics.
-    pub fn find_entry(&self, symbol: &str) -> Option<usize> {
-        if symbol.as_bytes().contains(&0) {
-            return None;
-        }
+    pub fn findEntry(&self, handle: usize, symbol: &str) -> Option<usize> {
         let libraries = self.loadedLibraries.lock().unwrap();
         libraries
             .iter()
-            .find_map(|loaded| loaded.symbol(symbol).map(|sym| sym as usize))
+            .find(|loaded| loaded.handle == handle)?
+            .symbol(symbol)
+            .map(|address| address as usize)
     }
 
     pub fn hasSymbol(&self, symbol: &str) -> io::Result<bool> {

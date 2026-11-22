@@ -774,71 +774,38 @@ impl<'a> ClassLoader<'a> {
         self.objects.borrow_mut()
     }
 
-    pub(crate) fn alloc_object(&self, object: InstanceOop<'a>) -> usize {
+    fn allocateInArena<T>(
+        &self,
+        value: T,
+        arena: &Share<Vec<T>>,
+        live: &Share<Vec<bool>>,
+        free: &Share<Vec<usize>>,
+    ) -> usize {
         self.note_allocation();
-        // Free-list pop first so the lock order (free -> arena -> live) is
-        // consistent with the GC sweep and cannot deadlock.
-        let reused = self.free_objects.borrow_mut().pop();
-        // Blocking borrow: other OS threads may hold the arena mid-
-        // allocation; same-thread reentrancy still panics via borrow rules.
-        let mut objects = self.objects.borrow_mut();
+        let reused = free.borrow_mut().pop();
+        let mut arena = arena.borrow_mut();
+        let mut live = live.borrow_mut();
         if let Some(index) = reused {
-            objects[index] = object;
-            drop(objects);
-            let mut live = self.objects_live.borrow_mut();
-            live.resize(self.borrow_objects().len(), true);
+            arena[index] = value;
             live[index] = true;
             return index;
         }
-        let handle = objects.len();
-        objects.push(object);
-        drop(objects);
-        let mut live = self.objects_live.borrow_mut();
-        live.resize(handle + 1, true);
-        live[handle] = true;
+        let handle = arena.len();
+        arena.push(value);
+        live.push(true);
         handle
+    }
+
+    pub(crate) fn alloc_object(&self, object: InstanceOop<'a>) -> usize {
+        self.allocateInArena(object, &self.objects, &self.objects_live, &self.free_objects)
     }
 
     pub(crate) fn alloc_type_array(&self, array: TypeArrayOop) -> usize {
-        self.note_allocation();
-        let reused = self.free_type_arrays.borrow_mut().pop();
-        let mut arrays = self.arrays.borrow_mut();
-        if let Some(index) = reused {
-            arrays[index] = array;
-            drop(arrays);
-            let mut live = self.arrays_live.borrow_mut();
-            live.resize(self.arrays.borrow().len(), true);
-            live[index] = true;
-            return index;
-        }
-        let handle = arrays.len();
-        arrays.push(array);
-        drop(arrays);
-        let mut live = self.arrays_live.borrow_mut();
-        live.resize(handle + 1, true);
-        live[handle] = true;
-        handle
+        self.allocateInArena(array, &self.arrays, &self.arrays_live, &self.free_type_arrays)
     }
 
     pub(crate) fn alloc_obj_array(&self, array: ObjArrayOop<'a>) -> usize {
-        self.note_allocation();
-        let reused = self.free_obj_arrays.borrow_mut().pop();
-        let mut arrays = self.obj_arrays.borrow_mut();
-        if let Some(index) = reused {
-            arrays[index] = array;
-            drop(arrays);
-            let mut live = self.obj_arrays_live.borrow_mut();
-            live.resize(self.obj_arrays.borrow().len(), true);
-            live[index] = true;
-            return index;
-        }
-        let handle = arrays.len();
-        arrays.push(array);
-        drop(arrays);
-        let mut live = self.obj_arrays_live.borrow_mut();
-        live.resize(handle + 1, true);
-        live[handle] = true;
-        handle
+        self.allocateInArena(array, &self.obj_arrays, &self.obj_arrays_live, &self.free_obj_arrays)
     }
 
     pub fn add_source(&self, source: ClassSource) {

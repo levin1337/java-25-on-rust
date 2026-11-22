@@ -40,7 +40,7 @@ use super::runtime::{
 };
 use crate::share::c1::asm::codeBuffer::CodeBuffer;
 use crate::share::c1::c1_LIR::{RuntimeStub, StubSite};
-use crate::share::classfile::classLoader::ClassLoader;
+use crate::share::classfile::classLoader::{CallSiteKey, ClassLoader};
 use crate::share::classfile::systemDictionary::SystemDictionary;
 use crate::share::interpreter::bytecodeInterpreter::{self, Value};
 use crate::share::interpreter::linkResolver::LinkResolver;
@@ -1073,17 +1073,14 @@ unsafe extern "C" fn h_array_store(
 /// payload sits in the low 32 bits when kind == 0), arg2 selects single
 /// (`0`) or double (`1`) precision.  Java remainder is fmod plus the
 /// Win64 infinity rule — `sharedRuntime::{frem,drem}` implement it
-/// exactly; the result leaves through the xmm channel like every other
-/// floating-point stub result.
+/// exactly.
 unsafe extern "C" fn h_float_rem(a: u64, b: u64, kind: u64, _d: u64, _frame: u64) -> u64 {
     use crate::share::runtime::sharedRuntime;
-    let bits = if kind == 0 {
+    if kind == 0 {
         sharedRuntime::frem(f32::from_bits(a as u32), f32::from_bits(b as u32)).to_bits() as u64
     } else {
         sharedRuntime::drem(f64::from_bits(a), f64::from_bits(b)).to_bits()
-    };
-    runtime::set_stub_xmm_result(bits);
-    bits
+    }
 }
 
 /// `f2i`/`f2l`/`d2i`/`d2l`: arg0 carries the source bit pattern, arg2
@@ -1111,26 +1108,6 @@ const MAX_CALL_ARGS: usize = 64;
 
 /// Access flags of the resolved method, found by scanning the holder
 /// hierarchy exactly like the interpreter's `methodAccessFlags`.
-fn method_access_flags<'a>(
-    klass: &InstanceKlass<'a>,
-    name: &[u8],
-    descriptor: &[u8],
-    is_static: bool,
-) -> u16 {
-    let mut current = Some(klass);
-    while let Some(owner) = current {
-        if let Some(method) = owner.class.methods.iter().find(|method| {
-            method.name == name
-                && method.descriptor == descriptor
-                && (method.accessFlags & 0x0008 != 0) == is_static
-        }) {
-            return method.accessFlags;
-        }
-        current = owner.super_klass.as_deref();
-    }
-    0
-}
-
 /// Converts an interpreter `Value` produced by a callee back into the
 /// raw word the JIT destination slot expects.
 fn call_result_raw(loader: &ClassLoader<'static>, value: &Value<'static>) -> u64 {
@@ -1207,6 +1184,9 @@ unsafe extern "C" fn h_call_method(
         }
     }
     let op = opcode as u8;
+    if !(0xb6..=0xb9).contains(&op) {
+        return deopt();
+    }
     let is_static = op == 0xb8;
     let n = n_args as usize;
     if n > MAX_CALL_ARGS {
@@ -1301,41 +1281,36 @@ unsafe extern "C" fn h_call_method(
     } else {
         None
     };
-    let resolved = (|| -> io::Result<(Arc<InstanceKlass<'static>>, crate::share::oops::method::Code<'static>)> {
-        match op {
-            0xb8 => {
-                let target = loader.load(owner)?;
-                LinkResolver::resolve_static_call(&target, name, descriptor)
-            }
-            0xb7 => {
-                let target = loader.load(owner)?;
-                LinkResolver::resolve_special_call(&target, name, descriptor)
-            }
+    let resolved = (|| {
+        let dispatchClass = match object_klass {
+            Some(klass) => klass,
+            None => loader.load(owner)?,
+        };
+        let key = CallSiteKey::new(op - 0xb6, &dispatchClass, owner, name, descriptor);
+        bytecodeInterpreter::cachedCall(&loader, key, name, descriptor, || match op {
+            0xb8 => LinkResolver::resolve_static_call(&dispatchClass, name, descriptor),
+            0xb7 => LinkResolver::resolve_special_call(&dispatchClass, name, descriptor),
             0xb9 => {
-                let object_klass = object_klass.as_ref().unwrap();
-                if !SystemDictionary::implements_interface(object_klass, owner) {
+                if !SystemDictionary::implements_interface(&dispatchClass, owner) {
                     return Err(io::Error::other(
                         "IncompatibleClassChangeError: receiver does not implement interface",
                     ));
                 }
-                LinkResolver::resolve_interface_call(object_klass, owner, name, descriptor)
+                LinkResolver::resolve_interface_call(&dispatchClass, owner, name, descriptor)
             }
-            0xb6 => {
-                let object_klass = object_klass.as_ref().unwrap();
-                match loader.load(owner) {
-                    Ok(owner_klass) => LinkResolver::resolve_virtual_call_scoped(
-                        object_klass,
-                        &owner_klass,
-                        name,
-                        descriptor,
-                    ),
-                    Err(_) => LinkResolver::resolve_virtual_call(object_klass, name, descriptor),
-                }
-            }
-            _ => Err(io::Error::other("unsupported invoke opcode")),
-        }
+            0xb6 => match loader.load(owner) {
+                Ok(ownerKlass) => LinkResolver::resolve_virtual_call_scoped(
+                    &dispatchClass,
+                    &ownerKlass,
+                    name,
+                    descriptor,
+                ),
+                Err(_) => LinkResolver::resolve_virtual_call(&dispatchClass, name, descriptor),
+            },
+            _ => unreachable!(),
+        })
     })();
-    let (target, code) = match resolved {
+    let (target, code, flags) = match resolved {
         Ok(resolved) => resolved,
         Err(error) => {
             if std::env::var_os("JVM25_JIT_DEBUG").is_some() {
@@ -1360,7 +1335,6 @@ unsafe extern "C" fn h_call_method(
             deopt()
         };
     }
-    let flags = method_access_flags(&target, name, descriptor, is_static);
     match bytecodeInterpreter::execute_labeled(
         &loader,
         &target,

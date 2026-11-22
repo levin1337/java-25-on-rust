@@ -28,6 +28,20 @@ impl Jvm {
         origin.get_or_init(Instant::now).elapsed().as_nanos() as i64
     }
 
+    pub fn nanoTimeAdjustment(offsetSeconds: i64) -> i64 {
+        let epochNanos = match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(duration) => duration.as_nanos() as i128,
+            Err(error) => -(error.duration().as_nanos() as i128),
+        };
+        let nanosPerSecond = 1_000_000_000;
+        let offsetSeconds = i128::from(offsetSeconds);
+        let difference = epochNanos.div_euclid(nanosPerSecond) - offsetSeconds;
+        if difference.abs() >= 1_i128 << 32 {
+            return -1;
+        }
+        (epochNanos - offsetSeconds * nanosPerSecond) as i64
+    }
+
     /// Implements Runtime.totalMemory
     pub fn total_memory() -> usize {
         128 * 1024 * 1024

@@ -4229,6 +4229,11 @@ pub fn bind_loader(loader: &ClassLoader<'_>) {
     unsafe { &*JavaVm::global() }.bind_loader(loader);
 }
 
+pub(crate) fn clearDllMisses() {
+    let vm = unsafe { &*JavaVm::global() };
+    vm.state().native_misses.clear();
+}
+
 /// Converts an interpreter Value into a jobject token (local ref).
 pub(crate) fn value_to_jobject(env: *mut c_void, value: Value<'static>) -> io::Result<*mut c_void> {
     let env = env as *mut NativeEnvironment;
@@ -4315,10 +4320,6 @@ pub fn invoke_dll_native(
 ) -> io::Result<Option<Option<Value<'static>>>> {
     let vm = unsafe { &*JavaVm::global() };
     vm.bind_loader(loader);
-    let env = vm.ensure_attached() as *mut NativeEnvironment;
-    if env.is_null() {
-        return Err(Error::other("Failed to attach JNI environment"));
-    }
     let loader = vm
         .class_loader()
         .ok_or_else(|| Error::other("No class loader bound"))?;
@@ -4382,6 +4383,10 @@ pub fn invoke_dll_native(
         };
 
     let (param_kinds, ret_kind) = sig_parts(descriptor)?;
+    let env = vm.ensure_attached() as *mut NativeEnvironment;
+    if env.is_null() {
+        return Err(Error::other("Failed to attach JNI environment"));
+    }
 
     // Split receiver/arguments and convert to raw u64 slots.
     let (receiver_value, java_args) = if is_static {

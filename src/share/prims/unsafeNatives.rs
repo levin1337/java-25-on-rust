@@ -1433,26 +1433,49 @@ fn copy_bytes<'a>(
     if bytes == 0 {
         return Ok(());
     }
-    let buffer = if src_object == Value::Null {
-        OffHeapMemory::global().read_bytes(u64::try_from(src_offset).map_err(io::Error::other)?, bytes)?
-    } else {
-        let mut buffer = vec![0; bytes];
-        for (index, byte) in buffer.iter_mut().enumerate() {
-            let address = src_offset.checked_add(index as i64).ok_or_else(|| invalid("Unsafe address overflow"))?;
-            *byte = read_byte(loader, src_object, address)?;
+    let buffer: Vec<u8> = match src_object {
+        Value::Null => OffHeapMemory::global()
+            .read_bytes(u64::try_from(src_offset).map_err(io::Error::other)?, bytes)?,
+        Value::PrimitiveArray(handle) => {
+            let range = copyArrayRange(src_offset, bytes)?;
+            let arrays = loader.arrays.borrow();
+            let array = arrays.get(handle).ok_or_else(|| invalid("Invalid array reference"))?;
+            match array {
+                TypeArrayOop::Byte(data) => data.get(range)
+                    .ok_or_else(|| invalid("Unsafe array copy out of bounds"))?
+                    .iter().map(|byte| *byte as u8).collect(),
+                _ => range.map(|offset| array_byte(array, offset)).collect::<io::Result<_>>()?,
+            }
         }
-        buffer
+        _ => return Err(invalid("Unsupported Unsafe copy object")),
     };
-    if dst_object == Value::Null {
-        return OffHeapMemory::global().write_bytes(u64::try_from(dst_offset).map_err(io::Error::other)?, &buffer);
+    match dst_object {
+        Value::Null => OffHeapMemory::global()
+            .write_bytes(u64::try_from(dst_offset).map_err(io::Error::other)?, &buffer),
+        Value::PrimitiveArray(handle) => {
+            let range = copyArrayRange(dst_offset, bytes)?;
+            let mut arrays = loader.arrays.borrow_mut();
+            let array = arrays.get_mut(handle).ok_or_else(|| invalid("Invalid array reference"))?;
+            match array {
+                TypeArrayOop::Byte(data) => {
+                    let destination = data.get_mut(range)
+                        .ok_or_else(|| invalid("Unsafe array copy out of bounds"))?;
+                    for (target, source) in destination.iter_mut().zip(buffer) {
+                        *target = source as i8;
+                    }
+                    Ok(())
+                }
+                _ => range.zip(buffer).try_for_each(|(offset, byte)| put_array_byte(array, offset, byte)),
+            }
+        }
+        _ => Err(invalid("Unsupported Unsafe copy object")),
     }
-    for (index, byte) in buffer.into_iter().enumerate() {
-        let address = dst_offset
-            .checked_add(index as i64)
-            .ok_or_else(|| invalid("Unsafe address overflow"))?;
-        write_byte(loader, dst_object, address, byte)?;
-    }
-    Ok(())
+}
+
+fn copyArrayRange(offset: i64, bytes: usize) -> io::Result<std::ops::Range<usize>> {
+    let start = usize::try_from(offset).map_err(|_| invalid("Invalid Unsafe array offset"))?;
+    let end = start.checked_add(bytes).ok_or_else(|| invalid("Unsafe address overflow"))?;
+    Ok(start..end)
 }
 
 /// `Unsafe.copySwapMemory0` with a nonzero element size: copies `bytes`

@@ -66,28 +66,42 @@ fn jit_skip(owner: &[u8], code: &crate::share::oops::method::Code<'_>) -> bool {
     skip.iter().any(|part| key.contains(part.as_str()))
 }
 
-fn env_flag(name: &str) -> bool {
-    static FLAGS: std::sync::OnceLock<std::collections::HashMap<String, bool>> =
-        std::sync::OnceLock::new();
-    FLAGS
-        .get_or_init(|| {
-            [
-                "JVM25_DUMP",
-                "JVM25_MEMSTAT",
-                "JVM25_TRACE",
-                "JVM25_TRACE_EXC",
-                "JVM25_BLOCKTRACE",
-                "JVM25_TRACE_CALLS",
-                "JVM25_TRACE_COMPILE",
-                "JVM25_NO_JIT",
-            ]
-            .into_iter()
-            .map(|key| (key.to_string(), std::env::var_os(key).is_some()))
-            .collect()
-        })
-        .get(name)
-        .copied()
-        .unwrap_or(false)
+struct InterpreterFlags {
+    dump: bool,
+    memstat: bool,
+    trace: bool,
+    traceExceptions: bool,
+    traceBlocking: bool,
+    traceCalls: bool,
+    traceCompile: bool,
+    noJit: bool,
+    debugField: bool,
+    traceStackOverflow: bool,
+    traceServiceConfiguration: bool,
+    traceLabeled: bool,
+    traceParser: bool,
+}
+
+fn interpreterFlags() -> &'static InterpreterFlags {
+    static flags: std::sync::OnceLock<InterpreterFlags> = std::sync::OnceLock::new();
+    flags.get_or_init(|| {
+        let enabled = |name| std::env::var_os(name).is_some();
+        InterpreterFlags {
+            dump: enabled("JVM25_DUMP"),
+            memstat: enabled("JVM25_MEMSTAT"),
+            trace: enabled("JVM25_TRACE"),
+            traceExceptions: enabled("JVM25_TRACE_EXC"),
+            traceBlocking: enabled("JVM25_BLOCKTRACE"),
+            traceCalls: enabled("JVM25_TRACE_CALLS"),
+            traceCompile: enabled("JVM25_TRACE_COMPILE"),
+            noJit: enabled("JVM25_NO_JIT"),
+            debugField: enabled("JVM25_DEBUG_FIELD"),
+            traceStackOverflow: enabled("JVM25_SOE"),
+            traceServiceConfiguration: enabled("JVM25_TRACE_SCE"),
+            traceLabeled: enabled("JVM25_TRACE_LABELED"),
+            traceParser: enabled("JVM25_TRACE_PARSER"),
+        }
+    })
 }
 
 fn sampleThreadFrames(bytecodeCount: u64) {
@@ -444,11 +458,11 @@ impl<'a> Frame<'a> {
             .ok_or_else(|| Error::other("Invalid branch target"))?;
         // Backward branch = loop backedge; feed the tiered-compilation
         // counters exactly like HotSpot's backward-branch dispatch does.
-        if target < self.pc && !env_flag("JVM25_NO_JIT") && !jit_skip(self.owner, &self.code)
+        if target < self.pc && !interpreterFlags().noJit && !jit_skip(self.owner, &self.code)
         {
             let key = self.code.bytes.as_ptr() as usize;
             if crate::share::oops::methodCounters::backedge_tick(key) {
-                if env_flag("JVM25_TRACE_COMPILE") {
+                if interpreterFlags().traceCompile {
                     eprintln!(
                         "[compile-request:backedge] {}.{}{}",
                         String::from_utf8_lossy(self.owner),
@@ -593,7 +607,7 @@ impl<'a> Frame<'a> {
                 };
 
                 if is_match {
-                    if env_flag("JVM25_TRACE_EXC")
+                    if interpreterFlags().traceExceptions
                         && let Value::Object(handle) = exc
                     {
                         eprintln!(
@@ -611,7 +625,7 @@ impl<'a> Frame<'a> {
                     self.pc = entry.handler_pc;
                     return true;
                 }
-                if env_flag("JVM25_TRACE_EXC") {
+                if interpreterFlags().traceExceptions {
                     let exc_name = match exc {
                         Value::Object(h) => loader
                             .borrow_objects()
@@ -634,7 +648,7 @@ impl<'a> Frame<'a> {
                 }
             }
         }
-        if env_flag("JVM25_TRACE_EXC")
+        if interpreterFlags().traceExceptions
             && !self.code.exception_table.is_empty()
         {
             eprintln!(
@@ -732,7 +746,7 @@ fn describeValueKind<'a>(
                         Ok(Some(result)) => describeValue(loader, result, output, depth + 1),
                         Ok(None) => Ok("null".to_owned()),
                         Err(error) => {
-                            if env_flag("JVM25_TRACE") {
+                            if interpreterFlags().trace {
                                 eprintln!(
                                     "[describeValue] toString failed for {}: {error}",
                                     dotted(klass.class.name)
@@ -743,7 +757,7 @@ fn describeValueKind<'a>(
                     }
                 }
                 Err(error) => {
-                    if env_flag("JVM25_TRACE") {
+                    if interpreterFlags().trace {
                         eprintln!(
                             "[describeValue] resolve toString failed for {}: {error}",
                             dotted(klass.class.name)
@@ -812,7 +826,7 @@ pub(crate) fn initialize<'a>(
                 *owner = Some(tid);
                 break;
             }
-            if env_flag("JVM25_BLOCKTRACE") {
+            if interpreterFlags().traceBlocking {
                 eprintln!("[block] init-wait tid={tid} class={}", dotted(klass.class.name));
             }
             owner = init_cond.wait(owner).unwrap();
@@ -845,7 +859,7 @@ pub(crate) fn initialize<'a>(
         Ok(())
     })();
     if let Err(error) = &result
-        && env_flag("JVM25_TRACE")
+        && interpreterFlags().trace
     {
         let detail = throwable_of(error)
             .map(|handle| throwableDescription(loader, handle))
@@ -950,7 +964,7 @@ pub fn execute_labeled<'a>(
     // the interpreter unchanged; `Deoptimize` retires the nmethod and
     // resumes interpretation, and `Thrown` propagates a Java
     // throwable raised inside compiled code.
-    let no_jit = env_flag("JVM25_NO_JIT");
+    let no_jit = interpreterFlags().noJit;
     let mut compiled_addr = if no_jit {
         0
     } else {
@@ -996,7 +1010,7 @@ pub fn execute_labeled<'a>(
                 return Ok(value);
             }
             Some(crate::share::jitruntime::CompiledResult::Thrown(handle)) => {
-                if env_flag("JVM25_TRACE_EXC") {
+                if interpreterFlags().traceExceptions {
                     eprintln!(
                         "[jit-throw] {}.{}{} handle={handle}",
                         String::from_utf8_lossy(owner),
@@ -1026,7 +1040,7 @@ pub fn execute_labeled<'a>(
         && !jit_skip(owner, &code)
         && crate::share::oops::methodCounters::invocation_tick(code_key)
     {
-        if env_flag("JVM25_TRACE_COMPILE") {
+        if interpreterFlags().traceCompile {
             eprintln!(
                 "[compile-request:invoke] {}.{}{}",
                 String::from_utf8_lossy(owner),
@@ -1092,7 +1106,7 @@ pub fn execute_labeled<'a>(
         && let Err(error) = &result
         && let Some(handle) = throwable_of(error)
     {
-        if env_flag("JVM25_TRACE") {
+        if interpreterFlags().trace {
             let stack: Vec<String> = loader
                 .call_stack
                 .snapshot()
@@ -1155,7 +1169,7 @@ fn executeFrame<'a>(
     if crate::share::runtime::threading::stack_near_overflow()
         || (!crate::share::runtime::threading::stack_bounds_known() && depth >= 2048)
     {
-        if env_flag("JVM25_SOE") {
+        if interpreterFlags().traceStackOverflow {
             let stack = loader.call_stack.snapshot();
             let start = stack.len().saturating_sub(200);
             eprintln!(
@@ -1195,7 +1209,7 @@ fn executeFrame<'a>(
     };
     let _registration = FrameRegistration::new(&frame);
     let mut safepoint_tick = 0u32;
-    let dumpEnabled = env_flag("JVM25_DUMP");
+    let dumpEnabled = interpreterFlags().dump;
     loop {
         safepoint_tick = safepoint_tick.wrapping_add(1);
         let bytecodeCount = BYTECODE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1209,7 +1223,7 @@ fn executeFrame<'a>(
         if loader.gc_due() {
             loader.reset_allocations();
             let _ = crate::share::memory::heap::collect(loader);
-            if env_flag("JVM25_MEMSTAT") {
+            if interpreterFlags().memstat {
                 static TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                 if TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 200 == 0 {
                     eprintln!(
@@ -1240,7 +1254,7 @@ fn executeFrame<'a>(
                 Some(handle) => {
                     let exc = Value::Object(handle);
                     if !frame.handle_exception(insn_pc, exc, loader, klass) {
-                        if env_flag("JVM25_TRACE") {
+                        if interpreterFlags().trace {
                             let mut frames = Vec::new();
                             for_each_active_frame(&mut |f| frames.push(f.site()));
                             eprintln!("[uncaught-in-frame] stack={frames:?}");
@@ -1258,7 +1272,7 @@ fn executeFrame<'a>(
                             continue;
                         }
                     }
-                    if env_flag("JVM25_TRACE") {
+                    if interpreterFlags().trace {
                         let mut frames = Vec::new();
                         for_each_active_frame(&mut |f| frames.push(f.site()));
                         eprintln!("[fatal] {error} stack={frames:?}");
@@ -1292,7 +1306,7 @@ pub(crate) fn throwableObject<'a>(
     class_name: &[u8],
     message: Option<&str>,
 ) -> io::Result<usize> {
-    if env_flag("JVM25_TRACE") {
+    if interpreterFlags().trace {
         eprintln!(
             "[npe] creating {} msg={:?} in {}",
             dotted(class_name),
@@ -1415,7 +1429,7 @@ pub(crate) fn jex<'a>(
     class_name: &[u8],
     message: Option<&str>,
 ) -> Error {
-    if env_flag("JVM25_TRACE") {
+    if interpreterFlags().trace {
         let mut frames = Vec::new();
         for_each_active_frame(&mut |frame| frames.push(frame.site()));
         eprintln!(
@@ -1664,7 +1678,7 @@ fn methodAccessFlags<'a>(
 /// failures re-resolve every time (matching uncached semantics). The
 /// resolved method's access flags are cached alongside so callers skip
 /// the `methodAccessFlags` hierarchy scan too.
-fn cached_call<'a>(
+pub(crate) fn cachedCall<'a>(
     loader: &ClassLoader<'a>,
     key: CallSiteKey,
     name: &[u8],
@@ -2383,7 +2397,7 @@ fn step<'a>(
                 receiver = materialized;
             }
             if matches!(receiver, Value::Null) {
-                if env_flag("JVM25_TRACE") {
+                if interpreterFlags().trace {
                     eprintln!(
                         "[npe-site] field {}.{}{} pc={} in {} [{}]",
                         String::from_utf8_lossy(owner),
@@ -2438,7 +2452,7 @@ fn step<'a>(
                     object.fields[index] = val;
                     return Ok(None);
                 }
-                if env_flag("JVM25_DEBUG_FIELD")
+                if interpreterFlags().debugField
                     && name == b"value"
                     && matches!(object.fields.get(index), Some(Value::Null) | None)
                 {
@@ -2859,21 +2873,6 @@ fn step<'a>(
                     frame.push(value)?;
                     return Ok(Step::Continue);
                 }
-                if (owner, name, descriptor)
-                    == (
-                        b"java/lang/System",
-                        b"arraycopy",
-                        b"(Ljava/lang/Object;ILjava/lang/Object;II)V",
-                    )
-                {
-                    let args = frame.stack[start..]
-                        .try_into()
-                        .map_err(|_| Error::other("Invalid arraycopy argument count"))?;
-                    crate::share::prims::arrayCopy::copy(loader, args)?;
-                    frame.stack.truncate(start);
-                    frame.stackSlots -= slots;
-                    return Ok(Step::Continue);
-                }
                 if let Some(intrinsic) = crate::share::prims::jdkIntrinsics::invoke(
                     loader,
                     owner,
@@ -2950,13 +2949,13 @@ fn step<'a>(
                     .load(owner)
                     .map_err(|error| linkageExc(loader, output, depth, error))?;
                 let key = CallSiteKey::new(2, &target, owner, name, descriptor);
-                let (target, code, flags) = cached_call(loader, key, name, descriptor, || {
+                let (target, code, flags) = cachedCall(loader, key, name, descriptor, || {
                     LinkResolver::resolve_static_call(&target, name, descriptor)
                 })
                 .map_err(methodError)
                 .map_err(|error| linkageExc(loader, output, depth, error))?;
                 initialize(loader, &target, output, depth + 1)?;
-                if std::env::var_os("JVM25_TRACE_LABELED").is_some()
+                if interpreterFlags().traceLabeled
                     && owner
                         .windows(b"VoxelShape".len())
                         .any(|w| w == b"VoxelShape")
@@ -3102,7 +3101,7 @@ fn step<'a>(
                 }
                 let receiver = frame.stack[start];
                 if matches!(receiver, Value::Null) {
-                    if env_flag("JVM25_TRACE") {
+                    if interpreterFlags().trace {
                         eprintln!(
                             "[npe-site] {}.{}{} pc={} in {}",
                             String::from_utf8_lossy(owner),
@@ -3206,21 +3205,21 @@ fn step<'a>(
                         .load(owner)
                         .map_err(|error| linkageExc(loader, output, depth, error))?;
                     let key = CallSiteKey::new(1, &target, owner, name, descriptor);
-                    cached_call(loader, key, name, descriptor, || {
+                    cachedCall(loader, key, name, descriptor, || {
                         LinkResolver::resolve_special_call(&target, name, descriptor)
                     })
                     .map_err(methodError)
                     .map_err(|error| linkageExc(loader, output, depth, error))?
                 } else if opcode == 0xb9 {
                     let key = CallSiteKey::new(3, &object_klass, owner, name, descriptor);
-                    cached_call(loader, key, name, descriptor, || {
+                    cachedCall(loader, key, name, descriptor, || {
                         LinkResolver::resolve_interface_call(&object_klass, owner, name, descriptor)
                     })
                     .map_err(methodError)
                     .map_err(|error| linkageExc(loader, output, depth, error))?
                 } else {
                     let key = CallSiteKey::new(0, &object_klass, owner, name, descriptor);
-                    cached_call(loader, key, name, descriptor, || {
+                    cachedCall(loader, key, name, descriptor, || {
                         // JVMS 5.4.5: private methods resolved in the symbolic
                         // class are selected without override lookup.
                         match loader.load(owner) {
@@ -3241,16 +3240,16 @@ fn step<'a>(
             };
 
 
-            if env_flag("JVM25_TRACE_CALLS")
+            if interpreterFlags().traceCalls
                 && (owner == b"net/fabricmc/loader/impl/launch/FabricLauncherBase"
                     || owner == b"net/fabricmc/loader/impl/launch/knot/FabricGlobalPropertyService"
                     || owner == b"org/spongepowered/asm/mixin/MixinEnvironment"
                     || owner == b"org/spongepowered/asm/mixin/MixinEnvironment$Phase"
                     || owner == b"org/spongepowered/asm/launch/GlobalProperties"
-                    || (std::env::var_os("JVM25_TRACE_PARSER").is_some()
+                    || (interpreterFlags().traceParser
                         && owner == b"sun/nio/fs/WindowsPathParser"))
             {
-                let parser_trace = std::env::var_os("JVM25_TRACE_PARSER").is_some()
+                let parser_trace = interpreterFlags().traceParser
                     && owner == b"sun/nio/fs/WindowsPathParser";
                 eprintln!(
                     "[call] {}.{}{} op={:#x} depth={}{}",
@@ -3644,7 +3643,7 @@ fn step<'a>(
                     Some("athrow operand is not a Throwable"),
                 ));
             }
-            let trace_throw = env_flag("JVM25_TRACE");
+            let trace_throw = interpreterFlags().trace;
             let is_oom = throwable.as_ref().is_some_and(|klass| {
                 klass
                     .class
@@ -3664,7 +3663,7 @@ fn step<'a>(
                 for_each_active_frame(&mut |frame| frames.push(frame.site()));
                 eprintln!("[athrow] {thrown} stack={frames:?}");
             }
-            if env_flag("JVM25_TRACE_SCE")
+            if interpreterFlags().traceServiceConfiguration
                 && let Value::Object(handle) = exc
                 && let Some(klass) = throwable.as_ref()
                 && klass.class.name == b"java/util/ServiceConfigurationError"
@@ -3709,7 +3708,7 @@ fn step<'a>(
                 ))
             } else {
                 if !loader.referenceAssignable(value, target)? {
-                    if env_flag("JVM25_TRACE") {
+                    if interpreterFlags().trace {
                         eprintln!(
                             "[trace] checkcast fail pc={pc} in {} target={} value={value:?}",
                             String::from_utf8_lossy(klass.class.name),

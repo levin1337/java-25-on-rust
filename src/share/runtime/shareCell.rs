@@ -35,16 +35,19 @@ impl<T> Share<T> {
         }))
     }
 
+    fn borrowGuard(&self, operation: &str) -> ReentrantMutexGuard<'_, Inner<T>> {
+        if let Some(guard) = self.0.try_lock() {
+            return guard;
+        }
+        static traceBlocking: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *traceBlocking.get_or_init(|| std::env::var_os("JVM25_BLOCKTRACE").is_some()) {
+            eprintln!("[block] share-{operation}-wait tid={:?}", std::thread::current().id());
+        }
+        self.0.lock()
+    }
+
     pub fn borrow(&self) -> ShareRef<'_, T> {
-        let guard = match self.0.try_lock() {
-            Some(guard) => guard,
-            None => {
-                if std::env::var_os("JVM25_BLOCKTRACE").is_some() {
-                    eprintln!("[block] share-borrow-wait tid={:?}", std::thread::current().id());
-                }
-                self.0.lock()
-            }
-        };
+        let guard = self.borrowGuard("borrow");
         if guard.borrows.get() < 0 {
             panic!("already mutably borrowed");
         }
@@ -60,15 +63,7 @@ impl<T> Share<T> {
     }
 
     pub fn borrow_mut(&self) -> ShareMut<'_, T> {
-        let guard = match self.0.try_lock() {
-            Some(guard) => guard,
-            None => {
-                if std::env::var_os("JVM25_BLOCKTRACE").is_some() {
-                    eprintln!("[block] share-borrowmut-wait tid={:?}", std::thread::current().id());
-                }
-                self.0.lock()
-            }
-        };
+        let guard = self.borrowGuard("borrowmut");
         if guard.borrows.get() != 0 {
             panic!(
                 "already borrowed: Share<{}> borrows={}",

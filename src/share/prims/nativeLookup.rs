@@ -976,7 +976,8 @@ fn invokeInstanceInner<'a>(
                 return Err(io::Error::other("Invalid library path"));
             };
             super::nativeLibraries::NativeLibraries::global()
-                .load(std::path::Path::new(filename.as_ref()))?;
+                .load(std::path::Path::new(filename.as_ref()))
+                .map_err(|error| io::Error::other(format!("java.lang.UnsatisfiedLinkError: {error}")))?;
             None
         }
         (b"java/lang/Runtime", b"loadLibrary0", b"(Ljava/lang/Class;Ljava/lang/String;)V") => {
@@ -1011,31 +1012,11 @@ fn invokeInstanceInner<'a>(
                 eprintln!("[loadLibrary0] name={name} file={file_name} home={java_home:?} builtin={builtin}");
             }
             if !builtin {
-                // JDK's default java.library.path starts with the current
-                // directory; honour an explicit property first.
-                let mut search_path = String::from(".");
-                {
-                    let props = loader.systemProperties.borrow();
-                    if let Some(value) = props.get("java.library.path") {
-                        search_path.push_str(*value);
-                    }
-                    if let Some(home) = props.get("java.home") {
-                        for sub in ["bin", "lib"] {
-                            if !search_path.is_empty() {
-                                search_path.push(';');
-                            }
-                            search_path.push_str(
-                                &std::path::Path::new(*home)
-                                    .join(sub)
-                                    .to_string_lossy(),
-                            );
-                        }
-                    }
-                }
+                let searchPath = loader.systemProperties.borrow().get("java.library.path").copied();
                 super::nativeLibraries::NativeLibraries::global().loadLibraryWithPaths(
                     name.as_ref(),
-                    Some(&search_path),
-                )?;
+                    searchPath,
+                ).map_err(|error| io::Error::other(format!("java.lang.UnsatisfiedLinkError: {error}")))?;
             }
             None
         }
@@ -1508,6 +1489,23 @@ pub fn invokeStatic<'a>(
     output: &mut dyn std::io::Write,
     depth: usize,
 ) -> io::Result<Option<Option<crate::share::interpreter::bytecodeInterpreter::Value<'a>>>> {
+    if matches!(
+        (owner, name, descriptor),
+        (b"java/lang/System", b"arraycopy", b"(Ljava/lang/Object;ILjava/lang/Object;II)V")
+    ) {
+        let args = arguments.try_into()
+            .map_err(|_| io::Error::other("Invalid arraycopy argument count"))?;
+        super::arrayCopy::copy(loader, args).map_err(|error| {
+            let class: &[u8] = match error.to_string().as_str() {
+                "NullPointerException" => b"java/lang/NullPointerException",
+                "ArrayStoreException" => b"java/lang/ArrayStoreException",
+                "ArrayIndexOutOfBoundsException" => b"java/lang/ArrayIndexOutOfBoundsException",
+                _ => return error,
+            };
+            crate::share::interpreter::bytecodeInterpreter::jex(loader, output, depth, class, None)
+        })?;
+        return Ok(Some(None));
+    }
     if native_miss_contains(owner, name, descriptor) {
         return Ok(None);
     }
@@ -2032,7 +2030,7 @@ fn invokeStaticInner<'a>(
                     Ok(value) => (value as i64, true),
                     Err(error) => {
                         if throw_on_fail {
-                            return Err(error);
+                            return Err(io::Error::other(format!("java.lang.UnsatisfiedLinkError: {error}")));
                         }
                         (0, false)
                     }
@@ -2079,7 +2077,7 @@ fn invokeStaticInner<'a>(
                 None
             } else {
                 symbol.and_then(|name| {
-                    super::nativeLibraries::NativeLibraries::global().find_entry(name.as_ref())
+                    super::nativeLibraries::NativeLibraries::global().findEntry(handle, name.as_ref())
                 })
             };
             Some(Some(Value::Long(address.unwrap_or(0) as i64)))
@@ -2260,7 +2258,13 @@ fn invokeStaticInner<'a>(
         }
         (b"java/util/concurrent/atomic/AtomicLong", b"VMSupportsCS8", b"()Z") => Some(Some(Value::Int(1))),
         (b"jdk/internal/misc/VM", b"isBooted", b"()Z") => Some(Some(Value::Int(1))),
-        (b"jdk/internal/misc/VM", b"getNanoTimeAdjustment", b"(J)J") => Some(Some(Value::Long(0))),
+        (b"jdk/internal/misc/VM", b"getNanoTimeAdjustment", b"(J)J") => {
+            if let Some(Value::Long(offsetSeconds)) = arguments.first() {
+                Some(Some(Value::Long(Jvm::nanoTimeAdjustment(*offsetSeconds))))
+            } else {
+                None
+            }
+        }
         (b"jdk/internal/misc/VM", b"latestUserDefinedLoader", b"()Ljava/lang/ClassLoader;") => {
             Some(Some(Value::Null))
         }

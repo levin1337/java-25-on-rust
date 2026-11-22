@@ -318,6 +318,16 @@ pub struct ClassLoader<'a> {
     /// keyed by internal class name. Mirrors the PD a real VM attaches to
     /// the `InstanceKlass` at definition time.
     pub(crate) class_protection_domains: Share<HashMap<Vec<u8>, usize>>,
+    /// `java.lang.ClassLoader` object handle that defined each class via
+    /// `defineClass*`, keyed by internal class name. Mirrors the defining
+    /// loader a real VM records on the `InstanceKlass`; `Class.getClassLoader`
+    /// consults it so `ServiceLoader`/resource lookups see the right loader.
+    pub(crate) defining_loaders: Share<HashMap<Vec<u8>, usize>>,
+    /// Nest-host overrides for hidden classes defined via `defineClass0`
+    /// with `NESTMATE_CLASS`: internal name -> host internal name. Hidden
+    /// class bytes carry no `NestHost` attribute; the VM assigns the host
+    /// from the lookup class at definition time.
+    pub(crate) nest_host_overrides: Share<HashMap<Vec<u8>, Vec<u8>>>,
     /// Resolved invoke* targets (klass + parsed Code) keyed by call site.
     /// Method resolution is deterministic per receiver class, so hits skip
     /// the vtable scan and `Code::parse` on every call.
@@ -639,6 +649,8 @@ impl<'a> ClassLoader<'a> {
             class_object_names: Share::new(HashMap::new()),
             class_origins: Share::new(HashMap::new()),
             class_protection_domains: Share::new(HashMap::new()),
+            nest_host_overrides: Share::new(HashMap::new()),
+            defining_loaders: Share::new(HashMap::new()),
             invoke_cache: Share::new(HashMap::new()),
             native_declaring_cache: Share::new(HashMap::new()),
             loader_type: ClassLoaderType::AppLoader,
@@ -736,6 +748,8 @@ impl<'a> ClassLoader<'a> {
             class_object_names: Share::new(HashMap::new()),
             class_origins: Share::new(HashMap::new()),
             class_protection_domains: Share::new(HashMap::new()),
+            nest_host_overrides: Share::new(HashMap::new()),
+            defining_loaders: Share::new(HashMap::new()),
             invoke_cache: Share::new(HashMap::new()),
             native_declaring_cache: Share::new(HashMap::new()),
             loader_type: ClassLoaderType::AppLoader,
@@ -913,6 +927,49 @@ impl<'a> ClassLoader<'a> {
         self.class_protection_domains.borrow().get(name).copied()
     }
 
+    /// Records the `ClassLoader` object that defined `name` via a
+    /// `defineClass*` native, keeping it alive as a GC root.
+    pub(crate) fn record_defining_loader(&self, name: &[u8], handle: usize) {
+        if self
+            .defining_loaders
+            .borrow_mut()
+            .insert(name.to_vec(), handle)
+            .is_none()
+        {
+            self.gc_extra_roots
+                .borrow_mut()
+                .push(Value::Object(handle));
+        }
+    }
+
+    /// `ClassLoader` object handle that defined `name`, if recorded.
+    pub fn defining_loader(&self, name: &[u8]) -> Option<usize> {
+        self.defining_loaders.borrow().get(name).copied()
+    }
+
+    /// Records the VM-assigned nest host for a hidden class.
+    pub(crate) fn record_nest_host(&self, name: &[u8], host: &[u8]) {
+        self.nest_host_overrides
+            .borrow_mut()
+            .insert(name.to_vec(), host.to_vec());
+    }
+
+    /// VM-assigned nest host for `name`, if the class was defined as a
+    /// hidden nestmate without a `NestHost` classfile attribute.
+    pub fn hidden_nest_host(&self, name: &[u8]) -> Option<Vec<u8>> {
+        self.nest_host_overrides.borrow().get(name).cloned()
+    }
+
+    /// Hidden classes whose VM-assigned nest host is `host`.
+    pub fn hidden_nest_members(&self, host: &[u8]) -> Vec<Vec<u8>> {
+        self.nest_host_overrides
+            .borrow()
+            .iter()
+            .filter(|(_, h)| h.as_slice() == host)
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
     /// Reads a non-class resource (properties files, data files, ...).
     /// Returns `Ok(None)` when the resource does not exist.
     pub fn open_resource(&self, name: &[u8]) -> io::Result<Option<Vec<u8>>> {
@@ -980,6 +1037,13 @@ impl<'a> ClassLoader<'a> {
                 }
                 ClassSource::Directory(dir) => dir.join(format!("{name}.class")).exists(),
             }))
+    }
+
+    /// True when `name` is already defined in this loader's class map —
+    /// i.e. a previous `load`/`define_class` registered it. Does not
+    /// trigger a load, unlike `load`.
+    pub fn is_defined(&self, name: &[u8]) -> bool {
+        self.classes.borrow().contains_key(name)
     }
 
     pub fn load_class(&self, name: &[u8]) -> io::Result<Arc<InstanceKlass<'a>>> {

@@ -12,7 +12,6 @@ use super::numeric;
 use crate::classfile::decodeString;
 use crate::share::classfile::classLoader::{CallSiteKey, ClassLoader};
 use crate::share::classfile::systemDictionary::SystemDictionary;
-use crate::share::interpreter::bootstrapInfo::BootstrapArg;
 use crate::share::oops::instanceOop::InstanceOop;
 use crate::share::oops::{arrayKlass::ArrayKlass, typeArrayOop::Element};
 use crate::share::runtime::javaCalls::{JavaCallArguments, JavaCalls};
@@ -30,6 +29,61 @@ use std::sync::Arc;
 
 static BYTECODE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static FRAME_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+thread_local! {
+    static CURRENT_FRAME: std::cell::RefCell<String> =
+        const { std::cell::RefCell::new(String::new()) };
+}
+
+fn blocktrace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("JVM25_BLOCKTRACE").is_some())
+}
+
+/// Innermost Java frame of the calling OS thread; used by `JVM25_BLOCKTRACE`
+/// diagnostics in `shareCell` to identify who is running when a `Share`
+/// stays contended.
+pub(crate) fn current_frame() -> String {
+    CURRENT_FRAME.with(|f| f.borrow().clone())
+}
+
+struct FrameGuard {
+    prev: String,
+    active: bool,
+}
+
+impl FrameGuard {
+    fn enter(owner: &[u8], method: Option<(&[u8], &[u8])>) -> Self {
+        if !blocktrace_enabled() {
+            return Self {
+                prev: String::new(),
+                active: false,
+            };
+        }
+        let frame = match method {
+            Some((name, desc)) => format!(
+                "{}.{}{}",
+                dotted(owner),
+                String::from_utf8_lossy(name),
+                String::from_utf8_lossy(desc)
+            ),
+            None => dotted(owner),
+        };
+        let prev = CURRENT_FRAME.with(|f| std::mem::replace(&mut *f.borrow_mut(), frame));
+        Self {
+            prev,
+            active: true,
+        }
+    }
+}
+
+impl Drop for FrameGuard {
+    fn drop(&mut self) {
+        if self.active {
+            CURRENT_FRAME.with(|f| *f.borrow_mut() = std::mem::take(&mut self.prev));
+        }
+    }
+}
 
 pub fn bytecode_count() -> u64 {
     BYTECODE_COUNT.load(std::sync::atomic::Ordering::Relaxed)
@@ -322,6 +376,21 @@ impl Drop for FrameRegistration {
     }
 }
 
+/// Maps an interpreter `Value` to the `OsrKind` used for OSR graph
+/// inputs.  `Empty` slots (cat2 second halves, dead locals) map to I32 —
+/// they are never read as values.  Non-primitive values map to Ref;
+/// `invoke_osr` refuses to marshal shapes `encode_ref` rejects.
+fn osr_kind_of(v: &Value<'_>) -> crate::share::opto::builder::OsrKind {
+    use crate::share::opto::builder::OsrKind::*;
+    match v {
+        Value::Int(_) => I32,
+        Value::Long(_) => I64,
+        Value::Float(_) => F32,
+        Value::Double(_) => F64,
+        _ => Ref,
+    }
+}
+
 pub(crate) struct Frame<'a> {
     code: Code<'a>,
     pc: usize,
@@ -332,6 +401,9 @@ pub(crate) struct Frame<'a> {
     stackSlots: usize,
     owner: &'a [u8],
     monitors: Vec<u64>,
+    /// Set when an OSR-compiled nmethod ran the method to completion;
+    /// the execute loop returns this value as the method result.
+    osr_result: Option<Value<'a>>,
     /// Raw pointer/length to the declaring class's constant pool, used by
     /// `stackWalkInfo` to resolve LineNumberTable entries. The `InstanceKlass`
     /// `Arc` owning the `ClassFile` (and thus this `Vec`'s buffer) is kept
@@ -418,11 +490,13 @@ impl<'a> Frame<'a> {
         let slots = self.stackSlots + value.slots();
         if slots > self.code.maxStack {
             return Err(Error::other(format!(
-                "Operand stack overflow: {} slots needed, {} max at pc {} in {}",
+                "Operand stack overflow: {} slots needed, {} max at pc {} in {}.{}{}",
                 slots,
                 self.code.maxStack,
                 self.pc,
-                String::from_utf8_lossy(self.owner)
+                String::from_utf8_lossy(self.owner),
+                String::from_utf8_lossy(self.code.name),
+                String::from_utf8_lossy(self.code.descriptor)
             )));
         }
         self.stack.push(value);
@@ -477,6 +551,14 @@ impl<'a> Frame<'a> {
                     is_static_initializer: self.code.name == b"<clinit>",
                     ..Default::default()
                 };
+                // Snapshot the frame for the OSR graph: local-slot kinds
+                // (max_locals entries) and operand-stack kinds at the
+                // branch target — the verifier guarantees these are the
+                // static types at that bci.
+                let osr_frame = crate::share::compiler::compileTask::OsrFrame {
+                    local_kinds: self.locals.iter().map(osr_kind_of).collect(),
+                    stack_kinds: self.stack.iter().map(osr_kind_of).collect(),
+                };
                 crate::share::compiler::compileBroker::CompileBroker::global()
                     .backedge_event(
                         crate::share::oops::symbol::Symbol::new(self.owner),
@@ -487,8 +569,40 @@ impl<'a> Frame<'a> {
                         flags,
                         false,
                         None,
-                        crate::share::compiler::compilerDefinitions::CompLevel::Simple,
+                        crate::share::compiler::compilerDefinitions::CompLevel::FullOptimization,
+                        Some(osr_frame),
                     );
+                // OSR entry: if an OSR nmethod was already installed for
+                // this backedge target, marshal the frame and run the
+                // compiled rest-of-method.  Checked on the same tick
+                // cadence as compile requests.
+                let owner_s = String::from_utf8_lossy(self.owner).into_owned();
+                let name_s = String::from_utf8_lossy(self.code.name).into_owned();
+                let desc_s = String::from_utf8_lossy(self.code.descriptor).into_owned();
+                let method_key = crate::share::code::codeCache::CodeCache::method_key(
+                    &owner_s, &name_s, &desc_s,
+                );
+                if let Some(nm) = crate::share::code::codeCache::CodeCache::global()
+                    .find_osr_nmethod_by_key(&method_key, target as i32)
+                    && nm.is_in_use()
+                    && nm.osr_entry_point() != 0
+                {
+                    match crate::share::jitruntime::runtime::invoke_osr(
+                        nm.osr_entry_point(),
+                        self.code.descriptor,
+                        false,
+                        &self.locals,
+                        &self.stack,
+                    ) {
+                        Some(crate::share::jitruntime::CompiledResult::Value(v)) => {
+                            self.osr_result = Some(v.unwrap_or(Value::Null));
+                        }
+                        Some(crate::share::jitruntime::CompiledResult::Thrown(h)) => {
+                            return Err(Error::other(JavaThrowable(h)));
+                        }
+                        _ => {}
+                    }
+                }
             }
         }
         self.pc = target;
@@ -711,7 +825,7 @@ pub(crate) fn describeValue<'a>(
     describeValueKind(loader, value, false, output, depth)
 }
 
-fn describeValueKind<'a>(
+pub(crate) fn describeValueKind<'a>(
     loader: &ClassLoader<'a>,
     value: Value<'a>,
     as_boolean: bool,
@@ -829,7 +943,12 @@ pub(crate) fn initialize<'a>(
             if interpreterFlags().traceBlocking {
                 eprintln!("[block] init-wait tid={tid} class={}", dotted(klass.class.name));
             }
+            // A thread parked on a class-init gate is GC-quiesced: its
+            // frames cannot change while it waits, and leaving it
+            // `Running` would deadlock any pending collection.
+            crate::share::memory::heap::quiesce();
             owner = init_cond.wait(owner).unwrap();
+            crate::share::memory::heap::unquiesce();
         }
     }
     klass.state.set(InitState::BeingInitialized);
@@ -915,6 +1034,7 @@ pub fn execute_labeled<'a>(
     // descriptor are already available through `code`, and `stackWalkInfo`
     // relies on `owner` being a real class name.
     let owner = klass.class.name;
+    let _frame_guard = FrameGuard::enter(owner, method);
     let _ = method;
     // JDK intrinsics must be honored on every entry path, not only when
     // the caller is interpreted: JIT-compiled callers reach this function
@@ -995,6 +1115,14 @@ pub fn execute_labeled<'a>(
             crate::share::oops::methodCounters::clear_compiled(code_key);
             compiled_addr = 0;
         }
+    }
+    if compiled_addr != 0 && std::env::var_os("JVM25_JIT_DEBUG").is_some() {
+        eprintln!(
+            "[jit-dispatch] {}.{}{} key={code_key:#x} -> {compiled_addr:#x}",
+            String::from_utf8_lossy(owner),
+            String::from_utf8_lossy(code.name),
+            String::from_utf8_lossy(code.descriptor)
+        );
     }
     if compiled_addr != 0
         && access_flags & (0x0100 | 0x0400 | 0x0020) == 0
@@ -1204,6 +1332,7 @@ fn executeFrame<'a>(
         locals,
         owner,
         monitors: Vec::new(),
+        osr_result: None,
         constants_ptr: klass.class.constants.as_ptr(),
         constants_len: klass.class.constants.len(),
     };
@@ -1246,7 +1375,11 @@ fn executeFrame<'a>(
                     return Err(error);
                 }
             }
-            Ok(Step::Continue) => {}
+            Ok(Step::Continue) => {
+                if let Some(v) = frame.osr_result.take() {
+                    return Ok(Some(v));
+                }
+            }
             Ok(Step::Return(value)) => {
                 return Ok(value);
             }
@@ -2434,7 +2567,24 @@ fn step<'a>(
                     return Err(Error::other("Unsupported field receiver class"));
                 }
                 let ownerKlass = loader.load(owner)?;
-                let index = ownerKlass.instanceField(name, descriptor)?;
+                let index = match ownerKlass.instanceField(name, descriptor) {
+                    Ok(index) => index,
+                    Err(error) => {
+                        if env_flag("JVM25_TRACE_FIELD") {
+                            eprintln!(
+                                "[field-miss] owner={} name={} desc={} obj_klass={} in {}.{} pc={}",
+                                String::from_utf8_lossy(owner),
+                                String::from_utf8_lossy(name),
+                                String::from_utf8_lossy(descriptor),
+                                String::from_utf8_lossy(object.klass.class.name),
+                                String::from_utf8_lossy(frame.owner),
+                                String::from_utf8_lossy(frame.code.name),
+                                pc,
+                            );
+                        }
+                        return Err(error);
+                    }
+                };
                 if index >= object.fields.len() {
                     return Err(Error::other("Invalid instance field slot"));
                 }
@@ -2882,7 +3032,9 @@ fn step<'a>(
                 )? {
                     frame.stack.truncate(start);
                     frame.stackSlots -= slots;
-                    frame.push(intrinsic)?;
+                    if !descriptor.ends_with(b")V") {
+                        frame.push(intrinsic)?;
+                    }
                     return Ok(Step::Continue);
                 }
                 let __t = std::time::Instant::now();
@@ -3397,117 +3549,17 @@ fn step<'a>(
                 slots += val.slots();
             }
 
-            let mut is_string_concat = name == b"makeConcat" || name == b"makeConcatWithConstants";
-            if !is_string_concat {
-                if let Some(target) = bs_info.resolved_target() {
-                    if target.contains("StringConcatFactory") {
-                        is_string_concat = true;
-                    }
-                }
+            let captured = frame.stack[start..].to_vec();
+            frame.stack.truncate(start);
+            frame.stackSlots -= slots;
+            // Shared with the C2 InvokeDynamic stub: concat fast path,
+            // ObjectMethods, LambdaMetafactory, generic JVMS linkage.
+            if let Some(value) = super::invokeDynamic::dispatch(
+                loader, klass, &bs_info, name, descriptor, &captured, output, depth,
+            )? {
+                frame.push(value)?;
             }
-
-            if is_string_concat {
-                let mut formatted = String::new();
-                let recipe = bs_info.arguments().first().and_then(|arg| {
-                    if let BootstrapArg::String(s) = arg {
-                        Some(s.as_str())
-                    } else {
-                        None
-                    }
-                });
-
-                let mut boolean_params = Vec::new();
-                {
-                    let mut rest = descriptor.strip_prefix(b"(").unwrap_or(descriptor);
-                    while !rest.is_empty() && rest[0] != b')' {
-                        let dims = rest.iter().take_while(|byte| **byte == b'[').count();
-                        let tag = rest.get(dims).copied().unwrap_or(0);
-                        boolean_params.push(tag == b'Z');
-                        let len = if tag == b'L' {
-                            dims + 1
-                                + rest[dims + 1..]
-                                    .iter()
-                                    .position(|byte| *byte == b';')
-                                    .map(|pos| pos + 1)
-                                    .unwrap_or(rest.len().saturating_sub(dims + 1))
-                        } else {
-                            dims + 1
-                        };
-                        rest = rest.get(len..).unwrap_or(&[]);
-                    }
-                }
-                let mut dynamic_args = Vec::with_capacity(frame.stack.len() - start);
-                for (arg_index, value) in frame.stack[start..].iter().enumerate() {
-                    dynamic_args.push(describeValueKind(
-                        loader,
-                        *value,
-                        boolean_params.get(arg_index).copied().unwrap_or(false),
-                        output,
-                        depth + 1,
-                    )?);
-                }
-
-                if let Some(recipe_str) = recipe {
-                    let mut arg_iter = dynamic_args.into_iter();
-                    let mut const_iter = bs_info.arguments().iter().skip(1);
-                    for ch in recipe_str.chars() {
-                        if ch == '\u{0001}' {
-                            if let Some(arg_val) = arg_iter.next() {
-                                formatted.push_str(&arg_val);
-                            }
-                        } else if ch == '\u{0002}' {
-                            if let Some(c) = const_iter.next() {
-                                match c {
-                                    BootstrapArg::String(s) => formatted.push_str(s),
-                                    BootstrapArg::Int(i) => formatted.push_str(&i.to_string()),
-                                    BootstrapArg::Long(l) => formatted.push_str(&l.to_string()),
-                                    _ => {}
-                                }
-                            }
-                        } else {
-                            formatted.push(ch);
-                        }
-                    }
-                } else {
-                    for arg_val in dynamic_args {
-                        formatted.push_str(&arg_val);
-                    }
-                }
-
-                frame.stack.truncate(start);
-                frame.stackSlots -= slots;
-                let allocated_str = loader.storage.alloc_str(&formatted);
-                Value::HostString(allocated_str)
-            } else {
-                let captured = frame.stack[start..].to_vec();
-                frame.stack.truncate(start);
-                frame.stackSlots -= slots;
-                if let Some(value) =
-                    super::objectMethods::invoke(loader, klass, &bs_info, &captured, output, depth)?
-                {
-                    frame.push(value)?;
-                    return Ok(Step::Continue);
-                }
-                match super::lambdaMetafactory::invoke(
-                    loader, klass, &bs_info, name, descriptor, &captured,
-                )? {
-                    Some(value) => {
-                        frame.push(value)?;
-                        return Ok(Step::Continue);
-                    }
-                    None => {
-                        // Generic JVMS linkage: run the real bootstrap
-                        // method, link the CallSite, and invoke its target.
-                        if let Some(value) = super::genericBootstrap::invoke(
-                            loader, klass, &bs_info, name, descriptor, &captured,
-                            output, depth,
-                        )? {
-                            frame.push(value)?;
-                        }
-                        return Ok(Step::Continue);
-                    }
-                }
-            }
+            return Ok(Step::Continue);
         }
         0xbb => {
             let name = klass.className(u16::from_be_bytes(frame.read()?))?;

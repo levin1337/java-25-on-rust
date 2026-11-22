@@ -385,16 +385,25 @@ fn is_subclass_of<'a>(sub: &InstanceKlass<'a>, sup_name: &[u8]) -> bool {
 
 /// Nestmate check (JVMS §5.4.4): two classes are nestmates when they share a
 /// nest host, or one is the other's nest host.
-fn nestmates<'a>(a: &InstanceKlass<'a>, b: &InstanceKlass<'a>) -> bool {
+fn nestmates<'a>(
+    loader: &ClassLoader<'a>,
+    a: &InstanceKlass<'a>,
+    b: &InstanceKlass<'a>,
+) -> bool {
     if a.class.name == b.class.name {
         return true;
     }
-    let a_host = a.class.nest_host();
-    let b_host = b.class.nest_host();
-    if a_host == Some(b.class.name) || b_host == Some(a.class.name) {
+    let host_of = |k: &InstanceKlass<'a>| -> Option<Vec<u8>> {
+        loader
+            .hidden_nest_host(k.class.name)
+            .or_else(|| k.class.nest_host().map(|h| h.to_vec()))
+    };
+    let a_host = host_of(a);
+    let b_host = host_of(b);
+    if a_host.as_deref() == Some(b.class.name) || b_host.as_deref() == Some(a.class.name) {
         return true;
     }
-    match (a_host, b_host) {
+    match (&a_host, &b_host) {
         (Some(ha), Some(hb)) => ha == hb,
         _ => false,
     }
@@ -426,7 +435,7 @@ pub fn check_member_access<'a>(
 
     // Private members: same class or nestmate only.
     if access_flags & ACC_PRIVATE != 0 {
-        if nestmates(caller, owner) {
+        if nestmates(loader, caller, owner) {
             return Ok(());
         }
         return Err(illegal_access(format!("private member of {}", describe())));

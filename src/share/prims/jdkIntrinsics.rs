@@ -644,6 +644,92 @@ fn compressBlock<'a>(loader: &ClassLoader<'a>, algo: u8, state: usize, input: us
     }
 }
 
+/// `DigestBase.engineReset` equivalent for the fast path: restores the
+/// chaining state to its initial value and clears the message-schedule
+/// array `W`. `DigestBase.engineUpdate` invokes this whenever
+/// `bytesProcessed < 0` (the flag `engineDigest` leaves behind), so a
+/// `MessageDigest` instance stays reusable across `digest()` calls.
+fn reset_digest<'a>(loader: &ClassLoader<'a>, receiver: usize, algo: u8) -> Option<()> {
+    let state_desc: &[u8] = if algo == 2 { b"[J" } else { b"[I" };
+    let Value::PrimitiveArray(state) =
+        super::methodHandleNatives::object_field(loader, receiver, b"state", state_desc).ok()?
+    else {
+        return None;
+    };
+    if algo == 2 {
+        // SHA-384/512: state is long[8] seeded from `initialHashes` ([J).
+        let initial: Vec<i64> = match super::methodHandleNatives::object_field(
+            loader, receiver, b"initialHashes", b"[J",
+        ) {
+            Ok(Value::PrimitiveArray(h)) => {
+                let arrays = loader.arrays.borrow();
+                let TypeArrayOop::Long(words) = arrays.get(h)? else {
+                    return None;
+                };
+                words.to_vec()
+            }
+            _ => return None,
+        };
+        let mut arrays = loader.arrays.borrow_mut();
+        let TypeArrayOop::Long(state_words) = arrays.get_mut(state)? else {
+            return None;
+        };
+        for (slot, word) in state_words.iter_mut().zip(initial.iter()) {
+            *slot = *word;
+        }
+    } else if algo == 1 {
+        // SHA-224/256: state is int[8] seeded from `initialHashes` ([I).
+        let initial: Vec<i32> = match super::methodHandleNatives::object_field(
+            loader, receiver, b"initialHashes", b"[I",
+        ) {
+            Ok(Value::PrimitiveArray(h)) => {
+                let arrays = loader.arrays.borrow();
+                let TypeArrayOop::Int(words) = arrays.get(h)? else {
+                    return None;
+                };
+                words.to_vec()
+            }
+            _ => return None,
+        };
+        let mut arrays = loader.arrays.borrow_mut();
+        let TypeArrayOop::Int(state_words) = arrays.get_mut(state)? else {
+            return None;
+        };
+        for (slot, word) in state_words.iter_mut().zip(initial.iter()) {
+            *slot = *word;
+        }
+    } else {
+        // SHA-1: state is int[5] with fixed IV constants (SHA.resetHashes).
+        const SHA1_IV: [i32; 5] = [
+            0x67452301u32 as i32,
+            0xefcdab89u32 as i32,
+            0x98badcfeu32 as i32,
+            0x10325476u32 as i32,
+            0xc3d2e1f0u32 as i32,
+        ];
+        let mut arrays = loader.arrays.borrow_mut();
+        let TypeArrayOop::Int(state_words) = arrays.get_mut(state)? else {
+            return None;
+        };
+        for (slot, word) in state_words.iter_mut().zip(SHA1_IV.iter()) {
+            *slot = *word;
+        }
+    }
+    // implReset also clears W ([I for SHA/SHA2, [J for SHA5) when present.
+    let w_desc: &[u8] = if algo == 2 { b"[J" } else { b"[I" };
+    if let Ok(Value::PrimitiveArray(w)) =
+        super::methodHandleNatives::object_field(loader, receiver, b"W", w_desc)
+    {
+        let mut arrays = loader.arrays.borrow_mut();
+        match arrays.get_mut(w) {
+            Some(TypeArrayOop::Int(words)) => words.fill(0),
+            Some(TypeArrayOop::Long(words)) => words.fill(0),
+            _ => {}
+        }
+    }
+    Some(())
+}
+
 /// `DigestBase.engineUpdate([BII)V`: byte-for-byte port of the JDK buffering
 /// logic with native block compression.
 fn digestEngineUpdate<'a>(loader: &ClassLoader<'a>, args: &[Value<'a>]) -> Option<()> {
@@ -691,14 +777,22 @@ fn digestEngineUpdate<'a>(loader: &ClassLoader<'a>, args: &[Value<'a>]) -> Optio
     let mut ofs = *ofs;
     let mut len = *len;
 
-    // bytesProcessed += len (field is package-visible `long`)
+    // bytesProcessed += len. A negative value means the previous
+    // engineDigest() left the object un-reset; DigestBase.engineUpdate
+    // runs engineReset() first — mirror that here (DigestBase.java:111).
     if let Some(Value::Long(processed)) = field(b"bytesProcessed", b"J") {
+        let mut base = processed;
+        if processed < 0 {
+            reset_digest(loader, *receiver, algo)?;
+            buf_ofs = 0;
+            base = 0;
+        }
         super::methodHandleNatives::set_object_field(
             loader,
             *receiver,
             b"bytesProcessed",
             b"J",
-            Value::Long(processed.wrapping_add(i64::from(len))),
+            Value::Long(base.wrapping_add(i64::from(len))),
         )
         .ok()?;
     }
@@ -1222,6 +1316,282 @@ fn byteHash(
     }))
 }
 
+// ---------------------------------------------------------------------------
+// sun.security.provider.ByteArrayAccess — bulk byte[] <-> int[]/long[]
+// conversions used by the SHA/MD message digests. The JDK implements these
+// with signature-polymorphic VarHandle accesses; each element costs a full
+// method-handle dispatch in this VM, so the loops run here instead.
+// ---------------------------------------------------------------------------
+
+fn byte_array_access<'a>(
+    loader: &ClassLoader<'a>,
+    name: &[u8],
+    descriptor: &[u8],
+    arguments: &[Value<'a>],
+) -> io::Result<Option<Value<'a>>> {
+    use TypeArrayOop as T;
+
+    fn i32_arg(arguments: &[Value<'_>], index: usize) -> Option<i32> {
+        match arguments.get(index) {
+            Some(Value::Int(value)) => Some(*value),
+            _ => None,
+        }
+    }
+    fn parr(arguments: &[Value<'_>], index: usize) -> Option<usize> {
+        match arguments.get(index) {
+            Some(Value::PrimitiveArray(handle)) => Some(*handle),
+            _ => None,
+        }
+    }
+    /// Borrows two distinct arena slots at once.
+    fn pair<'b>(
+        arrays: &'b mut [T],
+        a: usize,
+        b: usize,
+    ) -> Option<(&'b mut T, &'b mut T)> {
+        if a == b {
+            return None;
+        }
+        Some(if a < b {
+            let (left, right) = arrays.split_at_mut(b);
+            (&mut left[a], &mut right[0])
+        } else {
+            let (left, right) = arrays.split_at_mut(a);
+            (&mut right[0], &mut left[b])
+        })
+    }
+    fn rd_i32(bytes: &[i8], offset: usize, be: bool) -> Option<i32> {
+        let s = bytes.get(offset..offset + 4)?;
+        let raw = [s[0] as u8, s[1] as u8, s[2] as u8, s[3] as u8];
+        Some(if be {
+            i32::from_be_bytes(raw)
+        } else {
+            i32::from_le_bytes(raw)
+        })
+    }
+    fn rd_i64(bytes: &[i8], offset: usize, be: bool) -> Option<i64> {
+        let s = bytes.get(offset..offset + 8)?;
+        let raw = [
+            s[0] as u8, s[1] as u8, s[2] as u8, s[3] as u8, s[4] as u8, s[5] as u8, s[6] as u8,
+            s[7] as u8,
+        ];
+        Some(if be {
+            i64::from_be_bytes(raw)
+        } else {
+            i64::from_le_bytes(raw)
+        })
+    }
+    fn wr_i32(bytes: &mut [i8], offset: usize, value: i32, be: bool) -> Option<()> {
+        let raw = if be {
+            value.to_be_bytes()
+        } else {
+            value.to_le_bytes()
+        };
+        bytes
+            .get_mut(offset..offset + 4)?
+            .copy_from_slice(&raw.map(|b| b as i8));
+        Some(())
+    }
+    fn wr_i64(bytes: &mut [i8], offset: usize, value: i64, be: bool) -> Option<()> {
+        let raw = if be {
+            value.to_be_bytes()
+        } else {
+            value.to_le_bytes()
+        };
+        bytes
+            .get_mut(offset..offset + 8)?
+            .copy_from_slice(&raw.map(|b| b as i8));
+        Some(())
+    }
+
+    let mut arrays = loader.arrays.borrow_mut();
+    let arrays: &mut [T] = &mut arrays;
+    let done = Ok(Some(Value::Null));
+
+    // Bulk converters share the JDK loop shape: `count = ceil(len / elem)`,
+    // element `i` sits at `ofs + i * elem` on the byte side and `ofs + i`
+    // on the typed side. `len <= 0` is a no-op.
+    match (name, descriptor) {
+        // ---- typed[] -> byte[] ----
+        (b"i2bLittle" | b"i2bBig", b"([II[BII)V")
+        | (b"l2bLittle" | b"l2bBig", b"([JI[BII)V") => {
+            let is_long = name[0] == b'l';
+            let be = name.ends_with(b"Big");
+            let (Some(src_h), Some(dst_h)) = (parr(arguments, 0), parr(arguments, 2)) else {
+                return Ok(None);
+            };
+            let (Some(in_ofs), Some(out_ofs), Some(len)) = (
+                i32_arg(arguments, 1),
+                i32_arg(arguments, 3),
+                i32_arg(arguments, 4),
+            ) else {
+                return Ok(None);
+            };
+            if len <= 0 {
+                return done;
+            }
+            let elem = if is_long { 8 } else { 4 };
+            let count = (len as usize).div_ceil(elem);
+            let Some((src, dst)) = pair(arrays, src_h, dst_h) else {
+                return Ok(None);
+            };
+            match (src, dst) {
+                (T::Int(input), T::Byte(output)) if !is_long => {
+                    let (in_ofs, out_ofs) = (in_ofs as usize, out_ofs as usize);
+                    if in_ofs.checked_add(count).is_none_or(|e| e > input.len())
+                        || out_ofs
+                            .checked_add(count * 4)
+                            .is_none_or(|e| e > output.len())
+                    {
+                        return Ok(None);
+                    }
+                    for i in 0..count {
+                        wr_i32(output, out_ofs + i * 4, input[in_ofs + i], be)
+                            .ok_or_else(|| invalid("range"))?;
+                    }
+                }
+                (T::Long(input), T::Byte(output)) if is_long => {
+                    let (in_ofs, out_ofs) = (in_ofs as usize, out_ofs as usize);
+                    if in_ofs.checked_add(count).is_none_or(|e| e > input.len())
+                        || out_ofs
+                            .checked_add(count * 8)
+                            .is_none_or(|e| e > output.len())
+                    {
+                        return Ok(None);
+                    }
+                    for i in 0..count {
+                        wr_i64(output, out_ofs + i * 8, input[in_ofs + i], be)
+                            .ok_or_else(|| invalid("range"))?;
+                    }
+                }
+                _ => return Ok(None),
+            }
+            done
+        }
+        // ---- byte[] -> typed[] ----
+        (b"b2iBig", b"([BI[III)V") | (b"b2lBig" | b"b2lLittle", b"([BI[JII)V") => {
+            let is_long = name[1] == b'l';
+            let be = name != b"b2lLittle";
+            let (Some(src_h), Some(dst_h)) = (parr(arguments, 0), parr(arguments, 2)) else {
+                return Ok(None);
+            };
+            let (Some(in_ofs), Some(out_ofs), Some(len)) = (
+                i32_arg(arguments, 1),
+                i32_arg(arguments, 3),
+                i32_arg(arguments, 4),
+            ) else {
+                return Ok(None);
+            };
+            if len <= 0 {
+                return done;
+            }
+            let elem = if is_long { 8 } else { 4 };
+            let count = (len as usize).div_ceil(elem);
+            let Some((src, dst)) = pair(arrays, src_h, dst_h) else {
+                return Ok(None);
+            };
+            match (src, dst) {
+                (T::Byte(input), T::Int(output)) if !is_long => {
+                    let (in_ofs, out_ofs) = (in_ofs as usize, out_ofs as usize);
+                    if in_ofs
+                        .checked_add(count * 4)
+                        .is_none_or(|e| e > input.len())
+                        || out_ofs.checked_add(count).is_none_or(|e| e > output.len())
+                    {
+                        return Ok(None);
+                    }
+                    for i in 0..count {
+                        output[out_ofs + i] = rd_i32(input, in_ofs + i * 4, be)
+                            .ok_or_else(|| invalid("range"))?;
+                    }
+                }
+                (T::Byte(input), T::Long(output)) if is_long => {
+                    let (in_ofs, out_ofs) = (in_ofs as usize, out_ofs as usize);
+                    if in_ofs
+                        .checked_add(count * 8)
+                        .is_none_or(|e| e > input.len())
+                        || out_ofs.checked_add(count).is_none_or(|e| e > output.len())
+                    {
+                        return Ok(None);
+                    }
+                    for i in 0..count {
+                        output[out_ofs + i] = rd_i64(input, in_ofs + i * 8, be)
+                            .ok_or_else(|| invalid("range"))?;
+                    }
+                }
+                _ => return Ok(None),
+            }
+            done
+        }
+        // ---- single-element / fixed-count variants ----
+        (b"i2bLittle4" | b"i2bBig4", b"(I[BI)V") => {
+            let be = name == b"i2bBig4";
+            let (Some(value), Some(out_h), Some(out_ofs)) = (
+                i32_arg(arguments, 0),
+                parr(arguments, 1),
+                i32_arg(arguments, 2),
+            ) else {
+                return Ok(None);
+            };
+            let Some(T::Byte(output)) = arrays.get_mut(out_h) else {
+                return Ok(None);
+            };
+            wr_i32(output, out_ofs as usize, value, be)
+                .ok_or_else(|| invalid("range"))?;
+            done
+        }
+        (b"b2iBig64", b"([BI[I)V") => {
+            let (Some(src_h), Some(in_ofs), Some(dst_h)) = (
+                parr(arguments, 0),
+                i32_arg(arguments, 1),
+                parr(arguments, 2),
+            ) else {
+                return Ok(None);
+            };
+            let Some((src, dst)) = pair(arrays, src_h, dst_h) else {
+                return Ok(None);
+            };
+            let (T::Byte(input), T::Int(output)) = (src, dst) else {
+                return Ok(None);
+            };
+            let in_ofs = in_ofs as usize;
+            if in_ofs.checked_add(64).is_none_or(|e| e > input.len()) || output.len() < 16 {
+                return Ok(None);
+            }
+            for i in 0..16 {
+                output[i] = rd_i32(input, in_ofs + i * 4, true)
+                    .ok_or_else(|| invalid("range"))?;
+            }
+            done
+        }
+        (b"b2lBig128", b"([BI[J)V") => {
+            let (Some(src_h), Some(in_ofs), Some(dst_h)) = (
+                parr(arguments, 0),
+                i32_arg(arguments, 1),
+                parr(arguments, 2),
+            ) else {
+                return Ok(None);
+            };
+            let Some((src, dst)) = pair(arrays, src_h, dst_h) else {
+                return Ok(None);
+            };
+            let (T::Byte(input), T::Long(output)) = (src, dst) else {
+                return Ok(None);
+            };
+            let in_ofs = in_ofs as usize;
+            if in_ofs.checked_add(128).is_none_or(|e| e > input.len()) || output.len() < 16 {
+                return Ok(None);
+            }
+            for i in 0..16 {
+                output[i] = rd_i64(input, in_ofs + i * 8, true)
+                    .ok_or_else(|| invalid("range"))?;
+            }
+            done
+        }
+        _ => Ok(None),
+    }
+}
+
 /// Handles a single static JDK helper call. Returns `Ok(None)` when the
 /// (owner, name, descriptor) triple is not one of the fast-pathed methods.
 pub(crate) fn invoke<'a>(
@@ -1313,6 +1683,11 @@ pub(crate) fn invoke<'a>(
                 return Ok(Some(Value::Int(index)));
             }
             return Ok(None);
+        }
+        // sun.security.provider.ByteArrayAccess — digest byte/int/long
+        // conversions (void methods; see interpreter's `)V` handling).
+        (b"sun/security/provider/ByteArrayAccess", _, _) => {
+            return byte_array_access(loader, name, descriptor, arguments);
         }
         // jdk.internal.util.ArraysSupport
         // hashCodeOfUnsigned(byte[] a, int off, int len, int init)

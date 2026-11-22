@@ -167,6 +167,7 @@ pub fn ensure_watchdog() {
         .name("jvm-watchdog".to_string())
         .stack_size(1024 * 1024)
         .spawn(|| loop {
+            crate::share::memory::heap::set_gc_exempt();
             std::thread::sleep(Duration::from_secs(5));
             let snapshot: Vec<(std::thread::ThreadId, DebugInfo)> = THREAD_DEBUG
                 .lock()
@@ -304,9 +305,7 @@ fn spawn_os_thread(
             match result {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
-                    if std::env::var_os("JVM25_TRACE").is_some() {
-                        eprintln!("[thread {tid}] java.lang.Thread.run died: {error}");
-                    }
+                    eprintln!("[thread {tid}] java.lang.Thread.run died: {error}");
                 }
                 Err(payload) => {
                     let message = payload
@@ -630,6 +629,10 @@ pub fn unpark(loader: &ClassLoader<'_>, value: Value<'_>) -> io::Result<()> {
 /// exit). Polls the registry; infra threads were retired at `register`
 /// time so they never appear here as pending work.
 pub fn wait_non_daemon(loader: &ClassLoader<'_>) {
+    // The primordial thread parks here in Rust code after `main` returns;
+    // without a GC registration its stale `Running` entry would block
+    // every stop-the-world cycle forever.
+    crate::share::memory::heap::quiesce();
     loop {
         let pending = {
             let threads = loader.java_threads.borrow();

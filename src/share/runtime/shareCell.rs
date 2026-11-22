@@ -18,6 +18,16 @@ use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
 use std::panic::{RefUnwindSafe, UnwindSafe};
 use std::cell::UnsafeCell;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+static NEXT_OS_TID: AtomicU64 = AtomicU64::new(1);
+thread_local! {
+    static OS_TID: u64 = NEXT_OS_TID.fetch_add(1, Ordering::Relaxed);
+}
+
+fn os_tid() -> u64 {
+    OS_TID.with(|t| *t)
+}
 
 struct Inner<T> {
     value: UnsafeCell<T>,
@@ -25,16 +35,33 @@ struct Inner<T> {
     borrows: Cell<isize>,
 }
 
-pub struct Share<T>(ReentrantMutex<Inner<T>>);
+pub struct Share<T> {
+    inner: ReentrantMutex<Inner<T>>,
+    /// OS-thread id currently holding the lock (0 = free). Debug aid for
+    /// `JVM25_BLOCKTRACE`; only meaningful while the mutex is contended.
+    holder: AtomicU64,
+    /// `&'static Location` of the callsite that acquired the lock,
+    /// stored as a raw pointer for debug printing.
+    holder_site: AtomicUsize,
+    /// Leaked `Backtrace` captured at the last 0->1 borrow when
+    /// `JVM25_SHARE_TRACE` is set; printed by `borrow_mut` conflicts.
+    holder_bt: AtomicUsize,
+}
 
 impl<T> Share<T> {
     pub fn new(value: T) -> Self {
-        Self(ReentrantMutex::new(Inner {
-            value: UnsafeCell::new(value),
-            borrows: Cell::new(0),
-        }))
+        Self {
+            inner: ReentrantMutex::new(Inner {
+                value: UnsafeCell::new(value),
+                borrows: Cell::new(0),
+            }),
+            holder: AtomicU64::new(0),
+            holder_site: AtomicUsize::new(0),
+            holder_bt: AtomicUsize::new(0),
+        }
     }
 
+<<<<<<< HEAD
     fn borrowGuard(&self, operation: &str) -> ReentrantMutexGuard<'_, Inner<T>> {
         if let Some(guard) = self.0.try_lock() {
             return guard;
@@ -48,8 +75,61 @@ impl<T> Share<T> {
 
     pub fn borrow(&self) -> ShareRef<'_, T> {
         let guard = self.borrowGuard("borrow");
+=======
+    #[track_caller]
+    fn mark_holder(&self) {
+        self.holder.store(os_tid(), Ordering::Relaxed);
+        self.holder_site
+            .store(std::panic::Location::caller() as *const _ as usize, Ordering::Relaxed);
+        if std::env::var_os("JVM25_SHARE_TRACE").is_some()
+            && std::any::type_name::<T>().contains("ObjArrayOop")
+        {
+            let bt = Box::new(std::backtrace::Backtrace::force_capture());
+            self.holder_bt.store(Box::into_raw(bt) as usize, Ordering::Relaxed);
+        }
+    }
+
+    fn holder_desc(&self) -> String {
+        if self.holder.load(Ordering::Relaxed) == 0 {
+            return String::new();
+        }
+        let site = self.holder_site.load(Ordering::Relaxed);
+        if site == 0 {
+            return String::new();
+        }
+        let loc = unsafe { &*(site as *const std::panic::Location<'static>) };
+        format!(" at {loc}")
+    }
+
+    #[track_caller]
+    pub fn borrow(&self) -> ShareRef<'_, T> {
+        let guard = match self.inner.try_lock() {
+            Some(guard) => guard,
+            None => {
+                if std::env::var_os("JVM25_BLOCKTRACE").is_some() {
+                    eprintln!(
+                        "[block] share-borrow-wait tid={} holder={} share={:p}{} frame={}",
+                        os_tid(),
+                        self.holder.load(Ordering::Relaxed),
+                        self,
+                        self.holder_desc(),
+                        crate::share::interpreter::bytecodeInterpreter::current_frame()
+                    );
+                }
+                // Parked on a VM-internal mutex: register as GC-blocked so
+                // a pending collection neither deadlocks nor misses roots.
+                crate::share::memory::heap::quiesce();
+                let guard = self.inner.lock();
+                crate::share::memory::heap::unquiesce();
+                guard
+            }
+        };
+>>>>>>> 47a5aa0745674e6be15c2937f3493aa56b1bca78
         if guard.borrows.get() < 0 {
             panic!("already mutably borrowed");
+        }
+        if guard.borrows.get() == 0 {
+            self.mark_holder();
         }
         guard.borrows.set(guard.borrows.get() + 1);
         // SAFETY: the mutex is held for the guard's lifetime, so no other
@@ -58,19 +138,61 @@ impl<T> Share<T> {
         ShareRef {
             _guard: guard,
             ptr,
+            holder: &self.holder,
             _marker: PhantomData,
         }
     }
 
+    #[track_caller]
     pub fn borrow_mut(&self) -> ShareMut<'_, T> {
+<<<<<<< HEAD
         let guard = self.borrowGuard("borrowmut");
+=======
+        let guard = match self.inner.try_lock() {
+            Some(guard) => guard,
+            None => {
+                if std::env::var_os("JVM25_BLOCKTRACE").is_some() {
+                    eprintln!(
+                        "[block] share-borrowmut-wait tid={} holder={} share={:p}{} frame={}",
+                        os_tid(),
+                        self.holder.load(Ordering::Relaxed),
+                        self,
+                        self.holder_desc(),
+                        crate::share::interpreter::bytecodeInterpreter::current_frame()
+                    );
+                }
+                crate::share::memory::heap::quiesce();
+                let guard = self.inner.lock();
+                crate::share::memory::heap::unquiesce();
+                guard
+            }
+        };
+>>>>>>> 47a5aa0745674e6be15c2937f3493aa56b1bca78
         if guard.borrows.get() != 0 {
+            if std::env::var_os("JVM25_SHARE_TRACE").is_some() {
+                let bt = self.holder_bt.load(Ordering::Relaxed);
+                let bt_txt = if bt != 0 {
+                    format!("\n{}", unsafe { &*(bt as *const std::backtrace::Backtrace) })
+                } else {
+                        String::new()
+                };
+                eprintln!(
+                    "[share-busy] Share<{}> borrows={}{}{}\n{}",
+                    std::any::type_name::<T>(),
+                    guard.borrows.get(),
+                    self.holder_desc(),
+                    bt_txt,
+                    std::backtrace::Backtrace::force_capture()
+                );
+            }
             panic!(
-                "already borrowed: Share<{}> borrows={}",
+                "already borrowed: Share<{}> borrows={}{}",
                 std::any::type_name::<T>(),
-                guard.borrows.get()
+                guard.borrows.get(),
+                self.holder_desc()
             );
         }
+        self.mark_holder();
         guard.borrows.set(-1);
         // SAFETY: same as `borrow`, plus the borrow counter marks exclusive
         // access for the guard's lifetime.
@@ -78,54 +200,67 @@ impl<T> Share<T> {
         ShareMut {
             _guard: guard,
             ptr,
+            holder: &self.holder,
             _marker: PhantomData,
         }
     }
 
+    #[track_caller]
     pub fn try_borrow(&self) -> Option<ShareRef<'_, T>> {
-        let guard = self.0.try_lock()?;
+        let guard = self.inner.try_lock()?;
         if guard.borrows.get() < 0 {
             return None;
+        }
+        if guard.borrows.get() == 0 {
+            self.mark_holder();
         }
         guard.borrows.set(guard.borrows.get() + 1);
         let ptr = unsafe { &*guard.value.get() } as *const T;
         Some(ShareRef {
             _guard: guard,
             ptr,
+            holder: &self.holder,
             _marker: PhantomData,
         })
     }
 
+    #[track_caller]
     pub fn try_borrow_mut(&self) -> Option<ShareMut<'_, T>> {
-        let guard = self.0.try_lock()?;
+        let guard = self.inner.try_lock()?;
         if guard.borrows.get() != 0 {
             return None;
         }
+        self.mark_holder();
         guard.borrows.set(-1);
         let ptr = unsafe { &mut *guard.value.get() } as *mut T;
         Some(ShareMut {
             _guard: guard,
             ptr,
+            holder: &self.holder,
             _marker: PhantomData,
         })
     }
 
     /// Runs `f` with a shared borrow of the contents.
+    #[track_caller]
     pub fn with<R>(&self, f: impl FnOnce(&T) -> R) -> R {
         f(&self.borrow())
     }
 
     /// Runs `f` with an exclusive borrow of the contents.
+    #[track_caller]
     pub fn with_mut<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
         f(&mut self.borrow_mut())
     }
 }
 
 impl<T: Copy> Share<T> {
+    #[track_caller]
     pub fn get(&self) -> T {
         *self.borrow()
     }
 
+    #[track_caller]
     pub fn set(&self, value: T) {
         *self.borrow_mut() = value;
     }
@@ -146,6 +281,7 @@ impl<T> RefUnwindSafe for Share<T> {}
 pub struct ShareRef<'a, T> {
     _guard: ReentrantMutexGuard<'a, Inner<T>>,
     ptr: *const T,
+    holder: &'a AtomicU64,
     _marker: PhantomData<&'a T>,
 }
 
@@ -160,13 +296,18 @@ impl<T> Deref for ShareRef<'_, T> {
 
 impl<T> Drop for ShareRef<'_, T> {
     fn drop(&mut self) {
-        self._guard.borrows.set(self._guard.borrows.get() - 1);
+        let borrows = self._guard.borrows.get() - 1;
+        self._guard.borrows.set(borrows);
+        if borrows == 0 {
+            self.holder.store(0, Ordering::Relaxed);
+        }
     }
 }
 
 pub struct ShareMut<'a, T> {
     _guard: ReentrantMutexGuard<'a, Inner<T>>,
     ptr: *mut T,
+    holder: &'a AtomicU64,
     _marker: PhantomData<&'a mut T>,
 }
 
@@ -186,5 +327,6 @@ impl<T> DerefMut for ShareMut<'_, T> {
 impl<T> Drop for ShareMut<'_, T> {
     fn drop(&mut self) {
         self._guard.borrows.set(0);
+        self.holder.store(0, Ordering::Relaxed);
     }
 }

@@ -60,7 +60,56 @@ fn parse_params(descriptor: &str, is_static: bool) -> Option<(Vec<ParamSlot>, us
         let (kind, width) = match bytes[i] {
             b'B' | b'C' | b'I' | b'S' | b'Z' => (ParamKind::I32, 1usize),
             b'J' => (ParamKind::I64, 2usize),
-            // Floats/references are outside the executable bridge subset.
+            b'F' => (ParamKind::F32, 1usize),
+            b'D' => (ParamKind::F64, 2usize),
+            b'L' => {
+                // Reference type: skip to the terminating ';'.
+                let mut j = i + 1;
+                while j < bytes.len() && bytes[j] != b';' {
+                    j += 1;
+                }
+                if j >= bytes.len() {
+                    return None;
+                }
+                params.push(ParamSlot {
+                    local_slot: slot,
+                    kind: ParamKind::Ref,
+                });
+                slot += 1;
+                i = j + 1;
+                continue;
+            }
+            b'[' => {
+                // Array type: skip the bracket run then the element
+                // (primitive letter or L...;).
+                let mut j = i;
+                while j < bytes.len() && bytes[j] == b'[' {
+                    j += 1;
+                }
+                if j >= bytes.len() {
+                    return None;
+                }
+                if bytes[j] == b'L' {
+                    while j < bytes.len() && bytes[j] != b';' {
+                        j += 1;
+                    }
+                    if j >= bytes.len() {
+                        return None;
+                    }
+                } else if !matches!(
+                    bytes[j],
+                    b'B' | b'C' | b'D' | b'F' | b'I' | b'J' | b'S' | b'Z'
+                ) {
+                    return None;
+                }
+                params.push(ParamSlot {
+                    local_slot: slot,
+                    kind: ParamKind::Ref,
+                });
+                slot += 1;
+                i = j + 1;
+                continue;
+            }
             _ => return None,
         };
         params.push(ParamSlot {
@@ -93,12 +142,6 @@ impl AbstractCompiler for C2Compiler {
                 CompLevel::FullOptimization,
             )
         })?;
-        if task.is_osr() {
-            return Err(CompileError::unsupported(
-                "C2 OSR compilation is not ported",
-                CompLevel::FullOptimization,
-            ));
-        }
         let bytecode = method.bytecodes();
         if bytecode.is_empty() {
             return Err(CompileError::new(
@@ -116,14 +159,20 @@ impl AbstractCompiler for C2Compiler {
                 CompLevel::FullOptimization,
             ));
         }
-        let (params, param_slots) =
+        let is_osr = task.is_osr();
+        let (params, param_slots) = if is_osr {
+            // OSR entry reads locals/stack from the marshal buffer in
+            // rcx; local slot 0 of the frame reserves the buffer ptr.
+            (Vec::new(), 1usize)
+        } else {
             parse_params(descriptor, method.is_static()).ok_or_else(|| {
                 CompileError::new(
                     FailureReason::Unsupported,
                     format!("unsupported signature {}", descriptor),
                     CompLevel::FullOptimization,
                 )
-            })?;
+            })?
+        };
         let handlers: Vec<ExceptionHandler> = method
             .const_method()
             .exception_table()
@@ -135,6 +184,9 @@ impl AbstractCompiler for C2Compiler {
                 catch_type: e.catch_type as u32,
             })
             .collect();
+        // Typed catches dispatch through per-handler InstanceOf checks
+        // in the emitted code; each catch_type CP index resolves to a
+        // SiteInfo carrying the exception class's internal name.
         let method_code = MethodCode {
             name: task.method.method_name.as_str(),
             max_locals: method.max_locals() as usize,
@@ -145,6 +197,8 @@ impl AbstractCompiler for C2Compiler {
         };
         let mut sites: std::collections::HashMap<u16, super::builder::SiteInfo> =
             std::collections::HashMap::new();
+        let mut constants: std::collections::HashMap<u16, super::builder::ConstVal> =
+            std::collections::HashMap::new();
         if let Some(loader) = crate::share::runtime::threading::jvm_loader()
             && let Some(klass) = loader
                 .classes
@@ -153,6 +207,59 @@ impl AbstractCompiler for C2Compiler {
                 .cloned()
         {
             sites = super::builder::resolve_sites(&klass, bytecode);
+            for idx in crate::share::c1::c1_GraphBuilder::ldc_cp_indices(bytecode) {
+                if idx > u16::MAX as u32 {
+                    continue;
+                }
+                let Ok(c) = klass.constant(idx as u16) else {
+                    continue;
+                };
+                let v = match c {
+                    crate::share::classfile::classFileParser::Constant::Integer(v) => {
+                        super::builder::ConstVal::Int(*v)
+                    }
+                    crate::share::classfile::classFileParser::Constant::Long(v) => {
+                        super::builder::ConstVal::Long(*v)
+                    }
+                    crate::share::classfile::classFileParser::Constant::Float(v) => {
+                        super::builder::ConstVal::Float(*v)
+                    }
+                    crate::share::classfile::classFileParser::Constant::Double(v) => {
+                        super::builder::ConstVal::Double(*v)
+                    }
+                    _ => continue,
+                };
+                constants.insert(idx as u16, v);
+            }
+            // Typed-catch sites: catch_type is a CP index of a Class
+            // constant; expose its internal name through the same
+            // SiteInfo channel field/method sites use.
+            for h in &handlers {
+                let cp = h.catch_type;
+                if cp == 0 || cp > u16::MAX as u32 {
+                    continue;
+                }
+                let cp = cp as u16;
+                if sites.contains_key(&cp) {
+                    continue;
+                }
+                let Ok(crate::share::classfile::classFileParser::Constant::Class(name_idx)) =
+                    klass.constant(cp)
+                else {
+                    continue;
+                };
+                let Ok(name) = klass.utf8(*name_idx) else {
+                    continue;
+                };
+                sites.insert(
+                    cp,
+                    super::builder::SiteInfo {
+                        class: String::from_utf8_lossy(name).into_owned(),
+                        name: String::new(),
+                        desc: String::new(),
+                    },
+                );
+            }
         }
         if let Some(md) = &task.jit_metadata {
             for (idx, s) in &md.sites {
@@ -167,14 +274,56 @@ impl AbstractCompiler for C2Compiler {
                 }
             }
         }
-        let ctx = BuilderContext::with_sites(&sites);
+        let empty_fields: std::collections::HashMap<u16, super::builder::FieldAccess> =
+            std::collections::HashMap::new();
+        let empty_methods: std::collections::HashMap<u16, super::builder::MethodAccess> =
+            std::collections::HashMap::new();
+        let ctx = BuilderContext {
+            fields: &empty_fields,
+            methods: &empty_methods,
+            constants: &constants,
+            sites: &sites,
+        };
         let options = BackendOptions {
             stubs: crate::share::jitruntime::stub_map(),
+            stubs_no_unwind: crate::share::jitruntime::stub_map_no_unwind(),
             params,
             emit_safepoints: true,
             obj_layout: ObjLayoutMode::Uncompressed,
+            osr: is_osr,
         };
-        let mut compile = Compile::compile(&method_code, &ctx);
+        let mut compile = if is_osr {
+            let spec = task.osr_frame.as_ref().map(|f| {
+                super::builder::OsrSpec {
+                    entry_bci: task.osr_bci.max(0) as u32,
+                    local_kinds: f.local_kinds.clone(),
+                    stack_kinds: f.stack_kinds.clone(),
+                }
+            });
+            match spec {
+                Some(s) => Compile::compile_osr(&method_code, &ctx, &s),
+                None => {
+                    return Err(CompileError::unsupported(
+                        "OSR compile without frame snapshot",
+                        CompLevel::FullOptimization,
+                    ));
+                }
+            }
+        } else {
+            Compile::compile(&method_code, &ctx)
+        };
+        if let Some(build) = &compile.build
+            && !build.unsupported.is_empty()
+        {
+            return Err(CompileError::new(
+                FailureReason::Unsupported,
+                format!(
+                    "unsupported bytecodes: {}",
+                    build.unsupported.join("; ")
+                ),
+                CompLevel::FullOptimization,
+            ));
+        }
         let emitted = compile
             .backend(&method_code, &ctx, &options)
             .map_err(|e| match e {
@@ -195,6 +344,22 @@ impl AbstractCompiler for C2Compiler {
                 ),
             })?;
         self.compiled_methods += 1;
+        if let Ok(filter) = std::env::var("JVM25_DUMP_C2")
+            && method_code.name == filter
+        {
+            eprintln!(
+                "[c2-code] {} frame={}",
+                method_code.name,
+                emitted.frame_size
+            );
+            for (i, chunk) in emitted.code.chunks(16).enumerate() {
+                eprint!("  {:04x} ", i * 16);
+                for b in chunk {
+                    eprint!("{b:02x} ");
+                }
+                eprintln!();
+            }
+        }
         Ok(CompileOutcome {
             code_bytes: emitted.code,
             frame_size: emitted.frame_size,

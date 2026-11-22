@@ -41,6 +41,10 @@ thread_local! {
     /// Number of 8-byte slots below the JIT frame's `rbp` that may hold
     /// references; runtime stubs use it for conservative GC rooting.
     static FRAME_QWORDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Entry address of the innermost active nmethod; `jit_unwind`
+    /// uses it to locate the frame's epilogue for a register-restoring
+    /// unwind.
+    static CURRENT_NMETHOD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Result channel between JIT-called stubs and `try_invoke`.
@@ -85,6 +89,14 @@ pub(crate) fn set_frame_qwords(qwords: usize) {
 
 pub(crate) fn current_frame_qwords() -> usize {
     FRAME_QWORDS.with(|c| c.get())
+}
+
+pub(crate) fn set_current_nmethod(addr: usize) {
+    CURRENT_NMETHOD.with(|c| c.set(addr));
+}
+
+pub(crate) fn current_nmethod() -> usize {
+    CURRENT_NMETHOD.with(|c| c.get())
 }
 
 /// Outcome of a compiled-code invocation.
@@ -509,6 +521,15 @@ fn try_invoke_inner<'a>(
     set_depth(depth);
     let prev_frame_qwords = current_frame_qwords();
     set_frame_qwords(stubs::frame_qwords_for(addr));
+    let prev_nmethod = current_nmethod();
+    set_current_nmethod(addr);
+    if std::env::var_os("JVM25_JIT_ARGS").is_some() {
+        eprintln!(
+            "[jit-args] {} regs={:016x},{:016x},{:016x},{:016x} nstack={}",
+            String::from_utf8_lossy(descriptor),
+            regs[0], regs[1], regs[2], regs[3], nstack
+        );
+    }
     let call_args = CallArgs {
         regs,
         xmm,
@@ -517,12 +538,101 @@ fn try_invoke_inner<'a>(
         addr,
     };
     let (raw, xmm_raw) = unsafe { invoke_raw(&call_args) };
+    set_current_nmethod(prev_nmethod);
     set_frame_qwords(prev_frame_qwords);
     set_depth(previousDepth);
     static JIT_DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *JIT_DEBUG.get_or_init(|| std::env::var_os("JVM25_JIT_DEBUG").is_some()) {
         eprintln!("[jit] ret={:?} raw={:016x} xmm_raw={:016x}", sig.ret, raw, xmm_raw);
     }
+    match take_pending() {
+        Pending::Thrown(handle) => Some(CompiledResult::Thrown(handle)),
+        Pending::Deoptimize => Some(CompiledResult::Deoptimize),
+        Pending::None => {
+            let value = match sig.ret {
+                SlotKind::Void => None,
+                SlotKind::Int32 => Some(Value::Int(raw as u32 as i32)),
+                SlotKind::Int64 => Some(Value::Long(raw as i64)),
+                SlotKind::Float32 => Some(Value::Float(f32::from_bits(xmm_raw as u32))),
+                SlotKind::Float64 => Some(Value::Double(f64::from_bits(xmm_raw))),
+                SlotKind::Ref => Some(decode_ref(raw)),
+            };
+            Some(CompiledResult::Value(value))
+        }
+    }
+}
+
+/// OSR entry: marshals the interpreter's locals + operand stack into a
+/// contiguous `u64` buffer and calls the OSR nmethod with the buffer
+/// pointer in `rcx` (the compiled prologue spills it to frame slot 0;
+/// `OsrArg` nodes index `[buf + slot*8]`).  Returns `None` when the
+/// value shapes cannot be marshalled — the interpreter then continues.
+pub fn invoke_osr<'a>(
+    addr: usize,
+    descriptor: &[u8],
+    is_static: bool,
+    locals: &[Value<'a>],
+    stack: &[Value<'a>],
+) -> Option<CompiledResult<'a>> {
+    if addr == 0 {
+        return None;
+    }
+    let sig = parse_signature(descriptor, is_static)?;
+    let mut buf: Vec<u64> = Vec::with_capacity(locals.len() + stack.len());
+    for v in locals {
+        buf.push(match v {
+            Value::Empty => 0,
+            _ => arg_bits(v)?,
+        });
+    }
+    for v in stack {
+        buf.push(arg_bits(v)?);
+    }
+    take_pending();
+    let previous_depth = current_depth();
+    set_depth(0);
+    let prev_frame_qwords = current_frame_qwords();
+    set_frame_qwords(stubs::frame_qwords_for(addr));
+    let prev_nmethod = current_nmethod();
+    set_current_nmethod(addr);
+    let call_args = CallArgs {
+        regs: [buf.as_ptr() as u64, 0, 0, 0],
+        xmm: [0; 4],
+        stack: buf.as_ptr(),
+        nstack: 0,
+        addr,
+    };
+    // The marshal buffer holds live tagged references; scan it with the
+    // same conservative tagged-word check `frame_roots` uses and pin
+    // the decoded values for the duration of the call.
+    let _roots = crate::share::runtime::threading::jvm_loader().and_then(|loader| {
+        let mut roots = Vec::new();
+        for &raw in &buf {
+            if raw == 0 {
+                continue;
+            }
+            let tag = raw >> 48;
+            let slot = raw & REF_HANDLE_MASK;
+            if slot == 0 {
+                continue;
+            }
+            let handle = (slot - 1) as usize;
+            let in_bounds = match tag {
+                0 => handle < loader.borrow_objects().len(),
+                REF_TAG_OBJECT_ARRAY => handle < loader.obj_arrays.borrow().len(),
+                REF_TAG_PRIMITIVE_ARRAY => handle < loader.arrays.borrow().len(),
+                _ => false,
+            };
+            if in_bounds {
+                roots.push(decode_ref(raw));
+            }
+        }
+        stubs::register_frame_roots(&loader, roots)
+    });
+    let (raw, xmm_raw) = unsafe { invoke_raw(&call_args) };
+    set_current_nmethod(prev_nmethod);
+    set_frame_qwords(prev_frame_qwords);
+    set_depth(previous_depth);
     match take_pending() {
         Pending::Thrown(handle) => Some(CompiledResult::Thrown(handle)),
         Pending::Deoptimize => Some(CompiledResult::Deoptimize),

@@ -20,7 +20,7 @@
  */
 
 use super::gvn::PhaseGVN;
-use super::node::{NodeId, Opcode, Type};
+use super::node::{NodeId, Opcode, Type, NONE};
 use super::scheduler::{
     collect_materialized, effect_value_indices, phis_of_region, region_pred_index,
     terminal_value_indices, Schedule,
@@ -82,7 +82,23 @@ const XMM_POOL: [XMMRegister; 7] = [
 pub const TEMP_SLOTS: usize = 8;
 
 fn is_xmm_value(gvn: &PhaseGVN, node: NodeId) -> bool {
+    is_xmm_value_deep(gvn, node, 0)
+}
+
+fn is_xmm_value_deep(gvn: &PhaseGVN, node: NodeId, depth: u8) -> bool {
     let n = gvn.node(node);
+    if matches!(n.op, Opcode::Phi) {
+        // Phi carries no static type; its kind is that of its value
+        // inputs (all but the trailing Region control).  Depth cap
+        // keeps phi cycles terminating.
+        if depth >= 32 {
+            return false;
+        }
+        let values = &n.inputs[..n.inputs.len().saturating_sub(1)];
+        return values
+            .iter()
+            .any(|&i| i != NONE && is_xmm_value_deep(gvn, i, depth + 1));
+    }
     match n.op {
         Opcode::ConF(_) | Opcode::ConD(_) | Opcode::LoadF | Opcode::LoadD => true,
         _ => matches!(n.ty, Type::Float | Type::Double),
@@ -155,7 +171,7 @@ impl<'a> RegisterAllocator<'a> {
                 }
             }
             // Phi copies are uses in this predecessor block.
-            for e in &block.succs {
+            for e in block.succs.iter().chain(block.exc_succs.iter()) {
                 let succ_entry = self.schedule.blocks[e.block].entry;
                 if self.gvn.node(succ_entry).op != Opcode::Region {
                     continue;
@@ -167,6 +183,13 @@ impl<'a> RegisterAllocator<'a> {
                             self.collect_value(src, &mut use_set);
                         }
                     }
+                }
+            }
+            // Exception-edge tokens are defined by the dispatch sequence
+            // emitted after the trapping instruction.
+            for e in &block.exc_succs {
+                if matches!(self.gvn.node(e.ctrl).op, Opcode::IfException) {
+                    def.insert(e.ctrl);
                 }
             }
             out.insert(b, (use_set, def));
@@ -210,7 +233,11 @@ impl<'a> RegisterAllocator<'a> {
             let mut changed = false;
             for &b in self.order.iter().rev() {
                 let mut out = HashSet::new();
-                for e in &self.schedule.blocks[b].succs {
+                for e in self.schedule.blocks[b]
+                    .succs
+                    .iter()
+                    .chain(self.schedule.blocks[b].exc_succs.iter())
+                {
                     if let Some(s) = live_in.get(&e.block) {
                         out.extend(s.iter().copied());
                     }
@@ -260,6 +287,11 @@ impl<'a> RegisterAllocator<'a> {
     }
 
     fn def_key(&self, v: NodeId, use_def: &HashMap<usize, (HashSet<NodeId>, HashSet<NodeId>)>) -> (usize, usize) {
+        // Exception-edge tokens are defined on the edge out of their
+        // source block, not inside any instruction list.
+        if let Some(&(b, p)) = self.schedule.exc_def.get(&v) {
+            return (block_rpo(&self.schedule.blocks, b), p);
+        }
         for &b in &self.order {
             let block = &self.schedule.blocks[b];
             let (_, def) = &use_def[&b];

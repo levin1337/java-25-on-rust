@@ -203,7 +203,25 @@ pub(crate) fn string_value<'a>(loader: &ClassLoader<'a>, text: &str) -> Value<'a
 
 fn java_string<'a>(loader: &ClassLoader<'a>, value: Value<'a>) -> io::Result<String> {
     let Some(text) = stringNatives::string(loader, value)? else {
-        if std::env::var_os("JVM25_TRACE_STR").is_some() { eprintln!("[str-fail-refl]"); }
+        if std::env::var_os("JVM25_TRACE_STR").is_some() {
+            eprintln!(
+                "[str-fail-refl] {:?}",
+                match value {
+                    Value::Null => "Null",
+                    Value::Int(_) => "Int",
+                    Value::Long(_) => "Long",
+                    Value::Float(_) => "Float",
+                    Value::Double(_) => "Double",
+                    Value::Object(_) => "Object",
+                    Value::ObjectArray(_) => "ObjectArray",
+                    Value::PrimitiveArray(_) => "PrimitiveArray",
+                    Value::String(_) => "String",
+                    Value::HostString(_) => "HostString",
+                    Value::ClassMirror(_) => "ClassMirror",
+                    _ => "other",
+                }
+            );
+        }
         return Err(invalid("Expected java.lang.String"));
     };
     Ok(text.into_owned())
@@ -1949,6 +1967,10 @@ fn class_java_method<'a>(
         (b"getAnnotatedInterfaces", b"()[Ljava/lang/reflect/AnnotatedType;") => {
             member_array(loader, b"java/lang/reflect/AnnotatedType", Vec::new()).ok()
         }
+        (b"getAnnotations", b"()[Ljava/lang/annotation/Annotation;")
+        | (b"getDeclaredAnnotations", b"()[Ljava/lang/annotation/Annotation;") => {
+            member_array(loader, b"java/lang/annotation/Annotation", Vec::new()).ok()
+        }
         (b"getEnumConstants", b"()[Ljava/lang/Object;")
         | (b"getEnumConstantsShared", b"()[Ljava/lang/Object;") => {
             enum_constants(loader, class).ok()
@@ -2381,6 +2403,14 @@ pub(crate) fn class_invoke<'a>(
     descriptor: &[u8],
     arguments: &[Value<'a>],
 ) -> io::Result<Option<Value<'a>>> {
+    if std::env::var_os("JVM25_TRACE").is_some() {
+        eprintln!(
+            "[class_invoke] {} {} args={}",
+            String::from_utf8_lossy(name),
+            String::from_utf8_lossy(descriptor),
+            arguments.len()
+        );
+    }
     let receiver = arguments.first().copied().unwrap_or(Value::Null);
     // Heap `java.lang.Class` objects carry a populated `protectionDomain`
     // field; keep the handle so natives like `getProtectionDomain0` can
@@ -2587,6 +2617,11 @@ pub(crate) fn class_invoke<'a>(
             if is_array || is_primitive {
                 Value::Null
             } else {
+                if std::env::var_os("JVM25_TRACE").is_some() {
+                    let names: Vec<String> = klass.as_ref().unwrap().class.attributes.iter()
+                        .map(|a| String::from_utf8_lossy(a.name).into_owned()).collect();
+                    eprintln!("[gsig0] class={} attrs={names:?}", String::from_utf8_lossy(class));
+                }
                 let signature = klass.as_ref().unwrap().class.attributes.iter().find_map(|attribute| {
                     if attribute.name != b"Signature" || attribute.bytes.len() < 2 {
                         return None;
@@ -2648,10 +2683,13 @@ pub(crate) fn class_invoke<'a>(
             if is_array || is_primitive {
                 Value::Null
             } else {
-                match klass
-                    .as_ref()
-                    .and_then(|klass| klass.class.nest_host())
-                {
+                let host = klass.as_ref().and_then(|klass| {
+                    loader
+                        .hidden_nest_host(klass.class.name)
+                        .map(|h| &*loader.storage.alloc_slice_copy(&h))
+                        .or_else(|| klass.class.nest_host())
+                });
+                match host {
                     Some(host) => Value::ClassMirror(host),
                     None => Value::ClassMirror(class),
                 }
@@ -2670,6 +2708,17 @@ pub(crate) fn class_invoke<'a>(
                 }
                 if !names.iter().any(|name| *name == klass.class.name) {
                     names.push(klass.class.name);
+                }
+                // Hidden nestmates carry no NestMembers attribute entry;
+                // they belong to the nest of their VM-assigned host.
+                let host = loader
+                    .hidden_nest_host(klass.class.name)
+                    .or_else(|| klass.class.nest_host().map(|h| h.to_vec()))
+                    .unwrap_or_else(|| klass.class.name.to_vec());
+                for member in loader.hidden_nest_members(&host) {
+                    if !names.iter().any(|name| *name == member.as_slice()) {
+                        names.push(&*loader.storage.alloc_slice_copy(&member));
+                    }
                 }
                 class_array(loader, &names)?
             }

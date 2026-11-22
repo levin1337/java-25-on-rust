@@ -244,7 +244,16 @@ fn std_write(handle: u64, buf: &[u8]) -> io::Result<()> {
 fn std_read(handle: u64, buf: &mut [u8]) -> io::Result<usize> {
     use std::io::Read;
     match handle {
-        1 => io::stdin().lock().read(buf),
+        1 => {
+            // Blocking native I/O must quiesce the thread for GC: a
+            // thread parked here can wait forever (console input), and
+            // the collector only proceeds once every registered thread
+            // reports Quiesced/Blocked.
+            crate::share::memory::heap::quiesce();
+            let result = io::stdin().lock().read(buf);
+            crate::share::memory::heap::unquiesce();
+            result
+        }
         _ => Ok(0),
     }
 }

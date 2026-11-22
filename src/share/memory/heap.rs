@@ -380,6 +380,12 @@ struct ThreadEntry {
     id: ThreadId,
     roots: Vec<Handle>,
     state: ThreadGcState,
+    /// Set once the thread reports through `safepoint()` — proof it
+    /// executes Java and will keep reporting.  Entries created only by
+    /// `quiesce()` (service threads parked on a contended `Share`)
+    /// never safepoint again, so `unquiesce` drops them instead of
+    /// leaving them `Running` where every later collection would wait.
+    safepointed: bool,
 }
 
 struct GcShared {
@@ -394,6 +400,27 @@ static GC_STATE: Mutex<GcShared> = Mutex::new(GcShared {
     threads: Vec::new(),
 });
 static GC_CV: Condvar = Condvar::new();
+
+// Service threads that never execute Java (compiler threads, the
+// attach listener, the dump watchdog) must not join the stop-the-world
+// registry: they only get an entry when a contended `Share` borrow
+// parks them in `quiesce()`, after which `unquiesce()` would leave
+// them `Running` forever — they have no safepoint to report to, so
+// every later collection would wait on them indefinitely.  Their
+// arena borrows are already tolerated by the sweep's `try_borrow`
+// fast path, so skipping registration is safe.
+thread_local! {
+    static GC_EXEMPT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Marks the calling thread as GC-exempt; call once at thread start.
+pub fn set_gc_exempt() {
+    GC_EXEMPT.with(|flag| flag.set(true));
+}
+
+fn gc_exempt() -> bool {
+    GC_EXEMPT.with(|flag| flag.get())
+}
 /// Serializes `#[cfg(test)]` code paths that drive `collect_cycle`:
 /// the pending-GC guard would otherwise let a concurrent test's
 /// collection return early without sweeping, making assertions flaky.
@@ -412,10 +439,83 @@ fn entry_mut<'a>(state: &'a mut GcShared, id: ThreadId) -> &'a mut ThreadEntry {
             id,
             roots: Vec::new(),
             state: ThreadGcState::Running,
+            safepointed: false,
         });
         state.threads.last_mut().unwrap()
     }
 }
+
+/// JIT-compiled frames keep their reference slots as tagged words on the
+/// native stack but have no interpreter `Frame` for `snapshot_handles` to
+/// walk — stub-time `frame_roots` only covers the innermost frame, so
+/// references held by outer compiled frames would be swept.  As a
+/// conservative fallback we scan the whole committed stack for words that
+/// decode as in-bounds tagged references; false positives only retain
+/// objects longer, they can never free a live one.
+#[cfg(windows)]
+fn stack_tagged_roots(loader: &ClassLoader<'_>, out: &mut Vec<Handle>) {
+    use crate::share::jitruntime::runtime::{REF_HANDLE_MASK, REF_TAG_OBJECT, REF_TAG_OBJECT_ARRAY, REF_TAG_PRIMITIVE_ARRAY};
+    let (objects, obj_arrays, arrays) = {
+        let (Some(objects), Some(obj_arrays), Some(arrays)) = (
+            loader.objects.try_borrow(),
+            loader.obj_arrays.try_borrow(),
+            loader.arrays.try_borrow(),
+        ) else {
+            return;
+        };
+        (objects.len(), obj_arrays.len(), arrays.len())
+    };
+    let stack_base = unsafe {
+        unsafe extern "system" {
+            fn NtCurrentTeb() -> *mut u8;
+        }
+        // NT_TIB64: StackBase at +0x08 (high address of the stack).
+        (NtCurrentTeb().add(8) as *const usize).read_unaligned()
+    };
+    let mut rsp: usize;
+    unsafe {
+        core::arch::asm!("mov {}, rsp", out(reg) rsp);
+    }
+    let start = rsp & !7;
+    if stack_base <= start || stack_base - start > (64 << 20) {
+        return;
+    }
+    let mut addr = start;
+    let mut found = 0usize;
+    while addr + 8 <= stack_base {
+        let raw = unsafe { (addr as *const u64).read_unaligned() };
+        addr += 8;
+        if raw == 0 {
+            continue;
+        }
+        let tag = raw >> 48;
+        let slot = raw & REF_HANDLE_MASK;
+        if slot == 0 {
+            continue;
+        }
+        let handle = (slot - 1) as usize;
+        let in_bounds = match tag {
+            REF_TAG_OBJECT => handle < objects,
+            REF_TAG_OBJECT_ARRAY => handle < obj_arrays,
+            REF_TAG_PRIMITIVE_ARRAY => handle < arrays,
+            _ => false,
+        };
+        if in_bounds {
+            found += 1;
+            out.push(match tag {
+                REF_TAG_OBJECT => Handle::Object(handle),
+                REF_TAG_OBJECT_ARRAY => Handle::ObjArray(handle),
+                _ => Handle::TypeArray(handle),
+            });
+        }
+    }
+    if std::env::var_os("JVM25_BLOCKTRACE").is_some() {
+        eprintln!("[stackroots] rsp={start:#x} base={stack_base:#x} qwords={} found={found}", (stack_base - start) / 8);
+    }
+}
+
+#[cfg(not(windows))]
+fn stack_tagged_roots(_loader: &ClassLoader<'_>, _out: &mut Vec<Handle>) {}
 
 /// Captures the handles reachable from this thread's interpreter frames.
 fn snapshot_handles() -> Vec<Handle> {
@@ -427,6 +527,9 @@ fn snapshot_handles() -> Vec<Handle> {
             }
         }
     });
+    if let Some(loader) = crate::share::runtime::threading::jvm_loader() {
+        stack_tagged_roots(&loader, &mut out);
+    }
     out
 }
 
@@ -436,11 +539,15 @@ fn snapshot_handles() -> Vec<Handle> {
 /// wakeup so a new cycle started while this thread was still parked
 /// cannot strand it.
 pub fn safepoint() {
+    if gc_exempt() {
+        return;
+    }
     let id = crate::share::prims::jniReferences::current_thread_id();
     loop {
         let mut state = GC_STATE.lock();
         if !state.pending {
             let entry = entry_mut(&mut state, id);
+            entry.safepointed = true;
             if entry.state != ThreadGcState::Blocked {
                 entry.state = ThreadGcState::Running;
                 entry.roots = Vec::new();
@@ -452,6 +559,7 @@ pub fn safepoint() {
             let entry = entry_mut(&mut state, id);
             entry.roots = roots;
             entry.state = ThreadGcState::Quiesced;
+            entry.safepointed = true;
         }
         if std::env::var_os("JVM25_BLOCKTRACE").is_some() {
             eprintln!("[block] safepoint-park tid={id:?}");
@@ -465,6 +573,9 @@ pub fn safepoint() {
 /// are captured now; while blocked the frames cannot change, so the
 /// snapshot stays valid until `unquiesce`.
 pub fn quiesce() {
+    if gc_exempt() {
+        return;
+    }
     let mut state = GC_STATE.lock();
     let id = crate::share::prims::jniReferences::current_thread_id();
     let roots = snapshot_handles();
@@ -476,13 +587,26 @@ pub fn quiesce() {
 
 /// Called when a previously blocked thread resumes execution.
 pub fn unquiesce() {
+    if gc_exempt() {
+        return;
+    }
     let mut state = GC_STATE.lock();
     let id = crate::share::prims::jniReferences::current_thread_id();
-    if let Some(entry) = state.threads.iter_mut().find(|entry| entry.id == id)
-        && entry.state == ThreadGcState::Blocked
-    {
-        entry.state = ThreadGcState::Running;
-        entry.roots = Vec::new();
+    if let Some(position) = state.threads.iter().position(|entry| entry.id == id) {
+        let entry = &mut state.threads[position];
+        if entry.state == ThreadGcState::Blocked {
+            if entry.safepointed {
+                entry.state = ThreadGcState::Running;
+                entry.roots = Vec::new();
+            } else {
+                // Never reported through `safepoint()`: a service
+                // thread that only touched the registry via a
+                // contended `Share` borrow.  It will never safepoint
+                // again, so keeping it `Running` would stall every
+                // later collection; drop the entry instead.
+                state.threads.remove(position);
+            }
+        }
     }
 }
 
@@ -578,7 +702,7 @@ fn arena_total<'a>(loader: &ClassLoader<'a>) -> usize {
 /// `SWEEP_THRESHOLD` slots since the last completed sweep.
 pub fn collect<'a>(loader: &ClassLoader<'a>) -> io::Result<()> {
     let mode = heap_gc_mode();
-    if mode == HeapGcMode::NoCollect {
+    if mode == HeapGcMode::NoCollect || gc_exempt() {
         return Ok(());
     }
     let total = arena_total(loader);
@@ -596,7 +720,7 @@ pub fn collect<'a>(loader: &ClassLoader<'a>) -> io::Result<()> {
 /// WhiteBox, explicit `CollectedHeap::collect` calls).
 pub fn collect_now<'a>(loader: &ClassLoader<'a>) -> io::Result<()> {
     let mode = heap_gc_mode();
-    if mode == HeapGcMode::NoCollect {
+    if mode == HeapGcMode::NoCollect || gc_exempt() {
         return Ok(());
     }
     collect_cycle(loader, mode, arena_total(loader), gc_workers(mode))

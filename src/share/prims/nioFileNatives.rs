@@ -962,6 +962,9 @@ pub(crate) fn dispatcher<'a>(
         }
         (b"GetFileAttributesEx0", b"(JJ)V") => {
             let path = read_wide_path(arg(0))?;
+            if std::env::var_os("JVM25_TRACE_WIN").is_some() {
+                eprintln!("[GetFileAttributesEx0] {path:?}");
+            }
             let out = arg(1);
             let mut data = [0u8; 36];
             let meta = match std::fs::metadata(java_path(&path)) {

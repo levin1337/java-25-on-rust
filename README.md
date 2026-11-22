@@ -25,7 +25,7 @@
 
 - 🏗️ **Полную структуру оригинальной JVM** — каждый модуль `share/` из `srcJVMc++` (C++-референс OpenJDK 25 в репозитории) имеет свой аналог в `src/share/`
 - ⚡ **Максимальную производительность** — чистый оптимизированный код, arena-аллокации, JIT C1+C2
-- ✅ **Совместимость** — запуск любых Java-приложений, включая тяжёлые, цель — **Minecraft без ошибок**
+- ✅ **Совместимость** — запуск любых Java-приложений, включая тяжёлые, цель — **Minecraft client без ошибок**
 - 🧪 **Полный тестовый прогон** — все тесты JVM должны проходить на Rust-версии
 
 ---
@@ -96,27 +96,27 @@ cargo test --test asm_x86  # ассемблерный слой
 # JIT e2e: tests/jit/run-jit-tests.ps1 (JitBench: interpreter vs JIT diff)
 ```
 
-Отладочные флаги: `JVM25_TRACE`, `JVM25_DUMP`, `JVM25_BLOCKTRACE`, `JVM25_TRACE_COMPILE`, `JVM25_C1_THRESHOLD`, `JVM25_NO_JIT`, `JVM25_PROFILE_NATIVE`, `JVM25_MEMSTAT`, `JVM25_STACK_MB`, `JVM25_NO_VERIFY`, `JVM25_DUMP_JIT`, `JVM25_DUMP_LIR`.
+Отладочные флаги: `JVM25_TRACE`, `JVM25_DUMP`, `JVM25_BLOCKTRACE`, `JVM25_TRACE_COMPILE`, `JVM25_C1_THRESHOLD`, `JVM25_NO_JIT`, `JVM25_NO_C2`, `JVM25_PROFILE_NATIVE`, `JVM25_MEMSTAT`, `JVM25_STACK_MB`, `JVM25_NO_VERIFY`, `JVM25_DUMP_JIT`, `JVM25_DUMP_LIR`, `JVM25_DUMP_C2`, `JVM25_TRACE_WIN`, `JVM25_TRACE_EXC`, `JVM25_DBG_INDY`, `JVM25_DBG_PHASES`. На Windows при SIGSEGV печатается `[crash]` с RIP→nmethod-маппингом.
 
 ---
 
 ## 📈 Статус разработки
 
-Актуально на 2026-11-15. **~103k+ строк Rust** в `src/share/` (было ~73k до волны портирования GC/JIT/инфраструктуры).
+Актуально на 2026-11-20. **~202k строк Rust** в `src/share/` (было ~73k до волны портирования GC/JIT/инфраструктуры).
 
 ### ✅ Работает и проверено тестами
 
 | Подсистема | Что сделано |
 |---|---|
 | **Classfile / ClassLoader** | Полный парсер class-файлов Java 25: все JVMS-атрибуты структурно (`attributes.rs` ~1250 строк — BootstrapMethods/indy/condy, Signature grammar, Annotations, Module, Record, StackMapTable-декодер), верификатор с JVMS-проверками, загрузка из директорий/JAR/**JImage `lib/modules`**. |
-| **Иерархия и линковка** | Резолюция методов/полей, itable/vtable, default-методы, `<clinit>` порядок JVMS 5.5, реальные Java-исключения связывания. |
-| **Рефлексия / indy** | `java.lang.reflect`, `LambdaMetafactory`, `StringConcatFactory`, generic bootstrap, condy. |
+| **Иерархия и линковка** | Резолюция методов/полей, itable/vtable, default-методы, `<clinit>` порядок JVMS 5.5, реальные Java-исключения связывания. **Hidden classes**: `defineClass0` обрабатывает `NESTMATE_CLASS`/lookup-миррор — nest host для классов, которые спинит `LambdaMetafactory`/`LambdaForm`; `getNestHost0`/`areNestMates`/`getNestMembers0` учитывают VM-назначенный хост. |
+| **Рефлексия / indy** | `java.lang.reflect`, `LambdaMetafactory` (включая прямые вызовы `metafactory` — спиннинг hidden-классов и приватный доступ), `StringConcatFactory`, generic bootstrap, condy, `BoundMethodHandle` species через `lambda_form_invoke`. |
 | **Потоки / синхронизация** | Java-потоки на OS-потоках, мониторы, wait/notify, park/unpark, shutdown hooks. |
-| **Память и GC** | Рабочий mark-sweep с safepoints и `gc_extra_roots`; reference processing починен (pending-list — GC-корень). |
+| **Память и GC** | Рабочий mark-sweep с safepoints и `gc_extra_roots`; reference processing починен (pending-list — GC-корень). **GC-дедлок исправлен** (`5f4f9e4`): сервисные потоки (компиляторы C1/C2, attach listener, watchdog) больше не попадают в wait-set коллектора — safepoint-дедлок под JIT+GC-нагрузкой устранён (`JVM25_GC=serial|parallel|epsilon` выбирает движок). |
 | **Файлы / NIO / Сеть / ZIP** | FileDispatcher (pread/pwrite/mmap/locks), Selector/WEPoll, TCP/UDP, `java.util.zip` Inflater — всё проверено e2e. |
 | **Нативные методы** | **~700/777 нативов java.base** (аудит против src.zip JDK 25). Остаток ~77: FFM/libffi, Windows ACL, host-locale — capability-gated. |
 | **C1 JIT** | **Работает e2e**: heap-стабы (getfield/putfield/array/new/cast/instanceof/athrow с семантикой интерпретатора), JIT→JIT прямые вызовы, JIT→интерпретатор через stub, non-leaf unwind, рекурсия, проброс исключений, deopt/OSR-fallback. GC-безопасность JIT-фреймов через `FrameRoots`+`gc_extra_roots`. |
-| **C2 JIT (opto)** | Типы/ноды/GVN/scheduler/liveness+interference/x64-эмиттер; рабочее подмножество: примитивная арифметика, idiv с исключениями, массивы через стабы, float/double SSE. 45/45 тестов. |
+| **C2 JIT (opto)** | **В проде tiered-пайплайне**: типы/ноды/GVN/scheduler/liveness/x64-эмиттер; все сигнатуры (примитивы, float/double, ref/array), поля, вызовы, свитчи, массивы; **typed catches** (упорядоченная цепочка ExcCheck→InstanceOf→rethrow), **OSR** (marshal-буфер в rcx, `invoke_osr`), **`invokedynamic`** (общий с интерпретатором callsite-resolution стаб). **Планировщик упорядочивает эффекты по data-deps** (`5a42624`): use-before-def для trapping value producers (RemI/LoadP/…) и `ArrayLength` в mem-цепочке исправлены; array-стабы не держат borrow через throw. Верифицировано на C2StressP: acc бит-в-бит совпадает с интерпретатором под C1+C2+GC. 105/105 тестов (1 pre-existing failure). |
 | **asm/ (MacroAssembler)** | Полный порт: register/reloc/codeBuffer/x86_64 кодировки/MacroAssembler с oopmaps, safepoint_poll, G1 write barriers. 12/12 тестов. |
 | **code/ + compiler/** | CompileBroker с реальными C1/C2 очередями и worker-потоками, policy, nmethod с PcDesc/DeoptLiveMap, CodeCache с адаптерами и vtable-стабами (реальный x64-код). |
 | **ci/** | Compiler Interface: CiEnv/CiInstanceKlass/CiMethod/CiField/CIType/ciLiveness (полный MethodLiveness). |
@@ -134,23 +134,22 @@ cargo test --test asm_x86  # ассемблерный слой
 
 | Подсистема | Состояние |
 |---|---|
-| **C2 покрытие** | Расширение опкодов: fields/calls/ref-arrays в работе; полный regalloc (Chaitin), интеграция с `asm/` MacroAssembler. |
-| **Настоящий OSR** | Сейчас best-effort whole-method вызов; нужен перенос locals/stack в OSR-entry. |
+| **C2 покрытие** | Основное покрыто и в проде (см. выше). Осталось: точная деоптимизация (сейчас fallback = переисполнение метода), интеграция с `asm/` MacroAssembler для output-слоя. |
 | **Деоптимизация** | Fallback = переисполнение метода; нужен точный frame-state restore с BCI. |
-| **GC-интеграция** | Коллекторы портированы структурно, но выбор коллектора/барьеры в JIT-коде не подключены; рабочий путь — mark-sweep. |
+| **GC-интеграция** | Коллекторы портированы структурно; write-барьеры в этом дизайне не нужны (сторы идут через Rust-стабы, безопасность — `gc_extra_roots`/консервативный скан фреймов). Рабочий путь — mark-sweep. |
 | **jvm.dll** | Экспорты `JNI_CreateJavaVM`/`JVM_*` для запуска штатным `java.exe` — в работе. |
 | **interpreter/** | Доводка `templateInterpreter*`, `zero/`, `bytecodeUtils`, `rewriter` до полной структуры. |
 | **JFR события** | Каркас готов; генерация всех ~171 событий из events.xml и emit-точки — впереди. |
-| **Minecraft** | Fabric-сервер 1.16.1 проходит bootstrap; client — упирается в скорость интерпретатора до завершения JIT. |
+| **Minecraft** | **Цель — клиент** (26.3 + Fabric). Leaf/Paper server 1.21.11 используется как стресс-тест bootstrap: доходит до Netty `PlatformDependent.<clinit>`; критические баги исправлены — OSR-dispatch segfault (`f85c2e6`), hidden-class nest hosts (`32e8c95`). Для клиента дополнительно нужны: LWJGL/FFM нативы, OpenAL, GLFW — это самые тяжёлые оставшиеся подсистемы. |
 
 ### 🔴 Осталось
 
 1. **Стабилизация сборки** — параллельная работа агентов оставляет временные ошибки компиляции в WIP-областях.
-2. **C2 codegen** — matcher/regalloc/output через новый `asm/` слой.
-3. **Производительность JIT** — FrameRoots (консервативный скан) заменить точными oop-maps; сейчас JIT scale=1 медленнее интерпретатора (~63s vs ~25s на JitBench).
+2. **C2 codegen** — output-слой через новый `asm/` MacroAssembler; точная деоптимизация.
+3. **Производительность JIT** — FrameRoots (консервативный скан) заменить точными oop-maps; интерпретатор всё ещё быстрее JIT на части нагрузок.
 4. **jvm.dll + CDS-загрузка JDK-архивов**.
 5. **FFM (libffi)**, Windows ACL, host-locale — остаток ~77 нативов.
-6. **Minecraft client** — финальная цель.
+6. **Minecraft client до конца** — bootstrap Leaf-сервера как стресс-тест, затем Fabric/Knot клиент (LWJGL, OpenAL, GLFW — самые тяжёлые оставшиеся подсистемы).
 
 ### 📊 JIT-бенчмарк (JitBench scale=1, release)
 
@@ -160,6 +159,15 @@ cargo test --test asm_x86  # ассемблерный слой
 | C1 JIT | ~64s (вкл. компиляцию ~150 методов) | ✅ **побайтово идентичен** |
 
 Корректность JIT полная; скорость пока ниже интерпретатора — FrameRoots-скан на каждый stub-вызов доминирует. Ускорение ожидается после oop-maps и C2.
+
+### 🎯 Текущая точка (2026-11-20)
+
+- **C2 в проде**: invocation + OSR-компиляция, typed catches, `invokedynamic`, все сигнатуры — верифицировано smoke-тестами (`OsrSmoke`, `C2Catch`, `C2Indy`, `C2Fields`, `ProxyStress`, `ToLowerCrash`).
+- **Критические баги MC-path закрыты**: OSR nmethod публиковался в обычный dispatch → segfault на первом `OsrArg`; hidden classes не имели nest host → `LambdaMetafactory` падал.
+- **Диагности**: Windows VEH crash handler (RIP→nmethod), `JVM25_NO_C2`, `JVM25_DUMP_C2`, `JVM25_TRACE_DEFINE`, `JVM25_TRACE_WIN`, `JVM25_TRACE` unsafe-spin stack dumps, `JVM25_DUMP` watchdog (стеки Java-потоков каждые 5с).
+- **Classloader/ServiceLoader (566cd8a)**: трекинг defining loader через `defineClass*`, `getClassLoader0` возвращает реальный loader, `findLoadedClass0`/`findBootstrapClass` по JVMS, `JarURLConnection.connect()` заполняет настоящий `JarFile`/`JarEntry`. `ServiceLoader` для `io.papermc.paper.ServerBuildInfo` работает (провайдер инстанцируется).
+- **Leaf bootstrap (dev-classpath)**: прошёл старый краш `ServerBuildInfo Optional.empty`; сейчас глубоко внутри `PaperBootstrap.<clinit>` → log4j2 init — чистая интерпретаторная медлительность, ошибок нет. ВНИМАНИЕ: `leaf-runner` по умолчанию берёт устаревший клон `Leaf-ver-1.21.11/java-25-on-rust` — передавать `--jvm`/`JVM25_RUST` на этот репозиторий.
+- **Следующий шаг**: дождаться конца log4j init / `PaperBootstrap.boot()` — смотреть следующий блокер; затем либо `jvm.dll`-экспорты (`JNI_CreateJavaVM` уже есть, нужны `JVM_*`), либо точная деоптимизация в C2.
 
 ---
 

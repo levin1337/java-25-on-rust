@@ -90,6 +90,19 @@ pub enum RuntimeStub {
     FloatConvert,
     UnresolvedField,
     UnresolvedCall,
+    /// Consumes the pending-outcome channel after a non-unwinding
+    /// stub call: returns 0 when nothing is pending, otherwise the
+    /// tagged reference word of the thrown object plus one (the JIT
+    /// subtracts one to recover the `encode_ref` encoding).
+    ExcCheck,
+    /// Re-arms `Pending::Thrown` for an exception reference that
+    /// matched no typed handler and unwinds to `invoke_raw` — the
+    /// typed-catch dispatch fallthrough.
+    RethrowExc,
+    /// `invokedynamic`: resolves the bootstrap call site named by the
+    /// constant-pool index passed in the opcode slot and invokes the
+    /// linked target with the marshalled arguments.
+    InvokeDynamic,
 }
 
 /// Resolved constant-pool site passed to JIT runtime stubs.  One

@@ -53,12 +53,57 @@ impl Compile {
         c
     }
 
+    /// OSR compilation: graph entry is `osr.entry_bci` seeded from
+    /// marshal-buffer inputs instead of method parameters.
+    pub fn compile_osr(
+        method: &MethodCode,
+        ctx: &BuilderContext,
+        osr: &super::builder::OsrSpec,
+    ) -> Self {
+        let mut gvn = PhaseGVN::new();
+        let start = gvn.transform(Opcode::Start, vec![]);
+        let root = gvn.transform(Opcode::Root, vec![start]);
+        let mut c = Self {
+            method_name: method.name.to_string(),
+            gvn,
+            root,
+            start,
+            phases_run: Vec::new(),
+            build: None,
+            optimized: false,
+            node_types: Vec::new(),
+            loops: None,
+        };
+        let mut phase = Phase::new(PhaseNumber::Parser);
+        let res = BytecodeGraphBuilder::build_osr(
+            &mut c.gvn,
+            method,
+            ctx,
+            c.start,
+            c.root,
+            osr,
+        );
+        phase.complete();
+        c.phases_run.push(phase);
+        c.build = Some(res);
+        c
+    }
+
     pub fn build_graph(&mut self, method: &MethodCode, ctx: &BuilderContext) {
         let mut phase = Phase::new(PhaseNumber::Parser);
         let res = BytecodeGraphBuilder::build(&mut self.gvn, method, ctx, self.start, self.root);
         phase.complete();
         self.phases_run.push(phase);
         self.build = Some(res);
+    }
+
+    fn dbg_dump(&self, tag: &str) {
+        if std::env::var("JVM25_DBG_PHASES").is_ok() {
+            eprintln!("=== {} ===", tag);
+            for n in &self.gvn.nodes {
+                eprintln!("N{} {:?} in={:?}", n.id, n.op, n.inputs);
+            }
+        }
     }
 
     pub fn optimize(&mut self) {
@@ -71,6 +116,7 @@ impl Compile {
             phase.complete();
             self.phases_run.push(phase);
         }
+        self.dbg_dump("itergvn1");
         {
             let mut phase = Phase::with_name(PhaseNumber::GVN, "typer");
             let typer = PhaseTyperRun::optimize(&self.gvn);
@@ -78,12 +124,14 @@ impl Compile {
             phase.complete();
             self.phases_run.push(phase);
         }
+        self.dbg_dump("typer");
         {
             let mut phase = Phase::with_name(PhaseNumber::Optimistic, "canonicalizer");
             PhaseCanonicalizerRun::optimize(&mut self.gvn);
             phase.complete();
             self.phases_run.push(phase);
         }
+        self.dbg_dump("canonicalizer");
         {
             let mut phase = Phase::with_name(PhaseNumber::MacroExpand, "macroExpand");
             let mut me = PhaseMacroExpandRun::new();
@@ -91,36 +139,42 @@ impl Compile {
             phase.complete();
             self.phases_run.push(phase);
         }
+        self.dbg_dump("macroexpand");
         {
             let mut phase = Phase::new(PhaseNumber::IdealLoop);
             self.loops = Some(PhaseIdealLoopRun::optimize(&self.gvn));
             phase.complete();
             self.phases_run.push(phase);
         }
+        self.dbg_dump("idealloop");
         {
             let mut phase = Phase::new(PhaseNumber::GVN);
             PhaseIterGVN::optimize(&mut self.gvn);
             phase.complete();
             self.phases_run.push(phase);
         }
+        self.dbg_dump("itergvn2");
         {
             let mut phase = Phase::new(PhaseNumber::RemoveUselessAndRenumberLive);
             PhaseRemoveUselessAndRenumber::optimize(&mut self.gvn);
             phase.complete();
             self.phases_run.push(phase);
         }
+        self.dbg_dump("dce1");
         {
             let mut phase = Phase::new(PhaseNumber::Optimistic);
             PhaseCCP::optimize(&mut self.gvn);
             phase.complete();
             self.phases_run.push(phase);
         }
+        self.dbg_dump("ccp");
         {
             let mut phase = Phase::new(PhaseNumber::RemoveUseless);
             PhaseRemoveUselessAndRenumber::optimize(&mut self.gvn);
             phase.complete();
             self.phases_run.push(phase);
         }
+        self.dbg_dump("dce2");
         self.optimized = true;
     }
 
@@ -155,6 +209,22 @@ impl Compile {
                 "scheduler rejected graph: {}",
                 schedule.unsupported.join("; ")
             )));
+        }
+        if std::env::var("JVM25_DBG_SCHED").is_ok() {
+            eprintln!("[sched] {} blocks={}", method.name, schedule.blocks.len());
+            for (bi, b) in schedule.blocks.iter().enumerate() {
+                let ops: Vec<String> = b
+                    .instrs
+                    .iter()
+                    .map(|&n| {
+                        let node = self.gvn.node(n);
+                        let ins: Vec<String> =
+                            node.inputs.iter().map(|&i| format!("N{i}")).collect();
+                        format!("N{}:{:?}({})", n, node.op, ins.join(","))
+                    })
+                    .collect();
+                eprintln!("  blk{} rpo={} entry=N{}: {}", bi, b.rpo, b.entry, ops.join(" "));
+            }
         }
         let alloc = RegisterAllocator::new(&self.gvn, &schedule)
             .allocate(method.param_slots)
@@ -969,7 +1039,10 @@ mod tests {
     // real published runtime-stub table.
 
     use crate::share::interpreter::bytecodeInterpreter::Value;
-    use crate::share::jitruntime::{CompiledResult, publish_executable, stub_map as jit_stub_map, try_invoke};
+    use crate::share::jitruntime::{
+        CompiledResult, publish_executable, stub_map as jit_stub_map,
+        stub_map_no_unwind as jit_stub_map_no_unwind, try_invoke,
+    };
     use crate::share::opto::codegen::ParamKind;
     use crate::share::opto::codegen::ParamSlot;
 
@@ -1011,6 +1084,7 @@ mod tests {
         let options = BackendOptions {
             params,
             stubs: jit_stub_map(),
+            stubs_no_unwind: jit_stub_map_no_unwind(),
             ..BackendOptions::default()
         };
         let mut c = Compile::compile(&method(code, param_slots), &BuilderContext::empty());
@@ -1551,6 +1625,7 @@ mod tests {
         let options = BackendOptions {
             params,
             stubs: jit_stub_map(),
+            stubs_no_unwind: jit_stub_map_no_unwind(),
             ..BackendOptions::default()
         };
         let mut c = Compile::compile(&method(code, param_slots), ctx);
@@ -1861,4 +1936,726 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn e2e_try_catch_array_oob() {
+        // try { a[i] } catch-all -> 7 ; in-bounds -> 9
+        //
+        //   0: bipush 3 ; 2: newarray int ; 4: astore_1
+        //   5: aload_1 ; 6: iload_0 ; 7: iaload
+        //   8: pop ; 9: bipush 9 ; 11: ireturn
+        //  12: pop            <- handler_pc (catch_type = 0)
+        //  13: bipush 7 ; 15: ireturn
+        //
+        // Exception table covers [5,8): the aload/iload cannot trap but
+        // iaload at bci 7 can (ArrayIndexOutOfBounds).
+        use super::super::builder::ExceptionHandler;
+        // JVM_LOADER is a global OnceLock: whichever test installed first
+        // wins, so register the throwable klass on the *active* loader.
+        let _ = test_loader();
+        let loader = crate::share::runtime::threading::jvm_loader().unwrap();
+        register_klass(&loader, b"java/lang/ArrayIndexOutOfBoundsException", &[]);
+        let code: &[u8] = &[
+            0x10, 0x03, // 0: bipush 3
+            0xbc, 0x0a, // 2: newarray int
+            0x4c, // 4: astore_1
+            0x2b, // 5: aload_1
+            0x1a, // 6: iload_0
+            0x2e, // 7: iaload
+            0x57, // 8: pop
+            0x10, 0x09, // 9: bipush 9
+            0xac, // 11: ireturn
+            0x57, // 12: pop (handler)
+            0x10, 0x07, // 13: bipush 7
+            0xac, // 15: ireturn
+        ];
+        let handlers = [ExceptionHandler {
+            start_pc: 5,
+            end_pc: 8,
+            handler_pc: 12,
+            catch_type: 0,
+        }];
+        let m = MethodCode {
+            name: "test",
+            max_locals: 2,
+            max_stack: 8,
+            param_slots: 2,
+            code,
+            handlers: &handlers,
+        };
+        let options = BackendOptions {
+            params: vec![iparam(0)],
+            stubs: jit_stub_map(),
+            stubs_no_unwind: jit_stub_map_no_unwind(),
+            ..BackendOptions::default()
+        };
+        let mut c = Compile::compile(&m, &BuilderContext::empty());
+        c.optimize();
+        let emitted = c
+            .backend(&m, &BuilderContext::empty(), &options)
+            .expect("c2 backend should emit");
+        let addr = publish_executable(&emitted.code, emitted.code.len())
+            .expect("publish executable");
+        for (arg, want) in [(1, 9), (9, 7)] {
+            let result = try_invoke(addr, b"(I)I", true, &[Value::Int(arg)], 0).unwrap();
+            match result {
+                CompiledResult::Value(Some(Value::Int(v))) => {
+                    assert_eq!(v, want, "arg={arg}")
+                }
+                other => panic!("unexpected result for {arg}: {:?}", other),
+            }
+        }
+    }
+
+    #[test]
+    fn e2e_try_catch_div_by_zero() {
+        // try { x / y } catch-all -> 7 ; nonzero divisor -> quotient
+        //
+        //   0: iload_0 ; 1: iload_1 ; 2: idiv ; 3: ireturn
+        //   4: pop          <- handler_pc (catch_type = 0)
+        //   5: bipush 7 ; 7: ireturn
+        //
+        // idiv at bci 2 raises ArithmeticException when y == 0; the
+        // exception edge must dispatch in-method instead of unwinding.
+        use super::super::builder::ExceptionHandler;
+        let _ = test_loader();
+        let loader = crate::share::runtime::threading::jvm_loader().unwrap();
+        register_klass(&loader, b"java/lang/ArithmeticException", &[]);
+        let code: &[u8] = &[
+            0x1a, // 0: iload_0
+            0x1b, // 1: iload_1
+            0x6c, // 2: idiv
+            0xac, // 3: ireturn
+            0x57, // 4: pop (handler)
+            0x10, 0x07, // 5: bipush 7
+            0xac, // 7: ireturn
+        ];
+        let handlers = [ExceptionHandler {
+            start_pc: 0,
+            end_pc: 3,
+            handler_pc: 4,
+            catch_type: 0,
+        }];
+        let m = MethodCode {
+            name: "test",
+            max_locals: 2,
+            max_stack: 8,
+            param_slots: 2,
+            code,
+            handlers: &handlers,
+        };
+        let options = BackendOptions {
+            params: vec![iparam(0), iparam(1)],
+            stubs: jit_stub_map(),
+            stubs_no_unwind: jit_stub_map_no_unwind(),
+            ..BackendOptions::default()
+        };
+        let mut c = Compile::compile(&m, &BuilderContext::empty());
+        c.optimize();
+        let emitted = c
+            .backend(&m, &BuilderContext::empty(), &options)
+            .expect("c2 backend should emit");
+        let addr = publish_executable(&emitted.code, emitted.code.len())
+            .expect("publish executable");
+        for (x, y, want) in [(20, 4, 5), (20, 0, 7), (i32::MIN, -1, i32::MIN)] {
+            let result = try_invoke(
+                addr,
+                b"(II)I",
+                true,
+                &[Value::Int(x), Value::Int(y)],
+                0,
+            )
+            .unwrap();
+            match result {
+                CompiledResult::Value(Some(Value::Int(v))) => {
+                    assert_eq!(v, want, "x={x} y={y}")
+                }
+                other => panic!("unexpected result for {x}/{y}: {:?}", other),
+            }
+        }
+    }
+    #[test]
+    fn e2e_typed_catch() {
+        // Typed exception handlers: the dispatch chain must run
+        // InstanceOf against each covering catch type in exception-table
+        // order — match -> handler, no match -> next handler / rethrow.
+        //
+        //   0: iload_0 ; 1: iload_1 ; 2: idiv ; 3: ireturn
+        //   4: pop          <- handler_pc
+        //   5: bipush 7 ; 7: ireturn
+        use super::super::builder::{ExceptionHandler, SiteInfo};
+        use std::collections::HashMap;
+        let _ = test_loader();
+        let loader = crate::share::runtime::threading::jvm_loader().unwrap();
+        register_klass(&loader, b"java/lang/ArithmeticException", &[]);
+        register_klass(&loader, b"java/lang/NullPointerException", &[]);
+        let code: &[u8] = &[
+            0x1a, // 0: iload_0
+            0x1b, // 1: iload_1
+            0x6c, // 2: idiv
+            0xac, // 3: ireturn
+            0x57, // 4: pop (handler)
+            0x10, 0x07, // 5: bipush 7
+            0xac, // 7: ireturn
+        ];
+        let site = |class: &str| SiteInfo {
+            class: class.to_string(),
+            name: String::new(),
+            desc: String::new(),
+        };
+        let mut sites: HashMap<u16, SiteInfo> = HashMap::new();
+        sites.insert(100, site("java/lang/ArithmeticException"));
+        sites.insert(101, site("java/lang/NullPointerException"));
+        let fields = HashMap::new();
+        let methods = HashMap::new();
+        let constants = HashMap::new();
+        let ctx = super::super::builder::BuilderContext {
+            fields: &fields,
+            methods: &methods,
+            constants: &constants,
+            sites: &sites,
+        };
+        let options = BackendOptions {
+            params: vec![iparam(0), iparam(1)],
+            stubs: jit_stub_map(),
+            stubs_no_unwind: jit_stub_map_no_unwind(),
+            ..BackendOptions::default()
+        };
+        let compile = |handlers: &[ExceptionHandler]| {
+            let m = MethodCode {
+                name: "test",
+                max_locals: 2,
+                max_stack: 8,
+                param_slots: 2,
+                code,
+                handlers,
+            };
+            let mut c = Compile::compile(&m, &ctx);
+            c.optimize();
+            let emitted = c.backend(&m, &ctx, &options).expect("emit");
+            publish_executable(&emitted.code, emitted.code.len()).expect("publish")
+        };
+        let invoke = |addr: usize| {
+            try_invoke(addr, b"(II)I", true, &[Value::Int(20), Value::Int(0)], 0).unwrap()
+        };
+        // 1. catch(ArithmeticException): thrown AE matches -> 7.
+        let h = [ExceptionHandler { start_pc: 0, end_pc: 3, handler_pc: 4, catch_type: 100 }];
+        let addr = compile(&h);
+        match invoke(addr) {
+            CompiledResult::Value(Some(Value::Int(v))) => assert_eq!(v, 7),
+            other => panic!("matching typed catch: {:?}", other),
+        }
+        // 2. catch(NullPointerException) only: AE does not match -> rethrow.
+        let h = [ExceptionHandler { start_pc: 0, end_pc: 3, handler_pc: 4, catch_type: 101 }];
+        let addr = compile(&h);
+        match invoke(addr) {
+            CompiledResult::Thrown(_) => {}
+            other => panic!("non-matching typed catch should rethrow: {:?}", other),
+        }
+        // 3. catch(NPE) then catch-all: typed fails, catch-all catches -> 7.
+        let h = [
+            ExceptionHandler { start_pc: 0, end_pc: 3, handler_pc: 4, catch_type: 101 },
+            ExceptionHandler { start_pc: 0, end_pc: 3, handler_pc: 4, catch_type: 0 },
+        ];
+        let addr = compile(&h);
+        match invoke(addr) {
+            CompiledResult::Value(Some(Value::Int(v))) => assert_eq!(v, 7),
+            other => panic!("typed-then-catchall: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn e2e_try_catch_shared_handler_phi() {
+        // Two adjacent protected ranges feed ONE catch-all handler, so the
+        // handler entry is a Region merge of two IfException edges and the
+        // exception object on the stack becomes a Phi copied on each edge.
+        //
+        //   0: bipush 3 ; 2: newarray int ; 4: astore_2
+        //   5: aload_2 ; 6: iload_0 ; 7: iaload      <- try1 [5,8)
+        //   8: pop
+        //   9: aload_2 ; 10: iload_1 ; 11: iaload    <- try2 [9,12)
+        //  12: pop ; 13: bipush 3 ; 15: ireturn
+        //  16: astore_3                               <- handler_pc = 16
+        //  17: bipush 7 ; 19: ireturn
+        use super::super::builder::ExceptionHandler;
+        let _ = test_loader();
+        let loader = crate::share::runtime::threading::jvm_loader().unwrap();
+        register_klass(&loader, b"java/lang/ArrayIndexOutOfBoundsException", &[]);
+        let code: &[u8] = &[
+            0x10, 0x03, // 0: bipush 3
+            0xbc, 0x0a, // 2: newarray int
+            0x4d, // 4: astore_2
+            0x2c, // 5: aload_2
+            0x1a, // 6: iload_0
+            0x2e, // 7: iaload
+            0x57, // 8: pop
+            0x2c, // 9: aload_2
+            0x1b, // 10: iload_1
+            0x2e, // 11: iaload
+            0x57, // 12: pop
+            0x10, 0x03, // 13: bipush 3
+            0xac, // 15: ireturn
+            0x4e, // 16: astore_3 (handler)
+            0x10, 0x07, // 17: bipush 7
+            0xac, // 19: ireturn
+        ];
+        let handlers = [
+            ExceptionHandler {
+                start_pc: 5,
+                end_pc: 8,
+                handler_pc: 16,
+                catch_type: 0,
+            },
+            ExceptionHandler {
+                start_pc: 9,
+                end_pc: 12,
+                handler_pc: 16,
+                catch_type: 0,
+            },
+        ];
+        let m = MethodCode {
+            name: "test",
+            max_locals: 4,
+            max_stack: 8,
+            param_slots: 2,
+            code,
+            handlers: &handlers,
+        };
+        let options = BackendOptions {
+            params: vec![iparam(0), iparam(1)],
+            stubs: jit_stub_map(),
+            stubs_no_unwind: jit_stub_map_no_unwind(),
+            ..BackendOptions::default()
+        };
+        let mut c = Compile::compile(&m, &BuilderContext::empty());
+        c.optimize();
+        let emitted = c
+            .backend(&m, &BuilderContext::empty(), &options)
+            .expect("c2 backend should emit");
+        let addr = publish_executable(&emitted.code, emitted.code.len())
+            .expect("publish executable");
+        for (x, y, want) in [(1, 1, 3), (9, 1, 7), (1, 9, 7), (9, 9, 7)] {
+            let result = try_invoke(
+                addr,
+                b"(II)I",
+                true,
+                &[Value::Int(x), Value::Int(y)],
+                0,
+            )
+            .unwrap();
+            match result {
+                CompiledResult::Value(Some(Value::Int(v))) => {
+                    assert_eq!(v, want, "x={x} y={y}")
+                }
+                other => panic!("unexpected result for {x},{y}: {:?}", other),
+            }
+        }
+    }
+
+
+    #[test]
+    fn e2e_long_loop_phis() {
+        // Regression: production C2 run of this loop shape returned 0.
+        //   s=0L; i=0L; while (i < 2000000L) { s += (i*2654435761L)>>>13;
+        //   s ^= s<<7; if ((i&1023L)==0L) s+=i; i+=1L; } return s;
+        use super::super::builder::ConstVal;
+        use std::collections::HashMap;
+        let _ = test_loader();
+        let code: &[u8] = &[
+            0x09, // 0: lconst_0
+            0x3f, // 1: lstore_0
+            0x09, // 2: lconst_0
+            0x41, // 3: lstore_2
+            0x20, // 4: lload_2
+            0x14, 0x00, 0x0f, // 5: ldc2_w #15 (2000000)
+            0x94, // 8: lcmp
+            0x9c, 0x00, 0x2a, // 9: ifge 51
+            0x1e, // 12: lload_0
+            0x20, // 13: lload_2
+            0x14, 0x00, 0x11, // 14: ldc2_w #17 (2654435761)
+            0x69, // 17: lmul
+            0x10, 0x0d, // 18: bipush 13
+            0x7d, // 20: lushr
+            0x61, // 21: ladd
+            0x3f, // 22: lstore_0
+            0x1e, // 23: lload_0
+            0x1e, // 24: lload_0
+            0x10, 0x07, // 25: bipush 7
+            0x79, // 27: lshl
+            0x83, // 28: lxor
+            0x3f, // 29: lstore_0
+            0x20, // 30: lload_2
+            0x14, 0x00, 0x13, // 31: ldc2_w #19 (1023)
+            0x7f, // 34: land
+            0x09, // 35: lconst_0
+            0x94, // 36: lcmp
+            0x9a, 0x00, 0x07, // 37: ifne 44
+            0x1e, // 40: lload_0
+            0x20, // 41: lload_2
+            0x61, // 42: ladd
+            0x3f, // 43: lstore_0
+            0x20, // 44: lload_2
+            0x0a, // 45: lconst_1
+            0x61, // 46: ladd
+            0x41, // 47: lstore_2
+            0xa7, 0xff, 0xd4, // 48: goto 4
+            0x1e, // 51: lload_0
+            0xad, // 52: lreturn
+        ];
+        let mut constants: HashMap<u16, ConstVal> = HashMap::new();
+        constants.insert(15, ConstVal::Long(10));
+        constants.insert(17, ConstVal::Long(2_654_435_761));
+        constants.insert(19, ConstVal::Long(1023));
+        let fields = HashMap::new();
+        let methods = HashMap::new();
+        let sites = HashMap::new();
+        let ctx = super::super::builder::BuilderContext {
+            fields: &fields,
+            methods: &methods,
+            constants: &constants,
+            sites: &sites,
+        };
+        let m = MethodCode {
+            name: "burn",
+            max_locals: 4,
+            max_stack: 8,
+            param_slots: 0,
+            code,
+            handlers: &[],
+        };
+        let options = BackendOptions {
+            stubs: jit_stub_map(),
+            stubs_no_unwind: jit_stub_map_no_unwind(),
+            ..BackendOptions::default()
+        };
+        let mut c = Compile::compile(&m, &ctx);
+        c.optimize();
+        let emitted = c
+            .backend(&m, &ctx, &options)
+            .expect("c2 backend should emit");
+        let addr = publish_executable(&emitted.code, emitted.code.len())
+            .expect("publish executable");
+        let result = try_invoke(addr, b"()J", true, &[], 0).unwrap();
+        match result {
+            CompiledResult::Value(Some(Value::Long(v))) => {
+                assert_eq!(v, 9_039_158_812_727_735_167i64)
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn e2e_osr_long_loop() {
+        // OSR entry into the same burn-loop shape at the loop header
+        // (bci 4): locals s/i arrive via the marshal buffer instead of
+        // parameters.  Entering with s=0, i=0 must reproduce the
+        // whole-method result.
+        use super::super::builder::{ConstVal, OsrKind, OsrSpec};
+        use std::collections::HashMap;
+        let _ = test_loader();
+        let code: &[u8] = &[
+            0x09, // 0: lconst_0
+            0x3f, // 1: lstore_0
+            0x09, // 2: lconst_0
+            0x41, // 3: lstore_2
+            0x20, // 4: lload_2
+            0x14, 0x00, 0x0f, // 5: ldc2_w #15 (2000000)
+            0x94, // 8: lcmp
+            0x9c, 0x00, 0x2a, // 9: ifge 51
+            0x1e, // 12: lload_0
+            0x20, // 13: lload_2
+            0x14, 0x00, 0x11, // 14: ldc2_w #17 (2654435761)
+            0x69, // 17: lmul
+            0x10, 0x0d, // 18: bipush 13
+            0x7d, // 20: lushr
+            0x61, // 21: ladd
+            0x3f, // 22: lstore_0
+            0x1e, // 23: lload_0
+            0x1e, // 24: lload_0
+            0x10, 0x07, // 25: bipush 7
+            0x79, // 27: lshl
+            0x83, // 28: lxor
+            0x3f, // 29: lstore_0
+            0x20, // 30: lload_2
+            0x14, 0x00, 0x13, // 31: ldc2_w #19 (1023)
+            0x7f, // 34: land
+            0x09, // 35: lconst_0
+            0x94, // 36: lcmp
+            0x9a, 0x00, 0x07, // 37: ifne 44
+            0x1e, // 40: lload_0
+            0x20, // 41: lload_2
+            0x61, // 42: ladd
+            0x3f, // 43: lstore_0
+            0x20, // 44: lload_2
+            0x0a, // 45: lconst_1
+            0x61, // 46: ladd
+            0x41, // 47: lstore_2
+            0xa7, 0xff, 0xd4, // 48: goto 4
+            0x1e, // 51: lload_0
+            0xad, // 52: lreturn
+        ];
+        let mut constants: HashMap<u16, ConstVal> = HashMap::new();
+        constants.insert(15, ConstVal::Long(10));
+        constants.insert(17, ConstVal::Long(2_654_435_761));
+        constants.insert(19, ConstVal::Long(1023));
+        let fields = HashMap::new();
+        let methods = HashMap::new();
+        let sites = HashMap::new();
+        let ctx = super::super::builder::BuilderContext {
+            fields: &fields,
+            methods: &methods,
+            constants: &constants,
+            sites: &sites,
+        };
+        let m = MethodCode {
+            name: "burn",
+            max_locals: 4,
+            max_stack: 8,
+            param_slots: 1, // slot 0 reserves the OSR buffer pointer
+            code,
+            handlers: &[],
+        };
+        let osr = OsrSpec {
+            entry_bci: 4,
+            local_kinds: vec![OsrKind::I64; 4],
+            stack_kinds: vec![],
+        };
+        let options = BackendOptions {
+            stubs: jit_stub_map(),
+            stubs_no_unwind: jit_stub_map_no_unwind(),
+            osr: true,
+            ..BackendOptions::default()
+        };
+        let mut c = Compile::compile_osr(&m, &ctx, &osr);
+        c.optimize();
+        let emitted = c
+            .backend(&m, &ctx, &options)
+            .expect("c2 osr backend should emit");
+        let addr = publish_executable(&emitted.code, emitted.code.len())
+            .expect("publish executable");
+        // Interpreter state at the loop header: s=0, i=0.
+        let locals = vec![
+            Value::Long(0),
+            Value::Empty,
+            Value::Long(0),
+            Value::Empty,
+        ];
+        let result = crate::share::jitruntime::runtime::invoke_osr(
+            addr,
+            b"()J",
+            true,
+            &locals,
+            &[],
+        )
+        .expect("invoke_osr should marshal");
+        match result {
+            CompiledResult::Value(Some(Value::Long(v))) => {
+                assert_eq!(v, 9_039_158_812_727_735_167i64)
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn e2e_osr_try_catch() {
+        // OSR entry into a loop whose body contains a typed catch: the
+        // handler block is reachable only through exception edges, so
+        // restrict_to_osr must keep it and remap exc preds/edges.
+        //
+        //   0: iconst_0 ; 1: istore_1      ; s = 0
+        //   2: iconst_0 ; 3: istore_2      ; i = 0
+        //   4: iload_2 ; 5: iload_0 ; 6: if_icmpge 35   ; loop header
+        //   9: iload_1 ; 10: bipush 100 ; 12: iload_2 ; 13: iconst_1
+        //  14: iadd ; 15: iload_0 ; 16: isub ; 17: idiv ; 18: iadd
+        //  19: istore_1                    ; try body [9,20), trap@17
+        //  20: goto 29
+        //  23: pop ; 24: iload_1 ; 25: bipush 5 ; 27: iadd ; 28: istore_1
+        //                                        ; handler (catch AE)
+        //  29: iinc 2,1 ; 32: goto 4
+        //  35: iload_1 ; 36: ireturn
+        use super::super::builder::{ExceptionHandler, OsrKind, OsrSpec, SiteInfo};
+        use std::collections::HashMap;
+        let _ = test_loader();
+        let loader = crate::share::runtime::threading::jvm_loader().unwrap();
+        register_klass(&loader, b"java/lang/ArithmeticException", &[]);
+        let code: &[u8] = &[
+            0x03, // 0: iconst_0
+            0x3c, // 1: istore_1
+            0x03, // 2: iconst_0
+            0x3d, // 3: istore_2
+            0x1c, // 4: iload_2
+            0x1a, // 5: iload_0
+            0xa2, 0x00, 0x1d, // 6: if_icmpge 35
+            0x1b, // 9: iload_1
+            0x10, 0x64, // 10: bipush 100
+            0x1c, // 12: iload_2
+            0x04, // 13: iconst_1
+            0x60, // 14: iadd
+            0x1a, // 15: iload_0
+            0x64, // 16: isub
+            0x6c, // 17: idiv
+            0x60, // 18: iadd
+            0x3c, // 19: istore_1
+            0xa7, 0x00, 0x09, // 20: goto 29
+            0x57, // 23: pop (handler)
+            0x1b, // 24: iload_1
+            0x10, 0x05, // 25: bipush 5
+            0x60, // 27: iadd
+            0x3c, // 28: istore_1
+            0x84, 0x02, 0x01, // 29: iinc 2, 1
+            0xa7, 0xff, 0xe4, // 32: goto 4
+            0x1b, // 35: iload_1
+            0xac, // 36: ireturn
+        ];
+        let handlers = [ExceptionHandler {
+            start_pc: 9,
+            end_pc: 20,
+            handler_pc: 23,
+            catch_type: 100,
+        }];
+        let site = SiteInfo {
+            class: "java/lang/ArithmeticException".to_string(),
+            name: String::new(),
+            desc: String::new(),
+        };
+        let mut sites: HashMap<u16, SiteInfo> = HashMap::new();
+        sites.insert(100, site);
+        let fields = HashMap::new();
+        let methods = HashMap::new();
+        let constants = HashMap::new();
+        let ctx = super::super::builder::BuilderContext {
+            fields: &fields,
+            methods: &methods,
+            constants: &constants,
+            sites: &sites,
+        };
+        let m = MethodCode {
+            name: "test",
+            max_locals: 3,
+            max_stack: 8,
+            param_slots: 1, // slot 0 reserves the OSR buffer pointer
+            code,
+            handlers: &handlers,
+        };
+        let osr = OsrSpec {
+            entry_bci: 4,
+            local_kinds: vec![OsrKind::I32; 3],
+            stack_kinds: vec![],
+        };
+        let options = BackendOptions {
+            stubs: jit_stub_map(),
+            stubs_no_unwind: jit_stub_map_no_unwind(),
+            osr: true,
+            ..BackendOptions::default()
+        };
+        let mut c = Compile::compile_osr(&m, &ctx, &osr);
+        c.optimize();
+        let emitted = c
+            .backend(&m, &ctx, &options)
+            .expect("c2 osr backend should emit");
+        let addr = publish_executable(&emitted.code, emitted.code.len())
+            .expect("publish executable");
+        // Enter at the header with n=10, s=1000, i=3 — mid-loop state.
+        let locals = vec![
+            Value::Int(10),
+            Value::Int(1000),
+            Value::Int(3),
+        ];
+        let result = crate::share::jitruntime::runtime::invoke_osr(
+            addr,
+            b"()I",
+            true,
+            &locals,
+            &[],
+        )
+        .expect("invoke_osr should marshal");
+        // Reference: same loop from i=3, s=1000.
+        let mut want = 1000i32;
+        for i in 3..10i32 {
+            let d = i + 1 - 10;
+            if d == 0 {
+                want += 5; // ArithmeticException -> catch
+            } else {
+                want += 100 / d; // Rust / truncates toward zero like idiv
+            }
+        }
+        match result {
+            CompiledResult::Value(Some(Value::Int(v))) => assert_eq!(v, want),
+            other => panic!("unexpected result: {:?} want={}", other, want),
+        }
+    }
+
+    #[test]
+    fn e2e_sumloop_shape() {
+        // C2Smoke.sumLoop(J)J shape: s/i live at locals 2/4 (param n at 0/1),
+        // generic lload/lstore index forms.  C2 returned n in production.
+        use super::super::builder::ConstVal;
+        use std::collections::HashMap;
+        let _ = test_loader();
+        let code: &[u8] = &[
+            0x09, // 0: lconst_0
+            0x41, // 1: lstore_2      (s)
+            0x09, // 2: lconst_0
+            0x37, 0x04, // 3: lstore 4  (i)
+            0x16, 0x04, // 5: lload 4
+            0x1e, // 7: lload_0       (n)
+            0x94, // 8: lcmp
+            0x9c, 0x00, 0x17, // 9: ifge 32
+            0x20, // 12: lload_2      (s)
+            0x16, 0x04, // 13: lload 4 (i)
+            0x14, 0x00, 0x0b, // 15: ldc2_w #11 (3)
+            0x69, // 18: lmul
+            0x0a, // 19: lconst_1
+            0x61, // 20: ladd
+            0x61, // 21: ladd
+            0x41, // 22: lstore_2
+            0x16, 0x04, // 23: lload 4
+            0x0a, // 25: lconst_1
+            0x61, // 26: ladd
+            0x37, 0x04, // 27: lstore 4
+            0xa7, 0xff, 0xe8, // 29: goto 5
+            0x20, // 32: lload_2
+            0xad, // 33: lreturn
+        ];
+        let mut constants: HashMap<u16, ConstVal> = HashMap::new();
+        constants.insert(11, ConstVal::Long(3));
+        let fields = HashMap::new();
+        let methods = HashMap::new();
+        let sites = HashMap::new();
+        let ctx = super::super::builder::BuilderContext {
+            fields: &fields,
+            methods: &methods,
+            constants: &constants,
+            sites: &sites,
+        };
+        let m = MethodCode {
+            name: "sumLoop",
+            max_locals: 6,
+            max_stack: 4,
+            param_slots: 2,
+            code,
+            handlers: &[],
+        };
+        let options = BackendOptions {
+            stubs: jit_stub_map(),
+            stubs_no_unwind: jit_stub_map_no_unwind(),
+            params: vec![lparam(0)],
+            ..BackendOptions::default()
+        };
+        let mut c = Compile::compile(&m, &ctx);
+        c.optimize();
+        let emitted = c
+            .backend(&m, &ctx, &options)
+            .expect("c2 backend should emit");
+        let addr = publish_executable(&emitted.code, emitted.code.len())
+            .expect("publish executable");
+        let result = try_invoke(addr, b"(J)J", true, &[Value::Long(100)], 0).unwrap();
+        match result {
+            CompiledResult::Value(Some(Value::Long(v))) => {
+                assert_eq!(v, 14_950i64)
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
 }

@@ -174,6 +174,18 @@ pub struct CompileOutcome {
     pub num_inlined_bytecodes: usize,
 }
 
+/// Interpreter frame snapshot captured at the backedge that requested
+/// an OSR compile: local-slot kinds (max_locals entries) and operand
+/// stack depth at the target bci.  Carried on the task so the compiler
+/// can build `opto::builder::OsrSpec` without re-deriving types.
+#[derive(Clone, Debug, Default)]
+pub struct OsrFrame {
+    /// Local-slot kinds at the OSR entry bci (max_locals entries).
+    pub local_kinds: Vec<crate::share::opto::builder::OsrKind>,
+    /// Operand-stack slot kinds at the OSR entry bci.
+    pub stack_kinds: Vec<crate::share::opto::builder::OsrKind>,
+}
+
 #[derive(Clone, Debug)]
 pub struct CompileTask {
     pub compile_id: usize,
@@ -195,6 +207,8 @@ pub struct CompileTask {
     pub reason: CompileReason,
     pub is_osr: bool,
     pub osr_bci: i32,
+    /// Frame snapshot for OSR compiles; `None` for invocation entries.
+    pub osr_frame: Option<OsrFrame>,
     shared: Arc<TaskShared>,
 }
 
@@ -223,6 +237,7 @@ impl CompileTask {
             reason,
             is_osr: false,
             osr_bci: Self::INVOCATION_ENTRY_BCI,
+            osr_frame: None,
             shared: Arc::new(TaskShared::new(
                 comp_level,
                 is_blocking,

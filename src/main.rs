@@ -2,6 +2,87 @@ use jvm25_rust::classfile::ClassFile;
 use jvm25_rust::share::{classfile::classLoader::ClassLoader, runtime::javaCalls};
 use std::{env, error::Error, fs, io, path::Path, process::ExitCode};
 
+/// Windows vectored exception handler: on access violations prints the
+/// faulting RIP, the accessed address, and — when the RIP lands inside a
+/// JIT nmethod — the compiled method, then continues search so the
+/// process still dies with the original exception.
+#[cfg(windows)]
+mod crash_handler {
+    use std::ffi::c_void;
+
+    const EXCEPTION_ACCESS_VIOLATION: u32 = 0xC000_0005;
+    const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
+
+    #[repr(C)]
+    struct ExceptionRecord {
+        code: u32,
+        flags: u32,
+        next: *mut c_void,
+        address: *mut c_void,
+        n_params: u32,
+        _align: u32,
+        params: [usize; 15],
+    }
+
+    #[repr(C)]
+    struct ExceptionPointers {
+        record: *const ExceptionRecord,
+        context: *mut c_void,
+    }
+
+    unsafe extern "system" fn handler(pointers: *mut ExceptionPointers) -> i32 {
+        unsafe {
+            if pointers.is_null() {
+                return EXCEPTION_CONTINUE_SEARCH;
+            }
+            let record_ptr = (*pointers).record;
+            if record_ptr.is_null() {
+                return EXCEPTION_CONTINUE_SEARCH;
+            }
+            let record = &*record_ptr;
+            if record.code != EXCEPTION_ACCESS_VIOLATION {
+                return EXCEPTION_CONTINUE_SEARCH;
+            }
+            let rip = record.address as usize;
+            let access = record.params.get(1).copied().unwrap_or(0);
+            let rw = record.params.first().copied().unwrap_or(0);
+            let cache = jvm25_rust::share::code::codeCache::CodeCache::global();
+            let where_ = if let Some(nm) = cache.find_nmethod_at_address(rip) {
+                format!(
+                    "nmethod {}.{}{} entry={:#x}",
+                    nm.method_holder(),
+                    nm.method_name(),
+                    nm.method_signature(),
+                    nm.entry_point()
+                )
+            } else if let Some(blob) = cache.find_blob_at_address(rip) {
+                format!("codeblob {blob:?}")
+            } else {
+                "non-jit code".to_string()
+            };
+            eprintln!(
+                "[crash] AV rip={rip:#x} {}={access:#x} -> {where_}",
+                if rw == 0 { "read" } else { "write" }
+            );
+            let _ = std::fs::write(
+                r"D:\jvm25-rust\crash.log",
+                format!("rip={rip:#x} rw={rw} access={access:#x} {where_}\n"),
+            );
+        }
+        EXCEPTION_CONTINUE_SEARCH
+    }
+
+    pub fn install() {
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn AddVectoredExceptionHandler(first: i32, handler: *const c_void) -> *mut c_void;
+        }
+        unsafe {
+            AddVectoredExceptionHandler(1, handler as *const c_void);
+        }
+    }
+}
+
 fn inspect() -> Result<(), Box<dyn Error>> {
     // Panic-free thread identity for JNI callbacks arriving after TLS
     // destruction (native shutdown hooks).
@@ -141,6 +222,7 @@ fn inspect() -> Result<(), Box<dyn Error>> {
     let mut out = jvm25_rust::share::runtime::jvmOut::JvmOut::stdout();
     jvm25_rust::share::runtime::jvmOut::install(&out);
     javaCalls::mainClass(loader.as_ref(), &name, arguments, &mut out)?;
+    jvm25_rust::share::runtime::threading::wait_non_daemon(loader.as_ref());
     Ok(())
 }
 
@@ -247,6 +329,8 @@ fn inspectClass(path: &Path) -> Result<(), Box<dyn Error>> {
 }
 
 fn main() -> ExitCode {
+    #[cfg(windows)]
+    crash_handler::install();
     std::panic::set_hook(Box::new(|info| {
         let location = info
             .location()

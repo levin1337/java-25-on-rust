@@ -195,6 +195,10 @@ struct Block {
 struct ExcEdge {
     handler_block: usize,
     slot: usize,
+    /// Exception-table `catch_type` CP index; 0 = catch-all.
+    catch_type: u32,
+    /// Handler's index in the exception table — dispatch priority.
+    prio: u32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -208,6 +212,29 @@ struct Frame {
     stack: Vec<StackVal>,
     mem: NodeId,
     ctrl: NodeId,
+}
+
+/// Kind of one OSR marshal-buffer slot, captured from the interpreter
+/// frame at the backedge that triggered compilation.  Types at a given
+/// bytecode index are static, so request-time kinds stay valid at the
+/// later OSR entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OsrKind {
+    I32,
+    I64,
+    F32,
+    F64,
+    Ref,
+}
+
+/// OSR compilation request: enter at `entry_bci` (a backward-branch
+/// target) with `local_kinds` describing every local slot
+/// (`max_locals` entries, padded with `I32` when short) and
+/// `stack_kinds` the operand-stack values live at that point.
+pub struct OsrSpec {
+    pub entry_bci: u32,
+    pub local_kinds: Vec<OsrKind>,
+    pub stack_kinds: Vec<OsrKind>,
 }
 
 pub struct BytecodeGraphBuilder<'a> {
@@ -235,6 +262,32 @@ impl<'a> BytecodeGraphBuilder<'a> {
         start: NodeId,
         root: NodeId,
     ) -> BuildResult {
+        Self::build_inner(gvn, method, ctx, start, root, None)
+    }
+
+    /// OSR variant: the graph entry is the block containing
+    /// `osr.entry_bci`; its frame is seeded from `OsrArg` nodes that
+    /// read the interpreter-marshalled buffer at run time.  Blocks not
+    /// reachable from the entry are dropped from the CFG.
+    pub fn build_osr(
+        gvn: &'a mut PhaseGVN,
+        method: &'a MethodCode<'a>,
+        ctx: &'a BuilderContext<'a>,
+        start: NodeId,
+        root: NodeId,
+        osr: &OsrSpec,
+    ) -> BuildResult {
+        Self::build_inner(gvn, method, ctx, start, root, Some(osr))
+    }
+
+    fn build_inner(
+        gvn: &'a mut PhaseGVN,
+        method: &'a MethodCode<'a>,
+        ctx: &'a BuilderContext<'a>,
+        start: NodeId,
+        root: NodeId,
+        osr_spec: Option<&OsrSpec>,
+    ) -> BuildResult {
         let mut b = Self {
             gvn,
             code: method.code,
@@ -255,6 +308,9 @@ impl<'a> BytecodeGraphBuilder<'a> {
         b.halt = b.gvn.alloc(Opcode::Halt, vec![]);
         b.build_cfg(method);
         b.build_exception_edges(method);
+        if let Some(osr) = osr_spec {
+            b.restrict_to_osr(method, osr, start);
+        }
         for i in 0..b.blocks.len() {
             b.process_block(i, method, start);
         }
@@ -577,13 +633,171 @@ impl<'a> BytecodeGraphBuilder<'a> {
         }
     }
 
+    /// Restricts the CFG to blocks reachable from the OSR entry and
+    /// seeds the entry block's frame from marshal-buffer inputs.  The
+    /// seed is injected as an extra already-delivered predecessor so
+    /// the normal merge/phi machinery treats it like any other edge.
+    fn restrict_to_osr(&mut self, method: &MethodCode, osr: &OsrSpec, start: NodeId) {
+        let entry_bci = osr.entry_bci as usize;
+        let Some(entry) = self.blocks.iter().position(|b| b.start == entry_bci) else {
+            self.result
+                .unsupported
+                .push(format!("osr: bci {} is not a block start", osr.entry_bci));
+            return;
+        };
+        let n = self.blocks.len();
+
+        // Exception-edge bookkeeping before any remapping: each edge's
+        // source bci (inverted from exc_at) and containing block, plus
+        // per-block lists of trapping bcis for reachability.
+        let mut edge_bci = vec![usize::MAX; self.exc_edges.len()];
+        let mut bci_block: HashMap<usize, usize> = HashMap::new();
+        let mut exc_bcis_by_block: HashMap<usize, Vec<usize>> = HashMap::new();
+        for (&bci, eids) in &self.exc_at {
+            for &eid in eids {
+                edge_bci[eid] = bci;
+            }
+            if let Some(b) = self.block_index_of(bci) {
+                bci_block.insert(bci, b);
+                exc_bcis_by_block.entry(b).or_default().push(bci);
+            }
+        }
+
+        // Reachability over normal successors AND exception edges: a
+        // handler block is reachable when a trapping bci inside a
+        // reachable block is covered by it.  Fixpoint — handler bodies
+        // can themselves trap into outer handlers.
+        let mut reach = vec![false; n];
+        let mut work = vec![entry];
+        reach[entry] = true;
+        while let Some(b) = work.pop() {
+            for s in &self.blocks[b].succs {
+                if !reach[s.target] {
+                    reach[s.target] = true;
+                    work.push(s.target);
+                }
+            }
+            if let Some(bcis) = exc_bcis_by_block.get(&b) {
+                for &bci in bcis {
+                    if let Some(eids) = self.exc_at.get(&bci) {
+                        for &eid in eids {
+                            let hb = self.exc_edges[eid].handler_block;
+                            if hb < n && !reach[hb] {
+                                reach[hb] = true;
+                                work.push(hb);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Remap old block indices to the filtered list.
+        let mut map = vec![usize::MAX; n];
+        let mut new_blocks: Vec<Block> = Vec::new();
+        for (i, blk) in self.blocks.iter().enumerate() {
+            if reach[i] {
+                map[i] = new_blocks.len();
+                new_blocks.push(blk.clone());
+            }
+        }
+        for blk in new_blocks.iter_mut() {
+            blk.preds.clear();
+            blk.succs.clear();
+        }
+        for i in 0..n {
+            if !reach[i] {
+                continue;
+            }
+            let ni = map[i];
+            let succs = self.blocks[i].succs.clone();
+            for s in succs {
+                if !reach[s.target] {
+                    continue;
+                }
+                let nt = map[s.target];
+                let slot = new_blocks[nt].preds.len();
+                new_blocks[nt].preds.push(PredRef::Normal);
+                new_blocks[ni].succs.push(Succ {
+                    target: nt,
+                    slot,
+                });
+            }
+        }
+
+        // Exception preds: keep exactly the edges whose handler AND
+        // source block are reachable, appended after the Normal preds
+        // (matching the original [Normals..., Excs...] ordering).
+        // exc_edges order preserves each handler's pred order.
+        for eid in 0..self.exc_edges.len() {
+            let ed = self.exc_edges[eid];
+            let bci = edge_bci[eid];
+            if bci == usize::MAX || !reach[ed.handler_block] {
+                continue;
+            }
+            let Some(&src) = bci_block.get(&bci) else {
+                continue;
+            };
+            if !reach[src] {
+                continue;
+            }
+            let nt = map[ed.handler_block];
+            let slot = new_blocks[nt].preds.len();
+            new_blocks[nt].preds.push(PredRef::Exc);
+            self.exc_edges[eid] = ExcEdge {
+                handler_block: nt,
+                slot,
+                catch_type: ed.catch_type,
+                prio: ed.prio,
+            };
+        }
+        self.blocks = new_blocks;
+        let entry = map[entry];
+
+        // Seed frame: locals come from buffer slots [0, max_locals),
+        // stack values from [max_locals, max_locals + depth).
+        let mut locals = Vec::with_capacity(method.max_locals);
+        for i in 0..method.max_locals {
+            let kind = osr.local_kinds.get(i).copied().unwrap_or(OsrKind::I32);
+            locals.push(self.osr_node(kind, i as u32));
+        }
+        let mut stack = Vec::with_capacity(osr.stack_kinds.len());
+        for (j, &kind) in osr.stack_kinds.iter().enumerate() {
+            let cat2 = matches!(kind, OsrKind::I64 | OsrKind::F64);
+            stack.push(StackVal {
+                node: self.osr_node(kind, method.max_locals as u32 + j as u32),
+                cat2,
+            });
+        }
+        let seed_slot = self.blocks[entry].preds.len();
+        self.blocks[entry].preds.push(PredRef::Normal);
+        self.delivered.insert(
+            (entry, seed_slot),
+            EdgeInfo {
+                ctrl: start,
+                mem: start,
+                locals,
+                stack,
+            },
+        );
+    }
+
+    fn osr_node(&mut self, kind: OsrKind, idx: u32) -> NodeId {
+        let op = match kind {
+            OsrKind::I32 => Opcode::OsrI(idx),
+            OsrKind::I64 => Opcode::OsrL(idx),
+            OsrKind::F32 => Opcode::OsrF(idx),
+            OsrKind::F64 => Opcode::OsrD(idx),
+            OsrKind::Ref => Opcode::OsrP(idx),
+        };
+        self.gvn.alloc(op, vec![])
+    }
+
     fn build_exception_edges(&mut self, method: &MethodCode) {
         for (hi, h) in method.handlers.iter().enumerate() {
             let hb = match self.block_index_of(h.handler_pc as usize) {
                 Some(b) => b,
                 None => continue,
             };
-            let _ = hi;
             let (s, e) = (h.start_pc as usize, h.end_pc as usize);
             for bci in self.throwing_bcis(s, e) {
                 let edge_id = self.exc_edges.len();
@@ -592,6 +806,8 @@ impl<'a> BytecodeGraphBuilder<'a> {
                 self.exc_edges.push(ExcEdge {
                     handler_block: hb,
                     slot,
+                    catch_type: h.catch_type,
+                    prio: hi as u32,
                 });
                 self.exc_at.entry(bci).or_default().push(edge_id);
             }
@@ -1015,7 +1231,20 @@ impl<'a> BytecodeGraphBuilder<'a> {
     fn arith(&mut self, frame: &mut Frame, op: Opcode, cat2: bool) -> NodeId {
         let b = self.pop(frame);
         let a = self.pop(frame);
-        let n = self.gvn.transform(op, vec![a, b]);
+        // Integer div/rem can trap (ArithmeticException on a zero
+        // divisor), so they are control+memory dependent like loads:
+        // the extra inputs pin them to this program point, which both
+        // schedules them and keeps GVN from merging a trapping div
+        // inside a try region with an identical one outside it.
+        let n = if matches!(
+            op,
+            Opcode::DivI | Opcode::DivL | Opcode::RemI | Opcode::RemL
+        ) {
+            self.gvn
+                .transform(op, vec![frame.mem, frame.ctrl, a, b])
+        } else {
+            self.gvn.transform(op, vec![a, b])
+        };
         self.push(frame, n, cat2);
         n
     }
@@ -1094,7 +1323,12 @@ impl<'a> BytecodeGraphBuilder<'a> {
                 self.push_const_i(frame, v);
             }
             Ldc | LdcW | Ldc2W => {
-                let idx = bc.get_u2(1).unwrap_or(0);
+                // `ldc` carries a u1 index; `ldc_w`/`ldc2_w` carry u2.
+                let idx = if code == Ldc {
+                    bc.get_u1(1).unwrap_or(0) as u16
+                } else {
+                    bc.get_u2(1).unwrap_or(0)
+                };
                 match self.ctx.constants.get(&idx) {
                     Some(ConstVal::Int(v)) => self.push_const_i(frame, *v),
                     Some(ConstVal::Long(v)) => {
@@ -1856,6 +2090,31 @@ impl<'a> BytecodeGraphBuilder<'a> {
         }
     }
 
+    /// Builds the `IfException` token for one exception edge:
+    /// `[trap, catch_site, prio]` where `catch_site` is a `SitePtr`
+    /// node for the handler's `catch_type` class (0 = catch-all) and
+    /// `prio` the exception-table index used to order the dispatch
+    /// chain.  Returns `None` (recording `unsupported`) when a typed
+    /// catch has no resolved site.
+    fn exc_if_node(&mut self, bci: usize, trap_node: NodeId, ed: &ExcEdge) -> Option<NodeId> {
+        let site = if ed.catch_type == 0 {
+            self.gvn.transform(Opcode::SitePtr(0), vec![])
+        } else {
+            let cp = ed.catch_type as u16;
+            if ed.catch_type > u16::MAX as u32 || !self.ctx.sites.contains_key(&cp) {
+                self.unsupported(bci, "unresolved catch type");
+                return None;
+            }
+            self.site_node(cp)
+        };
+        let prio = self.gvn.transform(Opcode::ConI(ed.prio as i32), vec![]);
+        // inputs[3] tags the throwing bci so the scheduler can tell a
+        // legitimate same-site typed-catch chain apart from a CSE'd
+        // trapping node shared across different handler sets.
+        let bci_n = self.gvn.transform(Opcode::ConI(bci as i32), vec![]);
+        Some(self.gvn.alloc(Opcode::IfException, vec![trap_node, site, prio, bci_n]))
+    }
+
     fn maybe_throw(&mut self, bci: usize, trap_node: NodeId, frame: &Frame) {
         let edges = match self.exc_at.get(&bci) {
             Some(e) => e.clone(),
@@ -1866,7 +2125,10 @@ impl<'a> BytecodeGraphBuilder<'a> {
                 let ed = &self.exc_edges[eid];
                 (ed.handler_block, ed.slot)
             };
-            let ie = self.gvn.alloc(Opcode::IfException, vec![trap_node]);
+            let ed = self.exc_edges[eid];
+            let Some(ie) = self.exc_if_node(bci, trap_node, &ed) else {
+                continue;
+            };
             let stack = vec![StackVal {
                 node: ie,
                 cat2: false,
@@ -1891,12 +2153,20 @@ impl<'a> BytecodeGraphBuilder<'a> {
                 let ed = &self.exc_edges[eid];
                 (ed.handler_block, ed.slot)
             };
+            // Route the edge through a dedicated IfException token so every
+            // exception edge has a unique control point (the athrow node
+            // itself is the block terminator and may feed several handlers).
+            // Its value is never read: the handler sees `obj` directly.
+            let ed = self.exc_edges[eid];
+            let Some(ie) = self.exc_if_node(bci, athrow_node, &ed) else {
+                continue;
+            };
             let stack = vec![StackVal {
                 node: obj,
                 cat2: false,
             }];
             let info = EdgeInfo {
-                ctrl: athrow_node,
+                ctrl: ie,
                 mem: frame.mem,
                 locals: frame.locals.clone(),
                 stack,
@@ -2000,6 +2270,55 @@ pub fn resolve_sites(
                 | Code::Invokedynamic
         );
         if is_field || is_method {
+            if op == Code::Invokedynamic {
+                // InvokeDynamic entries carry (bsm_attr_idx, nat_idx);
+                // memberRef cannot resolve them.  The site needs the
+                // *caller* class (its BootstrapMethods attribute and
+                // constant pool drive linkage) plus the call-site
+                // name/descriptor from the NameAndType.
+                let resolved = (|| {
+                    let crate::share::classfile::classFileParser::Constant::InvokeDynamic(
+                        _,
+                        nat,
+                    ) = klass.constant(cp).ok()?
+                    else {
+                        return None;
+                    };
+                    let crate::share::classfile::classFileParser::Constant::NameAndType(
+                        name_idx,
+                        desc_idx,
+                    ) = klass.constant(*nat).ok()?
+                    else {
+                        return None;
+                    };
+                    Some((
+                        klass.utf8(*name_idx).ok()?,
+                        klass.utf8(*desc_idx).ok()?,
+                    ))
+                })();
+                if std::env::var("JVM25_DBG_INDY").is_ok() {
+                    eprintln!(
+                        "[indy-site] cp={} resolved={} class={}",
+                        cp,
+                        resolved.is_some(),
+                        String::from_utf8_lossy(klass.class.name)
+                    );
+                }
+                if let Some((name, desc)) = resolved {
+                    sites.insert(
+                        cp,
+                        SiteInfo {
+                            class: String::from_utf8_lossy(
+                                klass.class.name,
+                            )
+                            .into_owned(),
+                            name: String::from_utf8_lossy(name).into_owned(),
+                            desc: String::from_utf8_lossy(desc).into_owned(),
+                        },
+                    );
+                }
+                continue;
+            }
             if let Ok([owner, name, desc]) = klass.memberRef(cp, is_field) {
                 sites.insert(
                     cp,

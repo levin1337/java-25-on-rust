@@ -10,6 +10,7 @@ pub mod bytecodeUtils;
 pub mod genericBootstrap;
 pub mod interpreter;
 pub mod interpreterRuntime;
+pub mod invokeDynamic;
 pub mod invocationCounter;
 pub mod lambdaMetafactory;
 pub mod linkResolver;
